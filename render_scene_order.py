@@ -10,7 +10,13 @@ import sys
 
 import numpy as np
 
-from scene_orders import compile_job, load_order, order_runtime_settings, resolved_jobs
+from scene_orders import (
+    compile_job,
+    composition_metadata,
+    load_order,
+    order_runtime_settings,
+    resolved_jobs,
+)
 
 
 def _args(argv: list[str]) -> argparse.Namespace:
@@ -66,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
                 "bounds_max": np.asarray(scene.bounds_max).tolist(),
                 "source_triangles": int(scene.src_tri_idx.size),
                 "camera_groups": {k: int(v.size) for k, v in scene.camera_tri_groups.items()},
+                "composition": composition_metadata(job),
             }
             with open(os.path.join(job_dir, "compile_manifest.json"), "w", encoding="utf-8") as fh:
                 json.dump(manifest, fh, indent=2)
@@ -87,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
                 "resolved_job": job,
                 "runtime": order_runtime_settings(job),
             }, fh, indent=2)
+        with open(os.path.join(job_dir, "composition_manifest.json"), "w", encoding="utf-8") as fh:
+            json.dump(composition_metadata(job), fh, indent=2)
         cmd = [
             sys.executable, os.path.join(os.path.dirname(__file__), "exposure_render_demo.py"),
             "--scene-order", order_path, "--scene-job", job_id,

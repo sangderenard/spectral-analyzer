@@ -100,6 +100,8 @@ __all__ = [
     "SensorChipSpec",
     "FilmEmulsionSpec",
     "ColorScienceProfile",
+    "process_linear_sensor_image",
+    "save_linear_sensor_image",
     "SensorBackProfile",
     # Hook machinery
     "HookStage",
@@ -488,6 +490,9 @@ class ColorScienceProfile:
     output_space    : str   = "sRGB"
     gamma           : float = 2.2
     clip_output     : bool  = False
+    sensor_white_level: float = 1.0
+    exposure_compensation_ev: float = 0.0
+    tone_curve_mode : str = "linear"
 
     # ── Named constructors ────────────────────────────────────────────────────
 
@@ -500,6 +505,32 @@ class ColorScienceProfile:
     def srgb_standard(cls) -> "ColorScienceProfile":
         """sRGB transfer function, no matrix."""
         return cls(output_space="sRGB", gamma=2.2, clip_output=True)
+
+    @classmethod
+    def spectral_sensor_srgb(
+        cls,
+        *,
+        sensor_white_level: float = 1.0,
+        exposure_compensation_ev: float = 0.0,
+        white_balance: Optional[np.ndarray] = None,
+        color_matrix: Optional[np.ndarray] = None,
+        tone_curve_mode: str = "reinhard",
+    ) -> "ColorScienceProfile":
+        """Fixed-reference output profile for linear spectral sensor RGB.
+
+        No image statistic participates in this transform. The same sensor
+        value therefore maps to the same output value in every frame.
+        """
+        return cls(
+            color_matrix=color_matrix,
+            white_balance=white_balance,
+            output_space="sRGB",
+            gamma=2.2,
+            clip_output=True,
+            sensor_white_level=float(sensor_white_level),
+            exposure_compensation_ev=float(exposure_compensation_ev),
+            tone_curve_mode=str(tone_curve_mode),
+        )
 
     @classmethod
     def film_print(cls) -> "ColorScienceProfile":
@@ -537,6 +568,11 @@ class ColorScienceProfile:
     def apply_tone_curve(self, rgb: np.ndarray) -> np.ndarray:
         """Apply tone_curve_lut to (H,W,3) or (N,3) float64 array via lerp."""
         img = np.asarray(rgb, np.float64)
+        mode = str(self.tone_curve_mode).strip().lower()
+        if mode == "reinhard":
+            return np.maximum(img, 0.0) / (1.0 + np.maximum(img, 0.0))
+        if mode not in ("linear", "none"):
+            raise ValueError(f"unsupported tone_curve_mode {self.tone_curve_mode!r}")
         if self.tone_curve_lut is None:
             return img
         lut = np.asarray(self.tone_curve_lut, np.float64)
@@ -559,6 +595,82 @@ class ColorScienceProfile:
         if abs(self.gamma - 1.0) < 1e-6:
             return img
         return np.power(np.maximum(img, 0.0), 1.0 / max(self.gamma, 1e-4))
+
+
+def process_linear_sensor_image(
+    raw_image: np.ndarray,
+    profile: ColorScienceProfile,
+) -> np.ndarray:
+    """Interpret linear sensor RGB through an explicit camera output profile.
+
+    The input is never modified, no frame-relative normalization is performed,
+    and floating-point dtype is preserved through the returned display array.
+    """
+    raw = np.asarray(raw_image)
+    if raw.ndim != 3 or raw.shape[-1] < 3:
+        raise ValueError(
+            f"linear sensor image must have shape (H,W,C>=3), got {raw.shape}"
+        )
+    if not np.issubdtype(raw.dtype, np.floating):
+        raise TypeError(f"linear sensor image must be floating point, got {raw.dtype}")
+    dtype = raw.dtype
+    rgb = np.array(raw[..., :3], dtype=dtype, copy=True, order="C")
+    white_level = np.asarray(max(float(profile.sensor_white_level), 1.0e-30), dtype=dtype)
+    exposure_gain = np.asarray(
+        2.0 ** float(profile.exposure_compensation_ev), dtype=dtype
+    )
+    rgb *= exposure_gain / white_level
+
+    if profile.white_balance is not None:
+        rgb *= np.asarray(profile.white_balance, dtype=dtype).reshape(1, 1, 3)
+    if profile.color_matrix is not None:
+        matrix = np.asarray(profile.color_matrix, dtype=dtype).reshape(3, 3)
+        rgb = np.ascontiguousarray(rgb.reshape(-1, 3) @ matrix.T).reshape(rgb.shape)
+
+    mode = str(profile.tone_curve_mode).strip().lower()
+    if mode == "reinhard":
+        positive = np.maximum(rgb, np.asarray(0.0, dtype=dtype))
+        rgb = positive / (np.asarray(1.0, dtype=dtype) + positive)
+    elif mode not in ("linear", "none"):
+        raise ValueError(f"unsupported tone_curve_mode {profile.tone_curve_mode!r}")
+    if profile.tone_curve_lut is not None:
+        lut = np.asarray(profile.tone_curve_lut, dtype=dtype)
+        indices = np.clip(rgb, 0.0, 1.0) * np.asarray(len(lut) - 1, dtype=dtype)
+        lo = np.floor(indices).astype(np.intp)
+        hi = np.minimum(lo + 1, len(lut) - 1)
+        fraction = indices - lo.astype(dtype)
+        rgb = lut[lo] + fraction * (lut[hi] - lut[lo])
+
+    if profile.output_space == "sRGB":
+        threshold = np.asarray(0.0031308, dtype=dtype)
+        rgb = np.where(
+            rgb <= threshold,
+            rgb * np.asarray(12.92, dtype=dtype),
+            np.asarray(1.055, dtype=dtype)
+            * np.power(np.maximum(rgb, 0.0), np.asarray(1.0 / 2.4, dtype=dtype))
+            - np.asarray(0.055, dtype=dtype),
+        )
+    elif abs(float(profile.gamma) - 1.0) >= 1.0e-6:
+        rgb = np.power(
+            np.maximum(rgb, 0.0),
+            np.asarray(1.0 / max(float(profile.gamma), 1.0e-4), dtype=dtype),
+        )
+    if profile.clip_output:
+        rgb = np.clip(rgb, 0.0, 1.0)
+    return np.ascontiguousarray(rgb, dtype=dtype)
+
+
+def save_linear_sensor_image(
+    raw_image: np.ndarray,
+    path: str,
+    profile: ColorScienceProfile,
+) -> np.ndarray:
+    """Process linear sensor RGB and write the camera's display PNG."""
+    from .sdcard import _write_png
+
+    output = process_linear_sensor_image(raw_image, profile)
+    _write_png(output, path)
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -841,14 +953,15 @@ class _ColorScienceHook(RawHandoffHook):
                 src = np.asarray(cand, np.float64)
                 break
 
-        # Normalise to [0, 1] for downstream color processing
-        peak = float(np.max(np.abs(src)))
-        if peak < 1e-30:
-            # All-black — pass zeros through
-            ctx.rgb = np.zeros(src.shape[:2] + (3,), np.float64)
-            ctx.output = ctx.rgb.copy()
-            return
-        src_norm = src / peak   # dtype-neutral normalisation
+        # Convert physical/electronic stages to a fixed [0,1] sensor reference.
+        # Raw linear sensor RGB uses ColorScienceProfile.sensor_white_level in
+        # process_linear_sensor_image; no frame maximum is consulted.
+        src_norm = src
+        chip = ctx.profile.sensor_chip
+        if ctx.adu is not None and chip is not None:
+            src_norm = (src - float(chip.black_level_adu)) / float(chip.adu_range)
+        elif ctx.electrons is not None and chip is not None:
+            src_norm = src / max(float(chip.full_well_e), 1.0e-30)
 
         # Ensure (H, W, 3)
         if src_norm.ndim == 2:
@@ -868,12 +981,7 @@ class _ColorScienceHook(RawHandoffHook):
                 src_norm, np.zeros(src_norm.shape[:2] + (3 - src_norm.shape[-1],))
             ], axis=-1)
 
-        rgb = cs.apply_white_balance(rgb)
-        rgb = cs.apply_matrix(rgb)
-        rgb = cs.apply_tone_curve(rgb)
-        rgb = cs.apply_gamma(rgb)
-        if cs.clip_output:
-            rgb = np.clip(rgb, 0.0, 1.0)
+        rgb = process_linear_sensor_image(rgb, cs)
 
         ctx.rgb = rgb
         ctx.output = rgb

@@ -2371,6 +2371,21 @@ struct PyRayTracer
         return arr;
     }
 
+    py::array_t<float> get_sensor_image_linear() {
+        int res = 0;
+        ray_pipeline_get_sensor_image_linear(_pipeline, nullptr, &res);
+        if (res <= 0 || !_pipeline)
+            return py::array_t<float>(std::vector<py::ssize_t>{0});
+        auto arr = py::array_t<float>(
+            std::vector<py::ssize_t>{res, res, 3},
+            std::vector<py::ssize_t>{
+                (py::ssize_t)(res * 3 * sizeof(float)),
+                (py::ssize_t)(3 * sizeof(float)),
+                (py::ssize_t)(sizeof(float))});
+        ray_pipeline_get_sensor_image_linear(_pipeline, arr.mutable_data(), &res);
+        return arr;
+    }
+
     /* Return the sugar-auxin priority map as a float32 (res, res) array.
      * Values >= 1.0; baseline = 1.0; elevated regions recently had BDPT
      * convergence and will receive more backward-ray budget next frame. */
@@ -5752,6 +5767,11 @@ Resets accumulator.  Call before submitting rays.)doc")
 R"doc(Return current sensor image as float32 ndarray of shape (res, res, 3).
 R=forward plate hits, G=backward emissive+provisional near-miss, B=exact BDPT snap.
 Values are log-tone-mapped to [0, 1]. Thread-safe.)doc")
+    .def("get_sensor_image_linear",
+         &PyRayTracer::get_sensor_image_linear,
+R"doc(Return unnormalised sensor accumulation as float32 (res, res, 3) RGB.
+Orientation matches get_sensor_image(). No percentile scaling, clipping, or
+display curve is applied. Thread-safe.)doc")
         .def("get_priority_map",
              &PyRayTracer::get_priority_map,
 R"doc(Return the sugar-auxin work-priority map as float32 ndarray of shape (res, res).

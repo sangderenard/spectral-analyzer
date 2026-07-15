@@ -133,6 +133,36 @@ def _native_bdpt_work_units(width: int, height: int, aperture_samples: int,
         "sensor_rgb_bytes": int(pixels * 3 * np.dtype(np.float32).itemsize),
     }
 
+
+def _native_bdpt_refinement_schedule(
+    work_units: list[tuple[int, int]],
+    sensor_sweeps: int,
+) -> list[tuple[int, int, int]]:
+    """Repeat a complete spatial work plan for each independent sensor sweep."""
+    sweeps = int(sensor_sweeps)
+    if sweeps <= 0:
+        raise ValueError("sensor_sweeps must be positive")
+    return [
+        (sweep_index, int(offset), int(count))
+        for sweep_index in range(sweeps)
+        for offset, count in work_units
+    ]
+
+
+def _resolve_native_sensor_sweeps(
+    cli_sweeps: Optional[int], authored_sweeps: int = 1
+) -> int:
+    requested = authored_sweeps if cli_sweeps is None else cli_sweeps
+    return max(1, int(requested))
+
+
+def _average_native_sensor_sweeps(
+    linear_image: np.ndarray, sensor_sweeps: int
+) -> np.ndarray:
+    array = np.asarray(linear_image)
+    divisor = np.asarray(max(1, int(sensor_sweeps)), dtype=array.dtype)
+    return np.ascontiguousarray(array / divisor)
+
 def _native_sensor_to_display(img: np.ndarray) -> np.ndarray:
     """Reorient the native square sensor accumulator into display convention.
 
@@ -140,17 +170,60 @@ def _native_sensor_to_display(img: np.ndarray) -> np.ndarray:
     sensor-plane position (y, z) where iy runs along world +Y (camera right)
     and iz along world +Z (camera up) — see sensor_terminal_splat.comp.glsl
     (`pix = iy * sensor_res + iz`) and ray_pipeline_submit_sensor_sweep.
-        Display convention uses Z as rows and Y as columns.  Therefore the only
-        storage conversion is D[row_z, column_y] = img[iy, iz].  An earlier
-        horizontal flip happened to leave a single "A" looking plausible but
-        reversed multi-glyph text ("AXE" became "EXA").  Optical inversion is
-        already represented by the traced paths; applying it again at readback is
-        incorrect.  This is a pure storage reorientation; transport is untouched.
+    Display convention uses Z as rows and Y as columns. Therefore the only
+    storage conversion is D[row_z, column_y] = img[iy, iz]. An earlier
+    horizontal flip happened to leave a single "A" looking plausible but
+    reversed multi-glyph text ("AXE" became "EXA"). Optical inversion is
+    already represented by the traced paths; applying it again at readback is
+    incorrect. This is a pure storage reorientation; transport is untouched.
     """
     a = np.asarray(img)
     if a.ndim != 3 or a.shape[0] != a.shape[1]:
         return a
     return np.ascontiguousarray(a.transpose(1, 0, 2))
+
+
+def _native_sensor_tile_to_display(img: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Reorient and sample the native square accumulator to an exact tile shape."""
+    display = _native_sensor_to_display(img)
+    out_width = int(width)
+    out_height = int(height)
+    if display.ndim != 3 or out_width <= 0 or out_height <= 0:
+        return display
+    if display.shape[:2] == (out_height, out_width):
+        return display
+    y_index = np.minimum(
+        (np.arange(out_height, dtype=np.float64) + 0.5)
+        * float(display.shape[0]) / float(out_height),
+        display.shape[0] - 1,
+    ).astype(np.int64)
+    x_index = np.minimum(
+        (np.arange(out_width, dtype=np.float64) + 0.5)
+        * float(display.shape[1]) / float(out_width),
+        display.shape[1] - 1,
+    ).astype(np.int64)
+    return np.ascontiguousarray(display[y_index[:, None], x_index[None, :]])
+
+
+def _native_sensor_schedule_shape(width: int, height: int) -> tuple[int, int]:
+    """Return the square schedule required by the native square accumulator."""
+    resolution = max(int(width), int(height))
+    if resolution <= 0:
+        raise ValueError("native sensor schedule dimensions must be positive")
+    return resolution, resolution
+
+
+def _native_sensor_linear_output(backend: Any, display_image: np.ndarray) -> np.ndarray:
+    """Return raw native accumulation when available, preserving its dtype."""
+    linear_image = getattr(backend, "_native_sensor_linear_image", None)
+    if linear_image is None:
+        return np.asarray(display_image).copy()
+    linear = np.asarray(linear_image)
+    if linear.shape != np.asarray(display_image).shape:
+        raise ValueError(
+            f"native linear sensor shape {linear.shape} does not match display {np.asarray(display_image).shape}"
+        )
+    return linear.copy()
 
 
 from camera_exposure_budget import (
@@ -552,6 +625,8 @@ class TracerScene:
 # It still contains the proven thick-lens lab camera/lens/flash groups; only
 # the replaceable subject geometry and authored materials differ.
 _ORDERED_THICK_LENS_SCENE: Optional[TracerScene] = None
+_ORDERED_SCENE_JOB: Optional[dict[str, Any]] = None
+_ORDERED_TILE_OUTPUT: Optional[tuple[int, int]] = None
 
 
 _LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
@@ -678,6 +753,80 @@ def _build_camera_rig_mesh(
     return verts_flat, normals, mat_idx, groups_np
 
 
+def _lab_object_distance_for_sensor_focus(scene: Any, sensor_focus_m: float) -> float:
+    """Convert sensor-to-object distance to the lab solver's object-to-lens distance."""
+    design = scene.optical_design
+    focal_range = tuple(float(value) for value in design.focal_length_range_m)
+    focal_m = focal_range[0] + (focal_range[1] - focal_range[0]) * float(design.zoom)
+    group_span_m = (
+        (int(design.group_count) - 1) * float(design.min_air_gap_m)
+        + int(design.group_count) * float(design.group_thickness_m)
+    )
+    clearance_m = float(design.sensor_clearance_m)
+    target_m = float(sensor_focus_m)
+    minimum_m = focal_m * 1.05
+
+    def sensor_distance(object_distance_m: float) -> float:
+        image_distance_m = 1.0 / (1.0 / focal_m - 1.0 / object_distance_m)
+        return object_distance_m + group_span_m + image_distance_m + clearance_m
+
+    low = minimum_m
+    high = max(target_m, low * 2.0)
+    if target_m <= sensor_distance(low):
+        raise ValueError(
+            f"sensor focus distance {target_m:g}m is too close for the lab lens "
+            f"(minimum {sensor_distance(low):g}m)"
+        )
+    for _ in range(80):
+        middle = 0.5 * (low + high)
+        if sensor_distance(middle) < target_m:
+            low = middle
+        else:
+            high = middle
+    return 0.5 * (low + high)
+
+
+def _ordered_lab_scene_for_sensor_focus(tll: Any, sensor_focus_m: float) -> Any:
+    """Configure a fresh lab scene whose physical sensor conjugate matches the order."""
+    initial = tll.SceneConfig()
+    proposed_object_distance_m = _lab_object_distance_for_sensor_focus(
+        initial, sensor_focus_m
+    )
+    corrected_object_distance_m = proposed_object_distance_m
+    physical_error_m = 0.0
+    for _ in range(4):
+        probe = tll.SceneConfig()
+        probe.focus_distance_m = corrected_object_distance_m
+        probe.x_max = max(
+            float(probe.x_max),
+            float(probe.object_plane.x) + float(sensor_focus_m) + 0.25,
+        )
+        tll._scene_lenses(probe)
+        physical_sensor_focus_m = (
+            float(probe.image_plate.x) - float(probe.object_plane.x)
+        )
+        physical_error_m = physical_sensor_focus_m - float(sensor_focus_m)
+        corrected_object_distance_m -= physical_error_m
+        if abs(physical_error_m) <= 5.0e-7:
+            break
+
+    scene = tll.SceneConfig()
+    scene.focus_distance_m = corrected_object_distance_m
+    scene.x_max = max(
+        float(scene.x_max),
+        float(scene.object_plane.x) + float(sensor_focus_m) + 0.25,
+    )
+    print(
+        "[scene-focus] "
+        f"sensor_to_text={sensor_focus_m:.6f}m "
+        f"paraxial_object_distance={proposed_object_distance_m:.6f}m "
+        f"physical_probe_error={physical_error_m * 1e3:+.6f}mm "
+        f"corrected_object_distance={corrected_object_distance_m:.6f}m",
+        flush=True,
+    )
+    return scene
+
+
 def _build_thick_lens_lab_tracer_scene() -> TracerScene:
     """Materialise the articulated thick-lens lab scene as a TracerScene.
 
@@ -691,12 +840,25 @@ def _build_thick_lens_lab_tracer_scene() -> TracerScene:
 
     import thick_lens_focus_lab as tll
 
+    ordered_sensor_focus_m = None
+    if _ORDERED_SCENE_JOB is not None:
+        from scene_orders import camera_focus_distance
+        ordered_sensor_focus_m = camera_focus_distance(_ORDERED_SCENE_JOB)
+
     cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".spectral_cache")
-    cache_path = os.path.join(cache_dir, "thick_lens_exposure_scene_v3.npz")
+    focus_cache_tag = (
+        "default"
+        if ordered_sensor_focus_m is None
+        else f"focus_{int(round(ordered_sensor_focus_m * 1.0e6))}um"
+    )
+    cache_path = os.path.join(
+        cache_dir, f"thick_lens_exposure_scene_v4_{focus_cache_tag}.npz"
+    )
     cache_stamp = np.asarray([
-        3.0,
+        4.0,
         float(os.path.getmtime(tll.__file__)),
         float(DEFAULT_FREQ_HZ.size),
+        -1.0 if ordered_sensor_focus_m is None else float(ordered_sensor_focus_m),
     ], dtype=np.float64)
     try:
         with np.load(cache_path, allow_pickle=False) as cached:
@@ -727,7 +889,11 @@ def _build_thick_lens_lab_tracer_scene() -> TracerScene:
     except (OSError, KeyError, ValueError) as exc:
         print(f"[scene-cache] rebuild required: {exc}", flush=True)
 
-    lab_scene = tll.SceneConfig()
+    lab_scene = (
+        tll.SceneConfig()
+        if ordered_sensor_focus_m is None
+        else _ordered_lab_scene_for_sensor_focus(tll, ordered_sensor_focus_m)
+    )
     sidecar = tll.FreeFrequencySidecar.lazy_prepare(int(DEFAULT_FREQ_HZ.size))
     (
         verts_flat, normals, mat_idx, tri_arr, db,
@@ -841,29 +1007,46 @@ def _build_thick_lens_lab_camera_package(
         raise RuntimeError("thick-lens lab camera requires non-empty sensor tri group")
     sensor_pts = scene.verts[sensor_ids].reshape(-1, 3)
     sensor_center = sensor_pts.mean(axis=0).astype(np.float64)
-    sensor_half_w = 0.5 * float(np.max(sensor_pts[:, 1]) - np.min(sensor_pts[:, 1]))
-    sensor_half_h = 0.5 * float(np.max(sensor_pts[:, 2]) - np.min(sensor_pts[:, 2]))
+
+    fwd = np.array([-1.0, 0.0, 0.0], np.float64)
+    right = np.array([0.0, 1.0, 0.0], np.float64)
+    up = np.array([0.0, 0.0, 1.0], np.float64)
+    sensor_local = sensor_pts - sensor_center
+    sensor_half_w = 0.5 * float(np.ptp(sensor_local @ right))
+    sensor_half_h = 0.5 * float(np.ptp(sensor_local @ up))
 
     aperture_ids = np.asarray(cam_groups.get("aperture_blocker", np.zeros((0,), np.int32)), dtype=np.int32)
     if aperture_ids.size > 0:
         aperture_pts = scene.verts[aperture_ids].reshape(-1, 3)
         aperture_center = aperture_pts.mean(axis=0).astype(np.float64)
-        aperture_center[1] = 0.0
-        aperture_center[2] = 0.0
-        aperture_radial = np.linalg.norm(aperture_pts[:, 1:3] - aperture_center[1:3], axis=1)
+        aperture_delta = aperture_pts - aperture_center
+        aperture_radial = np.hypot(aperture_delta @ right, aperture_delta @ up)
         positive = aperture_radial[aperture_radial > 1.0e-6]
         aperture_radius_m = float(np.min(positive)) if positive.size else float(optics.aperture_mm) * 0.5e-3
     else:
-        aperture_center = np.array([sensor_center[0] - max(float(optics.focal_mm) * 1.0e-3, 1.0e-3), 0.0, 0.0], np.float64)
+        aperture_center = sensor_center + fwd * max(float(optics.focal_mm) * 1.0e-3, 1.0e-3)
         aperture_radius_m = float(optics.aperture_mm) * 0.5e-3
 
-    fwd = np.array([-1.0, 0.0, 0.0], np.float64)
-    up = np.array([0.0, 0.0, 1.0], np.float64)
-    focal_m = max(1.0e-4, float(sensor_center[0] - aperture_center[0]))
+    focal_m = max(1.0e-4, float(np.dot(aperture_center - sensor_center, fwd)))
     sensor_w_m = max(1.0e-4, 2.0 * sensor_half_w)
     sensor_h_m = max(1.0e-4, 2.0 * sensor_half_h)
+    if _ORDERED_SCENE_JOB is not None:
+        from scene_orders import sensor_tile
+        tile = sensor_tile(_ORDERED_SCENE_JOB, sensor_w_m, sensor_h_m)
+        sensor_center = (
+            sensor_center
+            + right * float(tile["right_offset_m"])
+            + up * float(tile["up_offset_m"])
+        )
+        sensor_w_m = float(tile["sensor_w_m"])
+        sensor_h_m = float(tile["sensor_h_m"])
     fov_y = 2.0 * math.atan2(sensor_h_m * 0.5, focal_m)
-    focus_distance_m = max(1.0e-4, float(sensor_center[0] - scene.bounds_min[0]))
+    focus_distance_m = None
+    if _ORDERED_SCENE_JOB is not None:
+        from scene_orders import camera_focus_distance
+        focus_distance_m = camera_focus_distance(_ORDERED_SCENE_JOB)
+    if focus_distance_m is None:
+        focus_distance_m = max(1.0e-4, float(sensor_center[0] - scene.bounds_min[0]))
 
     cam = PhysicalCameraRig(
         pos=np.ascontiguousarray(sensor_center, dtype=np.float64),
@@ -1446,6 +1629,7 @@ class CppExposureBackend(ExposureBackend):
         self._bdpt_dynamic_cap_hint: int = int(self._bdpt_initial_cap_hint)
         self._bdpt_last_overflow_path: Optional[str] = None
         self._native_sensor_image: Optional[np.ndarray] = None
+        self._native_sensor_linear_image: Optional[np.ndarray] = None
         self.sensor_uv_hits = np.zeros((cam.height, cam.width), np.float32)
         self.sensor_uv_thin_lens_hits = np.zeros((cam.height, cam.width), np.float32)
         
@@ -1457,6 +1641,7 @@ class CppExposureBackend(ExposureBackend):
     def reset_exposure(self) -> None:
         super().reset_exposure()
         self._native_sensor_image = None
+        self._native_sensor_linear_image = None
         self.sensor_uv_hits.fill(0.0)
         self.sensor_uv_thin_lens_hits.fill(0.0)
 
@@ -1810,7 +1995,8 @@ class CppExposureBackend(ExposureBackend):
                                    seed: int,
                                    exposure_weight: float = 1.0,
                                    sweep_offset: int = 0,
-                                   sweep_count: int = 0) -> np.ndarray:
+                                   sweep_count: int = 0,
+                                   sensor_sweeps: int = 1) -> np.ndarray:
         """Run one lab-standard native BDPT package and return sensor RGB.
 
         sweep_offset/sweep_count select a slice of the (pixel × aperture)
@@ -1938,8 +2124,21 @@ class CppExposureBackend(ExposureBackend):
             self.tracer.join_t5()
             latch = (self.tracer.get_bdpt_latch_state()
                      if hasattr(self.tracer, "get_bdpt_latch_state") else {})
-            img = _native_sensor_to_display(
-                np.asarray(self.tracer.get_sensor_image(), dtype=np.float32))
+            output_width, output_height = (
+                _ORDERED_TILE_OUTPUT if _ORDERED_TILE_OUTPUT is not None else (n_px, n_py)
+            )
+            img = _native_sensor_tile_to_display(
+                np.asarray(self.tracer.get_sensor_image(), dtype=np.float32),
+                output_width,
+                output_height,
+            )
+            linear_img = None
+            if hasattr(self.tracer, "get_sensor_image_linear"):
+                linear_img = _native_sensor_tile_to_display(
+                    np.asarray(self.tracer.get_sensor_image_linear(), dtype=np.float32),
+                    output_width,
+                    output_height,
+                )
             valid_shape = img.ndim == 3 and img.shape[2] >= 3
             rgb = img[..., :3] if valid_shape else np.empty((0, 0, 3), np.float32)
             finite = bool(rgb.size and np.all(np.isfinite(rgb)))
@@ -1974,6 +2173,10 @@ class CppExposureBackend(ExposureBackend):
                 self._native_sensor_image = np.zeros((_res, _res, 3), dtype=np.float32)
                 return self._native_sensor_image
             self._native_sensor_image = np.ascontiguousarray(np.clip(img[..., :3], 0.0, 1.0), dtype=np.float32)
+            if linear_img is not None and linear_img.shape == img.shape:
+                self._native_sensor_linear_image = _average_native_sensor_sweeps(
+                    linear_img[..., :3], sensor_sweeps
+                )
             self.n_rays_accumulated += int(submitted_flash) + int(submitted_sensor)
             print(
                 "  [bdpt-native-lab] usable image "
@@ -2943,7 +3146,8 @@ class ExposureSession:
                  vcm_radius_mm: float = 2.0,
                  vcm_radius_alpha: float = 0.7,
                  gpu_resident: bool = False,
-                 bdpt_native_packages: int = 1):
+                 bdpt_native_packages: int = 1,
+                 bdpt_native_sweeps: int = 1):
         self.optics = optics
         self.film   = film
         self.width  = int(width)
@@ -3020,12 +3224,11 @@ class ExposureSession:
         self.bdpt_intermediate_dir = str(bdpt_intermediate_dir or out_dir)
         self.t5_min_geom = float(t5_min_geom)
         self.gpu_resident = bool(gpu_resident)
-        # Number of flash+sensor packages per exposure in the native thick-lens
-        # path.  >1 splits the ray budget over repeated cycles in the SAME
-        # accumulation, so each cycle adds new data points and the C++ T5
-        # backlog can work previously deferred high-score pairs with a budget
-        # share that grows with backlog age.
+        # Package count is a lower bound on memory-safe spatial partitions of
+        # one sensor sweep. Sweeps are independent complete passes accumulated
+        # into the same native sensor and averaged at readback.
         self.bdpt_native_packages = int(max(1, bdpt_native_packages))
+        self.bdpt_native_sweeps = int(max(1, bdpt_native_sweeps))
         hard_cap_records = max(1, _bdpt_cap_from_bytes(_BDPT_INTERMEDIATE_HARD_CAP_BYTES))
         if requested_bdpt_cap > 0:
             self.bdpt_records_cap = max(4096, min(requested_bdpt_cap, hard_cap_records))
@@ -4799,6 +5002,9 @@ class ExposureSession:
         _bdpt_native_lab_active = False
         _bdpt_native_emitter_tri_ids = np.zeros((0,), dtype=np.int32)
         _bdpt_native_n_aperture_samples = 1
+        _bdpt_native_work_units: list[tuple[int, int]] = []
+        _bdpt_native_work_plan: dict[str, int] = {}
+        _bdpt_native_schedule: list[tuple[int, int, int]] = []
         if self.integrator in ("forward", "backward", "bdpt") and "cpp" in backs:
             cpp_back = backs["cpp"]  # type: ignore[assignment]
             tracer = getattr(cpp_back, "tracer", None)
@@ -5203,9 +5409,24 @@ class ExposureSession:
                     )
                     if _bdpt_native_lab_active:
                         _stream_divisor = 1
-                        _stream_seen = np.ones((1,), dtype=bool)
-                        _stream_cover_complete = True
-                        _stream_covered_n = 1
+                        _bdpt_native_work_units, _bdpt_native_work_plan = _native_bdpt_work_units(
+                            int(self.width),
+                            int(self.height),
+                            int(max(1, _bdpt_native_n_aperture_samples)),
+                            requested_packages=int(self.bdpt_native_packages),
+                            primary_ray_cap=200_000,
+                        )
+                        _bdpt_native_schedule = _native_bdpt_refinement_schedule(
+                            _bdpt_native_work_units,
+                            self.bdpt_native_sweeps,
+                        )
+                        _stream_seen = np.zeros((len(_bdpt_native_schedule),), dtype=bool)
+                        _stream_cover_complete = False
+                        _stream_covered_n = 0
+                        _stream_hard_cap_batches = max(
+                            _stream_hard_cap_batches,
+                            len(_bdpt_native_schedule),
+                        )
                         print("  BDPT: thick-lens lab using native flash/sensor/T5 package")
                     print(f"  {self.integrator.upper()}: streaming {n_emit_pre} emitter groups, "
                           f"~{_bdpt_target_total:_} rays/batch target")
@@ -5272,32 +5493,32 @@ class ExposureSession:
                         # stays cap-safe; --bdpt-native-packages raises it
                         # further if the user wants more accumulation cycles.
                         _nap_native = int(max(1, _bdpt_native_n_aperture_samples))
-                        _work_units, _work_plan = _native_bdpt_work_units(
-                            int(self.width), int(self.height), _nap_native,
-                            requested_packages=int(self.bdpt_native_packages),
-                            primary_ray_cap=200_000,
-                        )
+                        _work_units = _bdpt_native_work_units
+                        _work_plan = _bdpt_native_work_plan
                         _sched_total = int(_work_plan["schedule_rays"])
                         # Native launchers sample one spectral band per path and
                         # use a stochastic, band-dispersive Fresnel decision, so
                         # record growth is linear rather than exponential.
                         _n_pkgs = len(_work_units)
+                        _n_cycles = len(_bdpt_native_schedule)
                         if b_idx == 0:
                             print(
                                 "  [bdpt-native-lab] spatial work plan "
                                 f"image={self.width}x{self.height} pixels={_work_plan['pixels']:,} "
                                 f"aperture={_nap_native} schedule={_sched_total:,} "
-                                f"units={_n_pkgs:,} pixels/unit<={_work_plan['pixels_per_unit']:,} "
+                                f"units={_n_pkgs:,} sweeps={self.bdpt_native_sweeps:,} "
+                                f"cycles={_n_cycles:,} pixels/unit<={_work_plan['pixels_per_unit']:,} "
                                 f"primary/unit<={_work_plan['max_primary_rays_per_unit']:,} "
                                 f"global_sensor={_work_plan['sensor_rgb_bytes'] / (1024.0**2):.2f} MiB; "
                                 "scheduler metadata scales with pixels, not pixel×aperture",
                                 flush=True,
                             )
-                        _slice_offset, _slice_count = _work_units[int(b_idx)]
-                        if _n_pkgs > 1:
-                            print(f"  [bdpt-native-lab] spatial unit {b_idx + 1}/{_n_pkgs} "
-                                  f"schedule={_slice_offset:,}..{_slice_offset + _slice_count:,} "
-                                  f"({int(_slice_count // _nap_native):,} whole pixels)")
+                        _sweep_index, _slice_offset, _slice_count = _bdpt_native_schedule[int(b_idx)]
+                        _unit_index = int(b_idx % _n_pkgs)
+                        print(f"  [bdpt-native-lab] sweep {_sweep_index + 1}/{self.bdpt_native_sweeps} "
+                            f"spatial unit {_unit_index + 1}/{_n_pkgs} "
+                            f"schedule={_slice_offset:,}..{_slice_offset + _slice_count:,} "
+                            f"({int(_slice_count // _nap_native):,} whole pixels)")
                         _lab_max_children = 1
                         _cpp.run_thick_lens_native_bdpt(
                             emitter_tri_ids=_bdpt_native_emitter_tri_ids,
@@ -5309,14 +5530,17 @@ class ExposureSession:
                             exposure_weight=1.0,
                             sweep_offset=_slice_offset,
                             sweep_count=_slice_count,
+                            sensor_sweeps=self.bdpt_native_sweeps,
                         )
                         self._last_bdpt_records = np.zeros((0, 16), dtype=np.float32)
                         self._last_bdpt_emit_counts = np.zeros((0,), dtype=np.int32)
                         batches_executed = b_idx + 1
+                        _stream_seen[b_idx] = True
+                        _stream_covered_n = int(np.count_nonzero(_stream_seen))
                         b_idx += 1
-                        if b_idx >= _n_pkgs:
+                        if b_idx >= _n_cycles:
                             _stream_cover_complete = True
-                            _stream_covered_n = 1
+                            _stream_covered_n = _n_cycles
                             break
                         continue
                     else:
@@ -5618,7 +5842,7 @@ class ExposureSession:
                     native_img = np.asarray(cached_native_img if cached_native_img is not None else tracer_obj.get_sensor_image())
                     if native_img.ndim == 3 and native_img.shape[2] >= 3 and np.any(native_img[..., :3]):
                         img = np.clip(native_img[..., :3], 0.0, 1.0).astype(np.float32, copy=False)
-                        rgb_linear = img.copy()
+                        rgb_linear = _native_sensor_linear_output(back, img)
                     else:
                         self._warn_missing_rgb_source_once(
                             source="sensor",
@@ -5643,7 +5867,11 @@ class ExposureSession:
                         )
                         if _native_img.ndim == 3 and _native_img.shape[2] >= 3 and np.any(_native_img[..., :3]):
                             img = np.clip(_native_img[..., :3], 0.0, 1.0).astype(np.float32, copy=False)
-                            rgb_linear = img.copy()
+                            native_linear = getattr(back, "_native_sensor_linear_image", None)
+                            rgb_linear = np.asarray(
+                                native_linear if native_linear is not None else img,
+                                dtype=np.float32,
+                            ).copy()
                         else:
                             self._warn_missing_rgb_source_once(
                                 source="sensor",
@@ -6732,11 +6960,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Enable GPU-resident BDPT/T5 mode, matching thick_lens_focus_lab's "
                         "--gpu-resident path. This is required to exercise native GPU T5 scheduling.")
     p.add_argument("--bdpt-native-packages", type=int, default=1,
-                   help="Native thick-lens BDPT: number of flash+sensor packages per "
-                        "exposure (ray budget split across them, same accumulation). "
-                        ">1 gives the T5 backlog scheduler repeated passes so deferred "
-                        "high-score pairs from earlier packages are worked with an "
-                        "age-growing share of the pair budget (default: 1).")
+                   help="Minimum spatial partitions per native sensor sweep (default: 1; "
+                        "automatically raised to satisfy record caps).")
+    p.add_argument("--bdpt-native-sweeps", type=int, default=None,
+                   help="Override the scene-authored number of independent complete native "
+                        "sensor sweeps to average (default: scene order value, otherwise 1).")
     p.add_argument("--calibration-scene", action="store_true",
                    help="Use the tungsten-cavity blackbody calibration "
                         "scene instead of the default orbiters scene. "
@@ -6883,12 +7111,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    global _ORDERED_THICK_LENS_SCENE
+    global _ORDERED_THICK_LENS_SCENE, _ORDERED_SCENE_JOB, _ORDERED_TILE_OUTPUT
     _verify_native_bdpt_contract()
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
     order_job = None
     order_report = None
+    cli_native_sweeps = args.bdpt_native_sweeps
     if args.scene_order:
         from scene_orders import compile_job, load_order, order_runtime_settings, resolved_jobs
         order_package = load_order(str(args.scene_order))
@@ -6899,14 +7128,20 @@ def main(argv: Optional[list[str]] = None) -> int:
                 f"--scene-order contains multiple jobs ({ids}); select one with --scene-job"
             )
         order_job = order_jobs[0]
+        _ORDERED_SCENE_JOB = order_job
         runtime = order_runtime_settings(order_job)
-        args.width = runtime["width"]
-        args.height = runtime["height"]
+        _ORDERED_TILE_OUTPUT = (runtime["width"], runtime["height"])
+        args.width, args.height = _native_sensor_schedule_shape(
+            runtime["width"], runtime["height"]
+        )
         args.focal_mm = runtime["focal_mm"]
         args.aperture_mm = runtime["aperture_mm"]
         args.iso = runtime["iso"]
         args.exposure_time_s = runtime["exposure_time_s"]
         args.t5_pair_budget = runtime["pair_budget"]
+        args.bdpt_native_sweeps = _resolve_native_sensor_sweeps(
+            cli_native_sweeps, runtime["sensor_sweeps"]
+        )
         args.scene_mode = "thick-lens-lab"
         args.frames = 1
         # Build the canonical scene while no override is installed, then replace
@@ -6919,9 +7154,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"triangles={order_report.total_triangles:,} "
             f"(glyph={order_report.glyph_triangles:,} planes={order_report.plane_triangles:,}) "
             f"materials={list(order_report.material_names)} flash_scale={order_report.flash_scale:g} "
-            f"image={args.width}x{args.height}",
+            f"output={runtime['width']}x{runtime['height']} "
+            f"native_schedule={args.width}x{args.height} "
+            f"sensor_sweeps={args.bdpt_native_sweeps} "
+            f"(authored={runtime['sensor_sweeps']})",
             flush=True,
         )
+
+    args.bdpt_native_sweeps = _resolve_native_sensor_sweeps(
+        args.bdpt_native_sweeps
+    )
 
     if bool(args.camera_solve_preview):
         default_preview_modes = (
@@ -7122,6 +7364,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         vcm_radius_alpha = float(args.vcm_radius_alpha),
         gpu_resident    = bool(args.gpu_resident),
         bdpt_native_packages = int(args.bdpt_native_packages),
+        bdpt_native_sweeps = int(args.bdpt_native_sweeps),
         save_files       = args.save_files,
     )
 

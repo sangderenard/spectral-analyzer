@@ -16291,6 +16291,53 @@ void ray_pipeline_get_sensor_image(
     }
 }
 
+void ray_pipeline_get_sensor_image_linear(
+    const RayPipelineState* ps,
+    float* buf,
+    int* out_res)
+{
+    if (out_res) *out_res = 0;
+    if (!ps || ps->sensor_res <= 0) return;
+    const int res = ps->sensor_res;
+    if (out_res) *out_res = res;
+    if (!buf) return;
+    const size_t pix = static_cast<size_t>(res) * res;
+
+    if (ps->cfg.gpu_skip_record_readback) {
+        std::lock_guard<std::mutex> lk_gpu(ps->sensor_gpu_mu);
+        if (!ps->sensor_accum_gpu.empty() && ps->sensor_accum_gpu.size() >= 3 * pix) {
+            const uint32_t* src = ps->sensor_accum_gpu.data();
+            for (int y = 0; y < res; ++y) {
+                const int out_y = res - 1 - y;
+                for (int z = 0; z < res; ++z) {
+                    const size_t src_px = static_cast<size_t>(y * res + z);
+                    const size_t dst_px = static_cast<size_t>(out_y * res + z);
+                    for (size_t channel = 0; channel < 3; ++channel) {
+                        float value = 0.0f;
+                        std::memcpy(&value, &src[src_px + channel * pix], sizeof(float));
+                        buf[dst_px * 3 + channel] = std::isfinite(value) ? value : 0.0f;
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    std::scoped_lock lk(ps->sensor_mu[0], ps->sensor_mu[1], ps->sensor_mu[2]);
+    for (int y = 0; y < res; ++y) {
+        const int out_y = res - 1 - y;
+        for (int z = 0; z < res; ++z) {
+            const size_t src_px = static_cast<size_t>(y * res + z);
+            const size_t dst_px = static_cast<size_t>(out_y * res + z);
+            for (size_t channel = 0; channel < 3; ++channel) {
+                const double value = ps->sensor_accum[channel * pix + src_px];
+                buf[dst_px * 3 + channel] = std::isfinite(value)
+                    ? static_cast<float>(value) : 0.0f;
+            }
+        }
+    }
+}
+
 void ray_pipeline_get_priority_map(
     const RayPipelineState* ps,
     float* buf,

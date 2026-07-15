@@ -109,3 +109,92 @@ def test_empty_token_is_rejected():
         assert "token" in str(exc)
     else:
         raise AssertionError("blank token must be rejected")
+
+
+def test_spatial_camera_maps_world_subject_into_stationary_optical_rig():
+    import exposure_render_demo as exposure
+
+    base = exposure._build_thick_lens_lab_tracer_scene()
+    job = orders.resolved_jobs(orders.load_order(ORDER), "glyph_A")[0]
+    job = dict(job)
+    job["camera"] = dict(job["camera"], position_m=[2.0, -1.0, 0.5],
+                         target_m=[0.0, 0.0, 0.0], up=[0.0, 0.0, 1.0])
+    scene, report = orders.compile_job(base, job)
+
+    sensor = np.asarray(scene.camera_tri_groups["sensor"], np.int64)
+    sensor_center = np.asarray(scene.verts)[sensor].reshape(-1, 3).mean(axis=0)
+    base_sensor = np.asarray(base.camera_tri_groups["sensor"], np.int64)
+    base_sensor_center = np.asarray(base.verts)[base_sensor].reshape(-1, 3).mean(axis=0)
+    assert np.allclose(sensor_center, base_sensor_center, atol=1.0e-12)
+    assert report.camera_position_m == (2.0, -1.0, 0.5)
+
+    object_ids = np.asarray(scene.camera_tri_groups["object"], np.int64)
+    pose = orders.camera_pose(job)
+    expected_plane = orders._world_to_canonical_camera(
+        orders._box_plane_triangles(job["planes"][0]), pose, base_sensor_center
+    )
+    actual_plane = np.asarray(scene.verts)[object_ids[:12]].reshape(-1, 3, 3)
+    assert np.allclose(actual_plane, expected_plane, atol=1.0e-12)
+
+    base_lens = np.asarray(base.camera_tri_groups["thin_lens"], np.int64)
+    moved_lens = np.asarray(scene.camera_tri_groups["thin_lens"], np.int64)
+    assert np.array_equal(np.asarray(scene.verts)[moved_lens], np.asarray(base.verts)[base_lens])
+
+
+def test_sensor_region_maps_to_physical_tile_and_composition_coordinates():
+    job = orders.resolved_jobs(orders.load_order(ORDER), "glyph_A")[0]
+    job = dict(job)
+    job["image"] = {
+        "width": 800, "height": 600,
+        "region": {"x": 600, "y": 50, "width": 100, "height": 150},
+    }
+    tile = orders.sensor_tile(job, sensor_w_m=0.036, sensor_h_m=0.024)
+    metadata = orders.composition_metadata(job)
+
+    assert np.isclose(tile["sensor_w_m"], 0.0045)
+    assert np.isclose(tile["sensor_h_m"], 0.006)
+    assert np.isclose(tile["right_offset_m"], 0.01125)
+    assert np.isclose(tile["up_offset_m"], 0.007)
+    assert metadata["origin"] == "top-left"
+    assert metadata["full_frame"] == {"width": 800, "height": 600}
+    assert metadata["region"] == {"x": 600, "y": 50, "width": 100, "height": 150}
+
+
+def test_invalid_sensor_region_and_incomplete_camera_pose_are_rejected():
+    job = orders.resolved_jobs(orders.load_order(ORDER), "glyph_A")[0]
+    bad_region = dict(job)
+    bad_region["image"] = {"width": 64, "height": 64,
+                           "region": {"x": 60, "y": 0, "width": 8, "height": 8}}
+    bad_camera = dict(job)
+    bad_camera["camera"] = dict(job["camera"], position_m=[1.0, 0.0, 0.0])
+    for candidate in (bad_region, bad_camera):
+        try:
+            orders._validate_resolved_job(candidate)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid spatial order must be rejected")
+
+
+def test_native_square_accumulator_returns_exact_rectangular_tile_shape_and_dtype():
+    import exposure_render_demo as exposure
+
+    raw = np.arange(16 * 16 * 3, dtype=np.float64).reshape(16, 16, 3)
+    tile = exposure._native_sensor_tile_to_display(raw, width=12, height=7)
+    assert tile.shape == (7, 12, 3)
+    assert tile.dtype == raw.dtype
+    assert exposure._native_sensor_schedule_shape(width=12, height=7) == (12, 12)
+
+
+def test_native_cpp_linear_output_is_not_the_display_curve():
+    import exposure_render_demo as exposure
+
+    display = np.full((7, 12, 3), 0.75, dtype=np.float32)
+    raw = np.arange(display.size, dtype=np.float32).reshape(display.shape)
+    backend = type("Backend", (), {"_native_sensor_linear_image": raw})()
+    linear = exposure._native_sensor_linear_output(backend, display)
+
+    assert linear.dtype == raw.dtype
+    assert np.array_equal(linear, raw)
+    assert not np.shares_memory(linear, raw)
+    assert not np.array_equal(linear, display)

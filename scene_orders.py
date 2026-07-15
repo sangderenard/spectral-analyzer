@@ -8,6 +8,7 @@ font-outline extrusions.
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import math
 import os
@@ -31,6 +32,8 @@ class CompiledOrderReport:
     material_names: tuple[str, ...]
     flash_scale: float
     removed_subject_emitters: int = 0
+    camera_position_m: tuple[float, float, float] | None = None
+    camera_target_m: tuple[float, float, float] | None = None
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -114,9 +117,11 @@ def _validate_resolved_job(job: dict[str, Any]) -> None:
     if not token.strip():
         raise ValueError(f"job {job['id']!r}: token must be non-empty text")
     contracts = {
-        "image": {"width", "height"},
-        "camera": {"focal_mm", "aperture_mm"},
-        "exposure": {"time_s", "iso", "t5_pair_budget"},
+        "image": {"width", "height", "region"},
+        "camera": {
+            "focal_mm", "aperture_mm", "position_m", "target_m", "focus_target_m", "up"
+        },
+        "exposure": {"time_s", "iso", "sensor_sweeps", "t5_pair_budget"},
         "flash": {"intensity_scale"},
         "font": {"family", "weight", "style", "file"},
     }
@@ -131,12 +136,46 @@ def _validate_resolved_job(job: dict[str, Any]) -> None:
                 "refusing to silently ignore requested behavior"
             )
     image = job.get("image", {})
-    if int(image.get("width", 64)) <= 0 or int(image.get("height", 64)) <= 0:
+    full_width = int(image.get("width", 64))
+    full_height = int(image.get("height", 64))
+    if full_width <= 0 or full_height <= 0:
         raise ValueError("image width and height must be positive")
+    region = image.get("region", {})
+    if not isinstance(region, dict):
+        raise ValueError("image.region must be an object")
+    region_extra = sorted(set(region) - {"x", "y", "width", "height"})
+    if region_extra:
+        raise ValueError(f"image.region has unsupported fields {region_extra}")
+    region_x = int(region.get("x", 0))
+    region_y = int(region.get("y", 0))
+    region_width = int(region.get("width", full_width))
+    region_height = int(region.get("height", full_height))
+    if region_x < 0 or region_y < 0 or region_width <= 0 or region_height <= 0:
+        raise ValueError("image.region requires non-negative x/y and positive width/height")
+    if region_x + region_width > full_width or region_y + region_height > full_height:
+        raise ValueError("image.region must fit within image width and height")
+    camera = job.get("camera", {})
     _positive(job.get("camera", {}).get("focal_mm", 35.0), "camera.focal_mm")
     _positive(job.get("camera", {}).get("aperture_mm", 25.0), "camera.aperture_mm")
+    has_position = "position_m" in camera
+    has_target = "target_m" in camera
+    if has_position != has_target:
+        raise ValueError("camera.position_m and camera.target_m must be supplied together")
+    if has_position:
+        position = _vec(camera["position_m"], "camera.position_m")
+        target = _vec(camera["target_m"], "camera.target_m")
+        focus_target = _vec(camera.get("focus_target_m", target), "camera.focus_target_m")
+        up = _vec(camera.get("up", [0, 0, 1]), "camera.up")
+        fwd = target - position
+        if float(np.linalg.norm(fwd)) <= 1.0e-10:
+            raise ValueError("camera.position_m and camera.target_m must be distinct")
+        if float(np.linalg.norm(np.cross(fwd, up))) <= 1.0e-10:
+            raise ValueError("camera.up must not be parallel to the viewing axis")
+        if float(np.dot(focus_target - position, fwd)) <= 0.0:
+            raise ValueError("camera.focus_target_m must be in front of the camera")
     _positive(job.get("exposure", {}).get("time_s", 1.0/60.0), "exposure.time_s")
     _positive(job.get("exposure", {}).get("iso", 100.0), "exposure.iso")
+    _positive(job.get("exposure", {}).get("sensor_sweeps", 1), "exposure.sensor_sweeps")
     _positive(job.get("flash", {}).get("intensity_scale", 1.0), "flash.intensity_scale")
     geometry = job.get("geometry", {})
     planes = job.get("planes", [])
@@ -176,7 +215,8 @@ def _validate_resolved_job(job: dict[str, Any]) -> None:
     geometry_extra = sorted(set(geometry) - {
         "embed_plane", "height_m", "depth_m", "embed_fraction", "offset_m",
         "profile", "profile_segments", "profile_bulge", "outline_subdivisions",
-        "cap_grid", "material"
+        "cap_grid", "material", "text_box_m", "line_height_m", "line_spacing",
+        "horizontal_align", "vertical_align"
     })
     if geometry_extra:
         raise ValueError(f"geometry has unsupported fields {geometry_extra}")
@@ -184,6 +224,17 @@ def _validate_resolved_job(job: dict[str, Any]) -> None:
         raise ValueError("geometry.profile must be 'straight' or 'circular'")
     if profile == "circular" and int(geometry.get("profile_segments", 8)) < 2:
         raise ValueError("circular geometry.profile_segments must be at least 2")
+    if "text_box_m" in geometry:
+        text_box = _vec(geometry["text_box_m"], "geometry.text_box_m", 2)
+        if np.any(text_box <= 0.0):
+            raise ValueError("geometry.text_box_m must be positive")
+        _positive(geometry.get("line_height_m", geometry.get("height_m", 0.2)),
+                  "geometry.line_height_m")
+        _positive(geometry.get("line_spacing", 1.2), "geometry.line_spacing")
+        if str(geometry.get("horizontal_align", "center")) != "center":
+            raise ValueError("only centered geometry.horizontal_align is currently supported")
+        if str(geometry.get("vertical_align", "center")) != "center":
+            raise ValueError("only centered geometry.vertical_align is currently supported")
 
 
 def order_runtime_settings(job: dict[str, Any]) -> dict[str, Any]:
@@ -191,15 +242,121 @@ def order_runtime_settings(job: dict[str, Any]) -> dict[str, Any]:
     image = job.get("image", {})
     camera = job.get("camera", {})
     exposure = job.get("exposure", {})
+    full_width = int(image.get("width", 64))
+    full_height = int(image.get("height", 64))
+    region = image.get("region", {})
+    region_x = int(region.get("x", 0))
+    region_y = int(region.get("y", 0))
+    region_width = int(region.get("width", full_width))
+    region_height = int(region.get("height", full_height))
     return {
-        "width": int(image.get("width", 64)),
-        "height": int(image.get("height", 64)),
+        "width": region_width,
+        "height": region_height,
+        "full_width": full_width,
+        "full_height": full_height,
+        "region": {
+            "x": region_x, "y": region_y,
+            "width": region_width, "height": region_height,
+        },
         "focal_mm": float(camera.get("focal_mm", 35.0)),
         "aperture_mm": float(camera.get("aperture_mm", 25.0)),
         "iso": float(exposure.get("iso", 100.0)),
         "exposure_time_s": float(exposure.get("time_s", 1.0 / 60.0)),
+        "sensor_sweeps": int(exposure.get("sensor_sweeps", 1)),
         "pair_budget": int(exposure.get("t5_pair_budget", 20_000_000)),
     }
+
+
+def camera_pose(job: dict[str, Any]) -> dict[str, np.ndarray] | None:
+    """Return the authored camera frame, or None for the canonical lab pose."""
+    camera = job.get("camera", {})
+    if "position_m" not in camera:
+        return None
+    position = _vec(camera["position_m"], "camera.position_m")
+    target = _vec(camera["target_m"], "camera.target_m")
+    fwd = target - position
+    fwd /= float(np.linalg.norm(fwd))
+    up = _vec(camera.get("up", [0, 0, 1]), "camera.up")
+    up -= fwd * float(np.dot(up, fwd))
+    up /= float(np.linalg.norm(up))
+    right = np.cross(fwd, up)
+    right /= float(np.linalg.norm(right))
+    up = np.cross(right, fwd)
+    return {"position": position, "target": target, "fwd": fwd, "right": right, "up": up}
+
+
+def camera_focus_distance(job: dict[str, Any]) -> float | None:
+    """Return the axial sensor-to-focus-plane distance in authored world space."""
+    pose = camera_pose(job)
+    if pose is None:
+        return None
+    focus_target = _vec(
+        job.get("camera", {}).get("focus_target_m", pose["target"]),
+        "camera.focus_target_m",
+    )
+    distance = float(np.dot(focus_target - pose["position"], pose["fwd"]))
+    if distance <= 0.0:
+        raise ValueError("camera.focus_target_m must be in front of the camera")
+    return distance
+
+
+def sensor_tile(job: dict[str, Any], sensor_w_m: float, sensor_h_m: float) -> dict[str, Any]:
+    """Map the requested top-left image ROI onto the physical sensor plane."""
+    runtime = order_runtime_settings(job)
+    region = runtime["region"]
+    full_width = runtime["full_width"]
+    full_height = runtime["full_height"]
+    width_fraction = float(region["width"]) / float(full_width)
+    height_fraction = float(region["height"]) / float(full_height)
+    center_x = (float(region["x"]) + 0.5 * float(region["width"])) / float(full_width)
+    center_y = (float(region["y"]) + 0.5 * float(region["height"])) / float(full_height)
+    return {
+        "sensor_w_m": float(sensor_w_m) * width_fraction,
+        "sensor_h_m": float(sensor_h_m) * height_fraction,
+        "right_offset_m": (center_x - 0.5) * float(sensor_w_m),
+        "up_offset_m": (0.5 - center_y) * float(sensor_h_m),
+        "full_width": int(full_width),
+        "full_height": int(full_height),
+        "region": dict(region),
+        "origin": "top-left",
+    }
+
+
+def composition_metadata(job: dict[str, Any]) -> dict[str, Any]:
+    runtime = order_runtime_settings(job)
+    pose = camera_pose(job)
+    return {
+        "coordinate_space": "full_sensor_pixels",
+        "origin": "top-left",
+        "full_frame": {"width": runtime["full_width"], "height": runtime["full_height"]},
+        "region": dict(runtime["region"]),
+        "camera": None if pose is None else {
+            "position_m": pose["position"].tolist(),
+            "target_m": pose["target"].tolist(),
+            "up": pose["up"].tolist(),
+            "focus_target_m": _vec(
+                job.get("camera", {}).get("focus_target_m", pose["target"]),
+                "camera.focus_target_m",
+            ).tolist(),
+            "focus_distance_m": camera_focus_distance(job),
+        },
+        "render_basis": "camera_local_canonical_x",
+    }
+
+
+def _world_to_canonical_camera(
+    points: np.ndarray,
+    pose: dict[str, np.ndarray] | None,
+    canonical_origin: np.ndarray,
+) -> np.ndarray:
+    if pose is None:
+        return np.asarray(points, np.float64)
+    delta = np.asarray(points, np.float64) - pose["position"]
+    return np.stack((
+        canonical_origin[0] - delta @ pose["fwd"],
+        canonical_origin[1] + delta @ pose["right"],
+        canonical_origin[2] + delta @ pose["up"],
+    ), axis=-1)
 
 
 def _plane_basis(plane: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -301,6 +458,146 @@ def _normalize_contours(contours: list[np.ndarray], height_m: float) -> list[np.
     return [(p - center) * scale for p in contours]
 
 
+def _font_key(font: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(font.get("family", "DejaVu Sans")),
+        str(font.get("weight", "bold")),
+        str(font.get("style", "normal")),
+        os.path.abspath(str(font["file"])) if font.get("file") else "",
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _cached_font_path(token: str, key: tuple[str, str, str, str]):
+    from matplotlib.font_manager import FontProperties
+    from matplotlib.textpath import TextPath
+
+    family, weight, style, filename = key
+    kwargs: dict[str, Any] = {"family": family, "weight": weight, "style": style}
+    if filename:
+        kwargs["fname"] = filename
+    return TextPath((0.0, 0.0), token, size=1.0, prop=FontProperties(**kwargs))
+
+
+def _font_path(token: str, font: dict[str, Any]):
+    return _cached_font_path(str(token), _font_key(font))
+
+
+@functools.lru_cache(maxsize=8192)
+def _cached_text_advance(token: str, key: tuple[str, str, str, str]) -> float:
+    return float(_cached_font_path(token, key).get_extents().width) if token else 0.0
+
+
+def _text_advance(token: str, font: dict[str, Any]) -> float:
+    return _cached_text_advance(str(token), _font_key(font))
+
+
+def _wrap_paragraph(text: str, font: dict[str, Any], max_advance: float) -> list[str]:
+    """Greedy font-metric wrapping with explicit newlines and hard word breaks."""
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        words = paragraph.split()
+        if not words:
+            lines.append("")
+            continue
+        current = ""
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
+            if _text_advance(candidate, font) <= max_advance:
+                current = candidate
+                continue
+            if current:
+                lines.append(current)
+                current = ""
+            while word and _text_advance(word, font) > max_advance:
+                split_at = 1
+                for index in range(2, len(word) + 1):
+                    if _text_advance(word[:index], font) > max_advance:
+                        break
+                    split_at = index
+                lines.append(word[:split_at])
+                word = word[split_at:]
+            current = word
+        if current:
+            lines.append(current)
+    return lines or [""]
+
+
+def layout_paragraph(job: dict[str, Any]) -> dict[str, Any]:
+    """Resolve wrapped lines and their shared physical scale inside a text box."""
+    geometry = job.get("geometry", {})
+    text_box = _vec(geometry["text_box_m"], "geometry.text_box_m", 2)
+    font = job.get("font", {})
+    reference_height = max(float(_font_path("Hg", font).get_extents().height), 1.0e-12)
+    max_line_height = float(geometry.get("line_height_m", geometry.get("height_m", 0.2)))
+    line_spacing = float(geometry.get("line_spacing", 1.2))
+
+    def resolve(line_height: float) -> tuple[list[str], float]:
+        scale = line_height / reference_height
+        lines = _wrap_paragraph(str(job["token"]), font, float(text_box[0]) / scale)
+        block_height = line_height * (1.0 + line_spacing * max(0, len(lines) - 1))
+        return lines, block_height
+
+    lines, block_height = resolve(max_line_height)
+    line_height = max_line_height
+    if block_height > float(text_box[1]):
+        low = max_line_height * 1.0e-4
+        high = max_line_height
+        for _ in range(32):
+            candidate = 0.5 * (low + high)
+            candidate_lines, candidate_height = resolve(candidate)
+            if candidate_height <= float(text_box[1]):
+                low = candidate
+                lines, block_height = candidate_lines, candidate_height
+            else:
+                high = candidate
+        line_height = low
+        lines, block_height = resolve(line_height)
+    return {
+        "lines": lines,
+        "line_height_m": float(line_height),
+        "line_spacing": line_spacing,
+        "block_height_m": float(block_height),
+        "text_box_m": text_box,
+    }
+
+
+def _paragraph_contours(job: dict[str, Any]) -> list[np.ndarray]:
+    layout = layout_paragraph(job)
+    font = job.get("font", {})
+    curve_steps = int(job.get("geometry", {}).get("outline_subdivisions", 2))
+    reference_height = max(float(_font_path("Hg", font).get_extents().height), 1.0e-12)
+    scale = float(layout["line_height_m"]) / reference_height
+    lines = list(layout["lines"])
+    pitch = float(layout["line_height_m"]) * float(layout["line_spacing"])
+    block_center = 0.5 * float(max(0, len(lines) - 1)) * pitch
+    contours: list[np.ndarray] = []
+    for row, line in enumerate(lines):
+        if not line:
+            continue
+        raw = _font_contours(line, font, curve_steps)
+        points = np.concatenate([contour[:-1] for contour in raw], axis=0)
+        center_x = 0.5 * float(points[:, 0].min() + points[:, 0].max())
+        center_y = 0.5 * float(points[:, 1].min() + points[:, 1].max())
+        line_y = block_center - float(row) * pitch
+        for contour in raw:
+            shifted = contour.copy()
+            shifted[:, 0] = (shifted[:, 0] - center_x) * scale
+            shifted[:, 1] = (shifted[:, 1] - center_y) * scale + line_y
+            contours.append(shifted)
+    if not contours:
+        raise ValueError("paragraph produced no visible glyph contours")
+    all_points = np.concatenate([contour[:-1] for contour in contours], axis=0)
+    lo = all_points.min(axis=0)
+    hi = all_points.max(axis=0)
+    extent = np.maximum(hi - lo, 1.0e-15)
+    text_box = np.asarray(layout["text_box_m"], np.float64)
+    fit_scale = min(1.0, float(np.min(text_box / extent)))
+    bounds_center = 0.5 * (lo + hi)
+    contours = [(contour - bounds_center) * fit_scale for contour in contours]
+    return contours
+
+
 def _triangulate_caps(contours: list[np.ndarray], grid_n: int) -> tuple[np.ndarray, np.ndarray]:
     from scipy.spatial import Delaunay
 
@@ -329,10 +626,14 @@ def _triangulate_caps(contours: list[np.ndarray], grid_n: int) -> tuple[np.ndarr
 
 def _glyph_triangles(job: dict[str, Any], plane: dict[str, Any]) -> np.ndarray:
     geometry = job.get("geometry", {})
-    contours = _normalize_contours(
-        _font_contours(str(job["token"]), job.get("font", {}),
-                       int(geometry.get("outline_subdivisions", 2))),
-        float(geometry.get("height_m", 0.2)),
+    contours = (
+        _paragraph_contours(job)
+        if "text_box_m" in geometry
+        else _normalize_contours(
+            _font_contours(str(job["token"]), job.get("font", {}),
+                           int(geometry.get("outline_subdivisions", 2))),
+            float(geometry.get("height_m", 0.2)),
+        )
     )
     cap_points, cap_tri = _triangulate_caps(contours, int(geometry.get("cap_grid", 28)))
     center, normal, right, up = _plane_basis(plane)
@@ -510,7 +811,20 @@ def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrde
     remap = np.full(n_base, -1, dtype=np.int64)
     remap[keep_ids] = np.arange(keep_ids.size, dtype=np.int64)
 
-    tri_parts = [base_tri[keep_ids]]
+    pose = camera_pose(job)
+    canonical_sensor_ids = np.asarray(groups.get("sensor", np.zeros(0, np.int32)), np.int64)
+    canonical_sensor_ids = canonical_sensor_ids[
+        (canonical_sensor_ids >= 0) & (canonical_sensor_ids < n_base)
+    ]
+    if pose is not None and canonical_sensor_ids.size == 0:
+        raise ValueError("authored camera pose requires a non-empty base sensor group")
+    canonical_origin = (
+        base_tri[canonical_sensor_ids].reshape(-1, 3).mean(axis=0)
+        if canonical_sensor_ids.size
+        else np.zeros(3, np.float64)
+    )
+
+    tri_parts = [np.asarray(base_tri[keep_ids], np.float64)]
     normal_parts = [np.asarray(base_scene.normals, np.float64)[keep_ids]]
     mat_parts = [np.asarray(base_scene.mat_idx, np.int32)[keep_ids]]
     object_ids: list[np.ndarray] = []
@@ -534,7 +848,7 @@ def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrde
     planes_by_id = {str(p["id"]): p for p in job["planes"]}
     plane_triangles = 0
     for plane in job["planes"]:
-        tri = _box_plane_triangles(plane)
+        tri = _world_to_canonical_camera(_box_plane_triangles(plane), pose, canonical_origin)
         start = sum(part.shape[0] for part in tri_parts)
         tri_parts.append(tri)
         normal_parts.append(_triangle_normals(tri))
@@ -544,7 +858,9 @@ def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrde
         plane_triangles += int(tri.shape[0])
 
     target_plane = planes_by_id[str(job.get("geometry", {}).get("embed_plane", job["planes"][0]["id"]))]
-    glyph_tri = _glyph_triangles(job, target_plane)
+    glyph_tri = _world_to_canonical_camera(
+        _glyph_triangles(job, target_plane), pose, canonical_origin
+    )
     glyph_start = sum(part.shape[0] for part in tri_parts)
     tri_parts.append(glyph_tri)
     normal_parts.append(_triangle_normals(glyph_tri))
@@ -617,5 +933,7 @@ def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrde
         retained_base_triangles=int(keep_ids.size), total_triangles=int(tri_all.shape[0]),
         material_names=tuple(material_names), flash_scale=flash_scale,
         removed_subject_emitters=removed_subject_emitters,
+        camera_position_m=(None if pose is None else tuple(float(v) for v in pose["position"])),
+        camera_target_m=(None if pose is None else tuple(float(v) for v in pose["target"])),
     )
     return scene, report

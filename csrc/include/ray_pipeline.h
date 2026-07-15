@@ -1234,6 +1234,14 @@ void ray_pipeline_get_sensor_image(
     float* buf,
     int*   out_res);
 
+/* Copy the unnormalised sensor accumulation into caller-owned float32 RGB.
+ * Uses the same orientation as ray_pipeline_get_sensor_image but applies no
+ * percentile scaling, clipping, or display curve. Thread-safe. */
+void ray_pipeline_get_sensor_image_linear(
+    const RayPipelineState* ps,
+    float* buf,
+    int*   out_res);
+
 /* Copy the sugar-auxin priority map as a float32 (res×res) array.
  * Values ≥ 1 indicate regions of recent BDPT convergence; 1.0 = baseline.
  * buf must hold res*res floats.  Sets *out_res to the resolution. */

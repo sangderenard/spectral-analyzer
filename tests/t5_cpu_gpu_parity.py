@@ -82,6 +82,9 @@ def run(force_cpu_t5: bool, use_glass: bool = False) -> Result:
             "pixel_stream_phase_from_seed":0, "aperture_stop_group_id":-1,
         })
     tr.configure_sensor_image(0.0,0.2,0.2,8,0.002,1.0,0.4,0.0,0.0,0)
+    # Passive allocation/compile smoke for the recursive GPU sensor storage.
+    # It must not change legacy T5 radiance while the adaptive launcher is gated.
+    tr.configure_sensor_mipmap(max_nodes=1024, maximum_depth=3, samples_per_epoch=32)
     tr.set_vcm(False,0.002,0.7)
     tr.set_force_cpu_t5(force_cpu_t5)
     if not force_cpu_t5:
@@ -109,6 +112,135 @@ def run(force_cpu_t5: bool, use_glass: bool = False) -> Result:
     visible = int(np.count_nonzero(
         conn_rows[:,60:64].copy().view(np.float32) > 0.0)) if conns else 0
     overflow = dict(tr.get_bdpt_overflow())
+    if not force_cpu_t5:
+        # The legacy parity snapshot above requires host-visible BDPT records.
+        # Switch to the production GPU-resident transport contract only for
+        # the adaptive epoch being tested below.
+        tr.set_gpu_skip_record_readback(True)
+        assert tr.submit_sensor_mip_epoch(
+            top_k=1, seed=5, max_bounces=4,
+            min_amplitude=1.0e-12, exposure_weight=1.0)
+        adaptive_weight = np.asarray(tr.get_sensor_exposure_weight(), np.float32)
+        adaptive_sum = np.asarray(tr.get_sensor_image_sum_linear(), np.float32)
+        adaptive_mean = np.asarray(tr.get_sensor_image_linear(), np.float32)
+        assert adaptive_weight.shape == (8, 8)
+        assert np.isclose(float(adaptive_weight.sum()), 32.0, rtol=2e-5, atol=2e-5), (
+            float(adaptive_weight.sum()), float(adaptive_weight.max()),
+            int(np.count_nonzero(adaptive_weight)))
+        exposed = adaptive_weight > 0.0
+        assert np.any(exposed)
+        assert np.allclose(
+            adaptive_mean[exposed],
+            adaptive_sum[exposed] / adaptive_weight[exposed, None],
+            rtol=2e-5, atol=1e-7,
+        )
+    mip = tr.debug_sensor_mip_subdivide(np.asarray([0], np.uint32))
+    mip_control = np.asarray(mip["control"], np.uint32)
+    mip_bounds = np.asarray(mip["bounds"], np.float32)
+    mip_meta = np.asarray(mip["meta"], np.uint32)
+    assert int(mip_control[0]) == 10
+    assert mip_bounds.shape == (10, 4)
+    assert np.all(mip_meta[1:10, 0] == 0)
+    assert np.all(mip_meta[1:10, 2] == 1)
+    assert np.isclose(np.sum(
+        (mip_bounds[1:10, 2] - mip_bounds[1:10, 0])
+        * (mip_bounds[1:10, 3] - mip_bounds[1:10, 1])
+    ), 1.0)
+    samples = tr.debug_sensor_mip_samples(1, 11, 137, 29)
+    sample_uv = np.asarray(samples["uv"], np.float32)
+    sample_meta = np.asarray(samples["meta"], np.uint32)
+    assert sample_uv.shape == (137, 5)
+    assert np.all(sample_meta[:, 0] == 1)
+    assert np.all(sample_meta[:, 1] == 1)
+    assert np.array_equal(sample_meta[:, 2], np.arange(11, 148, dtype=np.uint32))
+    assert np.all((sample_uv[:, 2:4] >= 0.0) & (sample_uv[:, 2:4] < 1.0))
+    assert np.all(sample_uv[:, 0] >= mip_bounds[1, 0])
+    assert np.all(sample_uv[:, 0] < mip_bounds[1, 2])
+    assert np.all(sample_uv[:, 1] >= mip_bounds[1, 1])
+    assert np.all(sample_uv[:, 1] < mip_bounds[1, 3])
+    assert np.all(sample_uv[:, 4] == 1.0)
+    assert np.unique(sample_uv[:, :2], axis=0).shape[0] == 137
+    spectral_samples = np.tile(
+        np.asarray([[1.0, 2.0, 3.0, 4.0]], np.float32), (137, 1))
+    moments = tr.debug_sensor_mip_accumulate(spectral_samples)
+    direct_sum = np.asarray(moments["sum"], np.float32)
+    direct_sum_sq = np.asarray(moments["sum_sq"], np.float32)
+    direct_weight = np.asarray(moments["weight"], np.float32)
+    direct_count = np.asarray(moments["sample_count"], np.uint32)
+    root_direct_sum = direct_sum[0].copy()
+    root_direct_weight = float(direct_weight[0])
+    expected_root_count = 32 if not force_cpu_t5 else 0
+    assert root_direct_weight == float(expected_root_count), (
+        root_direct_weight, int(direct_count[0]), force_cpu_t5)
+    assert direct_count[0] == expected_root_count, (
+        root_direct_weight, int(direct_count[0]), force_cpu_t5)
+    assert np.allclose(direct_sum[1], 137.0 * spectral_samples[0])
+    assert np.allclose(direct_sum_sq[1], 137.0 * spectral_samples[0] ** 2)
+    assert direct_weight[1] == 137.0 and direct_count[1] == 137
+    base_spectrum = spectral_samples[0]
+    for child_id in range(2, 10):
+        tr.debug_sensor_mip_samples(child_id, 0, 1, 100 + child_id)
+        moments = tr.debug_sensor_mip_accumulate(
+            (base_spectrum * float(child_id))[None, :])
+    final_direct_sum = np.asarray(moments["sum"], np.float32)
+    final_direct_weight = np.asarray(moments["weight"], np.float32)
+    assert np.array_equal(final_direct_sum[0], root_direct_sum)
+    assert final_direct_weight[0] == root_direct_weight
+    rolled = tr.debug_sensor_mip_rollup()
+    rolled_mean = np.asarray(rolled["mean"], np.float32)
+    rolled_evidence = np.asarray(rolled["evidence"], np.float32)
+    assert np.allclose(rolled_mean[0], base_spectrum * 5.0)
+    assert rolled_evidence[0] == 1.0
+    assert np.all(rolled_evidence[1:10] == 0.0)
+    score_features = np.zeros((10, 4), np.float32)
+    score_features[9, 2] = 10.0
+    score_features[8, 3] = 3.0
+    score_features[7, 1] = 5.0
+    priorities = np.asarray(
+        tr.debug_sensor_mip_score(score_features, [1.0, 1.0, 1.0, 4.0]),
+        np.float32,
+    )
+    assert priorities.shape == (10,)
+    assert priorities[8] == 12.0
+    assert priorities[9] == 10.0
+    assert priorities[7] == 5.0
+    first_selection = np.asarray(
+        tr.debug_sensor_mip_select(4, 41)["meta"], np.uint32)
+    assert first_selection.shape == (4, 7)
+    assert np.unique(first_selection[:, 0]).size == 4
+    assert np.all((first_selection[:, 0] >= 1) & (first_selection[:, 0] <= 9))
+    assert np.array_equal(first_selection[:3, 0], np.asarray([8, 9, 7], np.uint32))
+    expected_begins = np.where(first_selection[:, 0] == 1, 137, 1).astype(np.uint32)
+    assert np.array_equal(first_selection[:, 1], expected_begins)
+    assert np.all(first_selection[:, 2] == 32)
+    assert np.array_equal(first_selection[:, 3], np.arange(4, dtype=np.uint32) * 32)
+    second_selection = np.asarray(
+        tr.debug_sensor_mip_select(9, 43)["meta"], np.uint32)
+    assert second_selection.shape == (5, 7)
+    expected_second_begins = np.where(
+        second_selection[:, 0] == 1, 137, 1).astype(np.uint32)
+    assert np.array_equal(second_selection[:, 1], expected_second_begins)
+    assert np.intersect1d(first_selection[:, 0], second_selection[:, 0]).size == 0
+    assert np.array_equal(
+        np.sort(np.concatenate((first_selection[:, 0], second_selection[:, 0]))),
+        np.arange(1, 10, dtype=np.uint32),
+    )
+    # Re-open a nine-node frontier and verify the mixed selector reserves an
+    # exact, disjoint half for broad coverage. Work flag bit 0 marks that lane.
+    mixed_parent = int(first_selection[0, 0])
+    mixed_children = tr.debug_sensor_mip_subdivide(
+        np.asarray([mixed_parent], np.uint32))
+    # The debug subdivision counter is append-oriented until the selector's
+    # frontier compaction pass; it includes the prior compacted entries here.
+    assert int(np.asarray(mixed_children["control"], np.uint32)[2]) >= 9
+    mixed = np.asarray(
+        tr.debug_sensor_mip_select(6, 47, targeted_fraction=0.5)["meta"],
+        np.uint32,
+    )
+    assert mixed.shape == (6, 7)
+    assert np.unique(mixed[:, 0]).size == 6
+    assert np.count_nonzero((mixed[:, 5] & 1) != 0) == 3
+    assert np.count_nonzero((mixed[:, 5] & 1) == 0) == 3
     tr.stop_pipeline()
     return Result(image,conns,visible,overflow)
 

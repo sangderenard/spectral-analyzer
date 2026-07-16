@@ -207,13 +207,22 @@ def _validate_resolved_job(job: dict[str, Any]) -> None:
     if target not in plane_ids:
         raise ValueError(f"job {job['id']!r}: embed_plane {target!r} is not declared")
     _positive(geometry.get("height_m", 0.2), "geometry.height_m")
-    _positive(geometry.get("depth_m", 0.03), "geometry.depth_m")
+    if "extrusion_depth_ratio" in geometry:
+        _positive(geometry["extrusion_depth_ratio"],
+                  "geometry.extrusion_depth_ratio")
+        if "depth_m" in geometry:
+            raise ValueError(
+                "geometry.depth_m and geometry.extrusion_depth_ratio are mutually exclusive"
+            )
+    else:
+        _positive(geometry.get("depth_m", 0.03), "geometry.depth_m")
     embed = float(geometry.get("embed_fraction", 0.5))
     if not 0.0 <= embed <= 1.0:
         raise ValueError("geometry.embed_fraction must be in [0,1]")
     profile = str(geometry.get("profile", "straight"))
     geometry_extra = sorted(set(geometry) - {
-        "embed_plane", "height_m", "depth_m", "embed_fraction", "offset_m",
+        "embed_plane", "height_m", "depth_m", "extrusion_depth_ratio",
+        "embed_fraction", "offset_m",
         "profile", "profile_segments", "profile_bulge", "outline_subdivisions",
         "cap_grid", "material", "text_box_m", "line_height_m", "line_spacing",
         "horizontal_align", "vertical_align"
@@ -222,6 +231,10 @@ def _validate_resolved_job(job: dict[str, Any]) -> None:
         raise ValueError(f"geometry has unsupported fields {geometry_extra}")
     if profile not in ("straight", "circular"):
         raise ValueError("geometry.profile must be 'straight' or 'circular'")
+    if int(geometry.get("outline_subdivisions", 2)) < 1:
+        raise ValueError("geometry.outline_subdivisions must be positive")
+    if int(geometry.get("cap_grid", 28)) < 4:
+        raise ValueError("geometry.cap_grid must be at least 4")
     if profile == "circular" and int(geometry.get("profile_segments", 8)) < 2:
         raise ValueError("circular geometry.profile_segments must be at least 2")
     if "text_box_m" in geometry:
@@ -562,6 +575,24 @@ def layout_paragraph(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def resolved_glyph_height(job: dict[str, Any]) -> float:
+    """Physical glyph height after paragraph formatting has chosen its scale."""
+
+    geometry = job.get("geometry", {})
+    if "text_box_m" in geometry:
+        return float(layout_paragraph(job)["line_height_m"])
+    return float(geometry.get("height_m", 0.2))
+
+
+def resolved_glyph_depth(job: dict[str, Any]) -> float:
+    """Extrusion depth derived from final glyph scale, or legacy fixed depth."""
+
+    geometry = job.get("geometry", {})
+    if "extrusion_depth_ratio" in geometry:
+        return resolved_glyph_height(job) * float(geometry["extrusion_depth_ratio"])
+    return float(geometry.get("depth_m", 0.03))
+
+
 def _paragraph_contours(job: dict[str, Any]) -> list[np.ndarray]:
     layout = layout_paragraph(job)
     font = job.get("font", {})
@@ -620,8 +651,35 @@ def _triangulate_caps(contours: list[np.ndarray], grid_n: int) -> tuple[np.ndarr
     keep = _points_inside_even_odd(samples.reshape(-1, 2), contours).reshape(-1, 4).all(axis=1)
     area2 = ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
              - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
-    keep &= np.abs(area2) > 1.0e-16
+    # Match the compiled-scene normal contract. Dense font outlines can make
+    # Delaunay return almost-collinear slivers that are numerically nonzero in
+    # 2-D but collapse after world transformation.
+    keep &= np.abs(area2) > 1.0e-14
     return points, tri[keep]
+
+
+def _sanitize_scaled_contours(
+    contours: list[np.ndarray], resolved_height: float
+) -> list[np.ndarray]:
+    """Remove duplicate microscopic outline steps before making sidewalls."""
+
+    tolerance = max(1.0e-12, float(resolved_height) * 1.0e-9)
+    cleaned: list[np.ndarray] = []
+    for contour in contours:
+        points = np.asarray(contour, np.float64).reshape(-1, 2)
+        if points.shape[0] > 1 and np.linalg.norm(points[-1] - points[0]) <= tolerance:
+            points = points[:-1]
+        kept: list[np.ndarray] = []
+        for point in points:
+            if not kept or np.linalg.norm(point - kept[-1]) > tolerance:
+                kept.append(point)
+        if len(kept) > 1 and np.linalg.norm(kept[-1] - kept[0]) <= tolerance:
+            kept.pop()
+        if len(kept) < 3:
+            raise ValueError("glyph contour collapsed below three distinct points")
+        closed = np.vstack([np.asarray(kept, np.float64), kept[0]])
+        cleaned.append(np.ascontiguousarray(closed, dtype=np.float64))
+    return cleaned
 
 
 def _glyph_triangles(job: dict[str, Any], plane: dict[str, Any]) -> np.ndarray:
@@ -635,11 +693,12 @@ def _glyph_triangles(job: dict[str, Any], plane: dict[str, Any]) -> np.ndarray:
             float(geometry.get("height_m", 0.2)),
         )
     )
+    contours = _sanitize_scaled_contours(contours, resolved_glyph_height(job))
     cap_points, cap_tri = _triangulate_caps(contours, int(geometry.get("cap_grid", 28)))
     center, normal, right, up = _plane_basis(plane)
     offset = _vec(geometry.get("offset_m", [0.0, 0.0]), "geometry.offset_m", 2)
     center = center + right * offset[0] + up * offset[1]
-    depth = float(geometry.get("depth_m", 0.03))
+    depth = resolved_glyph_depth(job)
     embed = float(geometry.get("embed_fraction", 0.5))
     front_d, back_d = depth * (1.0 - embed), -depth * embed
     profile = str(geometry.get("profile", "straight"))

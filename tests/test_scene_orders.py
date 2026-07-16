@@ -99,6 +99,34 @@ def test_multi_glyph_token_renders_as_laid_out_text():
     assert width > 1.5 * height
 
 
+def test_relative_extrusion_uses_resolved_paragraph_scale_without_moving_plane():
+    job = orders.resolved_jobs(orders.load_order(ORDER), "glyph_A")[0]
+    job = dict(job)
+    job["token"] = "A formatted paragraph that wraps onto several lines"
+    job["geometry"] = dict(
+        job["geometry"],
+        text_box_m=[0.24, 0.10],
+        line_height_m=0.05,
+        extrusion_depth_ratio=0.1,
+    )
+    job["geometry"].pop("depth_m", None)
+    job["geometry"]["embed_fraction"] = 0.25
+    plane = job["planes"][0]
+    tri = orders._glyph_triangles(job, plane)
+    normal = np.asarray(plane["normal"], np.float64)
+    normal /= np.linalg.norm(normal)
+    center = np.asarray(plane["center_m"], np.float64)
+    signed_depth = (tri.reshape(-1, 3) - center) @ normal
+    depth = orders.resolved_glyph_depth(job)
+
+    assert np.isclose(
+        depth / orders.resolved_glyph_height(job), 0.1, rtol=1.0e-12
+    )
+    assert np.isclose(signed_depth.max(), depth * 0.75, atol=1.0e-10)
+    assert np.isclose(signed_depth.min(), -depth * 0.25, atol=1.0e-10)
+    assert np.allclose(np.asarray(plane["center_m"]), [0.0, 0.0, 0.0])
+
+
 def test_empty_token_is_rejected():
     job = orders.resolved_jobs(orders.load_order(ORDER), "glyph_A")[0]
     job = dict(job)

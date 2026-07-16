@@ -32,6 +32,9 @@ def _args(argv: list[str]) -> argparse.Namespace:
                         help="Render every selected job through native thick-lens BDPT")
     p.add_argument("--out-dir", default="exposures/scene_orders")
     p.add_argument("--no-vcm", action="store_true")
+    p.add_argument("--progress-dir", default="",
+                   help="Directory for GPU exposure presentation snapshots announced on stdout.")
+    p.add_argument("--progress-exposure-id", default="")
     return p.parse_args(argv)
 
 
@@ -105,6 +108,13 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if args.no_vcm:
             cmd.append("--no-vcm")
+        if str(args.progress_dir).strip():
+            progress_dir = os.path.abspath(os.path.join(args.progress_dir, job_id))
+            cmd.extend(["--progress-dir", progress_dir])
+            cmd.extend([
+                "--progress-exposure-id",
+                str(args.progress_exposure_id).strip() or job_id,
+            ])
         print(f"RENDER job={job_id!r} -> {job_dir}", flush=True)
         subprocess.run(cmd, check=True)
     return 0

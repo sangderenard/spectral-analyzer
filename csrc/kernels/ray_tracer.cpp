@@ -60,6 +60,7 @@
 #include <thread>
 #include <cstring>
 #include "ray_pipeline.h"
+#include "sensor_mipmap.h"
 #include "gl_compute.h"
 #include "gpu_diag.h"
 
@@ -7675,6 +7676,8 @@ struct RayPipelineState {
     int                       sensor_target_mode = 0; /* 0=toward, 1=away_from_virtual */
     std::vector<double>       sensor_accum;       /* res*res*4 doubles: ch0=R, ch1=G, ch2=B (spectral), ch3=near-miss */
     std::vector<float>        priority_map;       /* res*res sugar-auxin field (1.0 = baseline) */
+    mutable std::mutex        sensor_epoch_mu;
+    std::vector<uint32_t>     sensor_epoch_count; /* completed primary film strata per bin */
     mutable double            sensor_peak[4]      = {1e-30, 1e-30, 1e-30, 1e-30}; /* running per-channel max, never decreases */
 
     /* GPU sensor shadow — updated by the GPU thread from ssbo_sensor_rgb at
@@ -7682,6 +7685,8 @@ struct RayPipelineState {
      * gpu_skip_record_readback production mode is active. */
     mutable std::mutex        sensor_gpu_mu;
     std::vector<uint32_t>     sensor_accum_gpu;   /* 3 × res² float-CAS uint32 shadow */
+    std::vector<uint32_t>     sensor_weight_gpu;  /* res² adaptive exposure weights */
+    std::vector<float>        sensor_learned_priority_gpu; /* res² NN work values */
     mutable double            sensor_peak_gpu[3]  = {1e-30, 1e-30, 1e-30};
 
     /* Set by ray_pipeline_destroy before set_done(); checked by T5 inner loop
@@ -7934,13 +7939,47 @@ public:
     /* Pass B: GPU-resident backward-sensor terminal accumulator */
     GLuint prog_sensor_splat = 0;
     GLuint ssbo_sensor_rgb   = 0;  /* 3 × res × res float-CAS uint32 */
+    GLuint ssbo_sensor_weight= 0;  /* res × res adaptive exposure weights */
     int    sensor_rgb_res    = 0;  /* resolution ssbo_sensor_rgb was allocated for */
     std::atomic<bool> clear_sensor_rgb_requested{false};
     struct {
         GLint term_float_base = -1;
         GLint sensor_half_w = -1, sensor_half_h = -1, sensor_res_u = -1;
         GLint n_bands = -1, n_mats = -1, splat_scale = -1, rgb_w = -1;
+        GLint sensor_mip_enabled = -1, sensor_mip_sample_capacity = -1;
     } uloc_splat;
+
+    /* Sparse recursive sensor mipmap. Spectral moments are structure-of-arrays
+     * so the node ABI remains fixed when the active band count changes. */
+    GLuint prog_sensor_mip_subdivide = 0;
+    GLuint prog_sensor_mip_sample = 0;
+    GLuint prog_sensor_mip_frontier = 0;
+    GLuint prog_sensor_mip_select = 0;
+    GLuint prog_sensor_mip_score = 0;
+    GLuint prog_sensor_mip_accumulate = 0;
+    GLuint prog_sensor_mip_rollup = 0;
+    GLuint prog_sensor_mip_raygen = 0;
+    GLuint prog_sensor_priority_infer = 0;
+    GLuint ssbo_sensor_mip_nodes = 0;
+    GLuint ssbo_sensor_mip_direct_sum = 0;
+    GLuint ssbo_sensor_mip_direct_sum_sq = 0;
+    GLuint ssbo_sensor_mip_direct_weight = 0;
+    GLuint ssbo_sensor_mip_rollup_mean = 0;
+    GLuint ssbo_sensor_mip_rollup_evidence = 0;
+    GLuint ssbo_sensor_mip_control = 0;
+    GLuint ssbo_sensor_mip_completed = 0;
+    GLuint ssbo_sensor_mip_frontier = 0;
+    GLuint ssbo_sensor_mip_work = 0;
+    GLuint ssbo_sensor_mip_lineage = 0;
+    GLuint ssbo_sensor_mip_schedule = 0;
+    GLuint ssbo_sensor_mip_priority_features = 0;
+    GLuint ssbo_sensor_mip_sample_spectra = 0;
+    GLuint ssbo_sensor_learned_priority = 0;
+    GLuint ssbo_sensor_priority_network_params = 0;
+    uint32_t sensor_mip_max_nodes = 0;
+    uint32_t sensor_mip_max_depth = 0;
+    uint32_t sensor_mip_n_bands = 0;
+    uint32_t sensor_mip_lineage_capacity = 0;
 
     /* T5 persistent SSBOs — allocated on first use, grown as needed */
     GLuint ssbo_t5_light    = 0;  /* binding 0: T5LightVertBuf       (float)  */
@@ -7986,6 +8025,39 @@ public:
     std::mutex                         dbg_job_mu;
     std::unique_ptr<DebugReadbackJob>  dbg_job_pending;
     std::atomic<bool>                  dbg_job_ready{false};
+
+    struct SensorMipSnapshot {
+        std::array<uint32_t, 8> control{};
+        std::vector<SensorMipNodeGpu> nodes;
+        std::vector<SensorMipSampleLineageGpu> lineage;
+        std::vector<SensorMipWorkGpu> selected_work;
+        std::vector<float> direct_sum;
+        std::vector<float> direct_sum_sq;
+        std::vector<float> direct_weight;
+        std::vector<float> rollup_mean;
+        std::vector<float> rollup_evidence;
+    };
+    struct SensorMipJob {
+        std::vector<uint32_t> completed;
+        std::vector<SensorMipWorkGpu> work;
+        std::vector<SensorMipPriorityFeaturesGpu> score_features;
+        std::vector<float> sample_spectra;
+        uint32_t accumulate_sample_count = 0;
+        bool rollup = false;
+        std::array<float, 4> score_weights{{1.0f, 1.0f, 1.0f, 4.0f}};
+        uint32_t output_count = 0;
+        uint32_t top_k = 0;
+        uint32_t seed = 0;
+        float targeted_fraction = 1.0f;
+        bool run_epoch = false;
+        uint32_t max_bounces = 8u;
+        float min_amplitude = 1.0e-12f;
+        float exposure_weight = 1.0f;
+        std::promise<SensorMipSnapshot> promise;
+    };
+    std::mutex mip_job_mu;
+    std::unique_ptr<SensorMipJob> mip_job_pending;
+    std::atomic<bool> mip_job_ready{false};
 
     /* UV blit shader + shared display textures (valid only when WGL context sharing
      * is active — i.e. ps.cfg.gl_display_hglrc != 0 and prog_uv_blit != 0). */
@@ -8153,6 +8225,110 @@ public:
         glc_BufferData(GL_SHADER_STORAGE_BUFFER, bytes, nullptr, GL_DYNAMIC_DRAW);
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         return (glGetError() == GL_NO_ERROR);
+    }
+
+    bool initialize_sensor_mipmap(const RayPipelineConfig& cfg, int n_bands) {
+        if (!cfg.sensor_mipmap_enabled) return true;
+        if (!prog_sensor_mip_subdivide || !prog_sensor_mip_sample
+            || !prog_sensor_mip_frontier || !prog_sensor_mip_select
+            || !prog_sensor_mip_score
+            || !prog_sensor_mip_accumulate
+            || !prog_sensor_mip_rollup
+            || !prog_sensor_mip_raygen
+            || cfg.sensor_mipmap_max_nodes < 10u || n_bands <= 0)
+            return false;
+        sensor_mip_max_nodes = cfg.sensor_mipmap_max_nodes;
+        sensor_mip_max_depth = cfg.sensor_mipmap_max_depth;
+        sensor_mip_n_bands = static_cast<uint32_t>(std::min(n_bands, MAX_SPECTRAL_BANDS));
+        const size_t spectral_words = static_cast<size_t>(sensor_mip_max_nodes)
+                                    * static_cast<size_t>(sensor_mip_n_bands);
+        /* Lineage is transient per dispatch, not persistent per node. Keep a
+         * generous bounded work arena instead of multiplying the entire node
+         * pool by samples_per_epoch (which made raising the strategic batch
+         * size consume multiple GiB before the first ray). */
+        const uint64_t lineage_capacity64 = std::min<uint64_t>(
+            static_cast<uint64_t>(sensor_mip_max_nodes)
+                * static_cast<uint64_t>(std::max(1u, cfg.sensor_mipmap_samples_per_epoch)),
+            1u << 20u);
+        if (lineage_capacity64 > static_cast<uint64_t>(UINT32_MAX)) return false;
+        sensor_mip_lineage_capacity = static_cast<uint32_t>(lineage_capacity64);
+        if (!ensure_ssbo(ssbo_sensor_mip_nodes,
+                         (GLsizeiptr)(sensor_mip_max_nodes * sizeof(SensorMipNodeGpu)))
+            || !ensure_ssbo(ssbo_sensor_mip_direct_sum,
+                            (GLsizeiptr)(spectral_words * sizeof(uint32_t)))
+            || !ensure_ssbo(ssbo_sensor_mip_direct_sum_sq,
+                            (GLsizeiptr)(spectral_words * sizeof(uint32_t)))
+            || !ensure_ssbo(ssbo_sensor_mip_direct_weight,
+                            (GLsizeiptr)(sensor_mip_max_nodes * sizeof(uint32_t)))
+            || !ensure_ssbo(ssbo_sensor_mip_rollup_mean,
+                            (GLsizeiptr)(spectral_words * sizeof(uint32_t)))
+            || !ensure_ssbo(ssbo_sensor_mip_rollup_evidence,
+                            (GLsizeiptr)(sensor_mip_max_nodes * sizeof(uint32_t)))
+            || !ensure_ssbo(ssbo_sensor_mip_control, 8 * sizeof(uint32_t))
+            || !ensure_ssbo(ssbo_sensor_mip_completed,
+                            (GLsizeiptr)(sensor_mip_max_nodes * sizeof(uint32_t)))
+            || !ensure_ssbo(ssbo_sensor_mip_frontier,
+                            (GLsizeiptr)(sensor_mip_max_nodes * sizeof(uint32_t)))
+            || !ensure_ssbo(ssbo_sensor_mip_work,
+                            (GLsizeiptr)(sensor_mip_max_nodes * sizeof(SensorMipWorkGpu)))
+            || !ensure_ssbo(ssbo_sensor_mip_lineage,
+                            (GLsizeiptr)(sensor_mip_lineage_capacity
+                                      * sizeof(SensorMipSampleLineageGpu)))
+            || !ensure_ssbo(ssbo_sensor_mip_schedule, 2 * sizeof(uint32_t))
+            || !ensure_ssbo(ssbo_sensor_mip_priority_features,
+                            (GLsizeiptr)(sensor_mip_max_nodes
+                                      * sizeof(SensorMipPriorityFeaturesGpu)))
+            || !ensure_ssbo(ssbo_sensor_mip_sample_spectra,
+                            (GLsizeiptr)(sensor_mip_lineage_capacity
+                                      * sensor_mip_n_bands * sizeof(float))))
+            return false;
+
+        SensorMipNodeGpu root{};
+        root.uv_bounds[0] = 0.0f; root.uv_bounds[1] = 0.0f;
+        root.uv_bounds[2] = 1.0f; root.uv_bounds[3] = 1.0f;
+        root.parent_id = SENSOR_MIP_NO_NODE;
+        root.first_child_id = SENSOR_MIP_NO_NODE;
+        root.level = 0u;
+        root.flags = SENSOR_MIP_NODE_FRONTIER;
+        root.direct_moment_offset = 0u;
+        root.rollup_moment_offset = 0u;
+        root.child_slot = SENSOR_MIP_NO_NODE;
+        uint32_t control[8] = {
+            1u, 0u, 1u, 0u,
+            sensor_mip_max_nodes, sensor_mip_max_depth, sensor_mip_n_bands,
+            cfg.sensor_mipmap_samples_per_epoch,
+        };
+        const uint32_t root_id = 0u;
+        const std::vector<uint32_t> zero_spectral(spectral_words, 0u);
+        const std::vector<uint32_t> zero_nodes(sensor_mip_max_nodes, 0u);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_direct_sum);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                          (GLsizeiptr)(zero_spectral.size() * sizeof(uint32_t)),
+                          zero_spectral.data());
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_direct_sum_sq);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                          (GLsizeiptr)(zero_spectral.size() * sizeof(uint32_t)),
+                          zero_spectral.data());
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_rollup_mean);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                          (GLsizeiptr)(zero_spectral.size() * sizeof(uint32_t)),
+                          zero_spectral.data());
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_direct_weight);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                          (GLsizeiptr)(zero_nodes.size() * sizeof(uint32_t)),
+                          zero_nodes.data());
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_rollup_evidence);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                          (GLsizeiptr)(zero_nodes.size() * sizeof(uint32_t)),
+                          zero_nodes.data());
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_nodes);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(root), &root);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_control);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(control), control);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_frontier);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(root_id), &root_id);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        return glGetError() == GL_NO_ERROR;
     }
 
     /* Max workgroup count for dispatch dim 0, queried lazily (context must be
@@ -8331,12 +8507,23 @@ public:
     void ensure_sensor_rgb_ssbo(int res) {
         if (res <= 0 || res == sensor_rgb_res) return;
         const GLsizeiptr sz = (GLsizeiptr)(3u * (size_t)res * res * sizeof(uint32_t));
+        const GLsizeiptr weight_sz = (GLsizeiptr)((size_t)res * res * sizeof(uint32_t));
         if (!ssbo_sensor_rgb) glc_GenBuffers(1, &ssbo_sensor_rgb);
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_rgb);
         glc_BufferData(GL_SHADER_STORAGE_BUFFER, sz, nullptr, GL_DYNAMIC_COPY);
         /* Zero — upload via a staging vector (same pattern as UV accum zeroing). */
         std::vector<uint32_t> zero(3u * (size_t)res * res, 0u);
         glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sz, zero.data());
+        if (!ssbo_sensor_weight) glc_GenBuffers(1, &ssbo_sensor_weight);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_weight);
+        glc_BufferData(GL_SHADER_STORAGE_BUFFER, weight_sz, nullptr, GL_DYNAMIC_COPY);
+        std::vector<uint32_t> zero_weight((size_t)res * res, 0u);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, weight_sz, zero_weight.data());
+        if (!ssbo_sensor_learned_priority)
+            glc_GenBuffers(1, &ssbo_sensor_learned_priority);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_learned_priority);
+        glc_BufferData(GL_SHADER_STORAGE_BUFFER, weight_sz, nullptr, GL_DYNAMIC_COPY);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, weight_sz, zero_weight.data());
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         sensor_rgb_res = res;
     }
@@ -8352,6 +8539,14 @@ public:
         std::vector<uint32_t> zero(3u * (size_t)sensor_rgb_res * sensor_rgb_res, 0u);
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_rgb);
         glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sz, zero.data());
+        if (ssbo_sensor_weight) {
+            const GLsizeiptr weight_sz = (GLsizeiptr)((size_t)sensor_rgb_res
+                * sensor_rgb_res * sizeof(uint32_t));
+            std::vector<uint32_t> zero_weight(
+                (size_t)sensor_rgb_res * sensor_rgb_res, 0u);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_weight);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, weight_sz, zero_weight.data());
+        }
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
     }
 
@@ -8374,6 +8569,8 @@ public:
         bind_ssbo(ssbo_sensor_rgb, 1);
         bind_ssbo(ssbo_t3_meta,    2);   /* splat shader reads nt_term from meta[1] */
         bind_ssbo(ssbo_mat_band,   3);
+        if (ssbo_sensor_mip_sample_spectra)
+            bind_ssbo(ssbo_sensor_mip_sample_spectra, 4);
 
         if (uloc_splat.term_float_base >= 0)
             glc_Uniform1i(uloc_splat.term_float_base, term_float_base);
@@ -8389,6 +8586,12 @@ public:
             glc_Uniform1i(uloc_splat.n_mats, ps.st ? ps.st->mat_n_mats : 0);
         if (uloc_splat.splat_scale >= 0)
             glc_Uniform1f(uloc_splat.splat_scale, 1.0f);
+        if (uloc_splat.sensor_mip_enabled >= 0)
+            glc_Uniform1ui(uloc_splat.sensor_mip_enabled,
+                           ssbo_sensor_mip_sample_spectra ? 1u : 0u);
+        if (uloc_splat.sensor_mip_sample_capacity >= 0)
+            glc_Uniform1ui(uloc_splat.sensor_mip_sample_capacity,
+                           sensor_mip_lineage_capacity);
         if (uloc_splat.rgb_w >= 0) {
             if (blit_n_bands_stored > 0) {
                 glc_Uniform3fv(uloc_splat.rgb_w, blit_n_bands_stored,
@@ -8424,12 +8627,30 @@ public:
         const int    res  = sensor_rgb_res;
         const size_t pix2 = (size_t)res * res;
         std::vector<uint32_t> tmp(3u * pix2);
+        std::vector<uint32_t> weight_tmp;
+        std::vector<float> learned_tmp;
 
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_rgb);
         glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
                              (GLsizeiptr)(3u * pix2 * sizeof(uint32_t)),
                              tmp.data());
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        if (ps.cfg.sensor_mipmap_enabled && ssbo_sensor_weight) {
+            weight_tmp.resize(pix2);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_weight);
+            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                 (GLsizeiptr)(pix2 * sizeof(uint32_t)),
+                                 weight_tmp.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
+        if (ps.cfg.sensor_priority_network_enabled && ssbo_sensor_learned_priority) {
+            learned_tmp.resize(pix2);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_learned_priority);
+            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                 (GLsizeiptr)(pix2 * sizeof(float)),
+                                 learned_tmp.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
 
         /* Compute per-channel peaks inline (avoids extra pass in get_sensor_image). */
         double pr = 1e-30, pg = 1e-30, pb = 1e-30;
@@ -8440,10 +8661,19 @@ public:
             std::memcpy(&fr, &tmp[i],          sizeof(float));
             std::memcpy(&fg, &tmp[i + pix2],   sizeof(float));
             std::memcpy(&fb, &tmp[i + 2*pix2], sizeof(float));
-            if (fr > (float)pr) pr = fr;
-            if (fg > (float)pg) pg = fg;
-            if (fb > (float)pb) pb = fb;
-            const double rgb = (double)fr + (double)fg + (double)fb;
+            float exposure = 1.0f;
+            if (!weight_tmp.empty()) {
+                std::memcpy(&exposure, &weight_tmp[i], sizeof(float));
+                exposure = (std::isfinite(exposure) && exposure > 0.0f)
+                    ? exposure : 0.0f;
+            }
+            const float nr = exposure > 0.0f ? fr / exposure : 0.0f;
+            const float ng = exposure > 0.0f ? fg / exposure : 0.0f;
+            const float nb = exposure > 0.0f ? fb / exposure : 0.0f;
+            if (nr > (float)pr) pr = nr;
+            if (ng > (float)pg) pg = ng;
+            if (nb > (float)pb) pb = nb;
+            const double rgb = (double)nr + (double)ng + (double)nb;
             if (rgb > 0.0 && std::isfinite(rgb)) {
                 ++lit_px;
                 sum_rgb += rgb;
@@ -8465,6 +8695,8 @@ public:
 
         std::lock_guard<std::mutex> lk(ps.sensor_gpu_mu);
         ps.sensor_accum_gpu   = std::move(tmp);
+        ps.sensor_weight_gpu  = std::move(weight_tmp);
+        ps.sensor_learned_priority_gpu = std::move(learned_tmp);
         ps.sensor_peak_gpu[0] = pr;
         ps.sensor_peak_gpu[1] = pg;
         ps.sensor_peak_gpu[2] = pb;
@@ -8556,6 +8788,622 @@ public:
             dbg_job_ready.store(true, std::memory_order_release);
         }
         return fut.get();
+    }
+
+    void service_sensor_mip_job(RayPipelineState& ps) {
+        std::unique_ptr<SensorMipJob> job;
+        {
+            std::lock_guard<std::mutex> lk(mip_job_mu);
+            job = std::move(mip_job_pending);
+            mip_job_ready.store(false, std::memory_order_release);
+        }
+        if (!job) return;
+        SensorMipSnapshot result;
+        if (ps.cancel.load(std::memory_order_relaxed)
+            || (!job->completed.empty() && !prog_sensor_mip_subdivide)
+            || (!job->work.empty() && !prog_sensor_mip_sample)
+            || (!job->score_features.empty() && !prog_sensor_mip_score)
+            || (job->accumulate_sample_count > 0u && !prog_sensor_mip_accumulate)
+            || (job->rollup && !prog_sensor_mip_rollup)) {
+            try { job->promise.set_value(std::move(result)); } catch (...) {}
+            return;
+        }
+        try {
+            if (job->run_epoch) ensure_sensor_rgb_ssbo(ps.sensor_res);
+            /* A newly configured sensor may still have a deferred clear. Apply
+             * it before adaptive raygen splats exposure weights; otherwise the
+             * first bounce dispatch can erase the just-generated denominator. */
+            if (job->run_epoch
+                    && clear_sensor_rgb_requested.exchange(
+                        false, std::memory_order_acq_rel))
+                clear_sensor_rgb();
+            auto score_moments = [&]() {
+                if (ps.cfg.sensor_priority_network_enabled
+                        && prog_sensor_priority_infer
+                        && ssbo_sensor_learned_priority
+                        && ps.sensor_res > 0) {
+                    glc_UseProgram(prog_sensor_priority_infer);
+                    glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_rgb);
+                    glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_sensor_weight);
+                    glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2,
+                                       ssbo_sensor_learned_priority);
+                    glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3,
+                                       ssbo_sensor_priority_network_params);
+                    GLint infer_res = glc_GetUniformLocation(
+                        prog_sensor_priority_infer, "sensor_res");
+                    if (infer_res >= 0)
+                        glc_Uniform1ui(infer_res, (uint32_t)ps.sensor_res);
+                    glc_DispatchCompute(
+                        ((GLuint)ps.sensor_res + 7u) / 8u,
+                        ((GLuint)ps.sensor_res + 7u) / 8u, 1u);
+                    glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                }
+                glc_UseProgram(prog_sensor_mip_score);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1,
+                                   ssbo_sensor_mip_priority_features);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2,
+                                   ssbo_sensor_mip_direct_sum);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3,
+                                   ssbo_sensor_mip_direct_sum_sq);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4,
+                                   ssbo_sensor_mip_direct_weight);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 5,
+                                   ssbo_sensor_mip_control);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo_sensor_rgb);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, ssbo_sensor_weight);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 8,
+                                   ssbo_sensor_learned_priority);
+                GLint loc = glc_GetUniformLocation(prog_sensor_mip_score, "node_count");
+                if (loc >= 0) glc_Uniform1ui(loc, sensor_mip_max_nodes);
+                loc = glc_GetUniformLocation(prog_sensor_mip_score, "n_bands");
+                if (loc >= 0) glc_Uniform1ui(loc, sensor_mip_n_bands);
+                loc = glc_GetUniformLocation(prog_sensor_mip_score,
+                                             "derive_from_moments");
+                if (loc >= 0) glc_Uniform1ui(loc, 1u);
+                loc = glc_GetUniformLocation(prog_sensor_mip_score, "sensor_res");
+                if (loc >= 0) glc_Uniform1ui(loc, (uint32_t)std::max(1, ps.sensor_res));
+                loc = glc_GetUniformLocation(prog_sensor_mip_score, "feature_weights");
+                const float weights[4] = {0.35f, 4.0f, 3.0f, 1.0f};
+                if (loc >= 0) glc_Uniform4fv(loc, 1, weights);
+                loc = glc_GetUniformLocation(prog_sensor_mip_score,
+                                             "learned_map_enabled");
+                if (loc >= 0) glc_Uniform1ui(
+                    loc, ps.cfg.sensor_priority_network_enabled ? 1u : 0u);
+                glc_DispatchCompute((sensor_mip_max_nodes + 63u) / 64u, 1u, 1u);
+                glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                glc_UseProgram(0);
+            };
+            if (!job->completed.empty()) {
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_completed);
+                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                    (GLsizeiptr)(job->completed.size() * sizeof(uint32_t)),
+                    job->completed.data());
+                const uint32_t completed_count = static_cast<uint32_t>(job->completed.size());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_control);
+                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, sizeof(uint32_t),
+                                  sizeof(uint32_t), &completed_count);
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+                glc_UseProgram(prog_sensor_mip_subdivide);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_sensor_mip_control);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_sensor_mip_completed);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssbo_sensor_mip_frontier);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo_sensor_mip_direct_sum);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, ssbo_sensor_mip_direct_sum_sq);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo_sensor_mip_direct_weight);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, ssbo_sensor_mip_rollup_mean);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, ssbo_sensor_mip_rollup_evidence);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, ssbo_sensor_mip_work);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, ssbo_sensor_mip_schedule);
+                const GLint u_from_work = glc_GetUniformLocation(
+                    prog_sensor_mip_subdivide, "completed_from_work");
+                if (u_from_work >= 0) glc_Uniform1ui(u_from_work, 0u);
+                glc_DispatchCompute((completed_count + 63u) / 64u, 1u, 1u);
+                glc_MemoryBarrier(GL_ALL_BARRIER_BITS);
+                glc_UseProgram(0);
+            }
+            if (job->rollup) {
+                glc_UseProgram(prog_sensor_mip_rollup);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_sensor_mip_control);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_sensor_mip_direct_sum);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssbo_sensor_mip_direct_weight);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo_sensor_mip_rollup_mean);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, ssbo_sensor_mip_rollup_evidence);
+                const GLint u_level = glc_GetUniformLocation(
+                    prog_sensor_mip_rollup, "target_level");
+                const GLint u_bands = glc_GetUniformLocation(
+                    prog_sensor_mip_rollup, "n_bands");
+                if (u_bands >= 0) glc_Uniform1ui(u_bands, sensor_mip_n_bands);
+                for (uint32_t level = sensor_mip_max_depth; level-- > 0u;) {
+                    if (u_level >= 0) glc_Uniform1ui(u_level, level);
+                    glc_DispatchCompute((sensor_mip_max_nodes + 63u) / 64u, 1u, 1u);
+                    glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                }
+                glc_MemoryBarrier(GL_ALL_BARRIER_BITS);
+                glc_UseProgram(0);
+            }
+            if (!job->work.empty()) {
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_work);
+                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                    (GLsizeiptr)(job->work.size() * sizeof(SensorMipWorkGpu)),
+                    job->work.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                glc_UseProgram(prog_sensor_mip_sample);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_sensor_mip_work);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_sensor_mip_lineage);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3,
+                                   ssbo_sensor_mip_sample_spectra);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo_sensor_mip_schedule);
+                const GLint u_work_count = glc_GetUniformLocation(prog_sensor_mip_sample, "work_count");
+                const GLint u_node_count = glc_GetUniformLocation(prog_sensor_mip_sample, "node_count");
+                const GLint u_output_capacity = glc_GetUniformLocation(
+                    prog_sensor_mip_sample, "output_capacity");
+                const GLint u_n_bands = glc_GetUniformLocation(
+                    prog_sensor_mip_sample, "n_bands");
+                const GLint u_use_schedule = glc_GetUniformLocation(
+                    prog_sensor_mip_sample, "use_schedule_count");
+                if (u_work_count >= 0) glc_Uniform1ui(u_work_count, (GLuint)job->work.size());
+                if (u_node_count >= 0) {
+                    uint32_t node_count = 0u;
+                    readback_ssbo(ssbo_sensor_mip_control, &node_count, sizeof(node_count));
+                    glc_Uniform1ui(u_node_count, node_count);
+                }
+                if (u_output_capacity >= 0)
+                    glc_Uniform1ui(u_output_capacity, sensor_mip_lineage_capacity);
+                if (u_n_bands >= 0) glc_Uniform1ui(u_n_bands, sensor_mip_n_bands);
+                if (u_use_schedule >= 0) glc_Uniform1ui(u_use_schedule, 0u);
+                glc_DispatchCompute((GLuint)job->work.size(), 1u, 1u);
+                glc_MemoryBarrier(GL_ALL_BARRIER_BITS);
+                glc_UseProgram(0);
+                result.lineage.resize(job->output_count);
+                if (job->output_count > 0u)
+                    readback_ssbo(ssbo_sensor_mip_lineage, result.lineage.data(),
+                                  (size_t)job->output_count
+                                  * sizeof(SensorMipSampleLineageGpu));
+            }
+            if (!job->score_features.empty()) {
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_priority_features);
+                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                    (GLsizeiptr)(job->score_features.size()
+                               * sizeof(SensorMipPriorityFeaturesGpu)),
+                    job->score_features.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                glc_UseProgram(prog_sensor_mip_score);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1,
+                                   ssbo_sensor_mip_priority_features);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2,
+                                   ssbo_sensor_mip_direct_sum);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3,
+                                   ssbo_sensor_mip_direct_sum_sq);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4,
+                                   ssbo_sensor_mip_direct_weight);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 5,
+                                   ssbo_sensor_mip_control);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo_sensor_rgb);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, ssbo_sensor_weight);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 8,
+                                   ssbo_sensor_learned_priority);
+                const GLint u_node_count = glc_GetUniformLocation(
+                    prog_sensor_mip_score, "node_count");
+                const GLint u_weights = glc_GetUniformLocation(
+                    prog_sensor_mip_score, "feature_weights");
+                if (u_node_count >= 0)
+                    glc_Uniform1ui(u_node_count, (GLuint)job->score_features.size());
+                const GLint u_n_bands = glc_GetUniformLocation(
+                    prog_sensor_mip_score, "n_bands");
+                const GLint u_derive = glc_GetUniformLocation(
+                    prog_sensor_mip_score, "derive_from_moments");
+                if (u_n_bands >= 0) glc_Uniform1ui(u_n_bands, sensor_mip_n_bands);
+                if (u_derive >= 0) glc_Uniform1ui(u_derive, 0u);
+                const GLint u_sensor_res = glc_GetUniformLocation(
+                    prog_sensor_mip_score, "sensor_res");
+                if (u_sensor_res >= 0)
+                    glc_Uniform1ui(u_sensor_res, (uint32_t)std::max(1, ps.sensor_res));
+                if (u_weights >= 0)
+                    glc_Uniform4fv(u_weights, 1, job->score_weights.data());
+                const GLint u_learned_enabled = glc_GetUniformLocation(
+                    prog_sensor_mip_score, "learned_map_enabled");
+                if (u_learned_enabled >= 0) glc_Uniform1ui(u_learned_enabled, 0u);
+                glc_DispatchCompute(
+                    ((GLuint)job->score_features.size() + 63u) / 64u, 1u, 1u);
+                glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                glc_UseProgram(0);
+            }
+            if (job->accumulate_sample_count > 0u) {
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_sample_spectra);
+                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                    (GLsizeiptr)(job->sample_spectra.size() * sizeof(float)),
+                    job->sample_spectra.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                glc_UseProgram(prog_sensor_mip_accumulate);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_sensor_mip_lineage);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_sensor_mip_sample_spectra);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssbo_sensor_mip_direct_sum);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo_sensor_mip_direct_sum_sq);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, ssbo_sensor_mip_direct_weight);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo_sensor_mip_control);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, ssbo_sensor_mip_schedule);
+                const GLint u_samples = glc_GetUniformLocation(
+                    prog_sensor_mip_accumulate, "sample_count");
+                const GLint u_bands = glc_GetUniformLocation(
+                    prog_sensor_mip_accumulate, "n_bands");
+                const GLint u_use_schedule = glc_GetUniformLocation(
+                    prog_sensor_mip_accumulate, "use_schedule_count");
+                if (u_samples >= 0) glc_Uniform1ui(
+                    u_samples, job->accumulate_sample_count);
+                if (u_bands >= 0) glc_Uniform1ui(u_bands, sensor_mip_n_bands);
+                if (u_use_schedule >= 0) glc_Uniform1ui(u_use_schedule, 0u);
+                glc_DispatchCompute((job->accumulate_sample_count + 63u) / 64u, 1u, 1u);
+                glc_MemoryBarrier(GL_ALL_BARRIER_BITS);
+                glc_UseProgram(0);
+            }
+            if (job->top_k > 0u) {
+                if (job->run_epoch) score_moments();
+                glc_UseProgram(prog_sensor_mip_frontier);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_sensor_mip_control);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_sensor_mip_frontier);
+                const GLint u_reset = glc_GetUniformLocation(
+                    prog_sensor_mip_frontier, "reset_only");
+                if (u_reset >= 0) glc_Uniform1ui(u_reset, 1u);
+                glc_DispatchCompute(1u, 1u, 1u);
+                glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                if (u_reset >= 0) glc_Uniform1ui(u_reset, 0u);
+                glc_DispatchCompute((sensor_mip_max_nodes + 63u) / 64u, 1u, 1u);
+                glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+                const uint32_t schedule[2] = {0u, job->top_k};
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_schedule);
+                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(schedule), schedule);
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                glc_UseProgram(prog_sensor_mip_select);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_sensor_mip_control);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_sensor_mip_frontier);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssbo_sensor_mip_work);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo_sensor_mip_schedule);
+                const GLint u_seed = glc_GetUniformLocation(prog_sensor_mip_select, "seed");
+                if (u_seed >= 0) glc_Uniform1ui(u_seed, job->seed);
+                const GLint u_targeted_fraction = glc_GetUniformLocation(
+                    prog_sensor_mip_select, "targeted_fraction");
+                if (u_targeted_fraction >= 0)
+                    glc_Uniform1f(u_targeted_fraction,
+                        std::clamp(job->targeted_fraction, 0.0f, 1.0f));
+                glc_DispatchCompute(1u, 1u, 1u);
+                glc_MemoryBarrier(GL_ALL_BARRIER_BITS);
+                if (!job->run_epoch) {
+                    uint32_t selected_count = 0u;
+                    readback_ssbo(ssbo_sensor_mip_schedule, &selected_count,
+                                  sizeof(selected_count));
+                    selected_count = std::min(selected_count, job->top_k);
+                    result.selected_work.resize(selected_count);
+                    if (selected_count > 0u)
+                        readback_ssbo(ssbo_sensor_mip_work, result.selected_work.data(),
+                                      (size_t)selected_count * sizeof(SensorMipWorkGpu));
+                }
+                glc_UseProgram(0);
+            }
+            if (job->run_epoch) {
+                if (!ps.cfg.gpu_skip_record_readback)
+                    throw std::runtime_error(
+                        "adaptive sensor epochs require GPU-resident bounce dispatch");
+                const uint64_t max_samples64 = (uint64_t)job->top_k
+                    * (uint64_t)std::max(1u, ps.cfg.sensor_mipmap_samples_per_epoch);
+                if (max_samples64 == 0u || max_samples64 > sensor_mip_lineage_capacity)
+                    throw std::runtime_error("adaptive sensor epoch exceeds sample capacity");
+                const uint32_t max_samples = (uint32_t)max_samples64;
+
+                glc_UseProgram(prog_sensor_mip_sample);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_sensor_mip_work);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_sensor_mip_lineage);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssbo_sensor_mip_sample_spectra);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo_sensor_mip_schedule);
+                GLint u = glc_GetUniformLocation(prog_sensor_mip_sample, "work_count");
+                if (u >= 0) glc_Uniform1ui(u, job->top_k);
+                u = glc_GetUniformLocation(prog_sensor_mip_sample, "output_capacity");
+                if (u >= 0) glc_Uniform1ui(u, sensor_mip_lineage_capacity);
+                u = glc_GetUniformLocation(prog_sensor_mip_sample, "node_count");
+                if (u >= 0) glc_Uniform1ui(u, sensor_mip_max_nodes);
+                u = glc_GetUniformLocation(prog_sensor_mip_sample, "n_bands");
+                if (u >= 0) glc_Uniform1ui(u, sensor_mip_n_bands);
+                u = glc_GetUniformLocation(prog_sensor_mip_sample, "use_schedule_count");
+                if (u >= 0) glc_Uniform1ui(u, 1u);
+                glc_DispatchCompute(job->top_k, 1u, 1u);
+                glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+                static constexpr int INTENT_STRIDE = 20 + 2 * MAX_SPECTRAL_BANDS;
+                static constexpr int COMBINED_STRIDE = (20 + 2 * MAX_SPECTRAL_BANDS)
+                                                     + (26 + 2 * MAX_SPECTRAL_BANDS);
+                if ((int)max_samples > cap_intents) {
+                    cap_intents = (int)max_samples + (int)max_samples / 8;
+                    ensure_ssbo(ssbo_intent,
+                        (GLsizeiptr)((size_t)cap_intents * COMBINED_STRIDE * sizeof(float)));
+                }
+                glc_UseProgram(prog_sensor_mip_raygen);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_sensor_mip_lineage);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_sensor_mip_control);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssbo_sensor_mip_schedule);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo_counter);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, ssbo_intent);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo_sensor_weight);
+                auto uf = [&](const char* name, float value) {
+                    GLint loc = glc_GetUniformLocation(prog_sensor_mip_raygen, name);
+                    if (loc >= 0) glc_Uniform1f(loc, value);
+                };
+                auto uu = [&](const char* name, uint32_t value) {
+                    GLint loc = glc_GetUniformLocation(prog_sensor_mip_raygen, name);
+                    if (loc >= 0) glc_Uniform1ui(loc, value);
+                };
+                uf("sensor_x", ps.sensor_px); uf("sensor_half_w", ps.sensor_half_w);
+                uf("sensor_half_h", ps.sensor_half_h); uf("aperture_radius", ps.sensor_target_r);
+                uf("min_amplitude", job->min_amplitude);
+                uf("exposure_weight", job->exposure_weight);
+                GLint target_loc = glc_GetUniformLocation(prog_sensor_mip_raygen, "camera_target");
+                if (target_loc >= 0) {
+                    const float target[3] = {
+                        ps.sensor_target_x, ps.sensor_target_y, ps.sensor_target_z};
+                    glc_Uniform3fv(target_loc, 1, target);
+                }
+                uu("target_mode", (uint32_t)ps.sensor_target_mode);
+                uu("sensor_res", (uint32_t)std::max(1, ps.sensor_res));
+                uu("n_bands", sensor_mip_n_bands); uu("max_bounces", job->max_bounces);
+                uu("epoch_seed", job->seed);
+                glc_DispatchCompute((max_samples + 63u) / 64u, 1u, 1u);
+                glc_MemoryBarrier(GL_ALL_BARRIER_BITS);
+                glc_UseProgram(0);
+
+                const std::vector<RayIntent> no_cpu_intents;
+                dispatch_t1_t2_t3(ps, no_cpu_intents, nullptr, nullptr, (int)max_samples);
+
+                glc_UseProgram(prog_sensor_mip_accumulate);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_sensor_mip_lineage);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_sensor_mip_sample_spectra);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssbo_sensor_mip_direct_sum);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo_sensor_mip_direct_sum_sq);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, ssbo_sensor_mip_direct_weight);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo_sensor_mip_control);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, ssbo_sensor_mip_schedule);
+                u = glc_GetUniformLocation(prog_sensor_mip_accumulate, "sample_count");
+                if (u >= 0) glc_Uniform1ui(u, max_samples);
+                u = glc_GetUniformLocation(prog_sensor_mip_accumulate, "n_bands");
+                if (u >= 0) glc_Uniform1ui(u, sensor_mip_n_bands);
+                u = glc_GetUniformLocation(prog_sensor_mip_accumulate, "use_schedule_count");
+                if (u >= 0) glc_Uniform1ui(u, 1u);
+                glc_DispatchCompute((max_samples + 63u) / 64u, 1u, 1u);
+                glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                /* Measure this completed exposure before mandatory subdivision
+                 * so all nine children inherit its evidence-derived work value. */
+                score_moments();
+                glc_UseProgram(prog_sensor_mip_subdivide);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_sensor_mip_control);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_sensor_mip_completed);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssbo_sensor_mip_frontier);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo_sensor_mip_direct_sum);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, ssbo_sensor_mip_direct_sum_sq);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo_sensor_mip_direct_weight);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, ssbo_sensor_mip_rollup_mean);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, ssbo_sensor_mip_rollup_evidence);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, ssbo_sensor_mip_work);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, ssbo_sensor_mip_schedule);
+                u = glc_GetUniformLocation(prog_sensor_mip_subdivide, "completed_from_work");
+                if (u >= 0) glc_Uniform1ui(u, 1u);
+                glc_DispatchCompute((job->top_k + 63u) / 64u, 1u, 1u);
+                glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+                glc_UseProgram(prog_sensor_mip_rollup);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_sensor_mip_control);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_sensor_mip_direct_sum);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssbo_sensor_mip_direct_weight);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo_sensor_mip_rollup_mean);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, ssbo_sensor_mip_rollup_evidence);
+                GLint ul = glc_GetUniformLocation(prog_sensor_mip_rollup, "target_level");
+                GLint ub = glc_GetUniformLocation(prog_sensor_mip_rollup, "n_bands");
+                if (ub >= 0) glc_Uniform1ui(ub, sensor_mip_n_bands);
+                for (uint32_t level = sensor_mip_max_depth; level-- > 0u;) {
+                    if (ul >= 0) glc_Uniform1ui(ul, level);
+                    glc_DispatchCompute((sensor_mip_max_nodes + 63u) / 64u, 1u, 1u);
+                    glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                }
+                glc_UseProgram(0);
+                result.control[0] = 1u;
+            }
+            if (!job->run_epoch) {
+            readback_ssbo(ssbo_sensor_mip_control, result.control.data(),
+                          result.control.size() * sizeof(uint32_t));
+            const uint32_t node_count = std::min(result.control[0], sensor_mip_max_nodes);
+            result.nodes.resize(node_count);
+            if (node_count > 0)
+                readback_ssbo(ssbo_sensor_mip_nodes, result.nodes.data(),
+                              (size_t)node_count * sizeof(SensorMipNodeGpu));
+            if (job->accumulate_sample_count > 0u && node_count > 0u) {
+                result.direct_sum.resize((size_t)node_count * sensor_mip_n_bands);
+                result.direct_sum_sq.resize((size_t)node_count * sensor_mip_n_bands);
+                result.direct_weight.resize(node_count);
+                readback_ssbo(ssbo_sensor_mip_direct_sum, result.direct_sum.data(),
+                              result.direct_sum.size() * sizeof(float));
+                readback_ssbo(ssbo_sensor_mip_direct_sum_sq, result.direct_sum_sq.data(),
+                              result.direct_sum_sq.size() * sizeof(float));
+                readback_ssbo(ssbo_sensor_mip_direct_weight, result.direct_weight.data(),
+                              result.direct_weight.size() * sizeof(float));
+            }
+            if (job->rollup && node_count > 0u) {
+                result.rollup_mean.resize((size_t)node_count * sensor_mip_n_bands);
+                result.rollup_evidence.resize(node_count);
+                readback_ssbo(ssbo_sensor_mip_rollup_mean, result.rollup_mean.data(),
+                              result.rollup_mean.size() * sizeof(float));
+                readback_ssbo(ssbo_sensor_mip_rollup_evidence,
+                              result.rollup_evidence.data(),
+                              result.rollup_evidence.size() * sizeof(float));
+            }
+            }
+            const uint32_t zero = 0u;
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_control);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, sizeof(uint32_t),
+                              sizeof(uint32_t), &zero);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            /* The production epoch is a publication boundary. Refresh both
+             * retained RGB sums and exposure weights before unblocking its
+             * caller, independent of the ordinary 20 Hz display throttle. */
+            if (job->run_epoch) refresh_sensor_gpu_shadow(ps);
+            job->promise.set_value(std::move(result));
+        } catch (const std::exception& exc) {
+            fprintf(stderr, "[sensor-mip-job] failed: %s\n", exc.what());
+            fflush(stderr);
+            try { job->promise.set_value(SensorMipSnapshot{}); } catch (...) {}
+        } catch (...) {
+            fprintf(stderr, "[sensor-mip-job] failed: unknown exception\n");
+            fflush(stderr);
+            try { job->promise.set_value(SensorMipSnapshot{}); } catch (...) {}
+        }
+    }
+
+    SensorMipSnapshot submit_sensor_mip_debug_subdivide(
+        const std::vector<uint32_t>& completed)
+    {
+        if (!prog_sensor_mip_subdivide || completed.empty()) return {};
+        auto job = std::make_unique<SensorMipJob>();
+        job->completed = completed;
+        std::future<SensorMipSnapshot> future = job->promise.get_future();
+        {
+            std::lock_guard<std::mutex> lk(mip_job_mu);
+            if (mip_job_pending)
+                throw std::runtime_error("sensor mipmap job already pending");
+            mip_job_pending = std::move(job);
+            mip_job_ready.store(true, std::memory_order_release);
+        }
+        return future.get();
+    }
+
+    SensorMipSnapshot submit_sensor_mip_debug_samples(
+        uint32_t node_id, uint32_t sample_begin, uint32_t sample_count, uint32_t seed)
+    {
+        if (!prog_sensor_mip_sample || sample_count == 0u
+            || sample_count > sensor_mip_lineage_capacity) return {};
+        auto job = std::make_unique<SensorMipJob>();
+        SensorMipWorkGpu item{};
+        item.node_id = node_id;
+        item.sample_begin = sample_begin;
+        item.sample_count = sample_count;
+        item.output_offset = 0u;
+        item.seed = seed;
+        job->work.push_back(item);
+        job->output_count = sample_count;
+        std::future<SensorMipSnapshot> future = job->promise.get_future();
+        {
+            std::lock_guard<std::mutex> lk(mip_job_mu);
+            if (mip_job_pending)
+                throw std::runtime_error("sensor mipmap job already pending");
+            mip_job_pending = std::move(job);
+            mip_job_ready.store(true, std::memory_order_release);
+        }
+        return future.get();
+    }
+
+    SensorMipSnapshot submit_sensor_mip_debug_select(
+        uint32_t top_k, uint32_t seed, float targeted_fraction) {
+        if (!prog_sensor_mip_frontier || !prog_sensor_mip_select || top_k == 0u) return {};
+        auto job = std::make_unique<SensorMipJob>();
+        job->top_k = std::min(top_k, sensor_mip_max_nodes);
+        job->seed = seed;
+        job->targeted_fraction = std::clamp(targeted_fraction, 0.0f, 1.0f);
+        std::future<SensorMipSnapshot> future = job->promise.get_future();
+        {
+            std::lock_guard<std::mutex> lk(mip_job_mu);
+            if (mip_job_pending)
+                throw std::runtime_error("sensor mipmap job already pending");
+            mip_job_pending = std::move(job);
+            mip_job_ready.store(true, std::memory_order_release);
+        }
+        return future.get();
+    }
+
+    SensorMipSnapshot submit_sensor_mip_debug_score(
+        const std::vector<SensorMipPriorityFeaturesGpu>& features,
+        const std::array<float, 4>& weights)
+    {
+        if (!prog_sensor_mip_score || features.empty()
+            || features.size() > sensor_mip_max_nodes) return {};
+        auto job = std::make_unique<SensorMipJob>();
+        job->score_features = features;
+        job->score_weights = weights;
+        std::future<SensorMipSnapshot> future = job->promise.get_future();
+        {
+            std::lock_guard<std::mutex> lk(mip_job_mu);
+            if (mip_job_pending)
+                throw std::runtime_error("sensor mipmap job already pending");
+            mip_job_pending = std::move(job);
+            mip_job_ready.store(true, std::memory_order_release);
+        }
+        return future.get();
+    }
+
+    SensorMipSnapshot submit_sensor_mip_debug_accumulate(
+        const std::vector<float>& spectra, uint32_t sample_count)
+    {
+        if (!prog_sensor_mip_accumulate || sample_count == 0u
+            || sample_count > sensor_mip_lineage_capacity
+            || spectra.size() != (size_t)sample_count * sensor_mip_n_bands) return {};
+        auto job = std::make_unique<SensorMipJob>();
+        job->sample_spectra = spectra;
+        job->accumulate_sample_count = sample_count;
+        std::future<SensorMipSnapshot> future = job->promise.get_future();
+        {
+            std::lock_guard<std::mutex> lk(mip_job_mu);
+            if (mip_job_pending)
+                throw std::runtime_error("sensor mipmap job already pending");
+            mip_job_pending = std::move(job);
+            mip_job_ready.store(true, std::memory_order_release);
+        }
+        return future.get();
+    }
+
+    SensorMipSnapshot submit_sensor_mip_debug_rollup() {
+        if (!prog_sensor_mip_rollup) return {};
+        auto job = std::make_unique<SensorMipJob>();
+        job->rollup = true;
+        std::future<SensorMipSnapshot> future = job->promise.get_future();
+        {
+            std::lock_guard<std::mutex> lk(mip_job_mu);
+            if (mip_job_pending)
+                throw std::runtime_error("sensor mipmap job already pending");
+            mip_job_pending = std::move(job);
+            mip_job_ready.store(true, std::memory_order_release);
+        }
+        return future.get();
+    }
+
+    bool submit_sensor_mip_epoch(uint32_t top_k, uint32_t seed,
+                                 uint32_t max_bounces, float min_amplitude,
+                                 float exposure_weight, float targeted_fraction) {
+        if (!prog_sensor_mip_raygen || top_k == 0u) return false;
+        auto job = std::make_unique<SensorMipJob>();
+        job->top_k = std::min(top_k, sensor_mip_max_nodes);
+        job->seed = seed;
+        job->run_epoch = true;
+        job->max_bounces = std::max(1u, max_bounces);
+        job->min_amplitude = std::max(0.0f, min_amplitude);
+        job->exposure_weight = std::max(0.0f, exposure_weight);
+        job->targeted_fraction = std::clamp(targeted_fraction, 0.0f, 1.0f);
+        std::future<SensorMipSnapshot> future = job->promise.get_future();
+        {
+            std::lock_guard<std::mutex> lk(mip_job_mu);
+            if (mip_job_pending)
+                throw std::runtime_error("sensor mipmap job already pending");
+            mip_job_pending = std::move(job);
+            mip_job_ready.store(true, std::memory_order_release);
+        }
+        return future.get().control[0] == 1u;
     }
 
     struct T5DispatchStats {
@@ -10576,6 +11424,75 @@ public:
             uloc_splat.n_mats          = glc_GetUniformLocation(prog_sensor_splat, "n_mats");
             uloc_splat.splat_scale     = glc_GetUniformLocation(prog_sensor_splat, "splat_scale");
             uloc_splat.rgb_w           = glc_GetUniformLocation(prog_sensor_splat, "rgb_w");
+            uloc_splat.sensor_mip_enabled = glc_GetUniformLocation(
+                prog_sensor_splat, "sensor_mip_enabled");
+            uloc_splat.sensor_mip_sample_capacity = glc_GetUniformLocation(
+                prog_sensor_splat, "sensor_mip_sample_capacity");
+        }
+
+        if (cfg.sensor_mipmap_enabled) {
+            if (!load("sensor_mip_subdivide.comp.glsl", prog_sensor_mip_subdivide)) {
+                snprintf(ctx.error, sizeof(ctx.error),
+                         "sensor_mip_subdivide.comp.glsl: %s", err);
+                return false;
+            }
+            if (!load("sensor_mip_sample.comp.glsl", prog_sensor_mip_sample)) {
+                snprintf(ctx.error, sizeof(ctx.error),
+                         "sensor_mip_sample.comp.glsl: %s", err);
+                return false;
+            }
+            if (!load("sensor_mip_frontier.comp.glsl", prog_sensor_mip_frontier)) {
+                snprintf(ctx.error, sizeof(ctx.error),
+                         "sensor_mip_frontier.comp.glsl: %s", err);
+                return false;
+            }
+            if (!load("sensor_mip_select.comp.glsl", prog_sensor_mip_select)) {
+                snprintf(ctx.error, sizeof(ctx.error),
+                         "sensor_mip_select.comp.glsl: %s", err);
+                return false;
+            }
+            if (!load("sensor_mip_score.comp.glsl", prog_sensor_mip_score)) {
+                snprintf(ctx.error, sizeof(ctx.error),
+                         "sensor_mip_score.comp.glsl: %s", err);
+                return false;
+            }
+            if (!load("sensor_mip_accumulate.comp.glsl", prog_sensor_mip_accumulate)) {
+                snprintf(ctx.error, sizeof(ctx.error),
+                         "sensor_mip_accumulate.comp.glsl: %s", err);
+                return false;
+            }
+            if (!load("sensor_mip_rollup.comp.glsl", prog_sensor_mip_rollup)) {
+                snprintf(ctx.error, sizeof(ctx.error),
+                         "sensor_mip_rollup.comp.glsl: %s", err);
+                return false;
+            }
+            if (!load("sensor_mip_raygen.comp.glsl", prog_sensor_mip_raygen)) {
+                snprintf(ctx.error, sizeof(ctx.error),
+                         "sensor_mip_raygen.comp.glsl: %s", err);
+                return false;
+            }
+            if (cfg.sensor_priority_network_enabled) {
+                if (!load("sensor_priority_infer.comp.glsl",
+                          prog_sensor_priority_infer)) {
+                    snprintf(ctx.error, sizeof(ctx.error),
+                             "sensor_priority_infer.comp.glsl: %s", err);
+                    return false;
+                }
+                if (!ensure_ssbo(ssbo_sensor_priority_network_params,
+                                 SENSOR_PRIORITY_NETWORK_PARAMS * sizeof(float)))
+                    return false;
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER,
+                               ssbo_sensor_priority_network_params);
+                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                    SENSOR_PRIORITY_NETWORK_PARAMS * sizeof(float),
+                    cfg.sensor_priority_network_params.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            }
+            if (!initialize_sensor_mipmap(cfg, ps.st ? ps.st->n_bands : 0)) {
+                snprintf(ctx.error, sizeof(ctx.error),
+                         "failed to allocate recursive sensor mipmap buffers");
+                return false;
+            }
         }
 
         /* GPU-native T5: sort and pack shaders — non-fatal */
@@ -11024,11 +11941,13 @@ public:
     int dispatch_t1_t2_t3(RayPipelineState& ps,
                            const std::vector<RayIntent>& batch,
                            int64_t* out_flash_children = nullptr,
-                           int64_t* out_sensor_children = nullptr)
+                           int64_t* out_sensor_children = nullptr,
+                           int gpu_initial_capacity = 0)
     {
         using Clock = std::chrono::high_resolution_clock;
         const RayTracerState& st = *ps.st;
-        int       n  = (int)batch.size();  /* mutable: updated to child count each bounce */
+        int       n  = gpu_initial_capacity > 0
+                     ? gpu_initial_capacity : (int)batch.size();
         const int nb = st.n_bands;
         const int nm = st.mat_n_mats;
         const int na = (int)ps.arenas.size();
@@ -11121,7 +12040,7 @@ public:
             ensure_ssbo(ssbo_intent, (GLsizeiptr)(cap_intents * COMBINED_STRIDE * sizeof(float)));
         }
 
-        if (first_gen) {
+        if (first_gen && gpu_initial_capacity <= 0) {
         /* Pack intents to flat float buffer — persistent staging, no malloc after warmup */
         stg_ibuf.resize((size_t)n * INTENT_STRIDE);
         auto& ibuf = stg_ibuf;
@@ -11241,7 +12160,7 @@ public:
          *  - Non-gpu-resident, bounce>0: n was updated to nc at end of prev bounce.
          *  - gpu-resident, bounce>0: post_t3_prep already wrote nc — do NOT overwrite.
          * Also write counters[9..11] for gpu-resident indirect dispatch when applicable. */
-        if (first_gen || !use_gpu_resident) {
+        if (gpu_initial_capacity <= 0 && (first_gen || !use_gpu_resident)) {
             const uint32_t n_u32 = (uint32_t)n;
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_counter);
             if (use_gpu_resident) {
@@ -12137,6 +13056,8 @@ public:
                     service_t5_job(ps);
                 if (dbg_job_ready.load(std::memory_order_acquire))
                     service_debug_readback_job(ps);
+                if (mip_job_ready.load(std::memory_order_acquire))
+                    service_sensor_mip_job(ps);
                 if (ps.bdpt_gpu_t5_pending.load(std::memory_order_acquire))
                     service_gpu_native_t5(ps);
                 /* T5 is now woken by bdpt_update_inflight via Q_t5_ready.
@@ -12163,6 +13084,8 @@ public:
                     service_t5_job(ps);
                 if (dbg_job_ready.load(std::memory_order_acquire))
                     service_debug_readback_job(ps);
+                if (mip_job_ready.load(std::memory_order_acquire))
+                    service_sensor_mip_job(ps);
                 if (ps.bdpt_gpu_t5_pending.load(std::memory_order_acquire))
                     service_gpu_native_t5(ps);
                 break;
@@ -14943,6 +15866,8 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
     };
     std::vector<RayIntent> intents;
     intents.reserve(static_cast<size_t>(limit));
+    std::vector<int> sampled_epoch_pixels;
+    sampled_epoch_pixels.reserve(static_cast<size_t>(limit / std::max(1, n_ap) + 1));
 
     struct MortonPixel {
         uint32_t tile_key;
@@ -15019,6 +15944,25 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
         return BDPT_FILM_TAG_FLAG | ch | (qu << BDPT_FILM_TAG_UV_SHIFT) | qv;
     };
 
+    /* Continuous, deterministic film sampling.  Pixel bins define ownership
+     * and reconstruction support; they are not ray origins.  A low-discrepancy
+     * sequence is Cranley-Patterson rotated independently per pixel so repeat
+     * exposure epochs add new sub-pixel evidence without introducing a global
+     * lattice.  This sequence is independent of the progressive pupil disk. */
+    auto unit_from_hash = [](uint64_t bits) -> double {
+        return static_cast<double>(bits >> 11) * (1.0 / 9007199254740992.0);
+    };
+    auto film_sample_at = [&](int pix, int ap_idx, double& jy, double& jz) {
+        const uint64_t epoch = (aperture_seed > 0) ? aperture_seed - 1u : 0u;
+        const uint64_t sample = epoch * static_cast<uint64_t>(n_ap)
+                              + static_cast<uint64_t>(std::max(0, ap_idx)) + 1u;
+        const uint64_t pixel_key = static_cast<uint64_t>(static_cast<uint32_t>(pix));
+        const double rotate_y = unit_from_hash(rt_splitmix64(pixel_key ^ 0x9E3779B97F4A7C15ULL));
+        const double rotate_z = unit_from_hash(rt_splitmix64(pixel_key ^ 0xD1B54A32D192ED03ULL));
+        jy = std::fmod(rt_radical_inverse(static_cast<uint32_t>(sample), 3u) + rotate_y, 1.0);
+        jz = std::fmod(rt_radical_inverse(static_cast<uint32_t>(sample), 5u) + rotate_z, 1.0);
+    };
+
     for (int ord = start; ord < schedule_total && static_cast<int>(intents.size()) < limit; ++ord) {
         const int pixel_ord = ord / n_ap;
         const int ap_idx = ord - pixel_ord * n_ap;
@@ -15026,8 +15970,10 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
         const int pix = mp.pix;
         const int iy = pix / res;
         const int iz = pix - iy * res;
-        const double y = -half_w + (static_cast<double>(iy) + 0.5) * step_w;
-        const double z = -half_h + (static_cast<double>(iz) + 0.5) * step_h;
+        double film_jy = 0.5, film_jz = 0.5;
+        film_sample_at(pix, ap_idx, film_jy, film_jz);
+        const double y = -half_w + (static_cast<double>(iy) + film_jy) * step_w;
+        const double z = -half_h + (static_cast<double>(iz) + film_jz) * step_h;
         const double u = (z + half_h) / std::max(2.0 * half_h, 1.0e-30);
         const double v = (y + half_w) / std::max(2.0 * half_w, 1.0e-30);
         const double shutter_w = shutter_weight_at(u, v);
@@ -15074,9 +16020,19 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
         ri.bdpt_stream = BDPT_SIDE_SENSOR;
         ri.bdpt_strategy = 0u;
         intents.push_back(std::move(ri));
+        if (ap_idx == 0)
+            sampled_epoch_pixels.push_back(pix);
     }
 
     if (intents.empty()) return 0;
+    {
+        std::lock_guard<std::mutex> lk(ps->sensor_epoch_mu);
+        for (int pix : sampled_epoch_pixels) {
+            if (pix >= 0 && static_cast<size_t>(pix) < ps->sensor_epoch_count.size())
+                ++ps->sensor_epoch_count[static_cast<size_t>(pix)];
+        }
+
+    }
     ray_pipeline_submit(ps, intents.data(), static_cast<int>(intents.size()));
     return static_cast<int>(intents.size());
 }
@@ -16170,12 +17126,17 @@ void ray_pipeline_configure_sensor_image(
     /* 4 channels: ch0=R, ch1=G, ch2=B (spectral, all path types), ch3=near-miss */
     ps->sensor_accum.assign(static_cast<size_t>(res) * res * 4, 0.0);
     ps->priority_map.assign(static_cast<size_t>(res) * res, 1.0f);
+    {
+        std::lock_guard<std::mutex> lk_epoch(ps->sensor_epoch_mu);
+        ps->sensor_epoch_count.assign(static_cast<size_t>(res) * res, 0u);
+    }
     /* Reset running peaks so the new accumulator starts fresh. */
     for (int _c = 0; _c < 4; ++_c) ps->sensor_peak[_c] = 1e-30;
     /* Clear GPU shadow so the next get_sensor_image doesn't serve stale data. */
     {
         std::lock_guard<std::mutex> lk_gpu(ps->sensor_gpu_mu);
         ps->sensor_accum_gpu.clear();
+        ps->sensor_weight_gpu.clear();
         for (int _c = 0; _c < 3; ++_c) ps->sensor_peak_gpu[_c] = 1e-30;
     }
     /* Request GPU buffer clear (executed on GPU thread via flag, avoids cross-thread GL calls). */
@@ -16210,6 +17171,15 @@ void ray_pipeline_get_sensor_image(
         {
             const double* peak = ps->sensor_peak_gpu;
             const uint32_t* src = ps->sensor_accum_gpu.data();
+            const uint32_t* weights = ps->sensor_weight_gpu.size() >= pix
+                ? ps->sensor_weight_gpu.data() : nullptr;
+            auto normalized = [&](float value, size_t index) -> float {
+                if (!weights) return value;
+                float weight = 0.0f;
+                std::memcpy(&weight, &weights[index], sizeof(float));
+                return (std::isfinite(weight) && weight > 0.0f)
+                    ? value / weight : 0.0f;
+            };
             std::vector<float> positive_scale;
             positive_scale.reserve(pix);
             for (size_t i = 0; i < pix; ++i) {
@@ -16217,6 +17187,9 @@ void ray_pipeline_get_sensor_image(
                 std::memcpy(&fr, &src[i],         sizeof(float));
                 std::memcpy(&fg, &src[i + pix],   sizeof(float));
                 std::memcpy(&fb, &src[i + 2*pix], sizeof(float));
+                fr = normalized(fr, i);
+                fg = normalized(fg, i);
+                fb = normalized(fb, i);
                 const float m = std::max({fr, fg, fb});
                 if (m > 0.0f && std::isfinite(m)) positive_scale.push_back(m);
             }
@@ -16238,6 +17211,9 @@ void ray_pipeline_get_sensor_image(
                     std::memcpy(&fr, &src[sp],          sizeof(float));
                     std::memcpy(&fg, &src[sp + pix],    sizeof(float));
                     std::memcpy(&fb, &src[sp + 2*pix],  sizeof(float));
+                    fr = normalized(fr, sp);
+                    fg = normalized(fg, sp);
+                    fb = normalized(fb, sp);
                     if (std::isfinite(fr + fg + fb) && fr + fg + fb > 0.0f)
                         ++dbg_lit;
                     buf[dp * 3 + 0] = tone((double)fr, common_peak);
@@ -16307,6 +17283,8 @@ void ray_pipeline_get_sensor_image_linear(
         std::lock_guard<std::mutex> lk_gpu(ps->sensor_gpu_mu);
         if (!ps->sensor_accum_gpu.empty() && ps->sensor_accum_gpu.size() >= 3 * pix) {
             const uint32_t* src = ps->sensor_accum_gpu.data();
+            const uint32_t* weights = ps->sensor_weight_gpu.size() >= pix
+                ? ps->sensor_weight_gpu.data() : nullptr;
             for (int y = 0; y < res; ++y) {
                 const int out_y = res - 1 - y;
                 for (int z = 0; z < res; ++z) {
@@ -16315,6 +17293,12 @@ void ray_pipeline_get_sensor_image_linear(
                     for (size_t channel = 0; channel < 3; ++channel) {
                         float value = 0.0f;
                         std::memcpy(&value, &src[src_px + channel * pix], sizeof(float));
+                        if (weights) {
+                            float weight = 0.0f;
+                            std::memcpy(&weight, &weights[src_px], sizeof(float));
+                            value = (std::isfinite(weight) && weight > 0.0f)
+                                ? value / weight : 0.0f;
+                        }
                         buf[dst_px * 3 + channel] = std::isfinite(value) ? value : 0.0f;
                     }
                 }
@@ -16336,6 +17320,241 @@ void ray_pipeline_get_sensor_image_linear(
             }
         }
     }
+}
+
+void ray_pipeline_get_sensor_epoch_count(
+    const RayPipelineState* ps,
+    uint32_t* buf,
+    int* out_res)
+{
+    if (out_res) *out_res = 0;
+    if (!ps || ps->sensor_res <= 0) return;
+    const int res = ps->sensor_res;
+    if (out_res) *out_res = res;
+    if (!buf) return;
+    std::lock_guard<std::mutex> lk(ps->sensor_epoch_mu);
+    if (ps->sensor_epoch_count.size() < static_cast<size_t>(res) * res) return;
+    for (int y = 0; y < res; ++y) {
+        const int out_y = res - 1 - y;
+        for (int z = 0; z < res; ++z) {
+            buf[static_cast<size_t>(out_y) * res + z] =
+                ps->sensor_epoch_count[static_cast<size_t>(y) * res + z];
+        }
+    }
+}
+
+void ray_pipeline_get_sensor_exposure_weight(
+    const RayPipelineState* ps,
+    float* buf,
+    int* out_res)
+{
+    if (out_res) *out_res = 0;
+    if (!ps || ps->sensor_res <= 0) return;
+    const int res = ps->sensor_res;
+    if (out_res) *out_res = res;
+    if (!buf) return;
+    const size_t pix = static_cast<size_t>(res) * res;
+    std::lock_guard<std::mutex> lk(ps->sensor_gpu_mu);
+    const uint32_t* weights = ps->sensor_weight_gpu.size() >= pix
+        ? ps->sensor_weight_gpu.data() : nullptr;
+    for (int y = 0; y < res; ++y) {
+        const int out_y = res - 1 - y;
+        for (int z = 0; z < res; ++z) {
+            const size_t src_px = static_cast<size_t>(y * res + z);
+            const size_t dst_px = static_cast<size_t>(out_y * res + z);
+            float value = 0.0f;
+            if (weights) std::memcpy(&value, &weights[src_px], sizeof(float));
+            buf[dst_px] = std::isfinite(value) && value > 0.0f ? value : 0.0f;
+        }
+    }
+}
+
+void ray_pipeline_get_sensor_learned_priority_map(
+    const RayPipelineState* ps, float* buf, int* out_res)
+{
+    if (out_res) *out_res = 0;
+    if (!ps || ps->sensor_res <= 0) return;
+    const int res = ps->sensor_res;
+    if (out_res) *out_res = res;
+    if (!buf) return;
+    std::lock_guard<std::mutex> lk(ps->sensor_gpu_mu);
+    const size_t pix = (size_t)res * res;
+    if (ps->sensor_learned_priority_gpu.size() < pix) {
+        std::fill(buf, buf + pix, 0.0f);
+        return;
+    }
+    std::copy_n(ps->sensor_learned_priority_gpu.data(), pix, buf);
+}
+
+void ray_pipeline_get_sensor_image_sum_linear(
+    const RayPipelineState* ps,
+    float* buf,
+    int* out_res)
+{
+    if (out_res) *out_res = 0;
+    if (!ps || ps->sensor_res <= 0) return;
+    const int res = ps->sensor_res;
+    if (out_res) *out_res = res;
+    if (!buf) return;
+    const size_t pix = static_cast<size_t>(res) * res;
+    if (ps->cfg.gpu_skip_record_readback) {
+        std::lock_guard<std::mutex> lk(ps->sensor_gpu_mu);
+        if (ps->sensor_accum_gpu.size() >= 3 * pix) {
+            const uint32_t* src = ps->sensor_accum_gpu.data();
+            for (int y = 0; y < res; ++y) {
+                const int out_y = res - 1 - y;
+                for (int z = 0; z < res; ++z) {
+                    const size_t sp = static_cast<size_t>(y * res + z);
+                    const size_t dp = static_cast<size_t>(out_y * res + z);
+                    for (size_t channel = 0; channel < 3; ++channel) {
+                        float value = 0.0f;
+                        std::memcpy(&value, &src[sp + channel * pix], sizeof(float));
+                        buf[dp * 3 + channel] = std::isfinite(value) ? value : 0.0f;
+                    }
+                }
+            }
+            return;
+        }
+    }
+    std::scoped_lock lk(ps->sensor_mu[0], ps->sensor_mu[1], ps->sensor_mu[2]);
+    for (int y = 0; y < res; ++y) {
+        const int out_y = res - 1 - y;
+        for (int z = 0; z < res; ++z) {
+            const size_t sp = static_cast<size_t>(y * res + z);
+            const size_t dp = static_cast<size_t>(out_y * res + z);
+            for (size_t channel = 0; channel < 3; ++channel) {
+                const double value = ps->sensor_accum[channel * pix + sp];
+                buf[dp * 3 + channel] = std::isfinite(value)
+                    ? static_cast<float>(value) : 0.0f;
+            }
+        }
+    }
+}
+
+bool ray_pipeline_debug_sensor_mip_subdivide(
+    RayPipelineState* ps,
+    const uint32_t* completed_node_ids,
+    int n_completed,
+    std::vector<SensorMipNodeGpu>& out_nodes,
+    std::array<uint32_t, 8>& out_control)
+{
+    out_nodes.clear();
+    out_control.fill(0u);
+    if (!ps || !ps->gpu_dispatch || !completed_node_ids || n_completed <= 0)
+        return false;
+    std::vector<uint32_t> completed(
+        completed_node_ids, completed_node_ids + n_completed);
+    auto snapshot = ps->gpu_dispatch->submit_sensor_mip_debug_subdivide(completed);
+    out_nodes = std::move(snapshot.nodes);
+    out_control = snapshot.control;
+    return !out_nodes.empty();
+}
+
+bool ray_pipeline_debug_sensor_mip_samples(
+    RayPipelineState* ps,
+    uint32_t node_id,
+    uint32_t sample_begin,
+    uint32_t sample_count,
+    uint32_t seed,
+    std::vector<SensorMipSampleLineageGpu>& out_lineage)
+{
+    out_lineage.clear();
+    if (!ps || !ps->gpu_dispatch || sample_count == 0u) return false;
+    auto snapshot = ps->gpu_dispatch->submit_sensor_mip_debug_samples(
+        node_id, sample_begin, sample_count, seed);
+    out_lineage = std::move(snapshot.lineage);
+    return out_lineage.size() == sample_count;
+}
+
+bool ray_pipeline_debug_sensor_mip_select(
+    RayPipelineState* ps,
+    uint32_t top_k,
+    uint32_t seed,
+    float targeted_fraction,
+    std::vector<SensorMipWorkGpu>& out_work)
+{
+    out_work.clear();
+    if (!ps || !ps->gpu_dispatch || top_k == 0u) return false;
+    auto snapshot = ps->gpu_dispatch->submit_sensor_mip_debug_select(
+        top_k, seed, targeted_fraction);
+    out_work = std::move(snapshot.selected_work);
+    return !out_work.empty();
+}
+
+bool ray_pipeline_debug_sensor_mip_score(
+    RayPipelineState* ps,
+    const SensorMipPriorityFeaturesGpu* features,
+    uint32_t feature_count,
+    const std::array<float, 4>& weights,
+    std::vector<float>& out_priorities)
+{
+    out_priorities.clear();
+    if (!ps || !ps->gpu_dispatch || !features || feature_count == 0u) return false;
+    std::vector<SensorMipPriorityFeaturesGpu> input(features, features + feature_count);
+    auto snapshot = ps->gpu_dispatch->submit_sensor_mip_debug_score(input, weights);
+    if (snapshot.nodes.size() < feature_count) return false;
+    out_priorities.reserve(feature_count);
+    for (uint32_t i = 0; i < feature_count; ++i)
+        out_priorities.push_back(snapshot.nodes[i].priority);
+    return true;
+}
+
+bool ray_pipeline_debug_sensor_mip_accumulate(
+    RayPipelineState* ps,
+    const float* spectra,
+    uint32_t sample_count,
+    uint32_t n_bands,
+    std::vector<float>& out_sum,
+    std::vector<float>& out_sum_sq,
+    std::vector<float>& out_weight,
+    std::vector<uint32_t>& out_sample_count)
+{
+    out_sum.clear(); out_sum_sq.clear(); out_weight.clear(); out_sample_count.clear();
+    if (!ps || !ps->gpu_dispatch || !spectra || sample_count == 0u
+        || n_bands != ps->gpu_dispatch->sensor_mip_n_bands) return false;
+    std::vector<float> input(spectra, spectra + (size_t)sample_count * n_bands);
+    auto snapshot = ps->gpu_dispatch->submit_sensor_mip_debug_accumulate(
+        input, sample_count);
+    if (snapshot.nodes.empty() || snapshot.direct_sum.empty()) return false;
+    out_sum = std::move(snapshot.direct_sum);
+    out_sum_sq = std::move(snapshot.direct_sum_sq);
+    out_weight = std::move(snapshot.direct_weight);
+    out_sample_count.reserve(snapshot.nodes.size());
+    for (const auto& node : snapshot.nodes)
+        out_sample_count.push_back(node.direct_sample_count);
+    return true;
+}
+
+bool ray_pipeline_debug_sensor_mip_rollup(
+    RayPipelineState* ps,
+    std::vector<float>& out_mean,
+    std::vector<float>& out_evidence,
+    uint32_t& out_n_bands)
+{
+    out_mean.clear(); out_evidence.clear(); out_n_bands = 0u;
+    if (!ps || !ps->gpu_dispatch) return false;
+    auto snapshot = ps->gpu_dispatch->submit_sensor_mip_debug_rollup();
+    if (snapshot.nodes.empty() || snapshot.rollup_mean.empty()) return false;
+    out_mean = std::move(snapshot.rollup_mean);
+    out_evidence = std::move(snapshot.rollup_evidence);
+    out_n_bands = ps->gpu_dispatch->sensor_mip_n_bands;
+    return true;
+}
+
+bool ray_pipeline_submit_sensor_mip_epoch(
+    RayPipelineState* ps,
+    uint32_t top_k,
+    uint32_t seed,
+    uint32_t max_bounces,
+    float min_amplitude,
+    float exposure_weight,
+    float targeted_fraction)
+{
+    if (!ps || !ps->gpu_dispatch || top_k == 0u || exposure_weight <= 0.0f)
+        return false;
+    return ps->gpu_dispatch->submit_sensor_mip_epoch(
+        top_k, seed, max_bounces, min_amplitude, exposure_weight,
+        targeted_fraction);
 }
 
 void ray_pipeline_get_priority_map(

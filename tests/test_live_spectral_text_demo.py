@@ -1,15 +1,29 @@
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 
 import live_spectral_text_demo as demo
 import scene_orders as orders
+from camera_software.progressive_exposure import (
+    ExposureProgressEvent,
+    ExposureProgressKind,
+    SensorRegion,
+)
 
 
 def _resolved(text: str) -> dict:
     package = demo.build_paragraph_order(text, display_width=160, display_height=96)
     return orders.resolved_jobs(package, demo.JOB_ID)[0]
+
+
+def test_live_program_defaults_to_four_complete_sensor_sweeps():
+    args = demo._args([])
+    assert args.sensor_sweeps == 4
+    package = demo.build_paragraph_order("default sweep count")
+    job = orders.resolved_jobs(package, demo.JOB_ID)[0]
+    assert orders.order_runtime_settings(job)["sensor_sweeps"] == 4
 
 
 def test_display_raster_and_text_face_focus_are_explicit():
@@ -20,7 +34,11 @@ def test_display_raster_and_text_face_focus_are_explicit():
     assert (runtime["width"], runtime["height"]) == (160, 96)
     assert runtime["region"] == {"x": 320, "y": 192, "width": 160, "height": 96}
     assert metadata["full_frame"] == {"width": 800, "height": 480}
-    expected = np.asarray(job["planes"][0]["normal"]) * 0.009
+    expected = (
+        np.asarray(job["planes"][0]["normal"])
+        * orders.resolved_glyph_depth(job)
+        * (1.0 - float(job["geometry"]["embed_fraction"]))
+    )
     assert np.allclose(job["camera"]["focus_target_m"], expected, atol=1.0e-12)
     assert np.isclose(
         metadata["camera"]["focus_distance_m"],
@@ -31,14 +49,41 @@ def test_display_raster_and_text_face_focus_are_explicit():
     )
 
 
+def test_live_font_depth_tracks_formatter_resolved_height_and_mesh_is_detailed():
+    short = _resolved("Hi")
+    long = _resolved(
+        "A substantially longer paragraph forces the formatter to reduce its "
+        "physical line height while preserving the authored extrusion ratio."
+    )
+
+    ratio = demo.DEFAULT_EXTRUSION_DEPTH_RATIO
+    for job in (short, long):
+        assert np.isclose(
+            orders.resolved_glyph_depth(job) / orders.resolved_glyph_height(job),
+            ratio,
+        )
+        assert job["geometry"]["outline_subdivisions"] == 4
+        assert job["geometry"]["cap_grid"] == 64
+    assert orders.resolved_glyph_height(long) < orders.resolved_glyph_height(short)
+    assert orders.resolved_glyph_depth(long) < orders.resolved_glyph_depth(short)
+
+
 def test_render_contract_reports_native_raster_and_coordinate_only_frame():
     summary = demo.render_contract_summary(120, 100, sensor_sweeps=4)
     assert "output=120x100" in summary
     assert "native_sensor=120x120" in summary
     assert "composition_frame=600x500" in summary
     assert "crop=(240,200,120,100)" in summary
-    assert "sensor_sweeps=4" in summary
+    assert "authored_sensor_sweeps=4" in summary
+    assert "live_exposure=continuous" in summary
     assert "coordinates only, not a rendered raster" in summary
+
+
+def test_progress_preview_uses_presentation_only_auto_exposure_source():
+    source = Path(demo.__file__).read_text(encoding="utf-8")
+    assert "preview_white" in source
+    assert "linear_progress[..., :3]" in source
+    assert "np.save" not in source[source.index("preview_white") - 500:source.index("preview_white") + 500]
 
 
 def test_live_order_exposes_independent_sensor_refinement_sweeps():
@@ -167,7 +212,7 @@ def test_render_worker_keeps_inflight_revision_and_coalesces_pending_edits():
     release_first = threading.Event()
     calls: list[tuple[int, str]] = []
 
-    def render(sequence, text, order):
+    def render(sequence, text, order, progress_sink):
         calls.append((sequence, text))
         if sequence == 1:
             first_started.set()
@@ -200,6 +245,66 @@ def test_render_worker_keeps_inflight_revision_and_coalesces_pending_edits():
         assert submitted == 3
         assert latest is not None and latest.sequence == 3
         assert calls == [(1, "one"), (3, "three")]
+    finally:
+        release_first.set()
+        worker.close()
+
+
+def test_render_worker_drops_superseded_progress_and_resets_between_submissions():
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    def event(sequence: int, event_sequence: int) -> ExposureProgressEvent:
+        return ExposureProgressEvent(
+            exposure_id=f"revision-{sequence:04d}",
+            sequence=event_sequence,
+            kind=ExposureProgressKind.PASS_AVAILABLE,
+            region=SensorRegion(x=0, y=0, width=8, height=8),
+            pass_index=event_sequence,
+            completed_work=event_sequence,
+            total_work=2,
+        )
+
+    def render(sequence, text, order, progress_sink):
+        if sequence == 1:
+            progress_sink(event(1, 1))
+            first_started.set()
+            assert release_first.wait(timeout=2.0)
+            progress_sink(event(1, 2))
+        else:
+            progress_sink(event(sequence, 1))
+        return demo.RenderedTextRevision(
+            sequence=sequence,
+            text=text,
+            image_path=f"{sequence}.png",
+            linear_path=f"{sequence}.npy",
+            manifest_path=f"{sequence}.json",
+            elapsed_s=0.01,
+        )
+
+    worker = demo.SpectralTextRenderWorker(render)
+    try:
+        worker.submit("one", {})
+        assert first_started.wait(timeout=2.0)
+        latest, _ = worker.progress_snapshot()
+        assert latest is not None and latest.exposure_id == "revision-0001"
+
+        worker.submit("two", {})
+        latest, layers = worker.progress_snapshot()
+        assert latest is None
+        assert layers == {}
+        release_first.set()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            latest, _ = worker.progress_snapshot()
+            rendered, busy, error, _ = worker.snapshot()
+            if latest is not None and rendered is not None and not busy:
+                break
+            time.sleep(0.01)
+        assert error == ""
+        assert latest is not None and latest.exposure_id == "revision-0002"
+        assert latest.sequence == 1
     finally:
         release_first.set()
         worker.close()

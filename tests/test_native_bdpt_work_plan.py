@@ -5,10 +5,25 @@ import numpy as np
 from exposure_render_demo import (
     CppExposureBackend,
     _average_native_sensor_sweeps,
+    _normalise_native_sensor_epochs,
     _native_bdpt_refinement_schedule,
     _native_bdpt_work_units,
     _resolve_native_sensor_sweeps,
 )
+
+
+def test_per_bin_epoch_normalization_supports_unequal_regional_sampling():
+    linear = np.asarray([
+        [[8.0, 4.0, 2.0], [9.0, 6.0, 3.0]],
+        [[0.0, 0.0, 0.0], [12.0, 8.0, 4.0]],
+    ], dtype=np.float32)
+    counts = np.asarray([[4, 3], [0, 2]], dtype=np.uint32)
+    normalized = _normalise_native_sensor_epochs(linear, counts)
+    assert np.allclose(normalized[0, 0], [2.0, 1.0, 0.5])
+    assert np.allclose(normalized[0, 1], [3.0, 2.0, 1.0])
+    assert np.allclose(normalized[1, 0], 0.0)
+    assert np.allclose(normalized[1, 1], [6.0, 4.0, 2.0])
+    assert normalized.dtype == np.float32
 
 
 def test_work_units_exactly_partition_large_sweep_on_pixel_boundaries():

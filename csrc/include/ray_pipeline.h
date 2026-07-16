@@ -28,6 +28,8 @@
 #include <atomic>
 #include <thread>
 #include <random>
+#include <array>
+#include "sensor_mipmap.h"
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
@@ -979,6 +981,16 @@ struct RayPipelineConfig {
      * Settable at runtime via ray_pipeline_set_skip_record_readback(). */
     bool        gpu_skip_record_readback = false;
 
+    /* Sparse recursive 3x3 sensor mipmap. Disabled until explicitly
+     * configured; legacy fixed-sweep rendering remains unchanged. */
+    bool        sensor_mipmap_enabled = false;
+    uint32_t    sensor_mipmap_max_nodes = 0;
+    uint32_t    sensor_mipmap_max_depth = 0;
+    uint32_t    sensor_mipmap_samples_per_epoch = 0;
+    bool        sensor_priority_network_enabled = false;
+    std::array<float, SENSOR_PRIORITY_NETWORK_PARAMS>
+                sensor_priority_network_params{};
+
     /* Handle to the display GL context (e.g. Pygame's HGLRC on Windows).
      * When non-zero the compute context is created as a share partner of this
      * context so all GL objects (SSBOs, textures) are visible in both.
@@ -1029,6 +1041,58 @@ void ray_pipeline_set_skip_record_readback(RayPipelineState* ps, bool skip);
 std::vector<float> ray_pipeline_debug_read_hits        (RayPipelineState* ps, int max_n);
 std::vector<float> ray_pipeline_debug_read_terminals   (RayPipelineState* ps, int max_n);
 std::vector<float> ray_pipeline_debug_read_bdpt_vertices(RayPipelineState* ps, int max_n);
+
+/* Debug/validation bridge for the recursive GPU hierarchy. Production frame
+ * scheduling will use the resident frontier directly and must not read back. */
+bool ray_pipeline_debug_sensor_mip_subdivide(
+    RayPipelineState* ps,
+    const uint32_t* completed_node_ids,
+    int n_completed,
+    std::vector<SensorMipNodeGpu>& out_nodes,
+    std::array<uint32_t, 8>& out_control);
+bool ray_pipeline_debug_sensor_mip_samples(
+    RayPipelineState* ps,
+    uint32_t node_id,
+    uint32_t sample_begin,
+    uint32_t sample_count,
+    uint32_t seed,
+    std::vector<SensorMipSampleLineageGpu>& out_lineage);
+bool ray_pipeline_debug_sensor_mip_select(
+    RayPipelineState* ps,
+    uint32_t top_k,
+    uint32_t seed,
+    float targeted_fraction,
+    std::vector<SensorMipWorkGpu>& out_work);
+bool ray_pipeline_debug_sensor_mip_score(
+    RayPipelineState* ps,
+    const SensorMipPriorityFeaturesGpu* features,
+    uint32_t feature_count,
+    const std::array<float, 4>& weights,
+    std::vector<float>& out_priorities);
+bool ray_pipeline_debug_sensor_mip_accumulate(
+    RayPipelineState* ps,
+    const float* spectra,
+    uint32_t sample_count,
+    uint32_t n_bands,
+    std::vector<float>& out_sum,
+    std::vector<float>& out_sum_sq,
+    std::vector<float>& out_weight,
+    std::vector<uint32_t>& out_sample_count);
+bool ray_pipeline_debug_sensor_mip_rollup(
+    RayPipelineState* ps,
+    std::vector<float>& out_mean,
+    std::vector<float>& out_evidence,
+    uint32_t& out_n_bands);
+bool ray_pipeline_submit_sensor_mip_epoch(
+    RayPipelineState* ps,
+    uint32_t top_k,
+    uint32_t seed,
+    uint32_t max_bounces,
+    float min_amplitude,
+    float exposure_weight,
+    float targeted_fraction);
+void ray_pipeline_get_sensor_learned_priority_map(
+    const RayPipelineState* ps, float* buf, int* out_res);
 
 /* Feed display frame timing back into the GPU producer governor.
  * frame_ms  : most recent interactive frame time.
@@ -1132,8 +1196,10 @@ void ray_pipeline_set_flash_modifier(RayPipelineState* ps, FlashModifierType typ
 /* Submit one native sensor-frame sweep into the same T1->T2->T3 pipeline.
  * pix_offset: first tiled-Morton film/pupil schedule index.
  * max_rays:   cap on schedule entries submitted (0 = from pix_offset onward).
- * aperture_samples: number of deterministic pupil placements interleaved per film.
+ * aperture_samples: number of deterministic pupil placements interleaved per film bin.
  * aperture_seed: 0 = center if aperture_samples == 1, otherwise schedule base.
+ * Film origins are continuous low-discrepancy sub-pixel samples keyed by film
+ * bin, aperture stratum, and exposure epoch; bin centres are never ray origins.
  * Returns number of submitted intents. */
 int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
                                      int max_bounces,
@@ -1234,13 +1300,33 @@ void ray_pipeline_get_sensor_image(
     float* buf,
     int*   out_res);
 
-/* Copy the unnormalised sensor accumulation into caller-owned float32 RGB.
- * Uses the same orientation as ray_pipeline_get_sensor_image but applies no
- * percentile scaling, clipping, or display curve. Thread-safe. */
+/* Copy linear sensor RGB. Recursive adaptive exposures are divided by their
+ * continuous tent-splat exposure weights; legacy uniform exposures retain
+ * their historical raw-sum semantics. No display curve is applied. */
 void ray_pipeline_get_sensor_image_linear(
     const RayPipelineState* ps,
     float* buf,
     int*   out_res);
+
+/* Copy the retained pre-normalization RGB sums for audit/checkpoint output. */
+void ray_pipeline_get_sensor_image_sum_linear(
+    const RayPipelineState* ps,
+    float* buf,
+    int* out_res);
+
+/* Copy adaptive continuous exposure weights as float32 (res×res), in the same
+ * orientation as the linear sensor image. Zero means the bin is unexposed. */
+void ray_pipeline_get_sensor_exposure_weight(
+    const RayPipelineState* ps,
+    float* buf,
+    int* out_res);
+
+/* Copy per-bin completed primary film-stratum counts. Orientation matches the
+ * linear sensor image. These counts normalize unequal regional exposure. */
+void ray_pipeline_get_sensor_epoch_count(
+    const RayPipelineState* ps,
+    uint32_t* buf,
+    int* out_res);
 
 /* Copy the sugar-auxin priority map as a float32 (res×res) array.
  * Values ≥ 1 indicate regions of recent BDPT convergence; 1.0 = baseline.

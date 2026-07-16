@@ -61,6 +61,13 @@ layout(std430, binding = 3) readonly buffer MatBandBuf {
     float mat_bands[];
 };
 
+/* Adaptive traces accumulate all terminal contributions by primary sample.
+ * A later finalize pass commits one complete spectrum (or zero for a miss) to
+ * the node moments, so squared moments are never computed per terminal. */
+layout(std430, binding = 4) coherent buffer SensorMipSampleSpectrumBuf {
+    uint sensor_mip_sample_spectra[];
+};
+
 /* Per-band display RGB weights: n_bands × 3 packed as vec3[32].
  * Index b: r = rgb_w[b].x, g = rgb_w[b].y, b_ = rgb_w[b].z */
 uniform vec3  rgb_w[MAX_BANDS];
@@ -74,6 +81,8 @@ uniform int   sensor_res;       /* pixel grid side (sensor_res × sensor_res)   
 uniform int   n_bands;          /* number of active spectral bands (≤ MAX_BANDS)   */
 uniform int   n_mats;           /* material count for emission lookup              */
 uniform float splat_scale;      /* direct visible-emitter scale; normally 1.0      */
+uniform uint  sensor_mip_enabled;
+uniform uint  sensor_mip_sample_capacity;
 
 float mat_emission(int mat, int b) {
     if (mat < 0 || mat >= n_mats || b < 0 || b >= MAX_BANDS) return 1.0f;
@@ -91,6 +100,17 @@ void atomic_add_float(uint idx, float val) {
         float fexp    = uintBitsToFloat(expected);
         uint  desired = floatBitsToUint(fexp + val);
         uint  actual  = atomicCompSwap(sensor_rgb[idx], expected, desired);
+        if (actual == expected) return;
+        expected = actual;
+    }
+}
+
+void atomic_add_sample_spectrum(uint idx, float val) {
+    if (val <= 0.0f || isnan(val) || isinf(val)) return;
+    uint expected = sensor_mip_sample_spectra[idx];
+    while (true) {
+        uint desired = floatBitsToUint(uintBitsToFloat(expected) + val);
+        uint actual = atomicCompSwap(sensor_mip_sample_spectra[idx], expected, desired);
         if (actual == expected) return;
         expected = actual;
     }
@@ -154,6 +174,11 @@ void main() {
     const uint is_emissive = floatBitsToUint(child_int_buf[base + 25]);
     if (is_emissive == 0u || ((color_flag & 1u) == 0u)) return;
     const int mat_id = floatBitsToInt(child_int_buf[base + 15]);
+    const uint tag_lo = floatBitsToUint(child_int_buf[base + 21]);
+    const uint tag_hi = floatBitsToUint(child_int_buf[base + 22]);
+    const bool adaptive_sample = sensor_mip_enabled != 0u
+        && (tag_hi & 0x40000000u) != 0u
+        && tag_lo < sensor_mip_sample_capacity;
 
     /* Map sensor-space origin to film coordinates */
     const float soy   = child_int_buf[base + 23];
@@ -166,6 +191,8 @@ void main() {
         const float re  = child_int_buf[base + 26 + b];
         const float im  = child_int_buf[base + 26 + MAX_BANDS + b];
         const float amp = sqrt(re * re + im * im) * mat_emission(mat_id, b);
+        if (adaptive_sample)
+            atomic_add_sample_spectrum(tag_lo * uint(n_bands) + uint(b), amp * splat_scale);
         cr += amp * rgb_w[b].x;
         cg += amp * rgb_w[b].y;
         cb += amp * rgb_w[b].z;

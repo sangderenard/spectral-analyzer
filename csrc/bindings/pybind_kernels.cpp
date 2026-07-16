@@ -33,6 +33,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/complex.h>
+#include <pybind11/stl.h>
 #include <atomic>
 #include <cstdint>
 #include <algorithm>
@@ -592,6 +593,13 @@ struct PyRayTracer
     std::array<float, MAX_SPECTRAL_BANDS * 3> _uv_blit_weights{};
     int         _uv_blit_n_bands = 0;
     int         _uv_blit_mode = 0;
+    bool        _sensor_mipmap_enabled = false;
+    uint32_t    _sensor_mipmap_max_nodes = 0;
+    uint32_t    _sensor_mipmap_max_depth = 0;
+    uint32_t    _sensor_mipmap_samples_per_epoch = 0;
+    bool        _sensor_priority_network_enabled = false;
+    std::array<float, SENSOR_PRIORITY_NETWORK_PARAMS>
+                _sensor_priority_network_params{};
 
     RayPipelineState* _get_pipeline(int max_children = 2, int seed = 42) {
         std::lock_guard<std::mutex> lk(_pipeline_mu);
@@ -605,6 +613,12 @@ struct PyRayTracer
             cfg.force_cpu_t5                = _force_cpu_t5;
             cfg.gpu_all_stages              = _gpu_all_stages;
             cfg.gpu_skip_record_readback    = _gpu_skip_record_readback;
+            cfg.sensor_mipmap_enabled = _sensor_mipmap_enabled;
+            cfg.sensor_mipmap_max_nodes = _sensor_mipmap_max_nodes;
+            cfg.sensor_mipmap_max_depth = _sensor_mipmap_max_depth;
+            cfg.sensor_mipmap_samples_per_epoch = _sensor_mipmap_samples_per_epoch;
+            cfg.sensor_priority_network_enabled = _sensor_priority_network_enabled;
+            cfg.sensor_priority_network_params = _sensor_priority_network_params;
             cfg.shader_dir                  = _shader_dir;
             cfg.gl_display_hglrc        = _gl_display_hglrc;
             cfg.gl_display_hdc          = _gl_display_hdc;
@@ -2189,6 +2203,40 @@ struct PyRayTracer
                                                 target_y, target_z, target_mode);
     }
 
+    void configure_sensor_mipmap(uint32_t max_nodes = 65536u,
+                                 uint32_t maximum_depth = 8u,
+                                 uint32_t samples_per_epoch = 9u) {
+        if (_pipeline)
+            throw std::runtime_error(
+                "configure_sensor_mipmap must be called before pipeline creation");
+        if (max_nodes < 10u)
+            throw std::invalid_argument("sensor mipmap requires at least 10 nodes");
+        if (maximum_depth == 0u || maximum_depth > 20u)
+            throw std::invalid_argument("sensor mipmap maximum_depth must be in [1, 20]");
+        if (samples_per_epoch == 0u)
+            throw std::invalid_argument("sensor mipmap samples_per_epoch must be positive");
+        _sensor_mipmap_enabled = true;
+        _sensor_mipmap_max_nodes = max_nodes;
+        _sensor_mipmap_max_depth = maximum_depth;
+        _sensor_mipmap_samples_per_epoch = samples_per_epoch;
+    }
+
+    void configure_sensor_priority_network(
+        py::array_t<float, py::array::c_style | py::array::forcecast> parameters) {
+        if (_pipeline)
+            throw std::runtime_error(
+                "configure_sensor_priority_network must be called before pipeline creation");
+        auto p = parameters.request();
+        if (p.ndim != 1 || p.size != SENSOR_PRIORITY_NETWORK_PARAMS)
+            throw std::invalid_argument("priority network requires exactly 305 float parameters");
+        std::memcpy(_sensor_priority_network_params.data(), p.ptr,
+                    SENSOR_PRIORITY_NETWORK_PARAMS * sizeof(float));
+        for (float value : _sensor_priority_network_params)
+            if (!std::isfinite(value))
+                throw std::invalid_argument("priority network parameters must be finite");
+        _sensor_priority_network_enabled = true;
+    }
+
     /* ── GPU T3 bridge ─────────────────────────────────────────────────────
      *
      * drain_refined_hits(max_n)
@@ -2384,6 +2432,269 @@ struct PyRayTracer
                 (py::ssize_t)(sizeof(float))});
         ray_pipeline_get_sensor_image_linear(_pipeline, arr.mutable_data(), &res);
         return arr;
+    }
+
+    py::array_t<uint32_t> get_sensor_epoch_count() {
+        int res = 0;
+        ray_pipeline_get_sensor_epoch_count(_pipeline, nullptr, &res);
+        if (res <= 0 || !_pipeline)
+            return py::array_t<uint32_t>(std::vector<py::ssize_t>{0});
+        auto arr = py::array_t<uint32_t>(
+            std::vector<py::ssize_t>{res, res},
+            std::vector<py::ssize_t>{
+                (py::ssize_t)(res * sizeof(uint32_t)),
+                (py::ssize_t)(sizeof(uint32_t))});
+        ray_pipeline_get_sensor_epoch_count(_pipeline, arr.mutable_data(), &res);
+        return arr;
+    }
+
+    py::array_t<float> get_sensor_image_sum_linear() {
+        int res = 0;
+        ray_pipeline_get_sensor_image_sum_linear(_pipeline, nullptr, &res);
+        if (res <= 0 || !_pipeline)
+            return py::array_t<float>(std::vector<py::ssize_t>{0});
+        auto arr = py::array_t<float>(
+            std::vector<py::ssize_t>{res, res, 3},
+            std::vector<py::ssize_t>{
+                (py::ssize_t)(res * 3 * sizeof(float)),
+                (py::ssize_t)(3 * sizeof(float)),
+                (py::ssize_t)(sizeof(float))});
+        ray_pipeline_get_sensor_image_sum_linear(_pipeline, arr.mutable_data(), &res);
+        return arr;
+    }
+
+    py::array_t<float> get_sensor_exposure_weight() {
+        int res = 0;
+        ray_pipeline_get_sensor_exposure_weight(_pipeline, nullptr, &res);
+        if (res <= 0 || !_pipeline)
+            return py::array_t<float>(std::vector<py::ssize_t>{0});
+        auto arr = py::array_t<float>(
+            std::vector<py::ssize_t>{res, res},
+            std::vector<py::ssize_t>{
+                (py::ssize_t)(res * sizeof(float)),
+                (py::ssize_t)(sizeof(float))});
+        ray_pipeline_get_sensor_exposure_weight(_pipeline, arr.mutable_data(), &res);
+        return arr;
+    }
+
+    py::array_t<float> get_sensor_learned_priority_map() {
+        int res = 0;
+        ray_pipeline_get_sensor_learned_priority_map(_pipeline, nullptr, &res);
+        if (res <= 0 || !_pipeline)
+            return py::array_t<float>(std::vector<py::ssize_t>{0});
+        auto arr = py::array_t<float>(
+            std::vector<py::ssize_t>{res, res},
+            std::vector<py::ssize_t>{
+                (py::ssize_t)(res * sizeof(float)),
+                (py::ssize_t)(sizeof(float))});
+        ray_pipeline_get_sensor_learned_priority_map(_pipeline, arr.mutable_data(), &res);
+        return arr;
+    }
+
+    py::dict debug_sensor_mip_subdivide(
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast> completed_ids)
+    {
+        if (!_pipeline)
+            throw std::runtime_error("sensor mipmap pipeline has not been created");
+        auto ids = completed_ids.request();
+        if (ids.ndim != 1 || ids.size <= 0)
+            throw std::invalid_argument("completed_ids must be a non-empty uint32 vector");
+        std::vector<SensorMipNodeGpu> nodes;
+        std::array<uint32_t, 8> control{};
+        bool ok = ray_pipeline_debug_sensor_mip_subdivide(
+            _pipeline, static_cast<const uint32_t*>(ids.ptr),
+            static_cast<int>(ids.size), nodes, control);
+        if (!ok)
+            throw std::runtime_error("GPU sensor mipmap subdivision failed");
+        const py::ssize_t n = static_cast<py::ssize_t>(nodes.size());
+        py::array_t<float> bounds({n, py::ssize_t(4)});
+        py::array_t<uint32_t> meta({n, py::ssize_t(10)});
+        auto b = bounds.mutable_unchecked<2>();
+        auto m = meta.mutable_unchecked<2>();
+        for (py::ssize_t i = 0; i < n; ++i) {
+            const auto& node = nodes[static_cast<size_t>(i)];
+            for (int k = 0; k < 4; ++k) b(i, k) = node.uv_bounds[k];
+            m(i, 0) = node.parent_id;
+            m(i, 1) = node.first_child_id;
+            m(i, 2) = node.level;
+            m(i, 3) = node.flags;
+            m(i, 4) = node.direct_moment_offset;
+            m(i, 5) = node.rollup_moment_offset;
+            m(i, 6) = node.direct_sample_count;
+            m(i, 7) = node.completed_epochs;
+            m(i, 8) = node.child_slot;
+            uint32_t priority_bits = 0u;
+            std::memcpy(&priority_bits, &node.priority, sizeof(uint32_t));
+            m(i, 9) = priority_bits;
+        }
+        py::array_t<uint32_t> control_array(8);
+        std::memcpy(control_array.mutable_data(), control.data(), 8 * sizeof(uint32_t));
+        py::dict result;
+        result["bounds"] = std::move(bounds);
+        result["meta"] = std::move(meta);
+        result["control"] = std::move(control_array);
+        return result;
+    }
+
+    py::dict debug_sensor_mip_samples(uint32_t node_id,
+                                      uint32_t sample_begin,
+                                      uint32_t sample_count,
+                                      uint32_t seed = 0u) {
+        if (!_pipeline)
+            throw std::runtime_error("sensor mipmap pipeline has not been created");
+        std::vector<SensorMipSampleLineageGpu> lineage;
+        if (!ray_pipeline_debug_sensor_mip_samples(
+                _pipeline, node_id, sample_begin, sample_count, seed, lineage))
+            throw std::runtime_error("GPU sensor mipmap sample generation failed");
+        const py::ssize_t n = static_cast<py::ssize_t>(lineage.size());
+        py::array_t<float> uv({n, py::ssize_t(5)});
+        py::array_t<uint32_t> meta({n, py::ssize_t(3)});
+        auto u = uv.mutable_unchecked<2>();
+        auto m = meta.mutable_unchecked<2>();
+        for (py::ssize_t i = 0; i < n; ++i) {
+            const auto& sample = lineage[static_cast<size_t>(i)];
+            u(i, 0) = sample.global_u;
+            u(i, 1) = sample.global_v;
+            u(i, 2) = sample.local_u;
+            u(i, 3) = sample.local_v;
+            u(i, 4) = sample.estimator_weight;
+            m(i, 0) = sample.node_id;
+            m(i, 1) = sample.level;
+            m(i, 2) = sample.sample_index;
+        }
+        py::dict result;
+        result["uv"] = std::move(uv);
+        result["meta"] = std::move(meta);
+        return result;
+    }
+
+    py::dict debug_sensor_mip_select(uint32_t top_k, uint32_t seed = 0u,
+                                     float targeted_fraction = 1.0f) {
+        if (!_pipeline)
+            throw std::runtime_error("sensor mipmap pipeline has not been created");
+        std::vector<SensorMipWorkGpu> work;
+        if (targeted_fraction < 0.0f || targeted_fraction > 1.0f)
+            throw std::invalid_argument("targeted_fraction must be in [0, 1]");
+        if (!ray_pipeline_debug_sensor_mip_select(
+                _pipeline, top_k, seed, targeted_fraction, work))
+            throw std::runtime_error("GPU sensor mipmap top-k selection failed");
+        const py::ssize_t n = static_cast<py::ssize_t>(work.size());
+        py::array_t<uint32_t> meta({n, py::ssize_t(7)});
+        py::array_t<float> priority(n);
+        auto m = meta.mutable_unchecked<2>();
+        auto p = priority.mutable_unchecked<1>();
+        for (py::ssize_t i = 0; i < n; ++i) {
+            const auto& item = work[static_cast<size_t>(i)];
+            m(i, 0) = item.node_id;
+            m(i, 1) = item.sample_begin;
+            m(i, 2) = item.sample_count;
+            m(i, 3) = item.output_offset;
+            m(i, 4) = item.seed;
+            m(i, 5) = item.flags;
+            m(i, 6) = item._pad0;
+            p(i) = item.priority;
+        }
+        py::dict result;
+        result["meta"] = std::move(meta);
+        result["priority"] = std::move(priority);
+        return result;
+    }
+
+    py::array_t<float> debug_sensor_mip_score(
+        py::array_t<float, py::array::c_style | py::array::forcecast> features,
+        std::array<float, 4> weights = {1.0f, 1.0f, 1.0f, 4.0f})
+    {
+        if (!_pipeline)
+            throw std::runtime_error("sensor mipmap pipeline has not been created");
+        auto f = features.request();
+        if (f.ndim != 2 || f.shape[1] != 4 || f.shape[0] <= 0)
+            throw std::invalid_argument("features must have shape (node_count, 4)");
+        std::vector<SensorMipPriorityFeaturesGpu> input((size_t)f.shape[0]);
+        const float* values = static_cast<const float*>(f.ptr);
+        for (size_t i = 0; i < input.size(); ++i) {
+            input[i].uncertainty = values[i * 4 + 0];
+            input[i].ambiguity = values[i * 4 + 1];
+            input[i].learned = values[i * 4 + 2];
+            input[i].requested = values[i * 4 + 3];
+        }
+        std::vector<float> priorities;
+        if (!ray_pipeline_debug_sensor_mip_score(
+                _pipeline, input.data(), static_cast<uint32_t>(input.size()),
+                weights, priorities))
+            throw std::runtime_error("GPU sensor mipmap scoring failed");
+        py::array_t<float> result(priorities.size());
+        std::memcpy(result.mutable_data(), priorities.data(),
+                    priorities.size() * sizeof(float));
+        return result;
+    }
+
+    py::dict debug_sensor_mip_accumulate(
+        py::array_t<float, py::array::c_style | py::array::forcecast> spectra)
+    {
+        if (!_pipeline)
+            throw std::runtime_error("sensor mipmap pipeline has not been created");
+        auto s = spectra.request();
+        if (s.ndim != 2 || s.shape[0] <= 0 || s.shape[1] <= 0)
+            throw std::invalid_argument("spectra must have shape (sample_count, n_bands)");
+        std::vector<float> sum, sum_sq, weight;
+        std::vector<uint32_t> sample_count;
+        if (!ray_pipeline_debug_sensor_mip_accumulate(
+                _pipeline, static_cast<const float*>(s.ptr),
+                static_cast<uint32_t>(s.shape[0]), static_cast<uint32_t>(s.shape[1]),
+                sum, sum_sq, weight, sample_count))
+            throw std::runtime_error("GPU sensor mipmap accumulation failed");
+        const py::ssize_t node_count = static_cast<py::ssize_t>(weight.size());
+        const py::ssize_t n_bands = s.shape[1];
+        py::array_t<float> sum_array({node_count, n_bands});
+        py::array_t<float> sum_sq_array({node_count, n_bands});
+        py::array_t<float> weight_array(node_count);
+        py::array_t<uint32_t> count_array(node_count);
+        std::memcpy(sum_array.mutable_data(), sum.data(), sum.size() * sizeof(float));
+        std::memcpy(sum_sq_array.mutable_data(), sum_sq.data(), sum_sq.size() * sizeof(float));
+        std::memcpy(weight_array.mutable_data(), weight.data(), weight.size() * sizeof(float));
+        std::memcpy(count_array.mutable_data(), sample_count.data(),
+                    sample_count.size() * sizeof(uint32_t));
+        py::dict result;
+        result["sum"] = std::move(sum_array);
+        result["sum_sq"] = std::move(sum_sq_array);
+        result["weight"] = std::move(weight_array);
+        result["sample_count"] = std::move(count_array);
+        return result;
+    }
+
+    py::dict debug_sensor_mip_rollup() {
+        if (!_pipeline)
+            throw std::runtime_error("sensor mipmap pipeline has not been created");
+        std::vector<float> mean, evidence;
+        uint32_t n_bands = 0u;
+        if (!ray_pipeline_debug_sensor_mip_rollup(
+                _pipeline, mean, evidence, n_bands))
+            throw std::runtime_error("GPU sensor mipmap rollup failed");
+        const py::ssize_t node_count = static_cast<py::ssize_t>(evidence.size());
+        py::array_t<float> mean_array({node_count, (py::ssize_t)n_bands});
+        py::array_t<float> evidence_array(node_count);
+        std::memcpy(mean_array.mutable_data(), mean.data(), mean.size() * sizeof(float));
+        std::memcpy(evidence_array.mutable_data(), evidence.data(),
+                    evidence.size() * sizeof(float));
+        py::dict result;
+        result["mean"] = std::move(mean_array);
+        result["evidence"] = std::move(evidence_array);
+        return result;
+    }
+
+    bool submit_sensor_mip_epoch(uint32_t top_k = 8u,
+                                 uint32_t seed = 0u,
+                                 uint32_t max_bounces = 8u,
+                                 float min_amplitude = 1.0e-12f,
+                                 float exposure_weight = 1.0f,
+                                 float targeted_fraction = 1.0f) {
+        if (!_pipeline)
+            throw std::runtime_error("sensor mipmap pipeline has not been created");
+        if (targeted_fraction < 0.0f || targeted_fraction > 1.0f)
+            throw std::invalid_argument("targeted_fraction must be in [0, 1]");
+        return ray_pipeline_submit_sensor_mip_epoch(
+            _pipeline, top_k, seed, max_bounces, min_amplitude, exposure_weight,
+            targeted_fraction);
     }
 
     /* Return the sugar-auxin priority map as a float32 (res, res) array.
@@ -5762,6 +6073,19 @@ target_x/target_r: camera projection target, normally the assembly exit pupil.
 target_y/target_z: transverse centre of that target disk.
 target_mode: 0 launches toward the target disk; 1 launches away from a virtual target.
 Resets accumulator.  Call before submitting rays.)doc")
+        .def("configure_sensor_mipmap",
+             &PyRayTracer::configure_sensor_mipmap,
+             py::arg("max_nodes") = 65536u,
+             py::arg("maximum_depth") = 8u,
+             py::arg("samples_per_epoch") = 9u,
+R"doc(Enable sparse recursive 3x3 sensor-mipmap storage before pipeline creation.
+Allocates a bounded GPU node pool; completed nonterminal nodes create nine
+children and finest nodes continue independent sampling epochs.)doc")
+        .def("configure_sensor_priority_network",
+             &PyRayTracer::configure_sensor_priority_network,
+             py::arg("parameters"),
+R"doc(Install the fixed conv3x3-4x8-ReLU-conv1x1-softplus sensor work-value
+network before pipeline creation. Inference runs over resident GPU sensor data.)doc")
         .def("get_sensor_image",
              &PyRayTracer::get_sensor_image,
 R"doc(Return current sensor image as float32 ndarray of shape (res, res, 3).
@@ -5769,9 +6093,75 @@ R=forward plate hits, G=backward emissive+provisional near-miss, B=exact BDPT sn
 Values are log-tone-mapped to [0, 1]. Thread-safe.)doc")
     .def("get_sensor_image_linear",
          &PyRayTracer::get_sensor_image_linear,
-R"doc(Return unnormalised sensor accumulation as float32 (res, res, 3) RGB.
-Orientation matches get_sensor_image(). No percentile scaling, clipping, or
-display curve is applied. Thread-safe.)doc")
+R"doc(Return linear sensor RGB as float32 (res, res, 3). Adaptive recursive
+exposures are divided by continuous per-bin exposure weights; legacy uniform
+exposures retain raw-sum semantics. No display curve is applied.)doc")
+        .def("get_sensor_exposure_weight",
+             &PyRayTracer::get_sensor_exposure_weight,
+R"doc(Return continuous adaptive exposure weights as float32 (res, res).
+Orientation matches get_sensor_image_linear(); zero means unexposed.)doc")
+        .def("get_sensor_image_sum_linear",
+             &PyRayTracer::get_sensor_image_sum_linear,
+R"doc(Return retained pre-normalization RGB sums as float32 (res, res, 3).
+Pair with get_sensor_exposure_weight() to audit adaptive reconstruction.)doc")
+        .def("get_sensor_learned_priority_map",
+             &PyRayTracer::get_sensor_learned_priority_map,
+R"doc(Return the most recently inferred neural work-value map as float32.)doc")
+        .def("get_sensor_epoch_count",
+             &PyRayTracer::get_sensor_epoch_count,
+R"doc(Return completed primary film-stratum counts as uint32 (res, res).
+Orientation matches get_sensor_image_linear(). Counts normalize unequal
+regional exposure and are independent of radiance.)doc")
+        .def("debug_sensor_mip_subdivide",
+             &PyRayTracer::debug_sensor_mip_subdivide,
+             py::arg("completed_ids"),
+R"doc(Validation-only GPU subdivision bridge. Returns sparse node bounds,
+metadata, and control counters after unconditionally splitting completed
+nonterminal nodes. Production scheduling remains GPU-resident.)doc")
+        .def("debug_sensor_mip_samples",
+             &PyRayTracer::debug_sensor_mip_samples,
+             py::arg("node_id"), py::arg("sample_begin"), py::arg("sample_count"),
+             py::arg("seed") = 0u,
+R"doc(Validation-only GPU node sampler. Returns continuous global/local UV,
+unit estimator weights, and exact node/level/sequence lineage. A workgroup owns
+one node and cannot write samples into a neighbouring node.)doc")
+        .def("debug_sensor_mip_select",
+             &PyRayTracer::debug_sensor_mip_select,
+             py::arg("top_k"), py::arg("seed") = 0u,
+             py::arg("targeted_fraction") = 1.0f,
+R"doc(Validation-only mixed GPU frontier selection. targeted_fraction reserves
+the remainder for least-exposed, seed-rotated Morton coverage. Work flag bit 0
+identifies coverage records; the two lanes are deduplicated.)doc")
+        .def("debug_sensor_mip_score",
+             &PyRayTracer::debug_sensor_mip_score,
+             py::arg("features"),
+             py::arg("weights"),
+R"doc(Validation-only GPU scorer boundary. Feature columns are uncertainty,
+ambiguity, learned work value, and explicit request strength. This pass writes
+only node priority and has no access to subdivision state transitions.)doc")
+        .def("debug_sensor_mip_accumulate",
+             &PyRayTracer::debug_sensor_mip_accumulate,
+             py::arg("spectra"),
+R"doc(Validation-only GPU spectral accumulator. Consumes the most recently
+generated GPU sample lineage and updates per-node direct sums, squared sums,
+weights, and sample counts without modifying parent evidence.)doc")
+        .def("debug_sensor_mip_rollup",
+             &PyRayTracer::debug_sensor_mip_rollup,
+R"doc(Validation-only reverse-depth GPU rollup. A parent receives a separate
+descendant estimate only when all nine child estimates are valid; its direct
+coarse evidence remains stored independently.)doc")
+        .def("submit_sensor_mip_epoch",
+             &PyRayTracer::submit_sensor_mip_epoch,
+             py::arg("top_k") = 8u, py::arg("seed") = 0u,
+             py::arg("max_bounces") = 8u,
+             py::arg("min_amplitude") = 1.0e-12f,
+             py::arg("exposure_weight") = 1.0f,
+             py::arg("targeted_fraction") = 1.0f,
+R"doc(Run one production recursive sensor epoch entirely on the GPU: compact
+the frontier, select a deduplicated mixture of targeted and broad-coverage
+nodes, generate continuous camera rays, trace all
+bounces, combine terminal spectra per primary sample, update direct moments,
+subdivide every completed nonterminal node, and roll descendants upward.)doc")
         .def("get_priority_map",
              &PyRayTracer::get_priority_map,
 R"doc(Return the sugar-auxin work-priority map as float32 ndarray of shape (res, res).

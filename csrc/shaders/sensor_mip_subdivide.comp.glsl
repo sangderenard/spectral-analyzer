@@ -8,6 +8,9 @@ const uint NODE_FRONTIER = 1u << 0;
 const uint NODE_RUNNING = 1u << 2;
 const uint NODE_DIRTY = 1u << 5;
 const uint NODE_TERMINAL = 1u << 6;
+const uint WORK_SPLIT_REQUESTED = 1u << 1;
+const uint WORK_PRESERVE_COVERAGE = 1u << 2;
+const uint NODE_COVERAGE_ANCHOR = 1u << 7;
 
 struct SensorMipNode {
     vec4 uv_bounds;
@@ -54,6 +57,18 @@ void main() {
         ? selected_work[work_index].node_id : completed[work_index];
     if (node_id >= control[0]) { atomicOr(control[3], 1u); return; }
     SensorMipNode parent = nodes[node_id];
+    bool split_requested = completed_from_work == 0u
+        || (selected_work[work_index].flags & WORK_SPLIT_REQUESTED) != 0u;
+    /* Sampling and splitting are separate decisions.  A completed leaf stays
+     * schedulable unless the coverage lattice or targeted attention explicitly
+     * asks to descend. */
+    if (!split_requested) {
+        nodes[node_id].flags = (parent.flags & ~NODE_RUNNING) | NODE_FRONTIER;
+        nodes[node_id].completed_epochs = parent.completed_epochs + 1u;
+        uint slot = atomicAdd(control[2], 1u);
+        if (slot < control[4]) frontier[slot] = node_id; else atomicOr(control[3], 2u);
+        return;
+    }
     if (parent.level >= control[5]) {
         nodes[node_id].flags = (parent.flags & ~NODE_RUNNING) | NODE_FRONTIER | NODE_TERMINAL;
         nodes[node_id].completed_epochs = parent.completed_epochs + 1u;
@@ -120,6 +135,11 @@ void main() {
     }
     memoryBarrierBuffer();
     nodes[node_id].first_child_id = first;
-    nodes[node_id].flags = (parent.flags & ~(NODE_RUNNING | NODE_FRONTIER)) | NODE_DIRTY;
+    bool preserve_coverage = completed_from_work != 0u
+        && (selected_work[work_index].flags & WORK_PRESERVE_COVERAGE) != 0u;
+    nodes[node_id].flags = preserve_coverage
+        ? ((parent.flags & ~NODE_RUNNING) | NODE_FRONTIER | NODE_DIRTY
+           | NODE_COVERAGE_ANCHOR)
+        : ((parent.flags & ~(NODE_RUNNING | NODE_FRONTIER)) | NODE_DIRTY);
     nodes[node_id].completed_epochs = parent.completed_epochs + 1u;
 }

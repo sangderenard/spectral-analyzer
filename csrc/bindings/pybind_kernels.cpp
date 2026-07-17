@@ -557,6 +557,13 @@ struct PyRayTracer
     float _sensor_target_z     = 0.0f;
     float _sensor_target_r     = 0.0f;
     int   _sensor_target_mode  = 0;
+    bool  _sensor_pose_configured = false;
+    std::array<float, 3> _sensor_center = {0.0f, 0.0f, 0.0f};
+    std::array<float, 3> _sensor_right = {0.0f, 1.0f, 0.0f};
+    std::array<float, 3> _sensor_up = {0.0f, 0.0f, 1.0f};
+    std::array<float, 3> _aperture_center = {0.0f, 0.0f, 0.0f};
+    std::array<float, 3> _aperture_right = {0.0f, 1.0f, 0.0f};
+    std::array<float, 3> _aperture_up = {0.0f, 0.0f, 1.0f};
     std::atomic<uint32_t> _bdpt_subpath_counter{1u};
 
     /* T5 connection config */
@@ -600,6 +607,12 @@ struct PyRayTracer
     bool        _sensor_priority_network_enabled = false;
     std::array<float, SENSOR_PRIORITY_NETWORK_PARAMS>
                 _sensor_priority_network_params{};
+    std::vector<float> _sensor_requested_priority_map;
+    uint32_t _sensor_requested_priority_res = 0;
+    std::vector<float> _sensor_restore_rgb;
+    std::vector<float> _sensor_restore_weight;
+    std::vector<uint32_t> _sensor_dirty_sites;
+    uint32_t _sensor_restore_res = 0;
 
     RayPipelineState* _get_pipeline(int max_children = 2, int seed = 42) {
         std::lock_guard<std::mutex> lk(_pipeline_mu);
@@ -619,6 +632,12 @@ struct PyRayTracer
             cfg.sensor_mipmap_samples_per_epoch = _sensor_mipmap_samples_per_epoch;
             cfg.sensor_priority_network_enabled = _sensor_priority_network_enabled;
             cfg.sensor_priority_network_params = _sensor_priority_network_params;
+            cfg.sensor_requested_priority_map = _sensor_requested_priority_map;
+            cfg.sensor_requested_priority_res = _sensor_requested_priority_res;
+            cfg.sensor_restore_rgb = _sensor_restore_rgb;
+            cfg.sensor_restore_weight = _sensor_restore_weight;
+            cfg.sensor_dirty_sites = _sensor_dirty_sites;
+            cfg.sensor_restore_res = _sensor_restore_res;
             cfg.shader_dir                  = _shader_dir;
             cfg.gl_display_hglrc        = _gl_display_hglrc;
             cfg.gl_display_hdc          = _gl_display_hdc;
@@ -649,6 +668,10 @@ struct PyRayTracer
                     _sensor_res, _sensor_bdpt_eps,
                     _sensor_target_x, _sensor_target_r,
                     _sensor_target_y, _sensor_target_z, _sensor_target_mode);
+            if (_sensor_pose_configured)
+                ray_pipeline_configure_sensor_pose(
+                    _pipeline, _sensor_center.data(), _sensor_right.data(), _sensor_up.data(),
+                    _aperture_center.data(), _aperture_right.data(), _aperture_up.data());
             if (_uv_blit_n_bands > 0)
                 ray_pipeline_set_uv_blit_weights(
                     _pipeline, _uv_blit_weights.data(),
@@ -2203,6 +2226,58 @@ struct PyRayTracer
                                                 target_y, target_z, target_mode);
     }
 
+    void configure_sensor_pose(
+        py::array_t<double, py::array::c_style | py::array::forcecast> sensor_center,
+        py::array_t<double, py::array::c_style | py::array::forcecast> sensor_right,
+        py::array_t<double, py::array::c_style | py::array::forcecast> sensor_up,
+        py::array_t<double, py::array::c_style | py::array::forcecast> aperture_center,
+        py::array_t<double, py::array::c_style | py::array::forcecast> aperture_right,
+        py::array_t<double, py::array::c_style | py::array::forcecast> aperture_up) {
+        auto copy_vec3 = [](const auto& input, const char* name) {
+            if (input.ndim() != 1 || input.shape(0) != 3)
+                throw std::invalid_argument(std::string(name) + " must have shape (3,)");
+            std::array<float, 3> result{};
+            const double* values = input.data();
+            for (int axis = 0; axis < 3; ++axis) {
+                if (!std::isfinite(values[axis]))
+                    throw std::invalid_argument(std::string(name) + " must be finite");
+                result[axis] = static_cast<float>(values[axis]);
+            }
+            return result;
+        };
+        auto normalize_pair = [](std::array<float, 3>& right,
+                                 std::array<float, 3>& up,
+                                 const char* name) {
+            auto norm = [](const std::array<float, 3>& value) {
+                return std::sqrt(value[0]*value[0] + value[1]*value[1] + value[2]*value[2]);
+            };
+            const float nr = norm(right);
+            const float nu = norm(up);
+            if (!(nr > 1.0e-6f) || !(nu > 1.0e-6f))
+                throw std::invalid_argument(std::string(name) + " axes must be non-zero");
+            for (int axis = 0; axis < 3; ++axis) {
+                right[axis] /= nr;
+                up[axis] /= nu;
+            }
+            const float dot = right[0]*up[0] + right[1]*up[1] + right[2]*up[2];
+            if (std::abs(dot) > 1.0e-4f)
+                throw std::invalid_argument(std::string(name) + " right/up axes must be orthogonal");
+        };
+        _sensor_center = copy_vec3(sensor_center, "sensor_center");
+        _sensor_right = copy_vec3(sensor_right, "sensor_right");
+        _sensor_up = copy_vec3(sensor_up, "sensor_up");
+        _aperture_center = copy_vec3(aperture_center, "aperture_center");
+        _aperture_right = copy_vec3(aperture_right, "aperture_right");
+        _aperture_up = copy_vec3(aperture_up, "aperture_up");
+        normalize_pair(_sensor_right, _sensor_up, "sensor");
+        normalize_pair(_aperture_right, _aperture_up, "aperture");
+        _sensor_pose_configured = true;
+        if (_pipeline)
+            ray_pipeline_configure_sensor_pose(
+                _pipeline, _sensor_center.data(), _sensor_right.data(), _sensor_up.data(),
+                _aperture_center.data(), _aperture_right.data(), _aperture_up.data());
+    }
+
     void configure_sensor_mipmap(uint32_t max_nodes = 65536u,
                                  uint32_t maximum_depth = 8u,
                                  uint32_t samples_per_epoch = 9u) {
@@ -2235,6 +2310,69 @@ struct PyRayTracer
             if (!std::isfinite(value))
                 throw std::invalid_argument("priority network parameters must be finite");
         _sensor_priority_network_enabled = true;
+    }
+
+    void configure_sensor_requested_priority_map(
+        py::array_t<float, py::array::c_style | py::array::forcecast> values) {
+        if (_pipeline)
+            throw std::runtime_error(
+                "requested priority map must be configured before pipeline creation");
+        auto map = values.request();
+        if (map.ndim != 2 || map.shape[0] <= 0 || map.shape[0] != map.shape[1])
+            throw std::invalid_argument("requested priority map must be a non-empty square array");
+        const float* source = static_cast<const float*>(map.ptr);
+        _sensor_requested_priority_map.assign(source, source + map.size);
+        for (float value : _sensor_requested_priority_map)
+            if (!std::isfinite(value) || value < 0.0f)
+                throw std::invalid_argument(
+                    "requested priority map values must be finite and non-negative");
+        _sensor_requested_priority_res = static_cast<uint32_t>(map.shape[0]);
+    }
+
+    void configure_sensor_delta_restore(
+        py::array_t<float, py::array::c_style | py::array::forcecast> rgb,
+        py::array_t<float, py::array::c_style | py::array::forcecast> weight,
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast> dirty_sites) {
+        if (_pipeline)
+            throw std::runtime_error(
+                "sensor delta restore must be configured before pipeline creation");
+        auto image = rgb.request();
+        auto exposure = weight.request();
+        auto dirty = dirty_sites.request();
+        if (image.ndim != 3 || image.shape[0] <= 0
+                || image.shape[0] != image.shape[1] || image.shape[2] != 3)
+            throw std::invalid_argument("restore RGB must be square HxWx3");
+        if (exposure.ndim != 2 || exposure.shape[0] != image.shape[0]
+                || exposure.shape[1] != image.shape[1])
+            throw std::invalid_argument("restore weight must match RGB");
+        if (dirty.ndim != 1)
+            throw std::invalid_argument("dirty sensor sites must be a flat index array");
+        const uint32_t res = static_cast<uint32_t>(image.shape[0]);
+        const size_t pixels = static_cast<size_t>(res) * res;
+        const float* source = static_cast<const float*>(image.ptr);
+        _sensor_restore_rgb.assign(3u * pixels, 0.0f);
+        for (size_t pixel = 0; pixel < pixels; ++pixel)
+            for (size_t channel = 0; channel < 3u; ++channel)
+                _sensor_restore_rgb[channel * pixels + pixel] =
+                    source[pixel * 3u + channel];
+        const float* weight_source = static_cast<const float*>(exposure.ptr);
+        _sensor_restore_weight.assign(weight_source, weight_source + pixels);
+        const uint32_t* dirty_source = static_cast<const uint32_t*>(dirty.ptr);
+        _sensor_dirty_sites.assign(dirty_source, dirty_source + dirty.size);
+        std::sort(_sensor_dirty_sites.begin(), _sensor_dirty_sites.end());
+        _sensor_dirty_sites.erase(
+            std::unique(_sensor_dirty_sites.begin(), _sensor_dirty_sites.end()),
+            _sensor_dirty_sites.end());
+        for (uint32_t index : _sensor_dirty_sites)
+            if (index >= pixels)
+                throw std::invalid_argument("dirty sensor site index is out of bounds");
+        for (float value : _sensor_restore_rgb)
+            if (!std::isfinite(value) || value < 0.0f)
+                throw std::invalid_argument("restore RGB must be finite and non-negative");
+        for (float value : _sensor_restore_weight)
+            if (!std::isfinite(value) || value < 0.0f)
+                throw std::invalid_argument("restore weight must be finite and non-negative");
+        _sensor_restore_res = res;
     }
 
     /* ── GPU T3 bridge ─────────────────────────────────────────────────────
@@ -6073,19 +6211,36 @@ target_x/target_r: camera projection target, normally the assembly exit pupil.
 target_y/target_z: transverse centre of that target disk.
 target_mode: 0 launches toward the target disk; 1 launches away from a virtual target.
 Resets accumulator.  Call before submitting rays.)doc")
+        .def("configure_sensor_pose",
+             &PyRayTracer::configure_sensor_pose,
+             py::arg("sensor_center"), py::arg("sensor_right"), py::arg("sensor_up"),
+             py::arg("aperture_center"), py::arg("aperture_right"), py::arg("aperture_up"),
+R"doc(Configure a physical film-plane pose and fixed aperture plane.
+Sensor UV and recursive mip coordinates remain local to sensor_right/sensor_up;
+changing the pose changes world-space ray origins and focusing geometry.)doc")
         .def("configure_sensor_mipmap",
              &PyRayTracer::configure_sensor_mipmap,
              py::arg("max_nodes") = 65536u,
              py::arg("maximum_depth") = 8u,
              py::arg("samples_per_epoch") = 9u,
 R"doc(Enable sparse recursive 3x3 sensor-mipmap storage before pipeline creation.
-Allocates a bounded GPU node pool; completed nonterminal nodes create nine
-children and finest nodes continue independent sampling epochs.)doc")
+Allocates a bounded GPU node pool; scheduling explicitly distinguishes sampling
+from 3x3 subdivision, and retained leaves continue independent epochs.)doc")
         .def("configure_sensor_priority_network",
              &PyRayTracer::configure_sensor_priority_network,
              py::arg("parameters"),
 R"doc(Install the fixed conv3x3-4x8-ReLU-conv1x1-softplus sensor work-value
 network before pipeline creation. Inference runs over resident GPU sensor data.)doc")
+        .def("configure_sensor_requested_priority_map",
+             &PyRayTracer::configure_sensor_requested_priority_map,
+             py::arg("values"),
+R"doc(Install a camera/network next-scan UV work request before pipeline creation.
+The map remains separate from inferred priority and is consumed by the GPU node scorer.)doc")
+        .def("configure_sensor_delta_restore",
+             &PyRayTracer::configure_sensor_delta_restore,
+             py::arg("rgb"), py::arg("weight"), py::arg("dirty_sites"),
+R"doc(Restore a prior square sensor sum/weight and zero only the arbitrary
+flat site indices selected for delta regrowth.)doc")
         .def("get_sensor_image",
              &PyRayTracer::get_sensor_image,
 R"doc(Return current sensor image as float32 ndarray of shape (res, res, 3).

@@ -282,7 +282,7 @@ try:
         CAMERA_MODE_PHYSICAL_PINHOLE,
         CAMERA_MODE_APERTURE_CONE,
         CAMERA_MODE_THIN_LENS_GEOMETRIC,
-        CAMERA_MODE_GEOMETRIC_ASSEMBLY,
+        CAMERA_MODE_PARAMETRIC_ASSEMBLY,
         CAMERA_MODE_WAVE_ASSEMBLY,
         CAMERA_MODE_BAKED_TRANSFORM,
     )
@@ -299,7 +299,7 @@ except ImportError:
     CAMERA_MODE_PHYSICAL_PINHOLE = 1
     CAMERA_MODE_APERTURE_CONE = 2
     CAMERA_MODE_THIN_LENS_GEOMETRIC = 3
-    CAMERA_MODE_GEOMETRIC_ASSEMBLY = 4
+    CAMERA_MODE_PARAMETRIC_ASSEMBLY = 4
     CAMERA_MODE_WAVE_ASSEMBLY = 5
     CAMERA_MODE_BAKED_TRANSFORM = 6
 
@@ -325,7 +325,8 @@ def _camera_mode_from_cli_string(mode_str: str | None) -> int | None:
         "physical_pinhole": CAMERA_MODE_PHYSICAL_PINHOLE,
         "aperture_cone": CAMERA_MODE_APERTURE_CONE,
         "thin_lens": CAMERA_MODE_THIN_LENS_GEOMETRIC,
-        "geometric_assembly": CAMERA_MODE_GEOMETRIC_ASSEMBLY,
+        "parametric_assembly": CAMERA_MODE_PARAMETRIC_ASSEMBLY,
+        "geometric_assembly": CAMERA_MODE_PARAMETRIC_ASSEMBLY,
         "wave_assembly": CAMERA_MODE_WAVE_ASSEMBLY,
         "baked_transform": CAMERA_MODE_BAKED_TRANSFORM,
     }
@@ -453,6 +454,22 @@ DEFAULT_FREQ_HZ = (C_LIGHT / np.linspace(700e-9, 400e-9, 8)).astype(np.float64)
 _SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "shaders")
 
 ENABLE_EXPOSURE_PROFILING = False
+
+
+def _active_frequency_sidecar(tll: Any, freq_hz: np.ndarray) -> Any:
+    """Build optical material bands in the tracer's exact active-band order."""
+    freq = np.asarray(freq_hz, np.float64).reshape(-1)
+    if freq.size <= 0 or np.any(~np.isfinite(freq)) or np.any(freq <= 0.0):
+        raise ValueError("active spectral frequencies must be finite and positive")
+    wavelength_nm = C_LIGHT / freq * 1.0e9
+    template = tll.FreeFrequencySidecar.lazy_prepare(int(freq.size))
+    order = np.argsort(np.asarray(template.wavelength_nm, np.float64))
+    weight = np.interp(
+        wavelength_nm,
+        np.asarray(template.wavelength_nm, np.float64)[order],
+        np.asarray(template.weight, np.float64)[order],
+    )
+    return tll.FreeFrequencySidecar.from_prepared(wavelength_nm, weight)
 
 
 class StageProfiler:
@@ -601,6 +618,17 @@ def _cleanup_stale_ephemeral_bdpt_files(dir_path: str,
 # ─────────────────────────────────────────────────────────────────────────────
 # Scene → tracer geometry adapter
 # ─────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class FilmPlanePose:
+    center: np.ndarray
+    normal_to_scene: np.ndarray
+    right: np.ndarray
+    up: np.ndarray
+    lens_distance_delta_m: float = 0.0
+    tilt_about_right_deg: float = 0.0
+    tilt_about_up_deg: float = 0.0
+
+
 @dataclass
 class TracerScene:
     """Everything both ray tracers need to be built once per camera frame."""
@@ -619,6 +647,8 @@ class TracerScene:
     bounds_min:   np.ndarray   # (3,)        float32
     bounds_max:   np.ndarray   # (3,)        float32
     camera_tri_groups: Optional[dict[str, np.ndarray]] = None
+    film_plane_pose: Optional[FilmPlanePose] = None
+    optical_camera: Optional[Any] = None
 
     @property
     def total_emissive_power_W(self) -> float:
@@ -636,12 +666,127 @@ class TracerScene:
             self.total_emissive_power_W, self.total_emissive_area_m2)
 
 
+def _rotate_vector(vector: np.ndarray, axis: np.ndarray, angle_rad: float) -> np.ndarray:
+    axis = np.asarray(axis, np.float64)
+    axis /= max(float(np.linalg.norm(axis)), 1.0e-15)
+    value = np.asarray(vector, np.float64)
+    return (
+        value * math.cos(angle_rad)
+        + np.cross(axis, value) * math.sin(angle_rad)
+        + axis * float(np.dot(axis, value)) * (1.0 - math.cos(angle_rad))
+    )
+
+
+def apply_next_site_scan(scene: TracerScene, command: Any, *,
+                         maximum_film_travel_m: float = 2.0e-3,
+                         maximum_film_tilt_deg: float = 5.0) -> TracerScene:
+    """Apply a validated physical film-stage command to camera geometry."""
+    from camera_software.scan_control import CameraScanController
+
+    controller = CameraScanController(
+        maximum_film_travel_m=maximum_film_travel_m,
+        maximum_film_tilt_deg=maximum_film_tilt_deg,
+    )
+    adjustment = controller.validate(command)
+    if adjustment is None:
+        return scene
+    groups = scene.camera_tri_groups or {}
+    sensor_ids = np.asarray(groups.get("sensor", ()), np.int64).reshape(-1)
+    if sensor_ids.size == 0:
+        raise ValueError("film-plane adjustment requires camera sensor geometry")
+
+    triangles = np.asarray(scene.verts, np.float64).reshape(-1, 3, 3).copy()
+    sensor_points = triangles[sensor_ids].reshape(-1, 3)
+    current_center = sensor_points.mean(axis=0)
+    nominal_center = current_center
+    nominal_right = np.asarray([0.0, 1.0, 0.0], np.float64)
+    nominal_up = np.asarray([0.0, 0.0, 1.0], np.float64)
+    current_right = nominal_right
+    current_up = nominal_up
+    if scene.optical_camera is not None:
+        nominal_center = np.asarray(
+            scene.optical_camera.machined_sensor_center, np.float64
+        )
+        nominal_right = np.asarray(
+            scene.optical_camera.machined_sensor_right, np.float64
+        )
+        nominal_up = np.asarray(
+            scene.optical_camera.machined_sensor_up, np.float64
+        )
+        current_right = np.asarray(scene.optical_camera.sensor_right, np.float64)
+        current_up = np.asarray(scene.optical_camera.sensor_up, np.float64)
+    away_from_lens = np.cross(nominal_right, nominal_up)
+    away_from_lens /= max(float(np.linalg.norm(away_from_lens)), 1.0e-15)
+    normal_to_scene = -away_from_lens
+    right = nominal_right.copy()
+    up = nominal_up.copy()
+    right_angle = math.radians(float(adjustment.tilt_about_right_deg))
+    up_angle = math.radians(float(adjustment.tilt_about_up_deg))
+    if right_angle != 0.0:
+        normal_to_scene = _rotate_vector(normal_to_scene, right, right_angle)
+        up = _rotate_vector(up, right, right_angle)
+    if up_angle != 0.0:
+        normal_to_scene = _rotate_vector(normal_to_scene, up, up_angle)
+        right = _rotate_vector(right, up, up_angle)
+    normal_to_scene /= max(float(np.linalg.norm(normal_to_scene)), 1.0e-15)
+    right /= max(float(np.linalg.norm(right)), 1.0e-15)
+    up = np.cross(right, normal_to_scene)
+    up /= max(float(np.linalg.norm(up)), 1.0e-15)
+
+    # Film-stage depth is measured along the fixed lens optical axis; tilting
+    # the carrier must not turn an axial focus move into a lateral translation.
+    adjusted_center = nominal_center + away_from_lens * float(
+        adjustment.lens_distance_delta_m
+    )
+    local = sensor_points - current_center
+    local_right = local @ current_right
+    local_up = local @ current_up
+    transformed = (
+        adjusted_center[None, :]
+        + local_right[:, None] * right[None, :]
+        + local_up[:, None] * up[None, :]
+    )
+    triangles[sensor_ids] = transformed.reshape(-1, 3, 3)
+
+    normals = np.asarray(scene.normals, np.float64).copy()
+    for triangle_id in sensor_ids:
+        edge_a = triangles[triangle_id, 1] - triangles[triangle_id, 0]
+        edge_b = triangles[triangle_id, 2] - triangles[triangle_id, 0]
+        normal = np.cross(edge_a, edge_b)
+        length = float(np.linalg.norm(normal))
+        if length <= 1.0e-18:
+            raise ValueError("film-plane adjustment collapsed a sensor triangle")
+        normals[triangle_id] = normal / length
+    scene.verts = np.ascontiguousarray(triangles.reshape(-1, 9), np.float64)
+    scene.normals = np.ascontiguousarray(normals, np.float64)
+    points = triangles.reshape(-1, 3)
+    scene.bounds_min = np.ascontiguousarray(points.min(axis=0), np.float32)
+    scene.bounds_max = np.ascontiguousarray(points.max(axis=0), np.float32)
+    scene.film_plane_pose = FilmPlanePose(
+        center=np.ascontiguousarray(adjusted_center, np.float64),
+        normal_to_scene=np.ascontiguousarray(normal_to_scene, np.float64),
+        right=np.ascontiguousarray(right, np.float64),
+        up=np.ascontiguousarray(up, np.float64),
+        lens_distance_delta_m=float(adjustment.lens_distance_delta_m),
+        tilt_about_right_deg=float(adjustment.tilt_about_right_deg),
+        tilt_about_up_deg=float(adjustment.tilt_about_up_deg),
+    )
+    if scene.optical_camera is not None:
+        scene.optical_camera.apply_film_pose(
+            center=adjusted_center,
+            right=right,
+            up=up,
+        )
+    return scene
+
+
 # Optional subject-scene override compiled from a declarative scene order.
 # It still contains the proven thick-lens lab camera/lens/flash groups; only
 # the replaceable subject geometry and authored materials differ.
 _ORDERED_THICK_LENS_SCENE: Optional[TracerScene] = None
 _ORDERED_SCENE_JOB: Optional[dict[str, Any]] = None
 _ORDERED_TILE_OUTPUT: Optional[tuple[int, int]] = None
+_NEXT_SITE_SCAN_COMMAND: Optional[Any] = None
 
 
 _LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
@@ -842,6 +987,35 @@ def _ordered_lab_scene_for_sensor_focus(tll: Any, sensor_focus_m: float) -> Any:
     return scene
 
 
+def _make_rebuilt_lab_camera(
+    tll: Any,
+    lab_scene: Any,
+    sidecar: Any,
+    lens_surface_groups: Any,
+    tri_arr: np.ndarray,
+    image_plate_ids: np.ndarray,
+) -> Any:
+    """Retain the camera lab's solved semantics beside its BVH proxy mesh."""
+    from camera_designer.lens_assembly import LensAssemblySpec
+    from camera_software.camera_build import RebuiltCameraArtifact
+
+    optics = tll._compound_lens_from_scene(lab_scene, sidecar)
+    assembly = LensAssemblySpec()
+    assembly.set_optics(optics, mode=LensAssemblySpec.MODE_PARAMETRIC)
+    assembly.sync_from_scene(lab_scene)
+    sensor_ids = np.asarray(image_plate_ids, np.int32).reshape(-1)
+    sensor_center = np.asarray(tri_arr, np.float64)[sensor_ids].reshape(-1, 3).mean(axis=0)
+    return RebuiltCameraArtifact.create(
+        scene_config=lab_scene,
+        lens_assembly=assembly,
+        lens_surface_groups=lens_surface_groups,
+        scene_lenses=tll._scene_lenses(lab_scene),
+        wavelengths_nm=sidecar.wavelength_nm,
+        sensor_center=sensor_center,
+        diffraction_model="disabled_unless_wave_arena_is_explicitly_registered",
+    )
+
+
 def _build_thick_lens_lab_tracer_scene() -> TracerScene:
     """Materialise the articulated thick-lens lab scene as a TracerScene.
 
@@ -860,6 +1034,13 @@ def _build_thick_lens_lab_tracer_scene() -> TracerScene:
         from scene_orders import camera_focus_distance
         ordered_sensor_focus_m = camera_focus_distance(_ORDERED_SCENE_JOB)
 
+    lab_scene = (
+        tll.SceneConfig()
+        if ordered_sensor_focus_m is None
+        else _ordered_lab_scene_for_sensor_focus(tll, ordered_sensor_focus_m)
+    )
+    sidecar = _active_frequency_sidecar(tll, DEFAULT_FREQ_HZ)
+
     cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".spectral_cache")
     focus_cache_tag = (
         "default"
@@ -867,18 +1048,36 @@ def _build_thick_lens_lab_tracer_scene() -> TracerScene:
         else f"focus_{int(round(ordered_sensor_focus_m * 1.0e6))}um"
     )
     cache_path = os.path.join(
-        cache_dir, f"thick_lens_exposure_scene_v4_{focus_cache_tag}.npz"
+        cache_dir, f"thick_lens_exposure_scene_v6_{focus_cache_tag}.npz"
     )
-    cache_stamp = np.asarray([
-        4.0,
-        float(os.path.getmtime(tll.__file__)),
-        float(DEFAULT_FREQ_HZ.size),
-        -1.0 if ordered_sensor_focus_m is None else float(ordered_sensor_focus_m),
-    ], dtype=np.float64)
+    cache_stamp = np.concatenate([
+        np.asarray([
+            6.0,
+            float(os.path.getmtime(tll.__file__)),
+            float(DEFAULT_FREQ_HZ.size),
+            -1.0 if ordered_sensor_focus_m is None else float(ordered_sensor_focus_m),
+        ], dtype=np.float64),
+        np.asarray(sidecar.wavelength_nm, dtype=np.float64),
+    ])
     try:
         with np.load(cache_path, allow_pickle=False) as cached:
             if np.array_equal(cached["cache_stamp"], cache_stamp):
                 print(f"[scene-cache] loaded {cache_path}", flush=True)
+                n_lens_groups = int(cached["lens_group_count"][0])
+                lens_surface_groups = [
+                    (
+                        np.ascontiguousarray(cached[f"lens_group_{i}_front"], np.int32),
+                        np.ascontiguousarray(cached[f"lens_group_{i}_back"], np.int32),
+                        float(cached["lens_group_radii"][i, 0]),
+                        float(cached["lens_group_radii"][i, 1]),
+                    )
+                    for i in range(n_lens_groups)
+                ]
+                cached_tri = np.ascontiguousarray(cached["verts"], np.float64).reshape(-1, 3, 3)
+                optical_camera = _make_rebuilt_lab_camera(
+                    tll, lab_scene, sidecar, lens_surface_groups, cached_tri,
+                    np.ascontiguousarray(cached["group_sensor"], np.int32),
+                )
                 return TracerScene(
                     verts=np.ascontiguousarray(cached["verts"]),
                     normals=np.ascontiguousarray(cached["normals"]),
@@ -900,20 +1099,15 @@ def _build_thick_lens_lab_tracer_scene() -> TracerScene:
                         "thin_lens": np.ascontiguousarray(cached["group_lens"]),
                         "object": np.ascontiguousarray(cached["group_object"]),
                     },
+                    optical_camera=optical_camera,
                 )
     except (OSError, KeyError, ValueError) as exc:
         print(f"[scene-cache] rebuild required: {exc}", flush=True)
 
-    lab_scene = (
-        tll.SceneConfig()
-        if ordered_sensor_focus_m is None
-        else _ordered_lab_scene_for_sensor_focus(tll, ordered_sensor_focus_m)
-    )
-    sidecar = tll.FreeFrequencySidecar.lazy_prepare(int(DEFAULT_FREQ_HZ.size))
     (
         verts_flat, normals, mat_idx, tri_arr, db,
         source_ids, lens_front_ids, lens_back_ids, image_plate_ids,
-        aperture_stop_ids, _tube_wall_ids, _lens_surface_groups,
+        aperture_stop_ids, _tube_wall_ids, lens_surface_groups,
         object_ids, _tube_baffle_ids, _camera_barrel_ids,
         _camera_rear_cap_ids, _camera_front_cap_ids, _camera_frustum_ids,
         red_probe_ids, _diffuser_wave_specs, _subject_group_tri_map,
@@ -964,6 +1158,9 @@ def _build_thick_lens_lab_tracer_scene() -> TracerScene:
         ),
         "object": np.ascontiguousarray(object_ids, dtype=np.int32),
     }
+    optical_camera = _make_rebuilt_lab_camera(
+        tll, lab_scene, sidecar, lens_surface_groups, tri_arr, image_plate_ids,
+    )
 
     result = TracerScene(
         verts=verts_flat,
@@ -981,11 +1178,11 @@ def _build_thick_lens_lab_tracer_scene() -> TracerScene:
         bounds_min=np.ascontiguousarray(pts_all.min(axis=0), dtype=np.float32),
         bounds_max=np.ascontiguousarray(pts_all.max(axis=0), dtype=np.float32),
         camera_tri_groups=camera_tri_groups,
+        optical_camera=optical_camera,
     )
     try:
         os.makedirs(cache_dir, exist_ok=True)
-        np.savez_compressed(
-            cache_path,
+        cache_payload = dict(
             cache_stamp=cache_stamp,
             verts=result.verts, normals=result.normals, mat_idx=result.mat_idx,
             mat_buf=result.mat_buf,
@@ -999,7 +1196,16 @@ def _build_thick_lens_lab_tracer_scene() -> TracerScene:
             group_aperture=camera_tri_groups["aperture_blocker"],
             group_lens=camera_tri_groups["thin_lens"],
             group_object=camera_tri_groups["object"],
+            lens_group_count=np.asarray([len(lens_surface_groups)], np.int32),
+            lens_group_radii=np.asarray(
+                [[float(group[2]), float(group[3])] for group in lens_surface_groups],
+                np.float64,
+            ),
         )
+        for i, (front, back, _radius_front, _radius_back) in enumerate(lens_surface_groups):
+            cache_payload[f"lens_group_{i}_front"] = np.ascontiguousarray(front, np.int32)
+            cache_payload[f"lens_group_{i}_back"] = np.ascontiguousarray(back, np.int32)
+        np.savez_compressed(cache_path, **cache_payload)
         print(f"[scene-cache] wrote {cache_path}", flush=True)
     except OSError as exc:
         print(f"[scene-cache] write skipped: {exc}", flush=True)
@@ -1023,9 +1229,17 @@ def _build_thick_lens_lab_camera_package(
     sensor_pts = scene.verts[sensor_ids].reshape(-1, 3)
     sensor_center = sensor_pts.mean(axis=0).astype(np.float64)
 
-    fwd = np.array([-1.0, 0.0, 0.0], np.float64)
-    right = np.array([0.0, 1.0, 0.0], np.float64)
-    up = np.array([0.0, 0.0, 1.0], np.float64)
+    pose = scene.film_plane_pose
+    fwd = np.asarray(
+        pose.normal_to_scene if pose is not None else [-1.0, 0.0, 0.0],
+        np.float64,
+    )
+    right = np.asarray(
+        pose.right if pose is not None else [0.0, 1.0, 0.0], np.float64
+    )
+    up = np.asarray(
+        pose.up if pose is not None else [0.0, 0.0, 1.0], np.float64
+    )
     sensor_local = sensor_pts - sensor_center
     sensor_half_w = 0.5 * float(np.ptp(sensor_local @ right))
     sensor_half_h = 0.5 * float(np.ptp(sensor_local @ up))
@@ -1035,14 +1249,14 @@ def _build_thick_lens_lab_camera_package(
         aperture_pts = scene.verts[aperture_ids].reshape(-1, 3)
         aperture_center = aperture_pts.mean(axis=0).astype(np.float64)
         aperture_delta = aperture_pts - aperture_center
-        aperture_radial = np.hypot(aperture_delta @ right, aperture_delta @ up)
+        aperture_radial = np.hypot(aperture_delta[:, 1], aperture_delta[:, 2])
         positive = aperture_radial[aperture_radial > 1.0e-6]
         aperture_radius_m = float(np.min(positive)) if positive.size else float(optics.aperture_mm) * 0.5e-3
     else:
         aperture_center = sensor_center + fwd * max(float(optics.focal_mm) * 1.0e-3, 1.0e-3)
         aperture_radius_m = float(optics.aperture_mm) * 0.5e-3
 
-    focal_m = max(1.0e-4, float(np.dot(aperture_center - sensor_center, fwd)))
+    focal_m = max(1.0e-4, float(np.linalg.norm(aperture_center - sensor_center)))
     sensor_w_m = max(1.0e-4, 2.0 * sensor_half_w)
     sensor_h_m = max(1.0e-4, 2.0 * sensor_half_h)
     if _ORDERED_SCENE_JOB is not None:
@@ -1077,6 +1291,8 @@ def _build_thick_lens_lab_camera_package(
     )
     cam.sensor_w_m = float(sensor_w_m)
     cam.sensor_h_m = float(sensor_h_m)
+    cam.aperture_center_world = np.ascontiguousarray(aperture_center, np.float64)
+    cam.lens_fwd_world = np.asarray([-1.0, 0.0, 0.0], np.float64)
 
     error_degree = SimpleNamespace(
         pinhole_target_sensor_z_m=0.0,
@@ -1116,7 +1332,7 @@ def _build_thick_lens_lab_camera_package(
             sensor_corner_br_mm=0.0,
         ),
         sanity_report=SimpleNamespace(
-            status="lab_native",
+            status=("lab_native_film_stage" if pose is not None else "lab_native"),
             geometry_ok=True,
             circle_of_confusion_um=0.0,
             sensor_adjustment_needed_mm=0.0,
@@ -1663,6 +1879,74 @@ class CppExposureBackend(ExposureBackend):
                 print(
                     f"[config] GPU sensor priority network loaded "
                     f"parameters={parameters.size} path={priority_model_path}"
+                )
+            if (
+                _NEXT_SITE_SCAN_COMMAND is not None
+                and (
+                    _NEXT_SITE_SCAN_COMMAND.uv_requests
+                    or _NEXT_SITE_SCAN_COMMAND.pixel_slice_requests
+                )
+            ):
+                if not hasattr(self.tracer, "configure_sensor_requested_priority_map"):
+                    raise RuntimeError(
+                        "native tracer does not expose next-scan UV requests"
+                    )
+                requested = _NEXT_SITE_SCAN_COMMAND.priority_map(
+                    max(self.cam.width, self.cam.height),
+                    max(self.cam.width, self.cam.height),
+                )
+                self.tracer.configure_sensor_requested_priority_map(requested)
+                print(
+                    f"[config] GPU next-scan UV requests loaded "
+                    f"regions={len(_NEXT_SITE_SCAN_COMMAND.uv_requests)} "
+                    f"pixel_slices={len(_NEXT_SITE_SCAN_COMMAND.pixel_slice_requests)}"
+                )
+            restore_sum_path = str(
+                os.environ.get("SPECTRAL_SENSOR_RESTORE_SUM", "")
+            ).strip()
+            restore_weight_path = str(
+                os.environ.get("SPECTRAL_SENSOR_RESTORE_WEIGHT", "")
+            ).strip()
+            restore_dirty_path = str(
+                os.environ.get("SPECTRAL_SENSOR_DIRTY_SITES", "")
+            ).strip()
+            if restore_sum_path or restore_weight_path or restore_dirty_path:
+                if not all((restore_sum_path, restore_weight_path, restore_dirty_path)):
+                    raise RuntimeError(
+                        "delta restore requires sum, weight, and dirty-site paths"
+                    )
+                if not hasattr(self.tracer, "configure_sensor_delta_restore"):
+                    raise RuntimeError(
+                        "native tracer does not expose sparse sensor delta restore"
+                    )
+                restored_sum = np.asarray(
+                    np.load(restore_sum_path, allow_pickle=False), np.float32
+                )
+                restored_weight = np.asarray(
+                    np.load(restore_weight_path, allow_pickle=False), np.float32
+                )
+                dirty_sites = np.asarray(
+                    np.load(restore_dirty_path, allow_pickle=False), np.uint32
+                ).reshape(-1)
+                native_resolution = max(self.cam.width, self.cam.height)
+                if restored_sum.shape != (
+                    native_resolution, native_resolution, 3
+                ):
+                    raise ValueError(
+                        "delta restore RGB must match the native square sensor"
+                    )
+                if restored_weight.shape != (
+                    native_resolution, native_resolution
+                ):
+                    raise ValueError(
+                        "delta restore weight must match the native square sensor"
+                    )
+                self.tracer.configure_sensor_delta_restore(
+                    restored_sum, restored_weight, dirty_sites
+                )
+                print(
+                    f"[config] restored GPU sensor exposure; "
+                    f"dirty_sites={dirty_sites.size}"
                 )
 
         if self._t5_min_geom > 0.0 and hasattr(self.tracer, "set_t5_min_geom"):
@@ -5076,6 +5360,14 @@ class ExposureSession:
               f"  pinhole_ref={solved.sanity_report.error_degree.pinhole_comparison_mm:.2f} mm"
               f"  err={solved.sanity_report.error_degree.overall:.3f}"
               f"  iter={solved.iterations}")
+        if scene.film_plane_pose is not None:
+            film_pose = scene.film_plane_pose
+            print(
+                "  film stage           : "
+                f"depth={film_pose.lens_distance_delta_m * 1.0e3:+.3f} mm  "
+                f"tilt_right={film_pose.tilt_about_right_deg:+.3f} deg  "
+                f"tilt_up={film_pose.tilt_about_up_deg:+.3f} deg"
+            )
         print(f"  cam targets          : thin_lens_z={solved.sanity_report.error_degree.thin_lens_target_sensor_z_m:+.6f} m"
               f"  pinhole_z={solved.sanity_report.error_degree.pinhole_target_sensor_z_m:+.6f} m"
               f"  pinhole_deg={solved.sanity_report.error_degree.pinhole_comparison_degree:.3f}")
@@ -5285,6 +5577,17 @@ class ExposureSession:
                         tri_pos = np.asarray(scene.verts[emissive_tris], np.float64).reshape(-1, 3)
                         emissive_group_centers.append(np.mean(tri_pos, axis=0))
 
+                # The rebuilt camera owns optical transport. These lens
+                # triangles are only BVH proxies; T2 evaluates the exact conics.
+                if scene.optical_camera is not None:
+                    scene.optical_camera.register_exact_transport(
+                        tracer, np.asarray(scene.verts, np.float64).reshape(-1, 3, 3)
+                    )
+                    print(
+                        f"  [camera-build] {scene.optical_camera.describe()}",
+                        flush=True,
+                    )
+
                 # ── Sensor group (PIXEL_CONE / AREA) ─────────────────────
                 # backward/bdpt: PIXEL_CONE (shoots backward rays from sensor)
                 # forward:       AREA (passive receiver — pixel-maps forward hits)
@@ -5397,15 +5700,26 @@ class ExposureSession:
                         _eff_f = float(_rpt.planes.effective_focal_m)
                         _fp_z  = float(_rpt.planes.focal_plane_z_m)
                         _s_z   = float(_si.sensor_plane_z_m)
-                        _s_to_ap = abs(_ap_z - _s_z)
+                        _lens_c = np.asarray(
+                            getattr(
+                                cam,
+                                "aperture_center_world",
+                                np.asarray(cam.pos, np.float64)
+                                + np.asarray(cam.fwd, np.float64) * _ap_z,
+                            ),
+                            np.float64,
+                        )
+                        _s_to_ap = float(np.linalg.norm(_lens_c - _cam_pos_w))
                         _foc_dist = max(1.0e-4, abs(_fp_z - _ap_z))
-                        _lens_c = np.asarray(cam.pos, np.float64) + np.asarray(cam.fwd, np.float64) * _ap_z
+                        _lens_fwd = np.asarray(
+                            getattr(cam, "lens_fwd_world", cam.fwd), np.float64
+                        )
                         _cam_desc_base.update({
                             "focal_m": float(max(_s_to_ap, 1.0e-6)) if _s_to_ap > 1.0e-6 else _cam_desc_base["focal_m"],
                             "effective_focal_m": float(_eff_f),
                             "focus_distance_m": float(_foc_dist),
                             "lens_center": _lens_c,
-                            "lens_fwd": np.asarray(cam.fwd, np.float64),
+                            "lens_fwd": _lens_fwd,
                         })
                     elif solved is not None and self.integrator in ("backward", "bdpt"):
                         # Failed solver packages can produce extreme thin-lens descriptors
@@ -5423,14 +5737,29 @@ class ExposureSession:
                             "; using aperture-cone sensor sampling for this frame "
                             "to preserve backward PIXEL_CONE coverage"
                         )
+                    if scene.optical_camera is not None:
+                        # No second thin-lens interpretation is permitted when
+                        # a rebuilt compound camera owns the optical path.
+                        _cam_desc_base.update({
+                            "camera_mode": int(CAMERA_MODE_PARAMETRIC_ASSEMBLY),
+                            "use_optical_handlers": 0,
+                        })
                     
                     # ── Validate camera configuration ────────────────────────────
+                    registered_lens_surfaces = 0
+                    if scene.optical_camera is not None:
+                        registered_lens_surfaces = int(
+                            scene.optical_camera.lens_assembly.build_parametric_payload()[1]
+                        )
                     val_error = validate_frame_configuration(
                         camera_mode=int(_cam_desc_base.get("camera_mode", self.camera_mode)),
                         n_aperture_samples=int(_cam_desc_base.get("n_aperture_samples", 1)),
                         aperture_radius_m=float(_cam_desc_base.get("aperture_radius_m", aperture_radius_m)),
                         has_aperture_stop=(aperture_stop_group_id >= 0),
-                        lens_event_count=0,
+                        # Preflight occurs before rays exist. For an exact
+                        # assembly, registration count is the only meaningful
+                        # proof that a lens can participate at this point.
+                        lens_event_count=registered_lens_surfaces,
                         effective_focal_m=float(_cam_desc_base.get("effective_focal_m", 0.0)),
                         focus_distance_m=float(_cam_desc_base.get("focus_distance_m", 0.0)),
                         solved_camera_package=solved,
@@ -5447,6 +5776,7 @@ class ExposureSession:
                         sensor_camera = _cam_desc_base,
                     )
                     self._sensor_camera_desc = dict(_cam_desc_base)
+                    self._active_camera_mode = int(_cam_desc_base["camera_mode"])
                     cpp_back = backs.get("cpp")
                     if isinstance(cpp_back, CppExposureBackend):
                         cpp_back._sensor_camera_desc = dict(self._sensor_camera_desc)
@@ -5455,13 +5785,28 @@ class ExposureSession:
                             and self.integrator in ("backward", "bdpt")
                             and hasattr(tracer, "configure_sensor_image")
                         ):
-                            target_center = np.asarray(
-                                _cam_desc_base.get(
-                                    "lens_center",
-                                    _cam_pos_w + np.asarray(cam.fwd, np.float64) * float(focal_m),
-                                ),
-                                np.float64,
-                            ).reshape(3)
+                            target_mode = 0
+                            target_radius = float(aperture_radius_m)
+                            target_spec = (
+                                None if scene.optical_camera is None
+                                else scene.optical_camera.backward_target_spec()
+                            )
+                            if target_spec is not None:
+                                target_center = np.asarray(
+                                    target_spec.center, np.float64
+                                ).reshape(3)
+                                target_radius = float(target_spec.radius)
+                                target_mode = int(
+                                    str(target_spec.direction_mode) == "away_from_virtual"
+                                )
+                            else:
+                                target_center = np.asarray(
+                                    _cam_desc_base.get(
+                                        "lens_center",
+                                        _cam_pos_w + np.asarray(cam.fwd, np.float64) * float(focal_m),
+                                    ),
+                                    np.float64,
+                                ).reshape(3)
                             sensor_image_res = int(max(16, int(max(self.width, self.height))))
                             tracer.configure_sensor_image(
                                 float(_cam_pos_w[0]),
@@ -5470,22 +5815,52 @@ class ExposureSession:
                                 int(sensor_image_res),
                                 0.008,
                                 float(target_center[0]),
-                                float(aperture_radius_m),
+                                float(target_radius),
                                 float(target_center[1]),
                                 float(target_center[2]),
-                                0,
+                                int(target_mode),
                             )
+                            if hasattr(tracer, "configure_sensor_pose"):
+                                sensor_fwd = np.asarray(_cam_desc_base["fwd"], np.float64)
+                                sensor_up = np.asarray(_cam_desc_base["up"], np.float64)
+                                sensor_right = np.cross(sensor_fwd, sensor_up)
+                                sensor_right /= max(
+                                    float(np.linalg.norm(sensor_right)), 1.0e-15
+                                )
+                                sensor_up = np.cross(sensor_right, sensor_fwd)
+                                sensor_up /= max(float(np.linalg.norm(sensor_up)), 1.0e-15)
+                                lens_fwd = np.asarray(
+                                    _cam_desc_base.get("lens_fwd", [-1.0, 0.0, 0.0]),
+                                    np.float64,
+                                )
+                                lens_up = np.asarray([0.0, 0.0, 1.0], np.float64)
+                                lens_right = np.cross(lens_fwd, lens_up)
+                                lens_right /= max(
+                                    float(np.linalg.norm(lens_right)), 1.0e-15
+                                )
+                                lens_up = np.cross(lens_right, lens_fwd)
+                                lens_up /= max(float(np.linalg.norm(lens_up)), 1.0e-15)
+                                tracer.configure_sensor_pose(
+                                    _cam_pos_w,
+                                    sensor_right,
+                                    sensor_up,
+                                    target_center,
+                                    lens_right,
+                                    lens_up,
+                                )
                             print(
                                 "  [gpu-resident] native sensor image configured "
                                 f"res={sensor_image_res} plate_x={float(_cam_pos_w[0]):.4f} "
                                 f"target_x={float(target_center[0]):.4f} "
-                                f"target_r={float(aperture_radius_m)*1e3:.2f}mm"
+                                f"target_r={float(target_radius)*1e3:.2f}mm "
+                                f"target_mode={target_mode}"
                             )
                         
                         # Create optical assembly for this frame's camera configuration
                         try:
                             if (
-                                int(_cam_desc_base.get("camera_mode", CAMERA_MODE_APERTURE_CONE)) == int(CAMERA_MODE_THIN_LENS_GEOMETRIC)
+                                scene.optical_camera is None
+                                and int(_cam_desc_base.get("camera_mode", CAMERA_MODE_APERTURE_CONE)) == int(CAMERA_MODE_THIN_LENS_GEOMETRIC)
                                 and int(_cam_desc_base.get("use_optical_handlers", 0)) != 0
                             ):
                                 focal_m = float(_cam_desc_base.get("focal_m", 0.035))
@@ -5525,7 +5900,18 @@ class ExposureSession:
 
                     # Bind sensor/film SSBO before batch dispatch.
                     self._bind_sensor_film_ssbo(tracer)
-                    self._configure_default_wave_contexts(tracer, cam, solved)
+                    if scene.optical_camera is not None:
+                        # Exact conic traversal owns the camera path. A second
+                        # thin/thick-lens scale context would steer the same ray
+                        # again and invalidate its optical geometry.
+                        tracer.clear_scale_contexts()
+                        print(
+                            "  [camera-build] surrogate scale contexts disabled; "
+                            "exact parametric assembly owns optical transport",
+                            flush=True,
+                        )
+                    else:
+                        self._configure_default_wave_contexts(tracer, cam, solved)
 
                     _bdpt_emitter_centers = (
                         np.asarray(emissive_group_centers, np.float64)
@@ -5574,6 +5960,15 @@ class ExposureSession:
                                     "SPECTRAL_SENSOR_TARGETED_FRACTION", "0.75"
                                 )), 0.0, 1.0,
                             ))
+                            from camera_software.scan_control import CoverageBalanceController
+                            _sensor_mip_balance = CoverageBalanceController(
+                                preferred_targeted=_sensor_mip_targeted_fraction,
+                                minimum_targeted=float(np.clip(
+                                    float(os.environ.get(
+                                        "SPECTRAL_SENSOR_MIN_TARGETED_FRACTION", "0.20"
+                                    )), 0.0, _sensor_mip_targeted_fraction,
+                                )),
+                            )
                             _sensor_mip_min_epochs = 8
                             _sensor_mip_hold_required = 3
                             _sensor_mip_hold = 0
@@ -5736,6 +6131,13 @@ class ExposureSession:
                                   else (int(self.width), int(self.height))),
                             )[..., :3]
                             _clarity = _sensor_mip_clarity.update(_mip_display)
+                            _coverage_weight = getattr(
+                                _cpp, "_native_sensor_exposure_weight", None
+                            )
+                            if _coverage_weight is not None:
+                                _sensor_mip_targeted_fraction = _sensor_mip_balance.update(
+                                    _coverage_weight, _clarity.noise_rse_p90
+                                )
                             _clear_now = _clarity.accepted
                             _sensor_mip_hold = (_sensor_mip_hold + 1) if _clear_now else 0
                             batches_executed = b_idx + 1
@@ -6121,10 +6523,16 @@ class ExposureSession:
                 f"front_shift<=±{float(rail_cfg.front_lens_shift_max_mm):.1f}mm "
                 f"front_tilt<=±{float(rail_cfg.front_lens_tilt_max_deg):.1f}deg"
             ),
-            "thin_lens_planes": True,
+            "thin_lens_planes": scene.optical_camera is None,
             "thin_lens_kind_bit": int(1 << int(getattr(_sk, "SCALE_CONTEXT_KIND_THIN_LENS_TRANSFORM", 2))),
-            "camera_mode": int(self.camera_mode),
-            "camera_mode_name": get_mode_name(int(self.camera_mode)),
+            "camera_mode": int(getattr(self, "_active_camera_mode", self.camera_mode)),
+            "camera_mode_name": get_mode_name(
+                int(getattr(self, "_active_camera_mode", self.camera_mode))
+            ),
+            "camera_optical_provenance": (
+                None if scene.optical_camera is None
+                else scene.optical_camera.provenance.as_dict()
+            ),
         }
 
         # ── Per-backend calibration + dump ───────────────────────────────
@@ -7349,6 +7757,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                         "proven thick-lens lab camera/flash scene.")
     p.add_argument("--scene-job", default=None,
                    help="Job id inside --scene-order (required when the package has multiple jobs).")
+    p.add_argument("--next-scan-control", default=None,
+                   help=("JSON next-site command produced by camera/network control. "
+                         "UV requests configure attention; bounded film-plane depth "
+                         "and tilt are applied before the next GPU scene is built."))
+    p.add_argument("--maximum-film-travel-mm", type=float, default=2.0,
+                   help="Camera-owned axial film-stage travel limit per next-scan command.")
+    p.add_argument("--maximum-film-tilt-deg", type=float, default=5.0,
+                   help="Camera-owned film tilt limit about either in-plane axis.")
     p.add_argument("--backend",        choices=("cpp", "glsl", "both"),
                    default="cpp")
     p.add_argument("--exposure-time-s", type=float, default=DEFAULT_FILM.exposure_time_s)
@@ -7484,6 +7900,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: Optional[list[str]] = None) -> int:
     global _ORDERED_THICK_LENS_SCENE, _ORDERED_SCENE_JOB, _ORDERED_TILE_OUTPUT
+    global _NEXT_SITE_SCAN_COMMAND
+    _NEXT_SITE_SCAN_COMMAND = None
     _verify_native_bdpt_contract()
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
@@ -7521,8 +7939,35 @@ def main(argv: Optional[list[str]] = None) -> int:
         _ORDERED_THICK_LENS_SCENE = None
         base_scene = _build_thick_lens_lab_tracer_scene()
         _ORDERED_THICK_LENS_SCENE, order_report = compile_job(base_scene, order_job)
+        next_scan_path = str(
+            args.next_scan_control
+            or os.environ.get("SPECTRAL_NEXT_SCAN_CONTROL", "")
+        ).strip()
+        if next_scan_path:
+            from camera_software.scan_control import NextSiteScan
+            with open(next_scan_path, "r", encoding="utf-8") as handle:
+                next_scan = NextSiteScan.from_mapping(json.load(handle))
+            _NEXT_SITE_SCAN_COMMAND = next_scan
+            _ORDERED_THICK_LENS_SCENE = apply_next_site_scan(
+                _ORDERED_THICK_LENS_SCENE,
+                next_scan,
+                maximum_film_travel_m=float(args.maximum_film_travel_mm) * 1.0e-3,
+                maximum_film_tilt_deg=float(args.maximum_film_tilt_deg),
+            )
+            if next_scan.targeted_fraction is not None:
+                os.environ["SPECTRAL_SENSOR_TARGETED_FRACTION"] = str(
+                    next_scan.targeted_fraction
+                )
+            print(
+                f"[next-scan] sequence={next_scan.sequence} "
+                f"uv_requests={len(next_scan.uv_requests)} "
+                f"pixel_slices={len(next_scan.pixel_slice_requests)} "
+                f"film_plane={'nominal' if next_scan.film_plane_adjustment is None else 'adjusted'}",
+                flush=True,
+            )
         print(
-            f"[scene-order] job={order_report.job_id!r} token={order_report.token!r} "
+            f"[scene-order] job={order_report.job_id!r} "
+            f"token={order_report.token.encode('ascii', 'backslashreplace').decode('ascii')!r} "
             f"triangles={order_report.total_triangles:,} "
             f"(glyph={order_report.glyph_triangles:,} planes={order_report.plane_triangles:,}) "
             f"materials={list(order_report.material_names)} flash_scale={order_report.flash_scale:g} "
@@ -7836,6 +8281,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     str(args.progress_exposure_id).strip()
                     or (str(order_job["id"]) if order_job is not None else "exposure")
                 )
+                _progress_active_uv = (
+                    None if _NEXT_SITE_SCAN_COMMAND is None
+                    else _NEXT_SITE_SCAN_COMMAND.active_uv_bounds()
+                )
 
                 def _publish_progress(_backs, _snapshots, batch_idx, n_batches, elapsed_s):
                     cpp_back = _backs.get("cpp")
@@ -7866,6 +8315,22 @@ def main(argv: Optional[list[str]] = None) -> int:
                         priority_display = _native_sensor_tile_to_display(
                             priority[..., None], output_width, output_height
                         )[..., 0]
+                    sensor_sum_display = None
+                    if hasattr(tracer, "get_sensor_image_sum_linear"):
+                        sensor_sum = np.asarray(
+                            tracer.get_sensor_image_sum_linear(), dtype=np.float32
+                        )
+                        sensor_sum_display = _native_sensor_tile_to_display(
+                            sensor_sum, output_width, output_height
+                        )[..., :3]
+                    exposure_weight_display = None
+                    if hasattr(tracer, "get_sensor_exposure_weight"):
+                        exposure_weight = np.asarray(
+                            tracer.get_sensor_exposure_weight(), dtype=np.float32
+                        )
+                        exposure_weight_display = _native_sensor_tile_to_display(
+                            exposure_weight[..., None], output_width, output_height
+                        )[..., 0]
                     _progress_sequence[0] += 1
                     event = ExposureProgressEvent(
                         exposure_id=_progress_exposure_id,
@@ -7877,13 +8342,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                         pass_index=int(batch_idx),
                         completed_work=int(batch_idx),
                         total_work=max(0, int(n_batches)),
+                        global_uv_bounds=_progress_active_uv,
                         message=(
                             "GPU sensor SSBO exposure epoch stable after "
                             f"{elapsed_s:.3f}s; linear artifact is a presentation readback"
                         ),
                     )
                     _progress_writer.publish(
-                        event, linear, epoch_count_display, priority_display
+                        event, linear, epoch_count_display, priority_display,
+                        sensor_sum_display, exposure_weight_display,
                     )
             else:
                 _publish_progress = None

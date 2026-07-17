@@ -129,8 +129,9 @@ extern "C" {
 /* Tier 3 — ideal thin-lens geometric: focus-plane convergence via thin lens */
 #define CAMERA_MODE_THIN_LENS_GEOMETRIC 3
 
-/* Tier 4 — element-by-element geometric assembly: real optical surface chain (STUB) */
-#define CAMERA_MODE_GEOMETRIC_ASSEMBLY 4
+/* Tier 4 — exact parametric compound assembly; mesh faces are BVH proxies. */
+#define CAMERA_MODE_PARAMETRIC_ASSEMBLY 4
+#define CAMERA_MODE_GEOMETRIC_ASSEMBLY CAMERA_MODE_PARAMETRIC_ASSEMBLY /* legacy */
 
 /* Tier 5 — wave-patch transport: diffraction, interference, finite-element waves (STUB) */
 #define CAMERA_MODE_WAVE_ASSEMBLY 5

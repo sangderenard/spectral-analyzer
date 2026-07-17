@@ -36,6 +36,7 @@ layout(std430, binding = 5) readonly buffer ControlBuf { uint control[]; };
 layout(std430, binding = 6) readonly buffer SensorRgbBuf { uint sensor_rgb[]; };
 layout(std430, binding = 7) readonly buffer SensorWeightBuf { uint sensor_weight[]; };
 layout(std430, binding = 8) readonly buffer LearnedMapBuf { float learned_map[]; };
+layout(std430, binding = 9) readonly buffer RequestedMapBuf { float requested_map[]; };
 
 uniform uint node_count;
 uniform uint n_bands;
@@ -43,6 +44,7 @@ uniform uint derive_from_moments;
 uniform uint sensor_res;
 uniform vec4 feature_weights;
 uniform uint learned_map_enabled;
+uniform uint requested_map_enabled;
 
 float valid_nonnegative(float value) {
     return (isnan(value) || isinf(value) || value < 0.0) ? 0.0 : value;
@@ -60,6 +62,13 @@ float sensor_luma(ivec2 p) {
     float exposure = uintBitsToFloat(sensor_weight[pix]);
     rgb = exposure > 0.0 ? rgb / exposure : vec3(0.0);
     return max(0.0, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
+}
+
+float sensor_exposure(ivec2 p) {
+    if (sensor_res == 0u) return 0.0;
+    p = clamp(p, ivec2(0), ivec2(int(sensor_res) - 1));
+    uint pix = uint(p.x) * sensor_res + uint(p.y);
+    return valid_nonnegative(uintBitsToFloat(sensor_weight[pix]));
 }
 
 void main() {
@@ -102,6 +111,9 @@ void main() {
         float image_mean = 0.0;
         float image_second = 0.0;
         float image_lit = 0.0;
+        float learned_peak = 0.0;
+        float requested_peak = 0.0;
+        float image_exposure = 0.0;
         for (int oy = -1; oy <= 1; ++oy) {
             for (int ox = -1; ox <= 1; ++ox) {
                 vec2 uv = center_uv + radius_uv * vec2(float(ox), float(oy));
@@ -109,12 +121,24 @@ void main() {
                     int(clamp(uv.y, 0.0, 0.99999994) * float(sensor_res)),
                     int(clamp(uv.x, 0.0, 0.99999994) * float(sensor_res)));
                 float value = sensor_luma(pixel);
+                image_exposure += sensor_exposure(pixel);
                 image_mean += value;
                 image_second += value * value;
                 image_lit += value > 0.0 ? 1.0 : 0.0;
+                if (learned_map_enabled != 0u) {
+                    uint learned_pixel = uint(pixel.x) * sensor_res + uint(pixel.y);
+                    learned_peak = max(learned_peak, valid_nonnegative(learned_map[learned_pixel]));
+                }
+                if (requested_map_enabled != 0u) {
+                    uint requested_pixel = uint(pixel.x) * sensor_res + uint(pixel.y);
+                    requested_peak = max(
+                        requested_peak,
+                        valid_nonnegative(requested_map[requested_pixel]));
+                }
             }
         }
         image_mean /= 9.0;
+        image_exposure /= 9.0;
         float image_variance = max(0.0, image_second / 9.0 - image_mean * image_mean);
         float image_ambiguity = sqrt(image_variance) / max(image_mean, 1.0e-7);
         float incomplete_support = image_lit > 0.0 ? (1.0 - image_lit / 9.0) : 0.0;
@@ -124,16 +148,16 @@ void main() {
          * channel for the compact discriminator network. */
         f.uncertainty = min(relative_uncertainty, 100.0);
         f.ambiguity = min(contrast, 1.0);
-        ivec2 center_pixel = ivec2(
-            int(clamp(center_uv.y, 0.0, 0.99999994) * float(sensor_res)),
-            int(clamp(center_uv.x, 0.0, 0.99999994) * float(sensor_res)));
-        uint learned_pixel = uint(center_pixel.x) * sensor_res + uint(center_pixel.y);
         f.learned = learned_map_enabled != 0u
-            ? learned_map[learned_pixel]
+            ? learned_peak
             : min(image_ambiguity, 10.0) + incomplete_support;
         float inherited = node.parent_id < node_count
             ? 0.1 * nodes[node.parent_id].priority : 0.0;
-        f.requested = max(0.01, inherited);
+        /* Authored work requests identify where evidence is needed, not a
+         * permanent burn-in priority. As exposure returns, their pressure
+         * decays and underexposed sibling UI chunks overtake them. */
+        float unresolved_request = requested_peak / sqrt(1.0 + image_exposure);
+        f.requested = max(max(0.01, inherited), unresolved_request);
     } else {
         f = features[node_id];
     }

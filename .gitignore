@@ -21,6 +21,7 @@ Thumbs.db
 *.npy
 *.npz
 /exposures/
+/exposures_test_temp/
 *summary.json
 .*
 # Environments

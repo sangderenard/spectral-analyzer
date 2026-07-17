@@ -1979,7 +1979,31 @@ def _auto_fit_scene_view_to_mesh(scene: SceneConfig, tri_arr: np.ndarray) -> Non
         )
 
 
-def _compound_lens_from_scene(scene: SceneConfig) -> CompoundLens:
+def _spectral_index_for_lens(
+    cfg: LensConfig,
+    sidecar: Optional[FreeFrequencySidecar],
+) -> Optional[np.ndarray]:
+    """Return the same measured n(lambda) used by the lens material bands."""
+    if sidecar is None:
+        return None
+    wl_um = np.maximum(np.asarray(sidecar.wavelength_nm, np.float64), 1.0) * 1.0e-3
+    lambda_ref_um = 0.589
+    try:
+        measured = _sellmeier_n(str(cfg.glass), wl_um)
+        reference = float(_sellmeier_n(str(cfg.glass), np.array([lambda_ref_um]))[0])
+        values = float(cfg.ior) + (measured - reference)
+    except KeyError:
+        cauchy_b_um2 = 0.00420
+        values = float(cfg.ior) + cauchy_b_um2 * (
+            1.0 / np.square(wl_um) - 1.0 / (lambda_ref_um * lambda_ref_um)
+        )
+    return np.ascontiguousarray(np.maximum(values, 1.0), np.float32)
+
+
+def _compound_lens_from_scene(
+    scene: SceneConfig,
+    sidecar: Optional[FreeFrequencySidecar] = None,
+) -> CompoundLens:
     """Build the canonical parametric optical model from SceneConfig.
 
     Mesh generation and optical transport both consume the same LensConfig list,
@@ -1993,6 +2017,11 @@ def _compound_lens_from_scene(scene: SceneConfig) -> CompoundLens:
         if not _lens_is_valid(cfg):
             continue
         n_glass = float(max(1.0, cfg.ior))
+        n_glass_spectral = _spectral_index_for_lens(cfg, sidecar)
+        n_air_spectral = (
+            None if n_glass_spectral is None
+            else np.ones_like(n_glass_spectral, dtype=np.float32)
+        )
         elements.append((
             float(cfg.x_front),
             CompoundConicSurface(
@@ -2002,6 +2031,8 @@ def _compound_lens_from_scene(scene: SceneConfig) -> CompoundLens:
                 n_after=n_glass,
                 aperture_r=float(cfg.aperture_radius),
                 conic_k=0.0,
+                n_before_spectral=n_air_spectral,
+                n_after_spectral=n_glass_spectral,
             ),
         ))
         elements.append((
@@ -2013,6 +2044,8 @@ def _compound_lens_from_scene(scene: SceneConfig) -> CompoundLens:
                 n_after=n_air,
                 aperture_r=float(cfg.aperture_radius),
                 conic_k=0.0,
+                n_before_spectral=n_glass_spectral,
+                n_after_spectral=n_air_spectral,
             ),
         ))
 
@@ -2032,7 +2065,11 @@ def _compound_lens_from_scene(scene: SceneConfig) -> CompoundLens:
     return lens
 
 
-def _compound_lens_from_stack(lens_stack, iris_aperture=None) -> CompoundLens:
+def _compound_lens_from_stack(
+    lens_stack,
+    iris_aperture=None,
+    sidecar: Optional[FreeFrequencySidecar] = None,
+) -> CompoundLens:
     """Build CompoundLens directly from a lens stack without calling _scene_lenses().
 
     Used for live element adjustment so apply_to_scene() is never triggered.
@@ -2044,17 +2081,26 @@ def _compound_lens_from_stack(lens_stack, iris_aperture=None) -> CompoundLens:
         if not _lens_is_valid(cfg):
             continue
         n_glass = float(max(1.0, cfg.ior))
+        n_glass_spectral = _spectral_index_for_lens(cfg, sidecar)
+        n_air_spectral = (
+            None if n_glass_spectral is None
+            else np.ones_like(n_glass_spectral, dtype=np.float32)
+        )
         elements.append((float(cfg.x_front), CompoundConicSurface(
             x_pos=float(cfg.x_front),
             R_curvature=float(cfg.radius_front),
             n_before=n_air, n_after=n_glass,
             aperture_r=float(cfg.aperture_radius), conic_k=0.0,
+            n_before_spectral=n_air_spectral,
+            n_after_spectral=n_glass_spectral,
         )))
         elements.append((float(cfg.x_back), CompoundConicSurface(
             x_pos=float(cfg.x_back),
             R_curvature=-float(cfg.radius_back),
             n_before=n_glass, n_after=n_air,
             aperture_r=float(cfg.aperture_radius), conic_k=0.0,
+            n_before_spectral=n_glass_spectral,
+            n_after_spectral=n_air_spectral,
         )))
     if iris_aperture is not None and bool(getattr(iris_aperture, "enabled", False)):
         elements.append((float(iris_aperture.x_pos), CompoundApertureStop(
@@ -5923,7 +5969,7 @@ class ForwardCppLensBench:
         if self._lens_assembly is None:
             self._lens_assembly = LensAssemblySpec()
         self._lens_assembly.set_optics(
-            _compound_lens_from_scene(self.scene),
+            _compound_lens_from_scene(self.scene, self.sidecar),
             mode=LensAssemblySpec.MODE_PARAMETRIC,
         )
         # Assembly now owns the sensor plate and iris aperture.  All backward-ray
@@ -9260,7 +9306,9 @@ class ForwardCppLensBench:
         with self._trace_lock:
             self._reset_native_morton_schedules(reset_pipeline=True, reason="lens-live")
             if self._lens_assembly is not None and self._lens_assembly.mode == LensAssemblySpec.MODE_PARAMETRIC:
-                new_cl = _compound_lens_from_stack(lenses, getattr(self.scene, "iris_aperture", None))
+                new_cl = _compound_lens_from_stack(
+                    lenses, getattr(self.scene, "iris_aperture", None), self.sidecar
+                )
                 self._lens_assembly.set_optics(new_cl)
                 lsg = getattr(self, "lens_surface_groups", None)
                 if lsg:
@@ -9474,7 +9522,7 @@ class ForwardCppLensBench:
         # Rebuild CompoundLens from the updated stack and push a new payload.
         if self._lens_assembly is not None and \
                 self._lens_assembly.mode == LensAssemblySpec.MODE_PARAMETRIC:
-            new_cl = _compound_lens_from_stack(new_lenses, iris)
+            new_cl = _compound_lens_from_stack(new_lenses, iris, self.sidecar)
             self._lens_assembly.set_optics(new_cl)
 
         self._reconfigure_optics_live()
@@ -9556,7 +9604,7 @@ class ForwardCppLensBench:
         # Sensor position: paraxial image of the current focus distance on the
         # new CompoundLens.  The sensor is the fixed film plane; we move it to
         # where the image actually forms for this zoom + focus combination.
-        new_cl = _compound_lens_from_stack(new_lenses, iris)
+        new_cl = _compound_lens_from_stack(new_lenses, iris, self.sidecar)
         u_m = float(getattr(self.scene, "focus_distance_m", 1.0) or 1.0)
         first_front = float(new_lenses[0].x_front)
         new_sensor_x = _paraxial_image_x(new_cl, first_front - u_m)
@@ -11859,7 +11907,7 @@ def run(
         bench._register_neural_payload(_na_payload, _na_payload_bwd)
     elif parametric:
         # ── Exact algebraic parametric lens: bypass LUT/MLP entirely ─────────
-        _cl = _compound_lens_from_scene(bench.scene)
+        _cl = _compound_lens_from_scene(bench.scene, bench.sidecar)
         print(
             f"[parametric] CompoundLens: {len(_cl.elements)} elements"
             f"  f_eff={_cl.f_eff * 1e3:.1f} mm  f/{_cl.f_number:.1f}",

@@ -1,7 +1,7 @@
-"""Top-k ordering for an unconditionally recursive sensor frontier."""
+"""Top-k ordering for an explicitly recursive sensor frontier."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping
 
 from .sensor_mipmap import SensorUvBounds, SparseSensorMipmap
@@ -29,15 +29,12 @@ class RefinementWork:
     subdivision_level: int
     sample_index: int
     priority: float = 0.0
+    coverage: bool = False
+    split_requested: bool = False
 
 
 class RecursiveSensorWorkScheduler:
-    """Order a sparse frontier without controlling whether subdivision occurs.
-
-    Completing any nonterminal node always creates and enqueues all nine
-    children. At maximum depth the same node is queued for a new independent
-    sample epoch. Learned scores only determine top-k removal order.
-    """
+    """Order a sparse frontier while keeping sampling separate from splitting."""
 
     def __init__(self, n_bands: int, *, maximum_depth: int) -> None:
         self.mipmap = SparseSensorMipmap(n_bands, maximum_depth=maximum_depth)
@@ -60,9 +57,11 @@ class RecursiveSensorWorkScheduler:
                 subdivision_level=previous.subdivision_level,
                 sample_index=previous.sample_index,
                 priority=value,
+                coverage=previous.coverage,
+                split_requested=previous.split_requested,
             )
 
-    def top_k(self, count: int) -> list[RefinementWork]:
+    def top_k(self, count: int, *, request_split: bool = True) -> list[RefinementWork]:
         if count <= 0:
             raise ValueError("top-k count must be positive")
         ordered = sorted(
@@ -71,14 +70,51 @@ class RecursiveSensorWorkScheduler:
         )[:count]
         for work in ordered:
             del self._pending[work.node_id]
-        return ordered
+        return [
+            replace(
+                work,
+                split_requested=bool(
+                    request_split
+                    and work.subdivision_level < self.mipmap.maximum_depth
+                ),
+            )
+            for work in ordered
+        ]
+
+    def coverage_k(self, count: int, *, coverage_depth: int) -> list[RefinementWork]:
+        """Take the oldest/coarsest broad work independently of learned value."""
+        if count <= 0:
+            raise ValueError("coverage count must be positive")
+        depth = max(0, min(int(coverage_depth), self.mipmap.maximum_depth))
+        ordered = sorted(
+            self._pending.values(),
+            key=lambda work: (
+                work.subdivision_level,
+                self.mipmap.nodes[work.node_id].completed_epochs,
+                work.sample_index,
+                _locality_key(work.bounds),
+                work.node_id,
+            ),
+        )[:count]
+        for work in ordered:
+            del self._pending[work.node_id]
+        return [
+            replace(
+                work,
+                coverage=True,
+                split_requested=work.subdivision_level < depth,
+            )
+            for work in ordered
+        ]
 
     def next(self) -> RefinementWork | None:
         work = self.top_k(1)
         return work[0] if work else None
 
     def complete(self, work: RefinementWork) -> tuple[RefinementWork, ...]:
-        child_ids = self.mipmap.complete_work(work.node_id)
+        child_ids = self.mipmap.complete_work(
+            work.node_id, subdivide=work.split_requested
+        )
         if child_ids:
             created = tuple(
                 RefinementWork(

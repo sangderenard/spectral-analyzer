@@ -238,6 +238,7 @@ bool vertex_connectable(uint vinfo, uint vflags, uint pdf_flags, uint opt_block)
     if ((vinfo     >> 31)                          == 0u) return false; /* tri_id < 0 */
     if ((vflags    & MAT_FLAG_APERTURE_STOP)       != 0u) return false;
     if ( opt_block                                 != 0u) return false;
+    if ((pdf_flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u) return false;
     return true;
 }
 
@@ -850,6 +851,14 @@ void main() {
 
         const bool c_ok = vertex_connectable(c_vinfo, c_flags, c_pdf_flags, c_optical_blk);
         const bool l_ok = vertex_connectable(l_vinfo, l_flags, l_pdf_flags, l_optical_blk);
+        if (t5_debug_enabled != 0 && (c_vinfo >> 31) != 0u) {
+            const uint region_bin = c_pos.x < 1.0f ? 0u : (c_pos.x > 3.0f ? 2u : 1u);
+            atomicAdd(debug_counts[87u + region_bin], 1u);
+            if (c_ok)
+                atomicAdd(debug_counts[90u + region_bin], 1u);
+            if ((c_pdf_flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u)
+                atomicAdd(debug_counts[93u + region_bin], 1u);
+        }
         if (t5_debug_enabled != 0 && c_ok) atomicAdd(debug_counts[1], 1u);
         if (t5_debug_enabled != 0 && l_ok) atomicAdd(debug_counts[2], 1u);
         if (t5_debug_enabled != 0 && c_ok &&
@@ -958,11 +967,49 @@ void main() {
                         }
                         if (t5_debug_enabled != 0 && contrib > 0.0f && !isinf(contrib) && !isnan(contrib))
                             atomicAdd(debug_counts[7], 1u);
+                        if (t5_debug_enabled != 0 && contrib > 0.0f && !isinf(contrib) && !isnan(contrib)) {
+                            if (c_pos.x < 1.0f) atomicAdd(debug_counts[76], 1u);
+                            if (c_pos.x > 3.0f) atomicAdd(debug_counts[77], 1u);
+                            if (li_v == 0u) atomicAdd(debug_counts[78], 1u);
+                        }
                         if (t5_debug_enabled != 0 && li_v == 0u && contrib > 0.0f && !isinf(contrib) && !isnan(contrib))
                             atomicAdd(debug_counts[14], 1u);
                         if (contrib > 0.0f && !isinf(contrib) && !isnan(contrib)) {
-                            const bool occluded = shadow_occluded_except(
-                                c_pos, l_pos, c_tri_id, l_tri_id);
+                            float blocker_t = -1.0f;
+                            float blocker_dist = 0.0f;
+                            const int blocker_tri = shadow_first_blocker_except(
+                                c_pos, l_pos, c_tri_id, l_tri_id,
+                                blocker_t, blocker_dist);
+                            const bool occluded = blocker_tri >= 0;
+                            if (t5_debug_enabled != 0 && occluded) {
+                                uint blocker_flags = floatBitsToUint(
+                                    shadow_trifull[blocker_tri * TRI_FULL_STRIDE + 12]);
+                                if ((blocker_flags & SHADOW_MAT_FLAG_APERTURE_STOP) != 0u)
+                                    atomicAdd(debug_counts[68], 1u);
+                                else if ((blocker_flags & 1u) != 0u)
+                                    atomicAdd(debug_counts[69], 1u);
+                                else if ((blocker_flags & SHADOW_MAT_FLAG_TRANSMISSIVE) != 0u)
+                                    atomicAdd(debug_counts[70], 1u);
+                                else
+                                    atomicAdd(debug_counts[71], 1u);
+                                if (blocker_t < 1.0e-3f)
+                                    atomicAdd(debug_counts[72], 1u);
+                                if (blocker_dist - blocker_t < 1.0e-3f)
+                                    atomicAdd(debug_counts[73], 1u);
+                                atomicMin(debug_counts[74], uint(blocker_tri));
+                                atomicMax(debug_counts[75], uint(blocker_tri));
+                                if (c_pos.x < 1.0f) atomicAdd(debug_counts[79], 1u);
+                                if (c_pos.x < 1.0f && li_v == 0u)
+                                    atomicAdd(debug_counts[80], 1u);
+                                atomicAdd(debug_counts[81], uint(max(c_pos.x, 0.0f) * 1000.0f));
+                                int blocker_mat = floatBitsToInt(
+                                    shadow_trifull[blocker_tri * TRI_FULL_STRIDE + 13]);
+                                if (blocker_mat == 0) atomicAdd(debug_counts[82], 1u);
+                                else if (blocker_mat == 1) atomicAdd(debug_counts[83], 1u);
+                                else if (blocker_mat == 2) atomicAdd(debug_counts[84], 1u);
+                                else if (blocker_mat == 8) atomicAdd(debug_counts[85], 1u);
+                                else atomicAdd(debug_counts[86], 1u);
+                            }
                             if (t5_profile_mode == 6) return;
                             if (!occluded) {
                                 if (t5_debug_enabled != 0) atomicAdd(debug_counts[8], 1u);

@@ -15,6 +15,7 @@ enum SensorMipNodeFlags : uint32_t {
     SENSOR_MIP_NODE_ROLL_VALID  = 1u << 4,
     SENSOR_MIP_NODE_DIRTY       = 1u << 5,
     SENSOR_MIP_NODE_TERMINAL    = 1u << 6,
+    SENSOR_MIP_NODE_COVERAGE_ANCHOR = 1u << 7,
 };
 
 static constexpr uint32_t SENSOR_MIP_NO_NODE = 0xFFFFFFFFu;

@@ -449,6 +449,12 @@ class ConicSurface:
     n_after:    float
     aperture_r: float
     conic_k:    float = 0.0
+    # Optional refractive-index samples in the tracer's spectral-band order.
+    # Scalar n_before/n_after remain the paraxial/reference values used by the
+    # CPU design tools.  The exact GPU transport selects one pair from these
+    # arrays for the wavelength carried by the current Monte-Carlo path.
+    n_before_spectral: Optional[Sequence[float]] = None
+    n_after_spectral: Optional[Sequence[float]] = None
 
     def refract(
         self,
@@ -491,6 +497,8 @@ class FlatSurface:
     n_before:  float
     n_after:   float
     aperture_r: float
+    n_before_spectral: Optional[Sequence[float]] = None
+    n_after_spectral: Optional[Sequence[float]] = None
 
     def refract(
         self,
@@ -1790,7 +1798,9 @@ class CompoundLens:
           [2]  hood_r_opening (0 = no hood)
           [3]  hood_x_front
           [4]  hood_x_rim
-          [5..7] reserved
+          [5]  n_spectral_bands (0 = scalar-index legacy payload)
+          [6]  spectral table offset (float index)
+          [7]  spectral values per surface (= 2 * n_spectral_bands)
 
         Per surface  (PLENS_SURF_STRIDE = 8 floats each):
           [0]  x_pos
@@ -1801,16 +1811,43 @@ class CompoundLens:
           [5]  conic_k
           [6]  flags  (bit 0 = is_stop: aperture check only, no refraction)
           [7]  reserved
+
+        Optional spectral tail, surface-major:
+          n_before[0:n_spectral_bands], n_after[0:n_spectral_bands]
+
+        A native camera path carries one sampled wavelength per ray.  Keeping
+        the wavelength table in this exact-conic payload therefore permits
+        dispersive Snell/Fresnel transport without splitting a ray into bands.
         """
         refracting = [
             el for el in self._elements
             if isinstance(el, (ConicSurface, FlatSurface, ApertureStop))
         ]
         n = len(refracting)
-        buf = np.zeros(PLENS_HEADER + n * PLENS_SURF_STRIDE, dtype=np.float32)
+        spectral_lengths = {
+            len(np.asarray(values).reshape(-1))
+            for el in refracting
+            for values in (
+                getattr(el, "n_before_spectral", None),
+                getattr(el, "n_after_spectral", None),
+            )
+            if values is not None
+        }
+        if len(spectral_lengths) > 1:
+            raise ValueError("all parametric lens spectral index tables must have equal length")
+        n_spectral = next(iter(spectral_lengths), 0)
+        spectral_offset = PLENS_HEADER + n * PLENS_SURF_STRIDE
+        spectral_stride = 2 * n_spectral
+        buf = np.zeros(
+            spectral_offset + n * spectral_stride,
+            dtype=np.float32,
+        )
 
         buf[0] = PLENS_MAGIC
         buf[1] = float(n)
+        buf[5] = float(n_spectral)
+        buf[6] = float(spectral_offset if n_spectral else 0)
+        buf[7] = float(spectral_stride)
         if self.hood is not None:
             buf[2] = float(self.hood.r_opening)
             buf[3] = float(self.hood.x_front)
@@ -1843,6 +1880,30 @@ class CompoundLens:
                 buf[off + 5] = float(el.conic_k)
                 buf[off + 6] = 0.0
 
+            if n_spectral:
+                spectral_base = spectral_offset + i * spectral_stride
+                scalar_before = float(getattr(el, "n_medium", getattr(el, "n_before", 1.0)))
+                scalar_after = float(getattr(el, "n_medium", getattr(el, "n_after", 1.0)))
+                before_values = getattr(el, "n_before_spectral", None)
+                after_values = getattr(el, "n_after_spectral", None)
+                before = (
+                    np.full(n_spectral, scalar_before, np.float32)
+                    if before_values is None
+                    else np.asarray(before_values, np.float32).reshape(-1)
+                )
+                after = (
+                    np.full(n_spectral, scalar_after, np.float32)
+                    if after_values is None
+                    else np.asarray(after_values, np.float32).reshape(-1)
+                )
+                if before.size != n_spectral or after.size != n_spectral:
+                    raise ValueError("parametric lens spectral index table length changed while packing")
+                buf[spectral_base:spectral_base + n_spectral] = before
+                buf[
+                    spectral_base + n_spectral:
+                    spectral_base + 2 * n_spectral
+                ] = after
+
         return buf
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -1857,7 +1918,11 @@ class CompoundLens:
             if isinstance(el, ApertureStop):
                 rev.append(ApertureStop(el.x_pos, el.r_clear, el.n_medium))
             elif isinstance(el, FlatSurface):
-                rev.append(FlatSurface(el.x_pos, el.n_after, el.n_before, el.aperture_r))
+                rev.append(FlatSurface(
+                    el.x_pos, el.n_after, el.n_before, el.aperture_r,
+                    n_before_spectral=el.n_after_spectral,
+                    n_after_spectral=el.n_before_spectral,
+                ))
             elif isinstance(el, ConicSurface):
                 rev.append(ConicSurface(
                     x_pos=float(el.x_pos),
@@ -1866,6 +1931,8 @@ class CompoundLens:
                     n_after=float(el.n_before),
                     aperture_r=float(el.aperture_r),
                     conic_k=float(el.conic_k),
+                    n_before_spectral=el.n_after_spectral,
+                    n_after_spectral=el.n_before_spectral,
                 ))
         return rev
 
@@ -1879,7 +1946,11 @@ class CompoundLens:
             if isinstance(el, ApertureStop):
                 rev.append((idx, ApertureStop(el.x_pos, el.r_clear, el.n_medium)))
             elif isinstance(el, FlatSurface):
-                rev.append((idx, FlatSurface(el.x_pos, el.n_after, el.n_before, el.aperture_r)))
+                rev.append((idx, FlatSurface(
+                    el.x_pos, el.n_after, el.n_before, el.aperture_r,
+                    n_before_spectral=el.n_after_spectral,
+                    n_after_spectral=el.n_before_spectral,
+                )))
             elif isinstance(el, ConicSurface):
                 rev.append((idx, ConicSurface(
                     x_pos=float(el.x_pos),
@@ -1888,6 +1959,8 @@ class CompoundLens:
                     n_after=float(el.n_before),
                     aperture_r=float(el.aperture_r),
                     conic_k=float(el.conic_k),
+                    n_before_spectral=el.n_after_spectral,
+                    n_after_spectral=el.n_before_spectral,
                 )))
         return rev
 

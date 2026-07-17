@@ -41,6 +41,7 @@ layout(local_size_x = 64) in;
 #define MAX_BANDS       32
 #define INTENT_STRIDE   (20 + 2 * MAX_BANDS)   /* child region stride = 84 floats */
 #define TERMINAL_STRIDE (26 + 2 * MAX_BANDS)   /* terminal record stride = 90 floats */
+#define CAMERA_PATH_SCATTERED_BIT 16u
 
 layout(std430, binding = 0) readonly buffer ChildIntBuf {
     float child_int_buf[];
@@ -169,10 +170,14 @@ void main() {
     /* Base offset into ChildIntBuf for this terminal record */
     const int base = term_float_base + ti * TERMINAL_STRIDE;
 
-    /* Only accumulate backward sensor rays that hit an emissive surface */
+    /* This strategy represents direct camera visibility through the camera
+     * optics. Emitter hits after an authored scene-material scatter remain in
+     * BDPT/VCM and must not enter this unpaired terminal splat. */
     const uint color_flag  = floatBitsToUint(child_int_buf[base + 16]);
     const uint is_emissive = floatBitsToUint(child_int_buf[base + 25]);
-    if (is_emissive == 0u || ((color_flag & 1u) == 0u)) return;
+    if (is_emissive == 0u
+        || ((color_flag & 1u) == 0u)
+        || ((color_flag & CAMERA_PATH_SCATTERED_BIT) != 0u)) return;
     const int mat_id = floatBitsToInt(child_int_buf[base + 15]);
     const uint tag_lo = floatBitsToUint(child_int_buf[base + 21]);
     const uint tag_hi = floatBitsToUint(child_int_buf[base + 22]);

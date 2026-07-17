@@ -19,7 +19,7 @@ from bdpt_integrator import (
     CAMERA_MODE_PHYSICAL_PINHOLE,
     CAMERA_MODE_APERTURE_CONE,
     CAMERA_MODE_THIN_LENS_GEOMETRIC,
-    CAMERA_MODE_GEOMETRIC_ASSEMBLY,
+    CAMERA_MODE_PARAMETRIC_ASSEMBLY,
     CAMERA_MODE_WAVE_ASSEMBLY,
     CAMERA_MODE_BAKED_TRANSFORM,
 )
@@ -248,9 +248,9 @@ CAMERA_MODE_CONSTRAINTS = {
         requires_focus_distance_m=True,
     ),
 
-    CAMERA_MODE_GEOMETRIC_ASSEMBLY: CameraModeConstraints(
-        mode=CAMERA_MODE_GEOMETRIC_ASSEMBLY,
-        mode_name="GEOMETRIC_ASSEMBLY",
+    CAMERA_MODE_PARAMETRIC_ASSEMBLY: CameraModeConstraints(
+        mode=CAMERA_MODE_PARAMETRIC_ASSEMBLY,
+        mode_name="PARAMETRIC_ASSEMBLY",
         allows_nonzero_aperture_radius=True,
         allows_aperture_stop_geometry=True,
         lens_event_count_must_be_nonzero=True,  # Full element chain must participate

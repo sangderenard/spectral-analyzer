@@ -1,7 +1,14 @@
 import numpy as np
 
 from camera_designer.camera_preset import simple_doublet_preset
-from camera_designer.compound_optics import CompoundLens, RayBundle, TerminationReason
+from camera_designer.compound_optics import (
+    CompoundLens,
+    ConicSurface,
+    RayBundle,
+    TerminationReason,
+    PLENS_HEADER,
+    PLENS_SURF_STRIDE,
+)
 from camera_designer.lens_assembly import ApertureSpec, LensAssemblySpec, StraightBoxSpec
 
 
@@ -51,6 +58,56 @@ def test_backward_parametric_payload_stays_canonical():
     bwd = assembly.build_parametric_payload_backward()
 
     assert np.array_equal(bwd, fwd)
+
+
+def test_parametric_payload_carries_per_wavelength_refractive_indices():
+    lens = CompoundLens()
+    lens.add(ConicSurface(
+        x_pos=0.1,
+        R_curvature=0.04,
+        n_before=1.0,
+        n_after=1.52,
+        aperture_r=0.02,
+        n_before_spectral=[1.0, 1.0, 1.0],
+        n_after_spectral=[1.530, 1.520, 1.515],
+    ))
+
+    payload = lens.build_gpu_payload()
+
+    assert int(payload[5]) == 3
+    assert int(payload[6]) == PLENS_HEADER + PLENS_SURF_STRIDE
+    assert int(payload[7]) == 6
+    spectral = payload[int(payload[6]):]
+    assert np.allclose(spectral[:3], [1.0, 1.0, 1.0])
+    assert np.allclose(spectral[3:], [1.530, 1.520, 1.515])
+
+
+def test_thick_lens_parametric_payload_uses_named_glass_dispersion():
+    from thick_lens_focus_lab import (
+        FreeFrequencySidecar,
+        LensConfig,
+        SceneConfig,
+        _compound_lens_from_scene,
+    )
+
+    scene = SceneConfig()
+    scene.optical_design = None
+    scene.iris_aperture = None
+    scene.lens_stack = [LensConfig(0.5, 0.04, 0.025, 0.08, 0.09, 1.52, "N-BK7")]
+    sidecar = FreeFrequencySidecar.from_prepared([450.0, 550.0, 650.0])
+
+    payload = _compound_lens_from_scene(scene, sidecar).build_gpu_payload()
+    spectral_offset = int(payload[6])
+    spectral_stride = int(payload[7])
+    n_spectral = int(payload[5])
+    front_after = payload[
+        spectral_offset + n_spectral:
+        spectral_offset + 2 * n_spectral
+    ]
+
+    assert spectral_stride == 2 * n_spectral
+    assert n_spectral == 3
+    assert front_after[0] > front_after[-1]
 
 
 def test_backward_ray_target_reports_virtual_pupil_without_iris_fallback():

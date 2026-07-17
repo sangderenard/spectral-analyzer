@@ -70,6 +70,9 @@ layout(local_size_x = 64) in;
 #define PLENS_HOOD_R      2
 #define PLENS_HOOD_XF     3    /* hood x_front */
 #define PLENS_HOOD_XR     4    /* hood x_rim */
+#define PLENS_N_SPECTRAL  5    /* per-surface refractive-index samples */
+#define PLENS_SPEC_OFFSET 6    /* float offset of spectral tail */
+#define PLENS_SPEC_STRIDE 7    /* floats per surface in spectral tail */
 #define PLENS_HEADER      8    /* floats before first surface record */
 #define PLENS_SURF_STRIDE 8
 #define PLENS_MAX_SURF    24   /* max surfaces supported in shader */
@@ -352,6 +355,24 @@ void parametric_lens_teleport(int hb, int pay_off)
     vec3 ray_pos = vec3(hit_f(hb, 0), hit_f(hb, 1), hit_f(hb, 2));
     vec3 ray_dir = normalize(vec3(hit_f(hb, 6), hit_f(hb, 7), hit_f(hb, 8)));
     bool is_backward = ((hit_u(hb, 16) & 1u) != 0u);
+    int spectral_count = max(0, int(npay[pay_off + PLENS_N_SPECTRAL]));
+    int spectral_offset = max(0, int(npay[pay_off + PLENS_SPEC_OFFSET]));
+    int spectral_stride = max(0, int(npay[pay_off + PLENS_SPEC_STRIDE]));
+    /* Native camera and emitter launchers carry one sampled wavelength per
+     * path. Find that lane so exact Snell/Fresnel uses n(lambda), while scalar
+     * legacy payloads continue to use the reference index. */
+    int active_band = 0;
+    float active_power = -1.0;
+    int active_count = min(n_bands, MAX_GPU_BANDS);
+    for (int b = 0; b < active_count; ++b) {
+        float ar = hit_f(hb, 26 + b);
+        float ai = hit_f(hb, 26 + MAX_GPU_BANDS + b);
+        float power = ar*ar + ai*ai;
+        if (power > active_power) {
+            active_power = power;
+            active_band = b;
+        }
+    }
 
     /* Lens hood: project to hood opening plane and check radius */
     if (!is_backward && hood_r > 0.0 && abs(ray_dir.x) > EPS) {
@@ -376,8 +397,16 @@ void parametric_lens_teleport(int hb, int pay_off)
         int   sb     = pay_off + PLENS_HEADER + s * PLENS_SURF_STRIDE;
         float x_v    = npay[sb + PLENS_S_XPOS];
         float R      = npay[sb + PLENS_S_RCURV];
-        float n_bef  = is_backward ? npay[sb + PLENS_S_NAFT] : npay[sb + PLENS_S_NBEF];
-        float n_aft  = is_backward ? npay[sb + PLENS_S_NBEF] : npay[sb + PLENS_S_NAFT];
+        float n_forward_before = npay[sb + PLENS_S_NBEF];
+        float n_forward_after  = npay[sb + PLENS_S_NAFT];
+        if (spectral_count > 0 && active_band < spectral_count &&
+                spectral_stride >= 2 * spectral_count) {
+            int spectral_base = pay_off + spectral_offset + s * spectral_stride;
+            n_forward_before = npay[spectral_base + active_band];
+            n_forward_after = npay[spectral_base + spectral_count + active_band];
+        }
+        float n_bef  = is_backward ? n_forward_after : n_forward_before;
+        float n_aft  = is_backward ? n_forward_before : n_forward_after;
         float ap_r   = npay[sb + PLENS_S_APR];
         float k      = npay[sb + PLENS_S_CONIK];
         bool  is_stop= (int(npay[sb + PLENS_S_FLAGS]) & 1) != 0;

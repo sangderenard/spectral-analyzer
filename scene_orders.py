@@ -71,8 +71,9 @@ def validate_order(payload: dict[str, Any]) -> None:
             raise ValueError(f"jobs[{i}].id must be non-empty and unique")
         seen.add(job_id)
         token = str(raw.get("token", ""))
-        if not token:
-            raise ValueError(f"job {job_id!r} requires a token")
+        inherited_objects = payload.get("defaults", {}).get("objects", ())
+        if not token and not raw.get("objects") and not inherited_objects:
+            raise ValueError(f"job {job_id!r} requires a token or display objects")
 
 
 def resolved_jobs(payload: dict[str, Any], job_id: str | None = None) -> list[dict[str, Any]]:
@@ -108,14 +109,15 @@ def _positive(value: Any, name: str, allow_zero: bool = False) -> float:
 def _validate_resolved_job(job: dict[str, Any]) -> None:
     supported = {
         "id", "token", "image", "camera", "exposure", "flash", "font",
-        "planes", "materials", "geometry"
+        "planes", "materials", "geometry", "objects"
     }
     unknown = sorted(set(job) - supported)
     if unknown:
         raise ValueError(f"job {job['id']!r}: unsupported fields {unknown}")
     token = str(job.get("token", ""))
-    if not token.strip():
-        raise ValueError(f"job {job['id']!r}: token must be non-empty text")
+    display_objects = job.get("objects", ())
+    if not token.strip() and not display_objects:
+        raise ValueError(f"job {job['id']!r}: token or objects must be supplied")
     contracts = {
         "image": {"width", "height", "region"},
         "camera": {
@@ -192,7 +194,8 @@ def _validate_resolved_job(job: dict[str, Any]) -> None:
             raise ValueError(f"job {job['id']!r}: plane ids must be unique")
         plane_ids.add(pid)
         plane_extra = sorted(set(plane) - {
-            "id", "center_m", "normal", "up", "size_m", "thickness_m", "material"
+            "id", "center_m", "normal", "up", "size_m", "thickness_m", "material",
+            "bevel_width_m", "bevel_depth_m", "bevel_profile", "bevel_seams",
         })
         if plane_extra:
             raise ValueError(f"plane {pid}: unsupported fields {plane_extra}")
@@ -203,6 +206,20 @@ def _validate_resolved_job(job: dict[str, Any]) -> None:
         if np.any(size <= 0.0):
             raise ValueError(f"plane {pid}.size_m must be positive")
         _positive(plane.get("thickness_m", 0.01), f"plane {pid}.thickness_m")
+        bevel_width = float(plane.get("bevel_width_m", 0.0))
+        bevel_depth = float(plane.get("bevel_depth_m", 0.0))
+        if bevel_width < 0.0 or bevel_depth < 0.0:
+            raise ValueError(f"plane {pid}: bevel dimensions must be non-negative")
+        if str(plane.get("bevel_profile", "square")) not in ("square", "chamfer"):
+            raise ValueError(f"plane {pid}: unsupported bevel profile")
+        seams = plane.get("bevel_seams", ["flush"] * 4)
+        if (
+            not isinstance(seams, list) or len(seams) != 4
+            or any(str(value) not in ("bevel", "flush") for value in seams)
+        ):
+            raise ValueError(
+                f"plane {pid}: bevel_seams must be left/right/bottom/top"
+            )
     target = str(geometry.get("embed_plane", planes[0]["id"]))
     if target not in plane_ids:
         raise ValueError(f"job {job['id']!r}: embed_plane {target!r} is not declared")
@@ -244,10 +261,59 @@ def _validate_resolved_job(job: dict[str, Any]) -> None:
         _positive(geometry.get("line_height_m", geometry.get("height_m", 0.2)),
                   "geometry.line_height_m")
         _positive(geometry.get("line_spacing", 1.2), "geometry.line_spacing")
-        if str(geometry.get("horizontal_align", "center")) != "center":
-            raise ValueError("only centered geometry.horizontal_align is currently supported")
-        if str(geometry.get("vertical_align", "center")) != "center":
-            raise ValueError("only centered geometry.vertical_align is currently supported")
+        if str(geometry.get("horizontal_align", "center")) not in (
+            "left", "center", "right"
+        ):
+            raise ValueError(
+                "geometry.horizontal_align must be left, center, or right"
+            )
+        if str(geometry.get("vertical_align", "center")) not in (
+            "bottom", "center", "top"
+        ):
+            raise ValueError(
+                "geometry.vertical_align must be bottom, center, or top"
+            )
+
+    if display_objects:
+        if not isinstance(display_objects, list):
+            raise ValueError(f"job {job['id']!r}: objects must be an array")
+        object_ids: set[str] = set()
+        for index, raw_object in enumerate(display_objects):
+            if not isinstance(raw_object, dict):
+                raise ValueError(f"objects[{index}] must be an object")
+            extra = sorted(set(raw_object) - {
+                "id", "token", "embed_plane", "font", "geometry", "enabled",
+            })
+            if extra:
+                raise ValueError(f"objects[{index}] has unsupported fields {extra}")
+            object_id = str(raw_object.get("id", "")).strip()
+            if not object_id or object_id in object_ids:
+                raise ValueError("display object ids must be non-empty and unique")
+            object_ids.add(object_id)
+            if bool(raw_object.get("enabled", True)) and not str(
+                raw_object.get("token", "")
+            ).strip():
+                raise ValueError(f"display object {object_id!r} requires authored text geometry")
+            embed_plane = str(raw_object.get("embed_plane", target))
+            if embed_plane not in plane_ids:
+                raise ValueError(
+                    f"display object {object_id!r}: embed_plane {embed_plane!r} is not declared"
+                )
+            object_font = raw_object.get("font", {})
+            object_geometry = raw_object.get("geometry", {})
+            if not isinstance(object_font, dict) or not isinstance(object_geometry, dict):
+                raise ValueError(f"display object {object_id!r}: font and geometry must be objects")
+            object_job = copy.deepcopy(job)
+            object_job.pop("objects", None)
+            object_job["token"] = str(raw_object.get("token", ""))
+            object_job["font"] = _deep_merge(
+                dict(job.get("font", {})), dict(object_font)
+            )
+            object_job["geometry"] = _deep_merge(
+                dict(job.get("geometry", {})), dict(object_geometry)
+            )
+            object_job["geometry"]["embed_plane"] = embed_plane
+            _validate_resolved_job(object_job)
 
 
 def order_runtime_settings(job: dict[str, Any]) -> dict[str, Any]:
@@ -390,6 +456,55 @@ def _box_plane_triangles(plane: dict[str, Any]) -> np.ndarray:
     center, normal, right, up = _plane_basis(plane)
     width, height = _vec(plane.get("size_m", [0.5, 0.5]), "plane.size_m", 2)
     thickness = float(plane.get("thickness_m", 0.01))
+    bevel_width = float(plane.get("bevel_width_m", 0.0))
+    bevel_depth = float(plane.get("bevel_depth_m", 0.0))
+    profile = str(plane.get("bevel_profile", "square"))
+    if profile == "chamfer" and bevel_width > 0.0 and bevel_depth > 0.0:
+        seams = tuple(map(str, plane.get("bevel_seams", ["bevel"] * 4)))
+        left = bevel_width if seams[0] == "bevel" else 0.0
+        right_inset = bevel_width if seams[1] == "bevel" else 0.0
+        bottom = bevel_width if seams[2] == "bevel" else 0.0
+        top = bevel_width if seams[3] == "bevel" else 0.0
+        hw, hh = width / 2.0, height / 2.0
+        if left + right_inset >= width or bottom + top >= height:
+            raise ValueError("plane bevel consumes the entire layout rectangle")
+        def point(x: float, y: float, depth: float) -> np.ndarray:
+            return center + right * x + up * y - normal * depth
+        outer = [
+            point(-hw, -hh, bevel_depth), point(hw, -hh, bevel_depth),
+            point(hw, hh, bevel_depth), point(-hw, hh, bevel_depth),
+        ]
+        inner = [
+            point(-hw + left, -hh + bottom, 0.0),
+            point(hw - right_inset, -hh + bottom, 0.0),
+            point(hw - right_inset, hh - top, 0.0),
+            point(-hw + left, hh - top, 0.0),
+        ]
+        back = [
+            point(-hw, -hh, thickness), point(hw, -hh, thickness),
+            point(hw, hh, thickness), point(-hw, hh, thickness),
+        ]
+        faces = [
+            (inner[0], inner[1], inner[2]), (inner[0], inner[2], inner[3]),
+            (back[0], back[2], back[1]), (back[0], back[3], back[2]),
+        ]
+        for i in range(4):
+            j = (i + 1) % 4
+            faces.extend((
+                (outer[i], outer[j], inner[j]),
+                (outer[i], inner[j], inner[i]),
+                (outer[i], back[i], back[j]),
+                (outer[i], back[j], outer[j]),
+            ))
+        triangles = np.asarray(faces, np.float64)
+        area2 = np.linalg.norm(
+            np.cross(
+                triangles[:, 1] - triangles[:, 0],
+                triangles[:, 2] - triangles[:, 0],
+            ),
+            axis=1,
+        )
+        return triangles[area2 > 1.0e-14]
     front = center
     back = center - normal * thickness
     corners = []
@@ -626,6 +741,28 @@ def _paragraph_contours(job: dict[str, Any]) -> list[np.ndarray]:
     fit_scale = min(1.0, float(np.min(text_box / extent)))
     bounds_center = 0.5 * (lo + hi)
     contours = [(contour - bounds_center) * fit_scale for contour in contours]
+    fitted_points = np.concatenate(
+        [contour[:-1] for contour in contours], axis=0
+    )
+    fitted_lo = fitted_points.min(axis=0)
+    fitted_hi = fitted_points.max(axis=0)
+    geometry = job.get("geometry", {})
+    horizontal = str(geometry.get("horizontal_align", "center"))
+    vertical = str(geometry.get("vertical_align", "center"))
+    if horizontal == "left":
+        dx = -0.5 * text_box[0] - fitted_lo[0]
+    elif horizontal == "right":
+        dx = 0.5 * text_box[0] - fitted_hi[0]
+    else:
+        dx = -0.5 * (fitted_lo[0] + fitted_hi[0])
+    if vertical == "bottom":
+        dy = -0.5 * text_box[1] - fitted_lo[1]
+    elif vertical == "top":
+        dy = 0.5 * text_box[1] - fitted_hi[1]
+    else:
+        dy = -0.5 * (fitted_lo[1] + fitted_hi[1])
+    alignment_offset = np.asarray([dx, dy], np.float64)
+    contours = [contour + alignment_offset for contour in contours]
     return contours
 
 
@@ -916,16 +1053,60 @@ def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrde
         object_ids.append(np.arange(start, start + tri.shape[0], dtype=np.int32))
         plane_triangles += int(tri.shape[0])
 
-    target_plane = planes_by_id[str(job.get("geometry", {}).get("embed_plane", job["planes"][0]["id"]))]
-    glyph_tri = _world_to_canonical_camera(
-        _glyph_triangles(job, target_plane), pose, canonical_origin
-    )
-    glyph_start = sum(part.shape[0] for part in tri_parts)
-    tri_parts.append(glyph_tri)
-    normal_parts.append(_triangle_normals(glyph_tri))
-    glyph_mat = material_index(str(job.get("geometry", {}).get("material", "glossy_red")), "glyph")
-    mat_parts.append(np.full(glyph_tri.shape[0], glyph_mat, np.int32))
-    object_ids.append(np.arange(glyph_start, glyph_start + glyph_tri.shape[0], dtype=np.int32))
+    authored_objects = job.get("objects", ())
+    glyph_triangle_total = 0
+    if authored_objects:
+        for raw_object in authored_objects:
+            if not bool(raw_object.get("enabled", True)):
+                continue
+            object_job = copy.deepcopy(job)
+            object_job.pop("objects", None)
+            object_job["token"] = str(raw_object["token"])
+            object_job["font"] = _deep_merge(
+                dict(job.get("font", {})), dict(raw_object.get("font", {}))
+            )
+            object_job["geometry"] = _deep_merge(
+                dict(job.get("geometry", {})), dict(raw_object.get("geometry", {}))
+            )
+            object_job["geometry"]["embed_plane"] = str(
+                raw_object.get(
+                    "embed_plane",
+                    object_job["geometry"].get("embed_plane", job["planes"][0]["id"]),
+                )
+            )
+            target_plane = planes_by_id[object_job["geometry"]["embed_plane"]]
+            glyph_tri = _world_to_canonical_camera(
+                _glyph_triangles(object_job, target_plane), pose, canonical_origin
+            )
+            glyph_start = sum(part.shape[0] for part in tri_parts)
+            tri_parts.append(glyph_tri)
+            normal_parts.append(_triangle_normals(glyph_tri))
+            glyph_mat = material_index(
+                str(object_job["geometry"].get("material", "glossy_red")), "glyph"
+            )
+            mat_parts.append(np.full(glyph_tri.shape[0], glyph_mat, np.int32))
+            object_ids.append(
+                np.arange(glyph_start, glyph_start + glyph_tri.shape[0], dtype=np.int32)
+            )
+            glyph_triangle_total += int(glyph_tri.shape[0])
+    else:
+        target_plane = planes_by_id[
+            str(job.get("geometry", {}).get("embed_plane", job["planes"][0]["id"]))
+        ]
+        glyph_tri = _world_to_canonical_camera(
+            _glyph_triangles(job, target_plane), pose, canonical_origin
+        )
+        glyph_start = sum(part.shape[0] for part in tri_parts)
+        tri_parts.append(glyph_tri)
+        normal_parts.append(_triangle_normals(glyph_tri))
+        glyph_mat = material_index(
+            str(job.get("geometry", {}).get("material", "glossy_red")), "glyph"
+        )
+        mat_parts.append(np.full(glyph_tri.shape[0], glyph_mat, np.int32))
+        object_ids.append(
+            np.arange(glyph_start, glyph_start + glyph_tri.shape[0], dtype=np.int32)
+        )
+        glyph_triangle_total = int(glyph_tri.shape[0])
 
     custom_buf = np.ascontiguousarray(db.build_mat_buf(), np.float32)
     if custom_buf.shape[0] % MAX_SPECTRAL_BANDS != 0:
@@ -985,10 +1166,24 @@ def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrde
         bounds_min=np.ascontiguousarray(pts.min(axis=0), np.float32),
         bounds_max=np.ascontiguousarray(pts.max(axis=0), np.float32),
         camera_tri_groups=new_groups,
+        film_plane_pose=getattr(base_scene, "film_plane_pose", None),
+        optical_camera=(
+            None
+            if getattr(base_scene, "optical_camera", None) is None
+            else base_scene.optical_camera.remap_triangles(remap)
+        ),
+    )
+    report_token = (
+        str(job.get("token", ""))
+        if not authored_objects
+        else " | ".join(
+            str(item.get("token", ""))
+            for item in authored_objects if bool(item.get("enabled", True))
+        )
     )
     report = CompiledOrderReport(
-        job_id=str(job["id"]), token=str(job["token"]),
-        plane_triangles=plane_triangles, glyph_triangles=int(glyph_tri.shape[0]),
+        job_id=str(job["id"]), token=report_token,
+        plane_triangles=plane_triangles, glyph_triangles=glyph_triangle_total,
         retained_base_triangles=int(keep_ids.size), total_triangles=int(tri_all.shape[0]),
         material_names=tuple(material_names), flash_scale=flash_scale,
         removed_subject_emitters=removed_subject_emitters,

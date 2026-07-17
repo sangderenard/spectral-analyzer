@@ -62,8 +62,10 @@ CAMERA_MODE_APERTURE_CONE = 2
 # Tier 3 — ideal thin-lens geometric: focus-plane convergence via thin lens
 CAMERA_MODE_THIN_LENS_GEOMETRIC = 3
 
-# Tier 4 — element-by-element geometric assembly: real optical surface chain (STUB)
-CAMERA_MODE_GEOMETRIC_ASSEMBLY = 4
+# Tier 4 — exact analytical compound assembly. Triangle faces are BVH proxies;
+# the registered parametric payload evaluates the complete conic surface chain.
+CAMERA_MODE_PARAMETRIC_ASSEMBLY = 4
+CAMERA_MODE_GEOMETRIC_ASSEMBLY = CAMERA_MODE_PARAMETRIC_ASSEMBLY  # legacy name
 
 # Tier 5 — wave-patch transport: diffraction, interference, finite-element waves (STUB)
 CAMERA_MODE_WAVE_ASSEMBLY = 5

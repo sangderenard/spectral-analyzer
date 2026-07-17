@@ -3,7 +3,7 @@
 The production implementation belongs on the GPU.  This reference model makes
 the storage and rollup invariants executable before shaders depend on them:
 
-* completed nonterminal work always creates a 3x3 child set;
+* sampling and subdivision are independent decisions;
 * samples retain global sensor UV and explicit node lineage;
 * direct observations never share storage with descendant-derived rollups;
 * rollups average child estimates by physical area, never by sample count.
@@ -161,11 +161,11 @@ class SparseSensorMipmap:
         )
         return node_id
 
-    def complete_work(self, node_id: int) -> tuple[int, ...]:
-        """Complete one node epoch and unconditionally subdivide when possible."""
+    def complete_work(self, node_id: int, *, subdivide: bool = False) -> tuple[int, ...]:
+        """Complete one node epoch and optionally materialize its 3x3 children."""
         node = self.nodes[node_id]
         node.completed_epochs += 1
-        if node.level >= self.maximum_depth:
+        if not subdivide or node.level >= self.maximum_depth:
             return ()
         if node.children:
             return node.children
@@ -174,6 +174,34 @@ class SparseSensorMipmap:
             for slot, bounds in enumerate(node.bounds.subdivide_3x3())
         )
         return node.children
+
+    def leaf_at_uv(self, u: float, v: float) -> SensorMipNode:
+        """Return the deepest currently materialized node containing a UV."""
+        u, v = float(u), float(v)
+        node = self.nodes[self.root_id]
+        if not node.bounds.contains(u, v):
+            raise ValueError("sensor UV lies outside [0, 1]")
+        while node.children:
+            node = next(
+                self.nodes[child_id]
+                for child_id in node.children
+                if self.nodes[child_id].bounds.contains(u, v)
+            )
+        return node
+
+    def refine_uv(self, u: float, v: float, *, target_level: int) -> SensorMipNode:
+        """Descend only the lineage needed to distinguish one continuous UV."""
+        if target_level < 0 or target_level > self.maximum_depth:
+            raise ValueError("target_level lies outside the configured hierarchy")
+        node = self.leaf_at_uv(u, v)
+        while node.level < target_level:
+            children = self.complete_work(node.node_id, subdivide=True)
+            node = next(
+                self.nodes[child_id]
+                for child_id in children
+                if self.nodes[child_id].bounds.contains(float(u), float(v))
+            )
+        return node
 
     def add_sample(
         self,

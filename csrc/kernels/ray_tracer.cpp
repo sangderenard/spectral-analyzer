@@ -124,6 +124,10 @@ static constexpr double EPS        = 1e-9;
 static constexpr double T_SELF     = 1e-10;
 static constexpr int    BVH_LEAF_MAX = 4;   /* triangles per BVH leaf */
 static constexpr bool    RT_ENABLE_PROFILE = false;
+/* Sensor-path history. Bit 0 selects the sensor family; bit 4 records that an
+ * ordinary scene material spawned a child. Those descendants remain valid
+ * BDPT/VCM paths but are not direct camera-visible-emitter terminals. */
+static constexpr uint8_t CAMERA_PATH_SCATTERED_BIT = 1u << 4;
 
 static inline uint32_t rt_morton_quant8(double v) {
     if (!std::isfinite(v)) v = 0.0;
@@ -1442,12 +1446,11 @@ static inline bool apply_parametric_surface_point(
 static inline bool tri_material_is_transmissive(const RayTracerState& st, const Triangle& tri, int band = 0)
 {
     /* A conductor (ior_imag k > 0.1) is an opaque reflector — never refracts,
-     * even though its ior_real differs from 1.  Excluding it here keeps silver/
-     * gold/etc. in the opaque-reflection branch (B.3a).  Weakly-absorbing
-     * dielectrics (k<<0.1) still refract and attenuate via Beer-Lambert. */
+     * even though its ior_real differs from 1.  A dielectric IOR still controls
+     * opaque-surface Fresnel response, but does not authorize transmission.
+     * Refraction requires explicitly authored spectral transmittance. */
     if (mat_n_imag(st, tri.mat_idx, band) > 0.1) return false;
-    return (mat_transmittance(st, tri.mat_idx, band) > 1e-6)
-        || (std::abs(mat_n_real(st, tri.mat_idx, band) - 1.0) > 1e-6);
+    return mat_transmittance(st, tri.mat_idx, band) > 1e-6;
 }
 
 static inline bool tri_param_kind_is_sdf(const int kind)
@@ -7072,10 +7075,31 @@ static inline bool apply_parametric_lens_from_f32(
     const int   n_surf  = (int)p[1];
     const float hood_r  = p[2];
     const float hood_xf = p[3];
+    const int n_spectral = std::max(0, (int)p[5]);
+    const int spectral_offset = std::max(0, (int)p[6]);
+    const int spectral_stride = std::max(0, (int)p[7]);
 
     if (n_surf < 1 || n_surf > 64) return true;
     if (payload_bytes < (int)((8 + n_surf * 8) * sizeof(float))) return true;
+    if (n_spectral > 0) {
+        const int spectral_end = spectral_offset + n_surf * spectral_stride;
+        if (spectral_offset < 8 + n_surf * 8 ||
+                spectral_stride < 2 * n_spectral ||
+                spectral_end < spectral_offset ||
+                payload_bytes < spectral_end * (int)sizeof(float))
+            return true;
+    }
     local_trace.events.reserve(static_cast<size_t>(n_surf));
+
+    int active_band = 0;
+    double active_power = -1.0;
+    for (int b = 0; b < amp.size(); ++b) {
+        const double power = std::norm(amp[b]);
+        if (power > active_power) {
+            active_power = power;
+            active_band = b;
+        }
+    }
 
     /* Lens hood check (only for forward direction). */
     if (!is_backward && hood_r > 0.0f && std::abs(dir[0]) > 1e-12) {
@@ -7100,8 +7124,17 @@ static inline bool apply_parametric_lens_from_f32(
         const double R     = (double)p[sb + 1];
         /* Forward: ray travels from n_bf into n_af.
          * Backward: ray travels from n_af into n_bf at this surface. */
-        const double n_bf  = is_backward ? (double)p[sb + 3] : (double)p[sb + 2];
-        const double n_af  = is_backward ? (double)p[sb + 2] : (double)p[sb + 3];
+        double n_forward_before = (double)p[sb + 2];
+        double n_forward_after = (double)p[sb + 3];
+        if (n_spectral > 0 && active_band < n_spectral) {
+            const int spectral_base = spectral_offset + s * spectral_stride;
+            n_forward_before = (double)p[spectral_base + active_band];
+            n_forward_after = (double)p[
+                spectral_base + n_spectral + active_band
+            ];
+        }
+        const double n_bf = is_backward ? n_forward_after : n_forward_before;
+        const double n_af = is_backward ? n_forward_before : n_forward_after;
         const double ap_r  = (double)p[sb + 4];
         const double k     = (double)p[sb + 5];
         const bool is_stop = ((int)p[sb + 6] & 1) != 0;
@@ -7674,6 +7707,12 @@ struct RayPipelineState {
     float                     sensor_target_z = 0.0f;
     float                     sensor_target_r = 0.0f;
     int                       sensor_target_mode = 0; /* 0=toward, 1=away_from_virtual */
+    float                     sensor_center[3] = {0.0f, 0.0f, 0.0f};
+    float                     sensor_right[3] = {0.0f, 1.0f, 0.0f};
+    float                     sensor_up[3] = {0.0f, 0.0f, 1.0f};
+    float                     aperture_right[3] = {0.0f, 1.0f, 0.0f};
+    float                     aperture_up[3] = {0.0f, 0.0f, 1.0f};
+    bool                      sensor_pose_configured = false;
     std::vector<double>       sensor_accum;       /* res*res*4 doubles: ch0=R, ch1=G, ch2=B (spectral), ch3=near-miss */
     std::vector<float>        priority_map;       /* res*res sugar-auxin field (1.0 = baseline) */
     mutable std::mutex        sensor_epoch_mu;
@@ -7975,6 +8014,7 @@ public:
     GLuint ssbo_sensor_mip_priority_features = 0;
     GLuint ssbo_sensor_mip_sample_spectra = 0;
     GLuint ssbo_sensor_learned_priority = 0;
+    GLuint ssbo_sensor_requested_priority = 0;
     GLuint ssbo_sensor_priority_network_params = 0;
     uint32_t sensor_mip_max_nodes = 0;
     uint32_t sensor_mip_max_depth = 0;
@@ -8504,26 +8544,59 @@ public:
 
     /* Allocate or reallocate ssbo_sensor_rgb for the given resolution.
      * Buffer is zeroed on (re)allocation.  No-op when res == sensor_rgb_res. */
-    void ensure_sensor_rgb_ssbo(int res) {
+    void ensure_sensor_rgb_ssbo(RayPipelineState& ps, int res) {
         if (res <= 0 || res == sensor_rgb_res) return;
         const GLsizeiptr sz = (GLsizeiptr)(3u * (size_t)res * res * sizeof(uint32_t));
         const GLsizeiptr weight_sz = (GLsizeiptr)((size_t)res * res * sizeof(uint32_t));
         if (!ssbo_sensor_rgb) glc_GenBuffers(1, &ssbo_sensor_rgb);
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_rgb);
         glc_BufferData(GL_SHADER_STORAGE_BUFFER, sz, nullptr, GL_DYNAMIC_COPY);
-        /* Zero — upload via a staging vector (same pattern as UV accum zeroing). */
-        std::vector<uint32_t> zero(3u * (size_t)res * res, 0u);
-        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sz, zero.data());
+        const size_t pixels = (size_t)res * res;
+        std::vector<uint32_t> initial_rgb(3u * pixels, 0u);
+        if (ps.cfg.sensor_restore_res == (uint32_t)res
+                && ps.cfg.sensor_restore_rgb.size() == 3u * pixels) {
+            for (size_t i = 0; i < initial_rgb.size(); ++i)
+                std::memcpy(
+                    &initial_rgb[i], &ps.cfg.sensor_restore_rgb[i],
+                    sizeof(uint32_t));
+            for (uint32_t pixel : ps.cfg.sensor_dirty_sites)
+                if (pixel < pixels)
+                    for (size_t channel = 0; channel < 3u; ++channel)
+                        initial_rgb[channel * pixels + pixel] = 0u;
+        }
+        glc_BufferSubData(
+            GL_SHADER_STORAGE_BUFFER, 0, sz, initial_rgb.data());
         if (!ssbo_sensor_weight) glc_GenBuffers(1, &ssbo_sensor_weight);
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_weight);
         glc_BufferData(GL_SHADER_STORAGE_BUFFER, weight_sz, nullptr, GL_DYNAMIC_COPY);
-        std::vector<uint32_t> zero_weight((size_t)res * res, 0u);
+        std::vector<uint32_t> zero_weight(pixels, 0u);
+        if (ps.cfg.sensor_restore_res == (uint32_t)res
+                && ps.cfg.sensor_restore_weight.size() == pixels) {
+            for (size_t i = 0; i < pixels; ++i)
+                std::memcpy(
+                    &zero_weight[i], &ps.cfg.sensor_restore_weight[i],
+                    sizeof(uint32_t));
+            for (uint32_t pixel : ps.cfg.sensor_dirty_sites)
+                if (pixel < pixels) zero_weight[pixel] = 0u;
+        }
         glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, weight_sz, zero_weight.data());
         if (!ssbo_sensor_learned_priority)
             glc_GenBuffers(1, &ssbo_sensor_learned_priority);
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_learned_priority);
         glc_BufferData(GL_SHADER_STORAGE_BUFFER, weight_sz, nullptr, GL_DYNAMIC_COPY);
         glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, weight_sz, zero_weight.data());
+        if (!ssbo_sensor_requested_priority)
+            glc_GenBuffers(1, &ssbo_sensor_requested_priority);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_requested_priority);
+        glc_BufferData(GL_SHADER_STORAGE_BUFFER, weight_sz, nullptr, GL_DYNAMIC_COPY);
+        if (ps.cfg.sensor_requested_priority_res == (uint32_t)res
+                && ps.cfg.sensor_requested_priority_map.size() == (size_t)res * res) {
+            glc_BufferSubData(
+                GL_SHADER_STORAGE_BUFFER, 0, weight_sz,
+                ps.cfg.sensor_requested_priority_map.data());
+        } else {
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, weight_sz, zero_weight.data());
+        }
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         sensor_rgb_res = res;
     }
@@ -8809,7 +8882,7 @@ public:
             return;
         }
         try {
-            if (job->run_epoch) ensure_sensor_rgb_ssbo(ps.sensor_res);
+            if (job->run_epoch) ensure_sensor_rgb_ssbo(ps, ps.sensor_res);
             /* A newly configured sensor may still have a deferred clear. Apply
              * it before adaptive raygen splats exposure weights; otherwise the
              * first bounce dispatch can erase the just-generated denominator. */
@@ -8854,6 +8927,8 @@ public:
                 glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, ssbo_sensor_weight);
                 glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 8,
                                    ssbo_sensor_learned_priority);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 9,
+                                   ssbo_sensor_requested_priority);
                 GLint loc = glc_GetUniformLocation(prog_sensor_mip_score, "node_count");
                 if (loc >= 0) glc_Uniform1ui(loc, sensor_mip_max_nodes);
                 loc = glc_GetUniformLocation(prog_sensor_mip_score, "n_bands");
@@ -8870,6 +8945,13 @@ public:
                                              "learned_map_enabled");
                 if (loc >= 0) glc_Uniform1ui(
                     loc, ps.cfg.sensor_priority_network_enabled ? 1u : 0u);
+                loc = glc_GetUniformLocation(prog_sensor_mip_score,
+                                             "requested_map_enabled");
+                if (loc >= 0) glc_Uniform1ui(
+                    loc,
+                    ps.cfg.sensor_requested_priority_res == (uint32_t)ps.sensor_res
+                    && ps.cfg.sensor_requested_priority_map.size()
+                        == (size_t)ps.sensor_res * ps.sensor_res ? 1u : 0u);
                 glc_DispatchCompute((sensor_mip_max_nodes + 63u) / 64u, 1u, 1u);
                 glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
                 glc_UseProgram(0);
@@ -8988,6 +9070,8 @@ public:
                 glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, ssbo_sensor_weight);
                 glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 8,
                                    ssbo_sensor_learned_priority);
+                glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 9,
+                                   ssbo_sensor_requested_priority);
                 const GLint u_node_count = glc_GetUniformLocation(
                     prog_sensor_mip_score, "node_count");
                 const GLint u_weights = glc_GetUniformLocation(
@@ -9009,6 +9093,9 @@ public:
                 const GLint u_learned_enabled = glc_GetUniformLocation(
                     prog_sensor_mip_score, "learned_map_enabled");
                 if (u_learned_enabled >= 0) glc_Uniform1ui(u_learned_enabled, 0u);
+                const GLint u_requested_enabled = glc_GetUniformLocation(
+                    prog_sensor_mip_score, "requested_map_enabled");
+                if (u_requested_enabled >= 0) glc_Uniform1ui(u_requested_enabled, 0u);
                 glc_DispatchCompute(
                     ((GLuint)job->score_features.size() + 63u) / 64u, 1u, 1u);
                 glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
@@ -9075,6 +9162,18 @@ public:
                 if (u_targeted_fraction >= 0)
                     glc_Uniform1f(u_targeted_fraction,
                         std::clamp(job->targeted_fraction, 0.0f, 1.0f));
+                const GLint u_coverage_depth = glc_GetUniformLocation(
+                    prog_sensor_mip_select, "coverage_depth");
+                if (u_coverage_depth >= 0) {
+                    uint32_t coverage_depth = 0u;
+                    uint32_t span = 1u;
+                    const uint32_t sensor_span = (uint32_t)std::max(1, ps.sensor_res);
+                    while (span < sensor_span && coverage_depth < sensor_mip_max_depth) {
+                        span *= 3u;
+                        ++coverage_depth;
+                    }
+                    glc_Uniform1ui(u_coverage_depth, coverage_depth);
+                }
                 glc_DispatchCompute(1u, 1u, 1u);
                 glc_MemoryBarrier(GL_ALL_BARRIER_BITS);
                 if (!job->run_epoch) {
@@ -9142,7 +9241,16 @@ public:
                     GLint loc = glc_GetUniformLocation(prog_sensor_mip_raygen, name);
                     if (loc >= 0) glc_Uniform1ui(loc, value);
                 };
-                uf("sensor_x", ps.sensor_px); uf("sensor_half_w", ps.sensor_half_w);
+                auto uv3 = [&](const char* name, const float value[3]) {
+                    GLint loc = glc_GetUniformLocation(prog_sensor_mip_raygen, name);
+                    if (loc >= 0) glc_Uniform3fv(loc, 1, value);
+                };
+                uv3("sensor_center", ps.sensor_center);
+                uv3("sensor_right", ps.sensor_right);
+                uv3("sensor_up", ps.sensor_up);
+                uv3("aperture_right", ps.aperture_right);
+                uv3("aperture_up", ps.aperture_up);
+                uf("sensor_half_w", ps.sensor_half_w);
                 uf("sensor_half_h", ps.sensor_half_h); uf("aperture_radius", ps.sensor_target_r);
                 uf("min_amplitude", job->min_amplitude);
                 uf("exposure_weight", job->exposure_weight);
@@ -9180,8 +9288,9 @@ public:
                 if (u >= 0) glc_Uniform1ui(u, 1u);
                 glc_DispatchCompute((max_samples + 63u) / 64u, 1u, 1u);
                 glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-                /* Measure this completed exposure before mandatory subdivision
-                 * so all nine children inherit its evidence-derived work value. */
+                /* Measure this completed exposure before the scheduler's
+                 * optional subdivision so children inherit evidence-derived
+                 * work value without forcing every sampled leaf to split. */
                 score_moments();
                 glc_UseProgram(prog_sensor_mip_subdivide);
                 glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
@@ -10478,7 +10587,7 @@ public:
 
         /* ── Step 5: T5 connection dispatch (writes to ssbo_sensor_rgb) ── */
         if (ps.sensor_res > 0)
-            ensure_sensor_rgb_ssbo(ps.sensor_res);
+            ensure_sensor_rgb_ssbo(ps, ps.sensor_res);
         if (!ssbo_sensor_rgb || sensor_rgb_res != ps.sensor_res) return;
 
         /* Unit = cam_target × light_target pairs is the acceptance granularity:
@@ -10511,8 +10620,9 @@ public:
         if (!ssbo_t5_params)
             ensure_ssbo(ssbo_t5_params, sizeof(T5GpuParams));
         if (ps.cfg.t5_profile) {
-            if (!ssbo_t5_debug) ensure_ssbo(ssbo_t5_debug, 68 * sizeof(uint32_t));
-            uint32_t zeros[68] = {};
+            if (!ssbo_t5_debug) ensure_ssbo(ssbo_t5_debug, 96 * sizeof(uint32_t));
+            uint32_t zeros[96] = {};
+            zeros[74] = 0xFFFFFFFFu;
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_debug);
             glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(zeros), zeros);
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
@@ -10696,7 +10806,7 @@ public:
             }
         }
         if (ps.cfg.t5_profile && ssbo_t5_debug) {
-            uint32_t d[68] = {};
+            uint32_t d[96] = {};
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_debug);
             glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(d), d);
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
@@ -10718,6 +10828,26 @@ public:
             fprintf(stderr,
                     "[T5-debug] delta-endpoint-tests camera=%u light=%u\n",
                     d[66], d[67]);
+            fprintf(stderr,
+                    "[T5-debug] blockers aperture=%u emissive=%u transmissive=%u "
+                    "other=%u near-camera=%u near-light=%u tri-range=%u..%u\n",
+                    d[68], d[69], d[70], d[71], d[72], d[73],
+                    d[74] == 0xFFFFFFFFu ? 0u : d[74], d[75]);
+            fprintf(stderr,
+                    "[T5-debug] spectral-endpoints subject=%u camera-body=%u emitter=%u "
+                    "blocked-subject=%u blocked-subject-emitter=%u mean-camera-x=%.4fm "
+                    "blocker-mat(0/1/2/8/other)=%u/%u/%u/%u/%u\n",
+                    d[76], d[77], d[78], d[79], d[80],
+                    (d[68] + d[69] + d[70] + d[71])
+                        ? (double)d[81] / (double)(d[68] + d[69] + d[70] + d[71]) / 1000.0
+                        : 0.0,
+                    d[82], d[83], d[84], d[85], d[86]);
+            fprintf(stderr,
+                    "[T5-debug] camera-endpoint-regions valid(subject/mid/body)=%u/%u/%u "
+                    "connectable=%u/%u/%u delta=%u/%u/%u\n",
+                    d[87], d[88], d[89],
+                    d[90], d[91], d[92],
+                    d[93], d[94], d[95]);
             fflush(stderr);
         }
         fprintf(stderr,
@@ -12448,7 +12578,7 @@ public:
          * Production mode drives both from counters[8] / ssbo_splat_indirect. */
         uint32_t t3_meta_rb[2] = {};
         int nc = 0, nt_term = 0;
-        if (!use_gpu_resident) {
+        if (!use_gpu_resident || ps.cfg.t5_profile) {
             readback_ssbo(ssbo_t3_meta, t3_meta_rb, 2 * sizeof(uint32_t));
             nc      = (int)std::min(t3_meta_rb[0], (uint32_t)cap_children);
             nt_term = (int)std::min(t3_meta_rb[1], (uint32_t)cap_children);
@@ -12471,6 +12601,66 @@ public:
         if (t3_post_diag) {
             fprintf(stderr, "[gpu-T3-post] child intents gpu-resident (nc=%d), no requeue\n", nc);
             fflush(stderr);
+        }
+
+        if (ps.cfg.t5_profile && nt_term > 0) {
+            const GLintptr term_off = (GLintptr)(
+                (size_t)max_children * CHILD_STRIDE * sizeof(float));
+            stg_tbuf.resize((size_t)nt_term * TERMINAL_STRIDE);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_child_int);
+            glc_GetBufferSubData(
+                GL_SHADER_STORAGE_BUFFER, term_off,
+                (GLsizeiptr)((size_t)nt_term * TERMINAL_STRIDE * sizeof(float)),
+                stg_tbuf.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            uint64_t sensor_emissive = 0;
+            uint64_t direct_sensor_emissive = 0;
+            uint64_t scattered_sensor_emissive = 0;
+            uint64_t dir_pos_x = 0;
+            uint64_t dir_neg_x = 0;
+            int min_tri = std::numeric_limits<int>::max();
+            int max_tri = -1;
+            double min_r = std::numeric_limits<double>::infinity();
+            double max_r = 0.0;
+            double min_x = std::numeric_limits<double>::infinity();
+            double max_x = -std::numeric_limits<double>::infinity();
+            for (int ti = 0; ti < nt_term; ++ti) {
+                const float* rec = stg_tbuf.data() + (size_t)ti * TERMINAL_STRIDE;
+                uint32_t is_emissive = 0, cflag = 0;
+                int hit_tri = -1;
+                memcpy(&is_emissive, rec + 25, sizeof(is_emissive));
+                memcpy(&cflag, rec + 16, sizeof(cflag));
+                memcpy(&hit_tri, rec + 14, sizeof(hit_tri));
+                if (!is_emissive || (cflag & 1u) == 0u) continue;
+                ++sensor_emissive;
+                if ((cflag & CAMERA_PATH_SCATTERED_BIT) != 0u)
+                    ++scattered_sensor_emissive;
+                else
+                    ++direct_sensor_emissive;
+                if (rec[6] > 0.0f) ++dir_pos_x;
+                if (rec[6] < 0.0f) ++dir_neg_x;
+                min_tri = std::min(min_tri, hit_tri);
+                max_tri = std::max(max_tri, hit_tri);
+                const double radius = std::hypot((double)rec[1], (double)rec[2]);
+                min_r = std::min(min_r, radius);
+                max_r = std::max(max_r, radius);
+                min_x = std::min(min_x, (double)rec[0]);
+                max_x = std::max(max_x, (double)rec[0]);
+            }
+            if (sensor_emissive > 0) {
+                fprintf(
+                    stderr,
+                    "[gpu-terminal-profile] sensor-emissive=%llu direct=%llu scattered=%llu "
+                    "dir-x(+/-)=%llu/%llu "
+                    "tri=%d..%d x=%.6f..%.6f r=%.6f..%.6f\n",
+                    (unsigned long long)sensor_emissive,
+                    (unsigned long long)direct_sensor_emissive,
+                    (unsigned long long)scattered_sensor_emissive,
+                    (unsigned long long)dir_pos_x,
+                    (unsigned long long)dir_neg_x,
+                    min_tri, max_tri, min_x, max_x, min_r, max_r);
+                fflush(stderr);
+            }
         }
 
         /* Accumulate emissive terminal hits onto the CPU sensor image.
@@ -12500,7 +12690,8 @@ public:
                 uint32_t is_emissive; memcpy(&is_emissive, rec + 25, 4);
                 if (!is_emissive) continue;
                 uint32_t cflag; memcpy(&cflag, rec + 16, 4);
-                if (cflag != 1u) continue;
+                if ((cflag & 1u) == 0u
+                    || (cflag & CAMERA_PATH_SCATTERED_BIT) != 0u) continue;
                 const float soy = rec[23], soz = rec[24];
                 const int iy = (int)((soy + ps.sensor_half_w) * inv_w);
                 const int iz = (int)((soz + ps.sensor_half_h) * inv_h);
@@ -12541,12 +12732,11 @@ public:
             fflush(stderr);
         }
 
-        /* Direct camera-visible emissive surfaces do not need a T5 vertex pair:
-         * sensor_terminal_splat filters to backward sensor rays whose terminal
-         * record is an emissive material hit, then accumulates the recorded
-         * terminal spectrum into the GPU film. */
+        /* Direct camera-visible emissive surfaces do not need a T5 vertex pair.
+         * The splat accepts lens-only sensor paths; emitter hits after a scene
+         * scatter remain exclusively in the paired BDPT/VCM estimators. */
         if (ps.cfg.gpu_skip_record_readback && ps.sensor_res > 0 && prog_sensor_splat) {
-            ensure_sensor_rgb_ssbo(ps.sensor_res);
+            ensure_sensor_rgb_ssbo(ps, ps.sensor_res);
             dispatch_terminal_splat(ps, max_children, nb);
         }
 
@@ -13283,7 +13473,7 @@ public:
          *   if (gpu_t5_ok && !gpu_pixel_result.empty())                         *
          * already skips the merge, so CPU sensor_accum is untouched.           */
         if (ps.cfg.gpu_skip_record_readback && prog_t5) {
-            ensure_sensor_rgb_ssbo(par.sensor_res);
+            ensure_sensor_rgb_ssbo(ps, par.sensor_res);
         }
         if (ps.cfg.gpu_skip_record_readback && ssbo_sensor_rgb != 0
                 && sensor_rgb_res == par.sensor_res && prog_t5)
@@ -13996,7 +14186,11 @@ static void pipeline_intersector(RayPipelineState& ps)
                 vr.vertex_index      = intent.bdpt_vertex;
                 vr.stream            = intent.bdpt_stream;
                 vr.sample_domain     = BDPT_DOMAIN_UNKNOWN;
-                vr.flags             = tri.flags;
+                const bool emissive_front = !(tri.flags & MAT_FLAG_EMISSIVE)
+                    || intent.dir.dot(tri.normal) < 0.0;
+                vr.flags             = emissive_front
+                    ? tri.flags
+                    : (tri.flags & ~MAT_FLAG_EMISSIVE);
                 vr.strategy_id       = intent.bdpt_strategy;
                 vr.tri_id            = hit_tri;
                 vr.group_id          = grp;
@@ -14027,14 +14221,21 @@ static void pipeline_intersector(RayPipelineState& ps)
              * plate from reflections would produce spurious sensor image
              * saturation before any emitter is found. */
             if (ps.sensor_res > 0 && ((intent.color_flag & 1u) == 0u)) {
-                const float hx = static_cast<float>(hit_pos.x());
-                const float hy = static_cast<float>(hit_pos.y());
-                const float hz = static_cast<float>(hit_pos.z());
-                if (std::abs(hx - ps.sensor_px) < 0.004f) {
+                const V3d film_center(ps.sensor_center[0], ps.sensor_center[1], ps.sensor_center[2]);
+                const V3d film_right(ps.sensor_right[0], ps.sensor_right[1], ps.sensor_right[2]);
+                const V3d film_up(ps.sensor_up[0], ps.sensor_up[1], ps.sensor_up[2]);
+                V3d film_normal = film_right.cross(film_up);
+                const double normal_length = film_normal.norm();
+                if (normal_length > 1.0e-12) film_normal /= normal_length;
+                const V3d film_delta = hit_pos - film_center;
+                const float plane_distance = static_cast<float>(std::abs(film_delta.dot(film_normal)));
+                if (plane_distance < 0.004f) {
+                    const float local_y = static_cast<float>(film_delta.dot(film_right));
+                    const float local_z = static_cast<float>(film_delta.dot(film_up));
                     const float inv_w = static_cast<float>(ps.sensor_res) / (2.0f * ps.sensor_half_w);
                     const float inv_h = static_cast<float>(ps.sensor_res) / (2.0f * ps.sensor_half_h);
-                    const int   iy    = static_cast<int>((hy + ps.sensor_half_w) * inv_w);
-                    const int   iz    = static_cast<int>((hz + ps.sensor_half_h) * inv_h);
+                    const int   iy    = static_cast<int>((local_y + ps.sensor_half_w) * inv_w);
+                    const int   iz    = static_cast<int>((local_z + ps.sensor_half_h) * inv_h);
                     const int   res   = ps.sensor_res;
                     if (iy >= 0 && iy < res && iz >= 0 && iz < res) {
                         double cr = 0.0, cg = 0.0, cb = 0.0;
@@ -14216,12 +14417,32 @@ static void pipeline_refiner(RayPipelineState& ps)
                         pipeline_finish_ray(ps);
                         continue;
                     }
+                    if (hr.ray.bdpt_subpath_id != 0u) {
+                        BdptPdfRecord pr{};
+                        pr.subpath_id = hr.ray.bdpt_subpath_id;
+                        pr.vertex_index = hr.ray.bdpt_vertex;
+                        pr.sample_domain = BDPT_DOMAIN_SOLID_ANGLE;
+                        pr.measure = BDPT_DOMAIN_SOLID_ANGLE;
+                        pr.pdf_fwd = 1.0f;
+                        pr.pdf_rev = 1.0f;
+                        pr.pdf_area = 1.0f;
+                        pr.pdf_solid_angle = 1.0f;
+                        pr.jacobian_det = 1.0f;
+                        pr.geometry_term = 1.0f;
+                        pr.flags = st.tris[static_cast<size_t>(hr.hit_tri)].flags
+                                 | BDPT_PDF_FLAG_DELTA_SPECULAR;
+                        ps.push_bdpt_pdf(pr);
+                    }
                     RayIntent ri      = hr.ray;
                     ri.pos            = tpos;
                     ri.dir            = tdir;
                     ri.amp            = std::move(tamp);
                     ri.path_len       = tpl;
                     ri.medium_mat_idx = -1;
+                    ri.bounce        += 1;
+                    ri.bounces_left   = std::max(0, hr.ray.bounces_left - 1);
+                    if (ri.bdpt_vertex < 0xFFFFu)
+                        ri.bdpt_vertex += 1u;
                     if (ri.priority > 1.0f)
                         ps.Q_intent.push_front(std::move(ri));
                     else
@@ -14407,15 +14628,20 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
         }
         /* ── Terminal: emissive ── */
         if (tri.flags & MAT_FLAG_EMISSIVE) {
+            const bool emissive_front = in_dir.dot(tri.normal) < 0.0;
             HitRecord eh = hr;
-            eh.is_emissive_hit = true;
+            eh.is_emissive_hit = emissive_front;
             push_terminal(eh);
             finish_later(ray_cf);
+            if (!emissive_front)
+                continue;
             /* ── Sensor accumulator (T3): backward ray found emissive surface.
              * Use sensor_origin_y/z (set at submit time, propagated through all
              * children) so this works regardless of how many refractions the ray
              * passed through on its way from the sensor to the source. */
-            if (ps.sensor_res > 0 && ((hr.ray.color_flag & 1u) != 0u)) {
+            if (ps.sensor_res > 0
+                    && ((hr.ray.color_flag & 1u) != 0u)
+                    && ((hr.ray.color_flag & CAMERA_PATH_SCATTERED_BIT) == 0u)) {
                 const float sy    = hr.ray.sensor_origin_y;
                 const float sz    = hr.ray.sensor_origin_z;
                 const int   res   = ps.sensor_res;
@@ -14462,6 +14688,8 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             ri.path_len       = hr.ray.path_len;
             ri.bounce        += 1;
             ri.bounces_left   = hr.ray.bounces_left - 1;
+            if ((ri.color_flag & 1u) != 0u)
+                ri.color_flag |= CAMERA_PATH_SCATTERED_BIT;
             if (new_medium != -2) ri.medium_mat_idx = new_medium;
             /* Advance BDPT vertex index for the child so all side-data records
              * emitted by T1/T2/T3 can be correlated back to (subpath, vertex). */
@@ -15979,10 +16207,17 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
         const double shutter_w = shutter_weight_at(u, v);
         if (!(shutter_w > 0.0) || !std::isfinite(shutter_w))
             continue;
-        V3d pos(static_cast<double>(ps->sensor_px), y, z);
+        const V3d sensor_center(ps->sensor_center[0], ps->sensor_center[1], ps->sensor_center[2]);
+        const V3d sensor_right(ps->sensor_right[0], ps->sensor_right[1], ps->sensor_right[2]);
+        const V3d sensor_up(ps->sensor_up[0], ps->sensor_up[1], ps->sensor_up[2]);
+        V3d pos = sensor_center + sensor_right * y + sensor_up * z;
         double ap_dx = 0.0, ap_dy = 0.0, ap_u = 0.5, ap_v = 0.5;
         aperture_sample_at(ap_idx, ap_dx, ap_dy, ap_u, ap_v);
-        V3d target(target_x, target_y + target_r * ap_dx, target_z + target_r * ap_dy);
+        const V3d aperture_right(ps->aperture_right[0], ps->aperture_right[1], ps->aperture_right[2]);
+        const V3d aperture_up(ps->aperture_up[0], ps->aperture_up[1], ps->aperture_up[2]);
+        V3d target = V3d(target_x, target_y, target_z)
+                   + aperture_right * (target_r * ap_dx)
+                   + aperture_up * (target_r * ap_dy);
         V3d dir = (target_mode == 1) ? (pos - target) : (target - pos);
         if (dir.squaredNorm() <= 1e-24)
             dir = V3d(-1.0, 0.0, 0.0);
@@ -17118,11 +17353,20 @@ void ray_pipeline_configure_sensor_image(
     ps->sensor_half_w = (plate_half_w > 0.0f) ? plate_half_w : 0.028f;
     ps->sensor_half_h = (plate_half_h > 0.0f) ? plate_half_h : 0.028f;
     ps->sensor_eps    = (bdpt_eps > 0.0f) ? bdpt_eps : 0.008f;
-    ps->sensor_target_x = target_x;
-    ps->sensor_target_y = target_y;
-    ps->sensor_target_z = target_z;
     ps->sensor_target_r = target_r;
     ps->sensor_target_mode = (target_mode == 1) ? 1 : 0;
+    if (!ps->sensor_pose_configured) {
+        ps->sensor_target_x = target_x;
+        ps->sensor_target_y = target_y;
+        ps->sensor_target_z = target_z;
+        ps->sensor_center[0] = plate_x;
+        ps->sensor_center[1] = 0.0f;
+        ps->sensor_center[2] = 0.0f;
+        ps->sensor_right[0] = 0.0f; ps->sensor_right[1] = 1.0f; ps->sensor_right[2] = 0.0f;
+        ps->sensor_up[0] = 0.0f; ps->sensor_up[1] = 0.0f; ps->sensor_up[2] = 1.0f;
+        ps->aperture_right[0] = 0.0f; ps->aperture_right[1] = 1.0f; ps->aperture_right[2] = 0.0f;
+        ps->aperture_up[0] = 0.0f; ps->aperture_up[1] = 0.0f; ps->aperture_up[2] = 1.0f;
+    }
     /* 4 channels: ch0=R, ch1=G, ch2=B (spectral, all path types), ch3=near-miss */
     ps->sensor_accum.assign(static_cast<size_t>(res) * res * 4, 0.0);
     ps->priority_map.assign(static_cast<size_t>(res) * res, 1.0f);
@@ -17341,6 +17585,31 @@ void ray_pipeline_get_sensor_epoch_count(
                 ps->sensor_epoch_count[static_cast<size_t>(y) * res + z];
         }
     }
+}
+
+void ray_pipeline_configure_sensor_pose(
+    RayPipelineState* ps,
+    const float sensor_center[3],
+    const float sensor_right[3],
+    const float sensor_up[3],
+    const float aperture_center[3],
+    const float aperture_right[3],
+    const float aperture_up[3])
+{
+    if (!ps || !sensor_center || !sensor_right || !sensor_up ||
+        !aperture_center || !aperture_right || !aperture_up) return;
+    for (int axis = 0; axis < 3; ++axis) {
+        ps->sensor_center[axis] = sensor_center[axis];
+        ps->sensor_right[axis] = sensor_right[axis];
+        ps->sensor_up[axis] = sensor_up[axis];
+        ps->aperture_right[axis] = aperture_right[axis];
+        ps->aperture_up[axis] = aperture_up[axis];
+    }
+    ps->sensor_px = sensor_center[0];
+    ps->sensor_target_x = aperture_center[0];
+    ps->sensor_target_y = aperture_center[1];
+    ps->sensor_target_z = aperture_center[2];
+    ps->sensor_pose_configured = true;
 }
 
 void ray_pipeline_get_sensor_exposure_weight(

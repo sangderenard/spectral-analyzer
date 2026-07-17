@@ -85,6 +85,9 @@ def run(force_cpu_t5: bool, use_glass: bool = False) -> Result:
     # Passive allocation/compile smoke for the recursive GPU sensor storage.
     # It must not change legacy T5 radiance while the adaptive launcher is gated.
     tr.configure_sensor_mipmap(max_nodes=1024, maximum_depth=3, samples_per_epoch=32)
+    requested_priority = np.zeros((8, 8), np.float32)
+    requested_priority[2:4, 5:7] = 3.0
+    tr.configure_sensor_requested_priority_map(requested_priority)
     tr.set_vcm(False,0.002,0.7)
     tr.set_force_cpu_t5(force_cpu_t5)
     if not force_cpu_t5:

@@ -15,7 +15,11 @@ layout(local_size_x = 1) in;
 
 const uint NODE_FRONTIER = 1u << 0;
 const uint NODE_RUNNING = 1u << 2;
+const uint NO_NODE = 0xFFFFFFFFu;
 const uint MAX_TOP_K = 1024u;
+const uint WORK_COVERAGE = 1u << 0;
+const uint WORK_SPLIT_REQUESTED = 1u << 1;
+const uint WORK_PRESERVE_COVERAGE = 1u << 2;
 
 struct SensorMipNode {
     vec4 uv_bounds;
@@ -53,6 +57,10 @@ layout(std430, binding = 4) buffer ScheduleBuf { uint schedule[]; };
 
 uniform uint seed;
 uniform float targeted_fraction;
+/* Broad work establishes a stable, complete base lattice.  Learned work may
+ * descend below that lattice without dragging the coverage cursor into a
+ * mixed-depth frontier. */
+uniform uint coverage_depth;
 
 shared uint heap_ids[MAX_TOP_K];
 shared uint heap_locality[MAX_TOP_K];
@@ -85,20 +93,21 @@ uint coverage_distance(uint locality) {
     return locality - cursor;
 }
 
-bool coverage_better(uint ae, uint asamp, uint al, uint ai,
-                     uint be, uint bsamp, uint bl, uint bi) {
+bool coverage_better(uint alevel, uint ae, uint asamp, uint al, uint ai,
+                     uint blevel, uint be, uint bsamp, uint bl, uint bi) {
     uint ad = coverage_distance(al);
     uint bd = coverage_distance(bl);
-    return ae < be
-        || (ae == be && (asamp < bsamp
-        || (asamp == bsamp && (ad < bd
-        || (ad == bd && ai < bi)))));
+    if (alevel != blevel) return alevel < blevel;
+    if (ae != be) return ae < be;
+    if (asamp != bsamp) return asamp < bsamp;
+    if (ad != bd) return ad < bd;
+    return ai < bi;
 }
 
 bool coverage_heap_entry_worse(uint a, uint b) {
     return coverage_better(
-        heap_epochs[b], heap_samples[b], heap_locality[b], heap_ids[b],
-        heap_epochs[a], heap_samples[a], heap_locality[a], heap_ids[a]);
+        nodes[heap_ids[b]].level, heap_epochs[b], heap_samples[b], heap_locality[b], heap_ids[b],
+        nodes[heap_ids[a]].level, heap_epochs[a], heap_samples[a], heap_locality[a], heap_ids[a]);
 }
 
 bool heap_entry_worse(uint a, uint b) {
@@ -205,8 +214,8 @@ void main() {
             coverage_sift_up(count);
             count += 1u;
         } else if (coverage_limit > 0u && coverage_better(
-                       node.completed_epochs, node.direct_sample_count, locality, node_id,
-                       heap_epochs[0], heap_samples[0], heap_locality[0], heap_ids[0])) {
+                       node.level, node.completed_epochs, node.direct_sample_count, locality, node_id,
+                       nodes[heap_ids[0]].level, heap_epochs[0], heap_samples[0], heap_locality[0], heap_ids[0])) {
             heap_ids[0] = node_id;
             heap_locality[0] = locality;
             heap_epochs[0] = node.completed_epochs;
@@ -219,7 +228,9 @@ void main() {
         uint output_index = count - 1u;
         uint node_id = heap_ids[0];
         float priority = max(0.0, nodes[node_id].priority);
-        write_work(output_index, node_id, priority, 1u);
+        uint flags = WORK_COVERAGE;
+        if (nodes[node_id].level < coverage_depth) flags |= WORK_SPLIT_REQUESTED;
+        write_work(output_index, node_id, priority, flags);
         count -= 1u;
         if (count > 0u) {
             heap_ids[0] = heap_ids[count];
@@ -238,6 +249,10 @@ void main() {
         if (node_id >= control[0]) continue;
         SensorMipNode node = nodes[node_id];
         if ((node.flags & NODE_FRONTIER) == 0u) continue;
+        /* Subdivided base-level coverage anchors remain sampleable, but the
+         * attention lane must descend into their leaves instead of repeatedly
+         * selecting the parent estimate. */
+        if (node.first_child_id != NO_NODE) continue;
         float priority = (isnan(node.priority) || node.priority < 0.0)
             ? 0.0 : node.priority;
         uint locality = locality_key(node.uv_bounds);
@@ -262,7 +277,11 @@ void main() {
      * the end produces deterministic best-to-worst work order. */
     while (count > 0u) {
         uint output_index = coverage_selected + count - 1u;
-        write_work(output_index, heap_ids[0], heap_priority[0], 0u);
+        uint node_id = heap_ids[0];
+        uint flags = nodes[node_id].level < control[5] ? WORK_SPLIT_REQUESTED : 0u;
+        if (nodes[node_id].level == coverage_depth)
+            flags |= WORK_PRESERVE_COVERAGE;
+        write_work(output_index, node_id, heap_priority[0], flags);
         count -= 1u;
         if (count > 0u) {
             heap_ids[0] = heap_ids[count];

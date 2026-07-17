@@ -7,8 +7,21 @@ from camera_software.progressive_exposure import (
     ExposureProgressEvent,
     ExposureProgressKind,
     LinearProgressArtifactWriter,
+    SensorPixelSlice,
     SensorRegion,
 )
+
+
+def test_sensor_pixel_slice_is_arbitrary_sparse_and_round_trips_mask():
+    mask = np.zeros((5, 7), dtype=bool)
+    mask[0, 6] = True
+    mask[2, 1] = True
+    mask[4, 4] = True
+    selected = SensorPixelSlice.from_mask(mask)
+
+    assert selected.site_indices == (6, 15, 32)
+    assert np.array_equal(selected.mask(), mask)
+    assert selected.bounds() == SensorRegion(1, 0, 6, 5)
 from camera_software.refinement_scheduler import RecursiveSensorWorkScheduler
 
 
@@ -99,9 +112,18 @@ def test_layer_artifact_announces_raw_nn_priority_map(tmp_path):
     writer = LinearProgressArtifactWriter(str(tmp_path), line_sink=lines.append)
     raw = np.ones((5, 7, 3), dtype=np.float32)
     priority = np.linspace(0.0, 1.0, 35, dtype=np.float32).reshape(5, 7)
-    announced = writer.publish(_event(pass_index=2), raw, priority_map=priority)
+    sensor_sum = raw * 7.0
+    exposure_weight = np.full((5, 7), 7.0, dtype=np.float32)
+    announced = writer.publish(
+        _event(pass_index=2), raw,
+        priority_map=priority,
+        sensor_sum=sensor_sum,
+        exposure_weight=exposure_weight,
+    )
 
     assert np.array_equal(np.load(announced.priority_map_path), priority)
+    assert np.array_equal(np.load(announced.sensor_sum_path), sensor_sum)
+    assert np.array_equal(np.load(announced.exposure_weight_path), exposure_weight)
     assert ExposureProgressEvent.from_line(lines[0]) == announced
 
 

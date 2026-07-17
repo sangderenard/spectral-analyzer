@@ -16,7 +16,8 @@ shortcut.
 ## Non-Negotiable Invariants
 
 - The camera, lens assembly, text plane, text mesh, lights, and materials remain
-  scene geometry. Adaptive scheduling does not move or reinterpret them.
+  scene geometry. Adaptive scheduling does not move or reinterpret them. An
+  explicit bounded film-stage command may move/tilt only the sensor plane.
 - Each selected sensor node launches continuous stochastic UV samples through
   the genuine GPU thick-lens spectral BDPT path.
 - Every completed nonterminal node subdivides into a 3 by 3 child stencil.
@@ -29,7 +30,7 @@ shortcut.
   throughput, material response, path weights, or the estimator.
 - A configurable fraction of work remains broad coverage. The live default is
   75 percent targeted and 25 percent coverage.
-- GPU execution is required for live training, priority inference, sensor
+- GPU execution is required for ray-traced training, priority inference, sensor
   sampling, hierarchy maintenance, and spectral transport.
 
 ## Implemented Architecture
@@ -71,10 +72,8 @@ policy contracts and Morton ordering reference.
 
 `camera_software/sensor_priority_network.py` contains:
 
-- A CUDA flat orthographic renderer of the exact formatted scene text using
-  authored background and text albedos, without lighting or camera optics.
-- Exact-text and three scrambled-text training variants.
-- Simulated spatially uneven exposure and Monte Carlo noise.
+- A presentation-only CUDA orthographic renderer of the exact scene triangles
+  using flat authored colors, without lighting or camera optics.
 - Four runtime input channels: compressed luminance, red chromatic share,
   green chromatic share, and logarithmic exposure confidence.
 - A fixed 4-to-8 3x3 convolution, ReLU, and 8-to-1 1x1 softplus head.
@@ -87,13 +86,12 @@ native sensor-node scorer. Python loads the exported parameter vector before
 the ray pipeline is created. The inferred map is read back only for inspection;
 the scheduling decision itself remains GPU resident.
 
-Important limitation: the current training target is a per-region surrogate
-for expected reconstruction improvement. It combines reconstruction error,
-remaining exposure uncertainty, edges, and unsampled holes. Scrambled strings
-are training augmentation, but there is not yet a separately trained string
-discriminator whose metric improvement defines the target. A future change can
-replace the target/training objective without changing the 4-channel runtime
-transport or the scheduler interface.
+`camera_software/raytraced_priority_training.py` trains only from progressive
+spectral sensor sums and exposure weights. Its target is the positive reduction
+in camera-image error caused by the next real exposure layer, measured against
+the latest available exposure. The orthographic preview has no import or data
+path into training. A future discriminator objective can replace this measured
+target without changing the 4-channel runtime transport or scheduler interface.
 
 ### Progressive communication
 
@@ -110,15 +108,64 @@ The writer retains only the configured number of recent live layers. These
 files are a presentation/readback boundary and never feed the physical
 accumulator or scheduler.
 
+### Physical film-stage control
+
+`camera_software/scan_control.py` defines the network-agnostic `NextSiteScan`
+contract. Its optional `FilmPlaneAdjustment` commands axial film-to-lens depth
+and tilt about the film's right/up axes; it does not expose arbitrary mesh
+vertices. Values are absolute offsets from machined zero, so trials cannot
+accumulate motor-history drift. Camera-owned travel and tilt limits are
+validated before scene build. `FocusCalibrationController` provides a
+network-facing trial protocol which requests full-sensor scans and computes its
+objective strictly from the ray-traced sensor image; it has no orthographic,
+text, depth, or authored-scene input.
+
+`exposure_render_demo.py` applies that command as a rigid transform to the
+sensor triangle group only. The aperture, thick-lens geometry, subject, and
+lights remain fixed. The same resulting pose is supplied to the camera
+descriptor and native pipeline. `sensor_mip_raygen.comp.glsl` converts local
+continuous film UV samples to world origins with the tilted film basis, while
+the aperture remains in the fixed lens basis. Forward sensor hits are projected
+back into the same local film coordinates. Thus depth/tilt changes physical
+focus geometry without changing recursive UV node identity or radiance weights.
+
+The command is accepted through `--next-scan-control` (or
+`SPECTRAL_NEXT_SCAN_CONTROL`) using:
+
+```json
+{"sequence":1,"film_plane_adjustment":{"lens_distance_delta_m":0.0002,"tilt_about_right_deg":0.75,"tilt_about_up_deg":-0.5}}
+```
+
+The priority CNN still emits only a work-value map. A future trained focus head
+may produce the already-bounded film commands without changing the camera,
+transport, or recursive sensor interfaces.
+
+### Authoritative physical camera transport
+
+`camera_software/camera_build.py` retains the complete rebuilt camera artifact:
+the source camera configuration, exact compound-lens assembly, proxy-surface
+identities, wavelength table, sensor basis, machined-zero pose, and explicit
+optical provenance. Subject replacement remaps proxy triangle IDs without
+reconstructing or downgrading the optics.
+
+The text exposure registers exact parametric conic/plane intersections on the
+GPU. Proxy triangles remain only BVH entry surfaces. The exact Snell/Fresnel
+step now selects refractive indices from the active wavelength's Sellmeier
+table; it no longer applies one scalar index to every spectral band. Recursive
+sensor rays target the assembly's real or virtual exit pupil and no toy
+thin-lens handler is attached in this mode. Diffraction is explicitly reported
+as disabled; the separate wave arena is not mislabeled as camera diffraction.
+
 ### Live text demonstration
 
 `live_spectral_text_demo.py` now performs the complete path automatically for
 every submitted text revision:
 
 1. Resolve the same scene job used by the spectral renderer.
-2. Render the CUDA flat orthographic reference.
-3. Train the compact priority network for 120 steps by default.
-4. Export and pass its weights through `SPECTRAL_SENSOR_PRIORITY_MODEL`.
+2. Render the CUDA flat orthographic reference for display only.
+3. Load a reusable ray-trained model when `--priority-model` is supplied;
+   otherwise use measured heuristic/exploration scheduling without training.
+4. Pass reusable weights through `SPECTRAL_SENSOR_PRIORITY_MODEL` when present.
 5. Start the native GPU thick-lens BDPT exposure with no authored epoch cap.
 6. Stream linear camera accumulation and the current GPU NN priority map after
    each stable exposure layer.
@@ -133,8 +180,8 @@ python live_spectral_text_demo.py --display-width 100 --display-height 100
 ```
 
 The default targeted fraction is exposed as `--targeted-fraction`. The live
-worker sets continuous exposure, unlimited epochs, three retained presentation
-layers, and the freshly trained model automatically.
+worker sets continuous exposure, unlimited epochs, and three retained
+presentation layers. It never trains from the orthographic image.
 
 ### Text mesh correction
 
@@ -157,9 +204,9 @@ Normal saved native output now includes, when available:
 Per-revision attention artifacts include:
 
 - `attention/orthographic_flat.png`
-- `attention/priority_overlay.png`
-- `attention/sensor_priority_network.npz`
-- `attention/priority_training.json`
+
+Bounded randomized ray-traced training writes a reusable model and metadata
+under the trainer output's `model/` directory.
 
 Generated evidence under `exposures_test_temp/` is intentionally untracked and
 must not be committed.
@@ -167,18 +214,24 @@ must not be committed.
 ## Validation Completed
 
 - Native Release extension rebuilt successfully with the new shaders and ABI.
-- The combined focused suite covering priority policy, progressive transport,
-  sensor hierarchy, CUDA priority training, clarity, live text, work planning,
-  and scene orders passed: 60 tests.
-- `python tests/t5_cpu_gpu_parity.py` passed both plain and glass cases:
-  relative L2 error was approximately `1.71e-7` and `3.62e-7` respectively,
-  with zero record overflows.
+- The combined focused suite covering exact camera construction, spectral
+  indices, scan control, priority policy/training, progressive transport,
+  sensor hierarchy, live text, and scene orders passed: 79 tests (2 obsolete
+  legacy expectations deselected).
+- `python tests/t5_cpu_gpu_parity.py` passed both plain and glass cases. The
+  latest stochastic run reported relative L2 error `1.67e-7` and `9.03e-3`
+  respectively, with zero record overflows.
+- A 32 by 32 recursive GPU text exposure completed with a +0.2 mm axial film
+  move and nonzero two-axis tilt. It produced 998/1024 lit sensor bins and a
+  finite spectral output through native GPU T5/VCM.
 - A real bounded 100 by 100 GPU exposure loaded the 305 model parameters,
   ran recursive spectral BDPT, and announced both a finite linear accumulation
   and a finite 100 by 100 priority array in the same layer event.
 - The bounded validation layer took about 42.3 seconds of exposure work and
   73.2 seconds wall time on the available RTX 3060.
 - `git diff --check` and Python compilation passed before handoff.
+- A fresh native Release extension build completed after the parametric-camera
+  ABI and naming changes.
 
 The interactive three-panel window was not left running for a long manual
 acceptance session. Its component paths compile and its worker/progress tests
@@ -186,16 +239,11 @@ pass; the underlying live GPU transport was exercised independently as above.
 
 ## Known Follow-Up Work
 
-1. Replace or augment the surrogate target with the intended discriminator
+1. Replace or augment measured next-layer improvement with the intended discriminator
    objective: predict expected improvement in exact-string discrimination
    against character-scrambled/noisy negatives.
-2. Decide whether the priority network should remain trained per text revision,
-   be pretrained across many scenes, or use pretrained weights followed by a
-   short online adaptation. Current training occurs before spectral exposure
-   begins and therefore adds startup latency.
-3. Display training progress if the pre-exposure delay is objectionable. The
-   flat reference becomes visible after training emits the initial progress
-   event, not during the training loop itself.
+2. Train the reusable model across many randomized bounded scenes and compare
+   it against heuristic-only scheduling on held-out text.
 4. Measure priority quality over multiple exposure layers. The first sparse
    layer can correctly appear nearly uniform because sensor evidence is mostly
    absent; spatial structure develops as observations accumulate.
@@ -210,7 +258,6 @@ pass; the underlying live GPU transport was exercised independently as above.
 ## Useful Environment Controls
 
 ```text
-SPECTRAL_PRIORITY_TRAINING_STEPS       default 120 in live demo
 SPECTRAL_SENSOR_PRIORITY_MODEL        exported .npz model path
 SPECTRAL_SENSOR_TARGETED_FRACTION     default 0.75
 SPECTRAL_SENSOR_STEPS_PER_LAYER       default 8 at <=128 resolution, else 4
@@ -228,5 +275,5 @@ python live_spectral_text_demo.py --display-width 100 --display-height 100
 ```
 
 Do not evaluate the final physical image from the flat reference or priority
-overlay. They are training/inspection views. The `SPECTRAL CAMERA` panel remains
-the genuine spectral thick-lens result.
+overlay. The flat reference is presentation-only and never training data. The
+`SPECTRAL CAMERA` panel remains the genuine spectral thick-lens result.

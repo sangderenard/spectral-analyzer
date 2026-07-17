@@ -44,6 +44,56 @@ class SensorRegion:
 
 
 @dataclass(frozen=True)
+class SensorPixelSlice:
+    """Arbitrary sparse sensor-site selection.
+
+    ``site_indices`` are unique row-major indices into ``width * height``.
+    There is deliberately no contiguity, rectangle, or scanline requirement.
+    """
+
+    width: int
+    height: int
+    site_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        width, height = int(self.width), int(self.height)
+        indices = tuple(sorted({int(index) for index in self.site_indices}))
+        if width <= 0 or height <= 0:
+            raise ValueError("sensor pixel slice dimensions must be positive")
+        if not indices:
+            raise ValueError("sensor pixel slice requires at least one site")
+        if indices[0] < 0 or indices[-1] >= width * height:
+            raise ValueError("sensor pixel slice index is outside its sensor raster")
+        object.__setattr__(self, "width", width)
+        object.__setattr__(self, "height", height)
+        object.__setattr__(self, "site_indices", indices)
+
+    @classmethod
+    def from_mask(cls, mask: np.ndarray) -> "SensorPixelSlice":
+        selected = np.asarray(mask, dtype=bool)
+        if selected.ndim != 2:
+            raise ValueError("sensor pixel slice mask must be two-dimensional")
+        return cls(
+            selected.shape[1],
+            selected.shape[0],
+            tuple(map(int, np.flatnonzero(selected))),
+        )
+
+    def mask(self) -> np.ndarray:
+        result = np.zeros(self.width * self.height, dtype=bool)
+        result[np.asarray(self.site_indices, dtype=np.int64)] = True
+        return result.reshape(self.height, self.width)
+
+    def bounds(self) -> SensorRegion:
+        indices = np.asarray(self.site_indices, dtype=np.int64)
+        y, x = np.divmod(indices, self.width)
+        return SensorRegion(
+            int(x.min()), int(y.min()),
+            int(x.max() - x.min() + 1), int(y.max() - y.min() + 1),
+        )
+
+
+@dataclass(frozen=True)
 class ExposureProgressEvent:
     exposure_id: str
     sequence: int
@@ -61,6 +111,8 @@ class ExposureProgressEvent:
     sample_count_path: str = ""
     preview_path: str = ""
     priority_map_path: str = ""
+    sensor_sum_path: str = ""
+    exposure_weight_path: str = ""
     orthographic_reference_path: str = ""
     message: str = ""
     schema_version: int = PROGRESS_SCHEMA_VERSION
@@ -170,7 +222,7 @@ class LinearProgressArtifactWriter:
         self.root = os.path.abspath(root)
         self._line_sink = line_sink
         self._retain_last = max(0, int(retain_last))
-        self._published_paths: list[tuple[str, str, str]] = []
+        self._published_paths: list[tuple[str, str, str, str, str]] = []
         os.makedirs(self.root, exist_ok=True)
 
     def publish(
@@ -179,6 +231,8 @@ class LinearProgressArtifactWriter:
         linear_accumulation: np.ndarray,
         sample_count: np.ndarray | None = None,
         priority_map: np.ndarray | None = None,
+        sensor_sum: np.ndarray | None = None,
+        exposure_weight: np.ndarray | None = None,
     ) -> ExposureProgressEvent:
         array = np.asarray(linear_accumulation)
         if array.ndim != 3 or array.shape[2] < 3 or not np.issubdtype(array.dtype, np.floating):
@@ -192,6 +246,8 @@ class LinearProgressArtifactWriter:
         temp_path = final_path + ".tmp"
         count_path = ""
         priority_path = ""
+        sensor_sum_path = ""
+        exposure_weight_path = ""
         if sample_count is not None:
             counts = np.asarray(sample_count)
             if counts.shape != array.shape[:2] or not np.issubdtype(counts.dtype, np.integer):
@@ -218,6 +274,32 @@ class LinearProgressArtifactWriter:
             with open(priority_temp_path, "wb") as handle:
                 np.save(handle, np.ascontiguousarray(priority), allow_pickle=False)
             os.replace(priority_temp_path, priority_path)
+        if sensor_sum is not None:
+            sums = np.asarray(sensor_sum)
+            if sums.shape != array.shape or not np.issubdtype(sums.dtype, np.floating):
+                raise ValueError("sensor sum must be a floating array matching the accumulation")
+            sum_name = (
+                f"sum_{event.pass_index:06d}_z{event.zoom_level:02d}_"
+                f"s{event.subdivision_level:02d}{node_suffix}.npy"
+            )
+            sensor_sum_path = os.path.join(self.root, sum_name)
+            sum_temp_path = sensor_sum_path + ".tmp"
+            with open(sum_temp_path, "wb") as handle:
+                np.save(handle, np.ascontiguousarray(sums), allow_pickle=False)
+            os.replace(sum_temp_path, sensor_sum_path)
+        if exposure_weight is not None:
+            weights = np.asarray(exposure_weight)
+            if weights.shape != array.shape[:2] or not np.issubdtype(weights.dtype, np.floating):
+                raise ValueError("exposure weight must be a floating array matching the sensor raster")
+            weight_name = (
+                f"weight_{event.pass_index:06d}_z{event.zoom_level:02d}_"
+                f"s{event.subdivision_level:02d}{node_suffix}.npy"
+            )
+            exposure_weight_path = os.path.join(self.root, weight_name)
+            weight_temp_path = exposure_weight_path + ".tmp"
+            with open(weight_temp_path, "wb") as handle:
+                np.save(handle, np.ascontiguousarray(weights), allow_pickle=False)
+            os.replace(weight_temp_path, exposure_weight_path)
         with open(temp_path, "wb") as handle:
             np.save(handle, np.ascontiguousarray(array), allow_pickle=False)
         os.replace(temp_path, final_path)
@@ -227,14 +309,19 @@ class LinearProgressArtifactWriter:
                 "linear_accumulation_path": final_path,
                 "sample_count_path": count_path,
                 "priority_map_path": priority_path,
+                "sensor_sum_path": sensor_sum_path,
+                "exposure_weight_path": exposure_weight_path,
             }
         )
         self._line_sink(announced.to_line())
-        self._published_paths.append((final_path, count_path, priority_path))
+        self._published_paths.append((
+            final_path, count_path, priority_path,
+            sensor_sum_path, exposure_weight_path,
+        ))
         if self._retain_last > 0:
             while len(self._published_paths) > self._retain_last:
-                stale_linear, stale_count, stale_priority = self._published_paths.pop(0)
-                for stale_path in (stale_linear, stale_count, stale_priority):
+                stale = self._published_paths.pop(0)
+                for stale_path in stale:
                     if not stale_path:
                         continue
                     try:

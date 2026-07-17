@@ -278,9 +278,11 @@ float mat_ggx_alpha(int mat)              { return clamp(mat_band_field(mat, 0, 
 bool  mat_is_transmissive(int mat) {
     if (mat < 0 || mat >= n_mats) return false;
     /* Conductor (ior_imag k > 0.1): opaque reflector, never refracts (B.3a).
-     * Weakly-absorbing dielectrics (k<<0.1) still refract + Beer-Lambert. */
+     * A dielectric IOR describes its surface Fresnel response; it does not by
+     * itself make an authored opaque surface transparent.  Only explicit
+     * spectral transmittance enters the refraction branch. */
     if (mat_band_field(mat, 0, 8, 0.0) > 0.1) return false;
-    return mat_transmittance(mat, 0) > 1.0e-6 || abs(mat_ior_real(mat, 0) - 1.0) > 1.0e-6;
+    return mat_transmittance(mat, 0) > 1.0e-6;
 }
 float medium_n_real(int mat) {
     if (mat < 0 || mat >= n_mats) return 1.0;
@@ -594,19 +596,24 @@ void main() {
         int  tri_idx_v  = hit_tri(hbase);
         int  mat_id_v   = hit_mat(hbase);
         uint tflags_u   = (tri_idx_v >= 0) ? uint(tri_flags(tri_idx_v)) : 0u;
+        bool emissive_front_v = (tri_idx_v >= 0)
+            && ((tflags_u & MAT_FLAG_EMISSIVE) != 0u)
+            && (dot(in_dir, normalize(tri_normal(tri_idx_v))) < 0.0);
+        uint vertex_flags_u = emissive_front_v
+            ? tflags_u
+            : (tflags_u & ~MAT_FLAG_EMISSIVE);
         float throughput = 0.0;
         for (int b = 0; b < nb; b++)
             throughput += sqrt(amp_re[b] * amp_re[b] + amp_im[b] * amp_im[b]);
-        g_bdpt_slot = emit_bdpt_vertex(bdpt_sid, packed_vi, tflags_u, tri_idx_v, mat_id_v,
+        g_bdpt_slot = emit_bdpt_vertex(bdpt_sid, packed_vi, vertex_flags_u, tri_idx_v, mat_id_v,
                                        pos, nrm, in_dir,
                                        path_len, hit_pathatseg(hbase),
                                        throughput, soy, soz);
         /* Fold emission Le into the arrival beta for emissive surfaces so the
          * emitter spectrum lives in this single record (no racing duplicate). */
-        bool is_emissive_v = (tri_idx_v >= 0) && ((tflags_u & MAT_FLAG_EMISSIVE) != 0u);
         for (int b = 0; b < nb; b++) {
             uint vi_band = (bdpt_vi << 16) | uint(b);
-            float le = (is_emissive_v && mat_id_v >= 0) ? mat_emission(mat_id_v, b) : 1.0;
+            float le = (emissive_front_v && mat_id_v >= 0) ? mat_emission(mat_id_v, b) : 1.0;
             emit_bdpt_spectral(bdpt_sid, vi_band, amp_re[b] * le, amp_im[b] * le, bdpt_band_pdf);
         }
         /* fill_bdpt_vertex_pdf() is called at each branch once pdf values are known. */
@@ -623,9 +630,19 @@ void main() {
     if ((cflag & 4u) != 0u) {
         float cf_re[MAX_BANDS], cf_im[MAX_BANDS];
         for (int b = 0; b < MAX_BANDS; b++) { cf_re[b] = amp_re[b]; cf_im[b] = amp_im[b]; }
+        /* The collapsed compound assembly is a delta path vertex, not an
+         * arbitrary surface connection endpoint. Preserve a unit discrete
+         * edge density so the following subject vertex has a valid camera
+         * prefix, while marking this vertex delta so T5 cannot connect to the
+         * lens proxy/exit plane itself. */
+        uint optical_flags = uint(tri_flags(hit_tri(hbase)))
+                           | BDPT_PDF_FLAG_DELTA_SPECULAR;
+        emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE,
+                      1.0, 1.0, optical_flags, nrm, in_dir, in_dir);
+        fill_bdpt_vertex_pdf(g_bdpt_slot, 1.0, 1.0, optical_flags);
         uint islot = atomicAdd(meta[0], 1u);
         write_intent(islot, pos, in_dir, path_len, medium, 0u,
-                     src_id, bounce, bleft, min_amp,
+                     src_id, bounce + 1, max(0, bleft - 1), min_amp,
                      tag_lo, tag_hi, cflag & ~4u, 1.0, soy, soz, bdpt_sid, cf_re, cf_im);
         return;
     }
@@ -730,6 +747,11 @@ void main() {
 
     /* ── Terminal: emissive ── */
     if ((flags & MAT_FLAG_EMISSIVE) != 0) {
+        if (!front_face) {
+            uint tslot = atomicAdd(meta[1], 1u);
+            write_terminal(tslot, hbase, false);
+            return;
+        }
         /* Emitter: incoming amplitude IS the emission spectrum — emit pre-scatter.
          * Also emit a PDF record so T5 can evaluate scatter_conn_pdf_area for
          * the (s=1, t=k) strategy where this camera vertex sits on the emitter.
@@ -790,6 +812,14 @@ void main() {
     int   new_bounce    = bounce + 1;
     int   new_bleft     = bleft - 1;
     uint  iflags        = 0u;
+
+    /* A sensor subpath that spawns a child at an authored scene material is no
+     * longer a direct camera-to-emitter visibility path. Preserve it for
+     * BDPT/VCM, but tag descendants so a later emitter hit is not raw-splatted
+     * as direct emission. The exact compound-lens teleport returns above. */
+    const uint CAMERA_PATH_SCATTERED_BIT = 16u;
+    if ((cflag & 1u) != 0u)
+        cflag |= CAMERA_PATH_SCATTERED_BIT;
 
     if (is_transmissive) {
         int med_pos = tri_med_pos(tri_idx);

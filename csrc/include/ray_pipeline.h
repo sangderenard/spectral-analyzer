@@ -990,6 +990,14 @@ struct RayPipelineConfig {
     bool        sensor_priority_network_enabled = false;
     std::array<float, SENSOR_PRIORITY_NETWORK_PARAMS>
                 sensor_priority_network_params{};
+    /* Optional camera/network request for the next scan. This is a separate
+     * channel from inferred work value so control intent remains auditable. */
+    std::vector<float> sensor_requested_priority_map{};
+    uint32_t    sensor_requested_priority_res = 0;
+    std::vector<float> sensor_restore_rgb{};
+    std::vector<float> sensor_restore_weight{};
+    std::vector<uint32_t> sensor_dirty_sites{};
+    uint32_t    sensor_restore_res = 0;
 
     /* Handle to the display GL context (e.g. Pygame's HGLRC on Windows).
      * When non-zero the compute context is created as a share partner of this
@@ -1290,6 +1298,18 @@ void ray_pipeline_configure_sensor_image(
     float target_y,
     float target_z,
     int   target_mode);
+
+/* Configure the physical pose used by sensor-ray generation and hit projection.
+ * right/up are the film-plane local axes; aperture_right/up span the fixed
+ * lens aperture. Local sensor_origin_y/z coordinates remain film coordinates. */
+void ray_pipeline_configure_sensor_pose(
+    RayPipelineState* ps,
+    const float sensor_center[3],
+    const float sensor_right[3],
+    const float sensor_up[3],
+    const float aperture_center[3],
+    const float aperture_right[3],
+    const float aperture_up[3]);
 
 /* Copy current sensor image into caller-owned float32 buffer.
  * buf must hold res*res*3 floats (row-major RGB).

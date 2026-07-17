@@ -108,10 +108,15 @@ float _shd_mt(vec3 v0, vec3 e1, vec3 e2, vec3 org, vec3 dir) {
  * connections are not falsely blocked by refractive surfaces.               *
  * Aperture-stop triangles are treated as opaque — they are physical blockers.*/
 
-bool shadow_occluded_except(vec3 p0, vec3 p1, int skip_tri0, int skip_tri1) {
+int shadow_first_blocker_except(
+    vec3 p0, vec3 p1, int skip_tri0, int skip_tri1,
+    out float blocker_t, out float segment_dist
+) {
     vec3  d    = p1 - p0;
     float dist = length(d);
-    if (dist < 2.0 * SHADOW_T_SELF) return false;   /* degenerate segment */
+    blocker_t = -1.0;
+    segment_dist = dist;
+    if (dist < 2.0 * SHADOW_T_SELF) return -1;      /* degenerate segment */
     vec3 dir     = d / dist;
     vec3 inv_dir = vec3(1.0) / dir;
     float t_max  = dist - SHADOW_T_SELF;             /* don't hit p1 itself */
@@ -147,7 +152,10 @@ bool shadow_occluded_except(vec3 p0, vec3 p1, int skip_tri0, int skip_tri1) {
                 vec3 e1 = vec3(shadow_trifull[tb+3], shadow_trifull[tb+4], shadow_trifull[tb+5]);
                 vec3 e2 = vec3(shadow_trifull[tb+6], shadow_trifull[tb+7], shadow_trifull[tb+8]);
                 float t = _shd_mt(v0, e1, e2, p0, dir);
-                if (t > SHADOW_T_SELF && t < t_max) return true;
+                if (t > SHADOW_T_SELF && t < t_max) {
+                    blocker_t = t;
+                    return ti;
+                }
             }
         } else {
             if (sp + 1 < SHADOW_STACK_SIZE) {
@@ -156,7 +164,15 @@ bool shadow_occluded_except(vec3 p0, vec3 p1, int skip_tri0, int skip_tri1) {
             }
         }
     }
-    return false;
+    return -1;
+}
+
+bool shadow_occluded_except(vec3 p0, vec3 p1, int skip_tri0, int skip_tri1) {
+    float blocker_t;
+    float segment_dist;
+    return shadow_first_blocker_except(
+        p0, p1, skip_tri0, skip_tri1, blocker_t, segment_dist
+    ) >= 0;
 }
 
 bool shadow_occluded(vec3 p0, vec3 p1) {

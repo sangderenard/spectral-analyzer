@@ -41,10 +41,14 @@ layout(std430, binding = 5) writeonly buffer IntentBuf { float intents[]; };
 /* One exposure weight per sensor bin, float bit-cast for CAS atomics. */
 layout(std430, binding = 6) coherent buffer SensorWeightBuf { uint sensor_weight[]; };
 
-uniform float sensor_x;
+uniform vec3 sensor_center;
+uniform vec3 sensor_right;
+uniform vec3 sensor_up;
 uniform float sensor_half_w;
 uniform float sensor_half_h;
 uniform vec3 camera_target;
+uniform vec3 aperture_right;
+uniform vec3 aperture_up;
 uniform float aperture_radius;
 uniform uint sensor_res;
 uniform uint target_mode;
@@ -120,7 +124,7 @@ void main() {
     SensorMipNode node = nodes[sample_lineage.node_id];
     float y = -sensor_half_w + sample_lineage.global_v * (2.0 * sensor_half_w);
     float z = -sensor_half_h + sample_lineage.global_u * (2.0 * sensor_half_h);
-    vec3 origin = vec3(sensor_x, y, z);
+    vec3 origin = sensor_center + sensor_right * y + sensor_up * z;
     /* Count the camera primary once, including misses. T5 may create several
      * camera vertices for this path, but all of their MIS strategies form one
      * radiance sample and share this single normalization weight. */
@@ -134,7 +138,9 @@ void main() {
                          * float(sample_lineage.sample_index + 1u));
     float radius = aperture_radius * sqrt(disk_u);
     float angle = 6.28318530718 * disk_v;
-    vec3 target = camera_target + vec3(0.0, radius * cos(angle), radius * sin(angle));
+    vec3 target = camera_target
+                + aperture_right * (radius * cos(angle))
+                + aperture_up * (radius * sin(angle));
     vec3 direction = target_mode == 1u ? origin - target : target - origin;
     float direction_length = length(direction);
     direction = direction_length > 1.0e-12 ? direction / direction_length

@@ -30,9 +30,67 @@ def test_live_program_defaults_to_four_complete_sensor_sweeps():
     assert orders.order_runtime_settings(job)["sensor_sweeps"] == 4
 
 
+def test_live_production_starts_with_fixed_width_alphabet_cells():
+    catalog = demo.RenderAssetCatalog()
+    plan = demo._ink_production_plan("Actual light", catalog)
+
+    assert len(plan.requests) >= len(demo.FIXED_IMAGE_ALPHABET)
+    assert {
+        request.target_kind for request in plan.requests
+    } == {demo.BakeTargetKind.ATLAS_GLYPH}
+    assert {
+        request.token_asset.font.family for request in plan.requests
+    } == {"DejaVu Sans Mono"}
+    assert not demo._total_scene_is_ready("Actual light", catalog)
+
+
 def test_live_cli_accepts_reusable_raytrained_priority_model():
     args = demo._args(["--priority-model", "learned.npz"])
     assert args.priority_model == "learned.npz"
+
+
+def test_live_cli_exposes_scoped_camera_clear_modes():
+    clear_then_start = demo._args(["--clear-camera"])
+    clear_only = demo._args(["--clear-camera-only"])
+
+    assert clear_then_start.clear_camera
+    assert not clear_then_start.clear_camera_only
+    assert clear_only.clear_camera_only
+
+
+def test_live_cli_defaults_to_large_ray_load_inside_each_atlas_epoch():
+    args = demo._args([])
+
+    assert args.atlas_epochs_per_exposure == 1
+    assert args.atlas_sensor_top_k == 1024
+    assert args.atlas_steps_per_epoch == 64
+    assert args.atlas_samples_per_node == 1024
+    assert (
+        args.atlas_sensor_top_k
+        * args.atlas_steps_per_epoch
+        * args.atlas_samples_per_node
+    ) == 67_108_864
+
+
+def test_clear_camera_storage_removes_only_live_camera_artifacts(tmp_path):
+    root = tmp_path / "live"
+    (root / "ink_atlas" / "glyph").mkdir(parents=True)
+    (root / "revision_0001" / "progress").mkdir(parents=True)
+    (root / "revision_42").mkdir()
+    (root / "display_inventory.json").write_text("{}", encoding="utf-8")
+    (root / "display_inventory.json.tmp").write_text("{}", encoding="utf-8")
+    (root / "notes.txt").write_text("keep", encoding="utf-8")
+    (root / "revision_draft").mkdir()
+
+    removed = demo.clear_camera_storage(str(root))
+
+    assert len(removed) == 5
+    assert not (root / "ink_atlas").exists()
+    assert not (root / "revision_0001").exists()
+    assert not (root / "revision_42").exists()
+    assert not (root / "display_inventory.json").exists()
+    assert (root / "notes.txt").read_text(encoding="utf-8") == "keep"
+    assert (root / "revision_draft").is_dir()
 
 
 def test_live_renderer_never_trains_from_orthographic_preview():
@@ -92,8 +150,8 @@ def test_render_contract_reports_native_raster_and_coordinate_only_frame():
     assert "native_sensor=960x960" in summary
     assert "composition_frame=4800x3000" in summary
     assert "authored_sensor_sweeps=4" in summary
-    assert "live_exposure=continuous" in summary
-    assert "requested regions and pixel slices accumulate at their scene coordinates" in summary
+    assert "foreground_epochs<=64" in summary
+    assert "production=alphabet->tokens->token-string->total-scene" in summary
 
 
 def test_progress_preview_uses_presentation_only_auto_exposure_source():
@@ -157,6 +215,20 @@ def test_static_geometry_change_invalidates_retained_sensor_evidence():
         ),
     )
     assert not demo._static_scene_is_reusable(stale, current)
+
+
+def test_retained_sensor_evidence_requires_matching_orientation_marker(tmp_path):
+    sensor_sum = tmp_path / "sum.npy"
+    sensor_sum.write_bytes(b"kept evidence")
+
+    assert not demo._sensor_sum_has_current_orientation(str(sensor_sum))
+
+    demo._mark_sensor_display_orientation(str(sensor_sum))
+    assert demo._sensor_sum_has_current_orientation(str(sensor_sum))
+
+    marker = Path(demo._sensor_orientation_marker_path(str(sensor_sum)))
+    marker.write_text("legacy-mirrored", encoding="utf-8")
+    assert not demo._sensor_sum_has_current_orientation(str(sensor_sum))
 
 
 def test_ui_products_become_gpu_uv_requests_inside_photographed_region():
@@ -298,6 +370,34 @@ def test_sensor_product_maps_to_exact_ui_view_destination():
     assert demo._sensor_product_window_rect(
         product, photographed, 400, 240
     ) == (200, 20, 100, 40)
+
+
+def test_display_to_native_square_is_inverse_of_readback_orientation():
+    import exposure_render_demo as exposure
+
+    native = np.arange(5 * 5 * 3, dtype=np.float32).reshape(5, 5, 3)
+    cpp_getter_output = native[::-1, :, :]
+    display = exposure._native_sensor_to_display(cpp_getter_output)
+
+    restored = demo._display_raster_to_native_square(display)
+
+    assert np.array_equal(restored, native)
+
+
+def test_asymmetric_sensor_restore_does_not_create_a_mirrored_copy():
+    import exposure_render_demo as exposure
+
+    native = np.zeros((7, 7, 3), np.float32)
+    native[1:6, 1, 0] = 1.0
+    native[1, 1:5, 0] = 1.0
+    native[3, 1:4, 0] = 1.0
+    display = exposure._native_sensor_to_display(native[::-1])
+
+    restored_native = demo._display_raster_to_native_square(display)
+    resumed_display = exposure._native_sensor_to_display(restored_native[::-1])
+
+    assert np.array_equal(resumed_display, display)
+    assert not np.array_equal(resumed_display, display[:, ::-1])
 
 
 def test_hud_extends_canvas_and_scales_for_small_displays():
@@ -459,8 +559,10 @@ def test_work_sized_scene_has_exact_camera_and_work_sensor_products():
     }
     assert jobs_by_id["editor-text"]["geometry"]["horizontal_align"] == "left"
     assert jobs_by_id["editor-text"]["geometry"]["vertical_align"] == "top"
+    assert jobs_by_id["editor-text"]["font"]["family"] == "DejaVu Sans Mono"
     assert jobs_by_id["status-text"]["geometry"]["horizontal_align"] == "left"
     assert jobs_by_id["status-text"]["geometry"]["vertical_align"] == "bottom"
+    assert jobs_by_id["status-text"]["font"]["family"] == "DejaVu Sans Mono"
     control = demo.build_ui_next_scan_control(
         scene,
         crop,
@@ -726,4 +828,76 @@ def test_render_worker_forwards_current_progress_to_inventory_observer():
         assert len(observed) == 1
         assert observed[0].exposure_id == "shared-scene"
     finally:
+        worker.close()
+
+
+def test_render_owner_preempts_background_atlas_work_for_foreground_revision():
+    from camera_software import (
+        BakeRequest,
+        BakeTargetKind,
+        DEFAULT_INK_CONDITION,
+        DisplayProductKind,
+        ink_token_asset,
+    )
+
+    glyph = ink_token_asset("A")
+    request = BakeRequest(
+        glyph.asset_key,
+        BakeTargetKind.ATLAS_GLYPH,
+        DEFAULT_INK_CONDITION,
+        DisplayProductKind.IMAGE,
+        "atlas",
+        ("A",),
+        glyph,
+    )
+    background_started = threading.Event()
+    background_retried = threading.Event()
+    release_first = threading.Event()
+    calls = []
+
+    class Background:
+        def __init__(self):
+            self.attempt = 0
+
+        def cancel_current(self):
+            release_first.set()
+
+        def __call__(self, _request):
+            self.attempt += 1
+            calls.append(f"background-{self.attempt}")
+            if self.attempt == 1:
+                background_started.set()
+                assert release_first.wait(timeout=2.0)
+                raise RuntimeError("preempted")
+            background_retried.set()
+
+    background = Background()
+
+    def source():
+        return None if background.attempt >= 2 else request
+
+    def render(sequence, text, order, next_scan_control, progress_sink):
+        calls.append(f"foreground-{sequence}")
+        return demo.RenderedTextRevision(
+            sequence=sequence,
+            text=text,
+            image_path="image.png",
+            linear_path="linear.npy",
+            manifest_path="manifest.json",
+            elapsed_s=0.01,
+        )
+
+    worker = demo.SpectralTextRenderWorker(
+        render,
+        background_source=source,
+        background_render_function=background,
+    )
+    try:
+        assert background_started.wait(timeout=2.0)
+        worker.submit("urgent", {})
+        assert background_retried.wait(timeout=2.0)
+        assert calls[:3] == ["background-1", "foreground-1", "background-2"]
+        assert worker.background_snapshot()[1] == ""
+    finally:
+        release_first.set()
         worker.close()

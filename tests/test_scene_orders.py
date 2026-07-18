@@ -214,6 +214,39 @@ def test_native_square_accumulator_returns_exact_rectangular_tile_shape_and_dtyp
     assert exposure._native_sensor_schedule_shape(width=12, height=7) == (12, 12)
 
 
+def test_native_sensor_readback_is_a_storage_transpose_without_double_flip():
+    import exposure_render_demo as exposure
+
+    native = np.zeros((3, 3, 3), np.float32)
+    native[0, 1] = (1.0, 0.0, 0.0)
+    native[2, 1] = (0.0, 0.0, 1.0)
+
+    display = exposure._native_sensor_to_display(native)
+
+    assert np.array_equal(display[1, 0], (1.0, 0.0, 0.0))
+    assert np.array_equal(display[1, 2], (0.0, 0.0, 1.0))
+
+
+def test_resumed_exposure_seeds_stay_inside_native_signed_int_contract():
+    import exposure_render_demo as exposure
+
+    raw_seeds = [
+        ((1 + refinement_pass * 1_000_003) * 1_000_003) + 1
+        for refinement_pass in (0, 1, 2, 10_000)
+    ]
+    bounded = [exposure._bounded_native_seed(seed) for seed in raw_seeds]
+
+    assert len(set(bounded)) == len(bounded)
+    assert all(
+        1 <= seed <= exposure._NATIVE_SIGNED_SEED_MAX
+        for seed in bounded
+    )
+    assert exposure._bounded_native_seed(1_000_007_000_013) <= 2_147_483_647
+    assert exposure._bounded_native_seed(
+        bounded[-1] * 257 + 7
+    ) <= 2_147_483_647
+
+
 def test_native_cpp_linear_output_is_not_the_display_curve():
     import exposure_render_demo as exposure
 

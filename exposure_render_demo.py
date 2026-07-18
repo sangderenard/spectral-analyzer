@@ -177,19 +177,23 @@ def _normalise_native_sensor_epochs(
     result = np.where(counts[..., None] > 0, result, np.asarray(0, dtype=linear.dtype))
     return np.ascontiguousarray(result)
 
-def _native_sensor_to_display(img: np.ndarray) -> np.ndarray:
-    """Reorient the native square sensor accumulator into display convention.
 
-    The native GPU/CPU sensor buffer is Y-major: element [iy, iz] holds the
-    sensor-plane position (y, z) where iy runs along world +Y (camera right)
-    and iz along world +Z (camera up) — see sensor_terminal_splat.comp.glsl
-    (`pix = iy * sensor_res + iz`) and ray_pipeline_submit_sensor_sweep.
-    Display convention uses Z as rows and Y as columns. Therefore the only
-    storage conversion is D[row_z, column_y] = img[iy, iz]. An earlier
-    horizontal flip happened to leave a single "A" looking plausible but
-    reversed multi-glyph text ("AXE" became "EXA"). Optical inversion is
-    already represented by the traced paths; applying it again at readback is
-    incorrect. This is a pure storage reorientation; transport is untouched.
+_NATIVE_SIGNED_SEED_MAX = 2_147_483_647
+
+
+def _bounded_native_seed(value: int) -> int:
+    """Map deterministic Python seed arithmetic into the native int contract."""
+
+    return ((int(value) - 1) % _NATIVE_SIGNED_SEED_MAX) + 1
+
+
+def _native_sensor_to_display(img: np.ndarray) -> np.ndarray:
+    """Transpose the C++ sensor getter output into display convention.
+
+    The C++ getters have already converted native [y, z] storage to an HWC
+    array and reversed native y via `out_y = res - 1 - y`. Python only swaps
+    getter axes so Z becomes display rows and out_y becomes display columns.
+    No conditional or additional mirror operation belongs here.
     """
     a = np.asarray(img)
     if a.ndim != 3 or a.shape[0] != a.shape[1]:
@@ -1857,13 +1861,20 @@ class CppExposureBackend(ExposureBackend):
             # covers well beyond the clarity horizon while leaving transport
             # records resident across repeated layers.
             mip_nodes = 524_288
+            sensor_samples_per_node = max(
+                1,
+                int(os.environ.get("SPECTRAL_SENSOR_SAMPLES_PER_NODE", "32")),
+            )
             self.tracer.configure_sensor_mipmap(
                 max_nodes=mip_nodes,
                 maximum_depth=7,
-                # Sampling evidence is independent of the 3x3 topology. Thirty
-                # two continuous primaries per selected node materially lowers
-                # per-band variance without changing subdivision semantics.
-                samples_per_epoch=32,
+                # Actual camera primaries emitted per selected sensor node in
+                # every native mip submission.
+                samples_per_epoch=sensor_samples_per_node,
+            )
+            print(
+                "[config] GPU sensor rays "
+                f"samples-per-selected-node={sensor_samples_per_node}"
             )
             priority_model_path = str(
                 os.environ.get("SPECTRAL_SENSOR_PRIORITY_MODEL", "")
@@ -2032,7 +2043,7 @@ class CppExposureBackend(ExposureBackend):
         for step in range(max(1, int(refinement_steps))):
             ok = bool(self.tracer.submit_sensor_mip_epoch(
                 top_k=max(1, int(top_k)),
-                seed=int(seed) * 257 + step,
+                seed=_bounded_native_seed(int(seed) * 257 + step),
                 max_bounces=max(1, int(self.max_bounces)),
                 min_amplitude=0.0,
                 exposure_weight=1.0,
@@ -3729,7 +3740,11 @@ class ExposureSession:
         print(f"  [rgb] source={self.rgb_source}")
         print(f"  [res] render={self.width}x{self.height} output={self.output_width}x{self.output_height} stencil={self.output_oversample_stencil}")
 
-        self._rng_seed = 1
+        # Resumable atlas subprocesses restore accumulated sensor state. Give
+        # each slice a deterministic disjoint seed instead of replaying slice 1.
+        self._rng_seed = 1 + int(
+            os.environ.get("SPECTRAL_EXPOSURE_SEED_OFFSET", "0")
+        )
         self._frame_index = 0
         self._sensor_group_id = -1  # BDPT sensor group ID for this frame
         self._sensor_camera_desc: Optional[dict] = None
@@ -5946,7 +5961,14 @@ class ExposureSession:
                                 os.environ.get("SPECTRAL_SENSOR_CONTINUOUS", "0")
                             ).strip().lower() in ("1", "true", "yes", "on")
                             _sensor_mip_top_k = min(
-                                1024, max(64, int(max(self.width, self.height)))
+                                1024,
+                                max(
+                                    64,
+                                    int(os.environ.get(
+                                        "SPECTRAL_SENSOR_TOP_K",
+                                        str(max(self.width, self.height)),
+                                    )),
+                                ),
                             )
                             _sensor_mip_steps_per_layer = max(
                                 1,
@@ -6057,7 +6079,9 @@ class ExposureSession:
                 print(f"  [conv] reached max_batches={conv_max_batches}; stopping acquisition")
                 break
 
-            seed = (self._rng_seed * 1_000_003) + b_idx + 1
+            seed = _bounded_native_seed(
+                (self._rng_seed * 1_000_003) + b_idx + 1
+            )
             if _bdpt_stream_active:
                 _cpp = backs.get("cpp")
                 if _cpp is not None:

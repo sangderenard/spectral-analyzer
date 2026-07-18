@@ -222,3 +222,27 @@ paths from this session include:
 
 Do not commit generated field captures, `.npy` evidence, render logs, or PNGs
 unless a later task deliberately establishes a compact golden-test fixture.
+
+## Reusable UI asset slice (2026-07-17)
+
+`camera_software/render_assets.py` now defines content-addressed extruded-token
+assets, rotating-stage light-field conditions, an atomic render catalog,
+character-atlas fallback, and whole-page/constituent-part bake plans. The live
+display scene uses this token asset contract when producing its existing scene
+order. See `LIGHT_FIELD_ASSET_ARCHITECTURE.md` for ownership and the next
+executor integration boundary.
+
+The production default has since been narrowed to the accepted fixed head-on
+red-ink-on-black-slate scene. Missing unique characters are queued before
+exact token sequences, captures retain a padded neighboring-light region, and
+rotation or camera/light action recording is optional rather than required.
+The live render owner now follows a hard production ladder: fixed-width
+upper/lowercase alphabet cells, word tokens, complete editor/fixed-UI token
+strings, then the total UI scene. Later tiers cannot be scheduled or composed
+before earlier tiers converge. Every prepared atlas process restores the
+asset's accumulated native sensor sum and weight, then executes one much
+larger epoch by default: up to 1,024 selected sensor nodes across 64 recursive
+refinement submissions, versus the former 128 × 8. The configurable per-epoch
+ray load amortizes procedural setup without changing the convergence unit.
+Covered frames become immediately composable but remain scheduled
+least-refined-first until successive image-delta checks converge.

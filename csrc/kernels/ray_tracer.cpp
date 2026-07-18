@@ -12525,10 +12525,18 @@ public:
             static std::atomic<uint32_t> _diag_batch_ctr{0};
             const uint32_t bc = _diag_batch_ctr.fetch_add(1u, std::memory_order_relaxed);
             if (first_gen && (bc % 64u == 0u)) {
+                int diagnostic_n_hits = n_hits;
+                if (use_gpu_resident) {
+                    uint32_t gpu_hit_count = 0u;
+                    readback_ssbo(
+                        ssbo_counter, &gpu_hit_count, sizeof(gpu_hit_count));
+                    diagnostic_n_hits = std::min(
+                        static_cast<int>(gpu_hit_count), cap_hits);
+                }
                 printf("[gpu-bounce] batch#%u  intents=%d  n_hits=%d  nb=%d  nm=%d  "
                        "max_bdpt_v=%d  max_bdpt_s=%d  max_bdpt_p=%d  "
                        "uloc_max_verts=%d  uloc_max_spectral=%d  uloc_max_pdfs=%d\n",
-                       bc, n, n_hits, nb, nm,
+                       bc, n, diagnostic_n_hits, nb, nm,
                        max_bdpt_v, max_bdpt_s, max_bdpt_p,
                        (int)uloc_t3.bdpt_max_verts,
                        (int)uloc_t3.bdpt_max_spectral,
@@ -12587,9 +12595,25 @@ public:
         const bool t3_post_diag = t3_post_diag_once;
         if (t3_post_diag) {
             t3_post_diag_once = false;
+            if (use_gpu_resident && !ps.cfg.t5_profile) {
+                readback_ssbo(
+                    ssbo_t3_meta, t3_meta_rb, 2 * sizeof(uint32_t));
+                nc = (int)std::min(
+                    t3_meta_rb[0], (uint32_t)cap_children);
+                nt_term = (int)std::min(
+                    t3_meta_rb[1], (uint32_t)cap_children);
+            }
+            int diagnostic_n_hits = n_hits;
+            if (use_gpu_resident) {
+                uint32_t gpu_hit_count = 0u;
+                readback_ssbo(
+                    ssbo_counter, &gpu_hit_count, sizeof(gpu_hit_count));
+                diagnostic_n_hits = std::min(
+                    static_cast<int>(gpu_hit_count), cap_hits);
+            }
             fprintf(stderr,
                 "[gpu-T3-post] n_hits=%d child_count=%u capped_child=%d terminal_count=%u capped_terminal=%d do_field=%d\n",
-                n_hits, t3_meta_rb[0], nc, t3_meta_rb[1], nt_term,
+                diagnostic_n_hits, t3_meta_rb[0], nc, t3_meta_rb[1], nt_term,
                 (int)(ps.cfg.gpu_segment_field_capture && ps.st && ps.st->camera_field_grid));
             fflush(stderr);
         }

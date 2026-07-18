@@ -6,6 +6,8 @@ import copy
 import json
 import math
 import os
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -36,6 +38,19 @@ from camera_software import (
     BevelRegion,
     LayoutRectangle,
     LayoutSeam,
+    FontAssetSpec,
+    ExtrusionAssetSpec,
+    ExtrudedTokenAsset,
+    BakeRequest,
+    BakeTargetKind,
+    SENSOR_DISPLAY_ORIENTATION,
+    RenderAssetCatalog,
+    plan_ink_atlas_bake,
+    ink_order_for_request,
+    extract_raytraced_sprite,
+    token_alpha_mask,
+    measure_sprite_exposure_quality,
+    CachedTokenStringComposer,
     process_linear_sensor_image,
     save_linear_sensor_image,
 )
@@ -47,10 +62,28 @@ DEFAULT_DISPLAY_WIDTH = 960
 DEFAULT_DISPLAY_HEIGHT = 600
 DEFAULT_SENSOR_SWEEPS = 4
 DEFAULT_TARGETED_FRACTION = 0.75
+DEFAULT_LIVE_FOREGROUND_EPOCHS = 64
+DEFAULT_ATLAS_EPOCHS_PER_EXPOSURE = 1
+DEFAULT_ATLAS_SENSOR_TOP_K = 1024
+DEFAULT_ATLAS_STEPS_PER_EPOCH = 64
+DEFAULT_ATLAS_SAMPLES_PER_NODE = 1024
 SENSOR_CROP_SCALE = 5
 DEFAULT_EXTRUSION_DEPTH_RATIO = 0.08
 PROGRAM_SCENE_ID = "spectral-program-scene"
 PROGRAM_STATIC_GEOMETRY_REVISION = 7
+FIXED_IMAGE_ALPHABET = tuple(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+)
+FIXED_IMAGE_FONT = FontAssetSpec(
+    family="DejaVu Sans Mono",
+    weight="bold",
+    style="normal",
+)
+FIXED_UI_TOKEN_STRINGS = (
+    "CAMERA",
+    "WORK VALUE",
+    "SPECTRAL EXPOSURE ACTIVE",
+)
 # The native thick-camera sensor is square. Its exact 200x153 product readback
 # restores the UI aspect afterward, so the camera-facing world layout must use
 # one square physical frame or it is vertically compressed twice.
@@ -108,8 +141,9 @@ def render_contract_summary(
         f"native_sensor={native_resolution}x{native_resolution} "
         f"composition_frame={full_width * SENSOR_CROP_SCALE}x"
         f"{full_height * SENSOR_CROP_SCALE} "
-        f"authored_sensor_sweeps={int(sensor_sweeps)} live_exposure=continuous; "
-        "requested regions and pixel slices accumulate at their scene coordinates"
+        f"authored_sensor_sweeps={int(sensor_sweeps)} "
+        f"foreground_epochs<={DEFAULT_LIVE_FOREGROUND_EPOCHS}; "
+        "production=alphabet->tokens->token-string->total-scene"
     )
 
 
@@ -524,6 +558,9 @@ def build_self_rendering_program_scene(
     editor = replace(
         base.objects[0],
         object_id="editor-text",
+        font_family=FIXED_IMAGE_FONT.family,
+        font_weight=FIXED_IMAGE_FONT.weight,
+        font_style=FIXED_IMAGE_FONT.style,
         horizontal_align="left",
         vertical_align="top",
         placement=_placement_for_sensor_region(
@@ -581,6 +618,9 @@ def build_self_rendering_program_scene(
             ),
             material="text_surface",
             surface_material="quiet_background",
+            font_family=FIXED_IMAGE_FONT.family,
+            font_weight=FIXED_IMAGE_FONT.weight,
+            font_style=FIXED_IMAGE_FONT.style,
             horizontal_align=(
                 "left" if object_id == "status-text" else "center"
             ),
@@ -670,6 +710,36 @@ def _static_scene_is_reusable(
         if item.object_id not in {"editor-text", "status-text"}
     }
     return previous_static == current_static
+
+
+def _sensor_orientation_marker_path(sensor_sum_path: str) -> str:
+    return str(sensor_sum_path) + ".display-orientation"
+
+
+def _mark_sensor_display_orientation(sensor_sum_path: str) -> None:
+    """Mark evidence produced under the current display/readback convention."""
+
+    path = str(sensor_sum_path)
+    if not path:
+        return
+    marker = _sensor_orientation_marker_path(path)
+    temporary = marker + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        handle.write(SENSOR_DISPLAY_ORIENTATION)
+    os.replace(temporary, marker)
+
+
+def _sensor_sum_has_current_orientation(sensor_sum_path: str) -> bool:
+    """Never mix unmarked legacy sums with current progressive frames."""
+
+    marker = _sensor_orientation_marker_path(sensor_sum_path)
+    if not sensor_sum_path or not os.path.isfile(marker):
+        return False
+    try:
+        with open(marker, "r", encoding="utf-8") as handle:
+            return handle.read().strip() == SENSOR_DISPLAY_ORIENTATION
+    except OSError:
+        return False
 
 
 def build_ui_next_scan_control(
@@ -934,35 +1004,34 @@ def build_display_scene_order(
                 placement.size_m[0] * 0.30,
             ),
         )
-        objects.append({
-            "id": spec.object_id,
-            "token": spec.primitive.authored_text(),
-            "embed_plane": plane_id,
-            "enabled": bool(spec.enabled),
-            "font": {
-                "family": spec.font_family,
-                "weight": spec.font_weight,
-                "style": spec.font_style,
-            },
-            "geometry": {
-                "height_m": text_height,
-                "line_height_m": text_height,
-                "line_spacing": 1.05,
-                "horizontal_align": spec.horizontal_align,
-                "vertical_align": spec.vertical_align,
-                "text_box_m": [
+        token_asset = ExtrudedTokenAsset(
+            token=spec.primitive.authored_text(),
+            font=FontAssetSpec(
+                family=spec.font_family,
+                weight=spec.font_weight,
+                style=spec.font_style,
+            ),
+            extrusion=ExtrusionAssetSpec(
+                height_m=text_height,
+                line_height_m=text_height,
+                line_spacing=1.05,
+                text_box_m=(
                     placement.size_m[0] * 0.94,
                     placement.size_m[1] * 0.90,
-                ],
-                "embed_fraction": 0.25,
-                "extrusion_depth_ratio": DEFAULT_EXTRUSION_DEPTH_RATIO,
-                "offset_m": [0.0, 0.0],
-                "profile": "straight",
-                "outline_subdivisions": 4,
-                "cap_grid": 64,
-                "material": spec.material,
-            },
-        })
+                ),
+                horizontal_align=spec.horizontal_align,
+                vertical_align=spec.vertical_align,
+                depth_ratio=DEFAULT_EXTRUSION_DEPTH_RATIO,
+                embed_fraction=0.25,
+                profile="straight",
+                outline_subdivisions=4,
+                cap_grid=64,
+            ),
+            material=spec.material,
+        )
+        objects.append(token_asset.scene_order_object(
+            spec.object_id, plane_id, enabled=spec.enabled
+        ))
     first_plane = planes[0]
     first_geometry = objects[0]["geometry"]
     return {
@@ -1026,6 +1095,31 @@ def build_display_scene_order(
     }
 
 
+def _display_raster_to_native_square(array: np.ndarray) -> np.ndarray:
+    """Invert the C++ getter's y-flip plus the Python display transpose."""
+
+    display = np.asarray(array)
+    if display.ndim not in (2, 3):
+        raise ValueError("display sensor raster must be HxW or HxWxC")
+    height, width = display.shape[:2]
+    resolution = max(width, height)
+    source_y = np.minimum(
+        ((np.arange(resolution) + 0.5) * height / resolution).astype(np.int64),
+        height - 1,
+    )
+    source_x = np.minimum(
+        ((np.arange(resolution) + 0.5) * width / resolution).astype(np.int64),
+        width - 1,
+    )
+    square = display[source_y[:, None], source_x[None, :]]
+    # C++ readback writes getter[out_y, z] = native[y, z], with
+    # out_y = resolution - 1 - y. Display then transposes getter[z, out_y].
+    # Therefore native[y, z] = display.T[resolution - 1 - y, z].
+    return np.ascontiguousarray(
+        np.flip(np.swapaxes(square, 0, 1), axis=0)
+    )
+
+
 def _prepare_native_delta_restore(
     revision_dir: str,
     next_scan_control: dict[str, Any],
@@ -1048,29 +1142,19 @@ def _prepare_native_delta_restore(
     ):
         raise ValueError("retained delta exposure artifacts have incompatible shapes")
     height, width = display_sum.shape[:2]
-    resolution = max(width, height)
-    source_y = np.minimum(
-        ((np.arange(resolution) + 0.5) * height / resolution).astype(np.int64),
-        height - 1,
-    )
-    source_x = np.minimum(
-        ((np.arange(resolution) + 0.5) * width / resolution).astype(np.int64),
-        width - 1,
-    )
-    display_square_sum = display_sum[source_y[:, None], source_x[None, :]]
-    display_square_weight = display_weight[source_y[:, None], source_x[None, :]]
     dirty_display = np.zeros((height, width), dtype=bool)
     for request in next_scan_control.get("pixel_slice_requests", ()):
         if int(request["width"]) != width or int(request["height"]) != height:
             raise ValueError("dirty pixel slice must match retained display exposure")
         indices = np.asarray(request["site_indices"], dtype=np.int64)
         dirty_display.reshape(-1)[indices] = True
-    dirty_square = dirty_display[source_y[:, None], source_x[None, :]]
-    # Native storage is [camera-right, camera-up], the transpose of display.
-    native_sum = np.ascontiguousarray(display_square_sum.transpose(1, 0, 2))
-    native_weight = np.ascontiguousarray(display_square_weight.T)
+    native_sum = _display_raster_to_native_square(display_sum)
+    native_weight = _display_raster_to_native_square(display_weight)
     native_dirty = np.ascontiguousarray(
-        np.flatnonzero(dirty_square.T.reshape(-1)), np.uint32
+        np.flatnonzero(
+            _display_raster_to_native_square(dirty_display).reshape(-1)
+        ),
+        np.uint32,
     )
     native_sum_path = os.path.join(revision_dir, "restore_sensor_sum_native.npy")
     native_weight_path = os.path.join(
@@ -1136,6 +1220,315 @@ RenderFunction = Callable[
     [int, str, dict[str, Any], dict[str, Any] | None, ProgressSink],
     RenderedTextRevision,
 ]
+BackgroundRenderFunction = Callable[[BakeRequest], Any]
+BackgroundRequestSource = Callable[[], BakeRequest | None]
+
+
+class InkAtlasSubprocessRenderer:
+    """Advance one persistent atlas asset by one substantial resumable burst."""
+
+    def __init__(
+        self,
+        output_root: str,
+        catalog: RenderAssetCatalog,
+        *,
+        epochs_per_exposure: int = DEFAULT_ATLAS_EPOCHS_PER_EXPOSURE,
+        sensor_top_k: int = DEFAULT_ATLAS_SENSOR_TOP_K,
+        steps_per_epoch: int = DEFAULT_ATLAS_STEPS_PER_EPOCH,
+        samples_per_node: int = DEFAULT_ATLAS_SAMPLES_PER_NODE,
+    ) -> None:
+        self.output_root = os.path.abspath(output_root)
+        self.catalog = catalog
+        self.epochs_per_exposure = max(1, int(epochs_per_exposure))
+        self.sensor_top_k = max(64, min(1024, int(sensor_top_k)))
+        self.steps_per_epoch = max(1, int(steps_per_epoch))
+        # Native lineage storage is bounded to 2^20 records. With the maximum
+        # 1024 selected nodes, 1024 rays/node fills that arena exactly.
+        self.samples_per_node = max(1, min(1024, int(samples_per_node)))
+        self._lock = threading.Lock()
+        self._active_process: subprocess.Popen[str] | None = None
+        self._work_revision = 0
+        self._work_state: tuple[str, str, int, bool] = ("", "", 0, False)
+
+    def work_snapshot(self) -> tuple[int, str, str, int, bool]:
+        """Latest individual asset shown by the UI work panel."""
+
+        with self._lock:
+            path, token, refinement_pass, active = self._work_state
+            return (
+                self._work_revision,
+                path,
+                token,
+                refinement_pass,
+                active,
+            )
+
+    def cancel_current(self) -> None:
+        with self._lock:
+            process = self._active_process
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+    def __call__(self, request: BakeRequest):
+        package = ink_order_for_request(request)
+        job_id = str(package["jobs"][0]["id"])
+        short_key = request.target_key.rsplit(":", 1)[-1][:16]
+        request_dir = os.path.join(
+            self.output_root, "ink_atlas", f"{request.target_kind.value}_{short_key}"
+        )
+        os.makedirs(request_dir, exist_ok=True)
+        preview_path = os.path.join(request_dir, "0000_cpp.png")
+        with self._lock:
+            self._work_revision += 1
+            self._work_state = (
+                preview_path if os.path.isfile(preview_path) else "",
+                request.token_asset.token,
+                request.refinement_pass,
+                True,
+            )
+        prior_record = self.catalog.find(
+            request.target_key, request.condition, request.product_kind
+        )
+        prior_metadata = (
+            {} if prior_record is None else dict(prior_record.metadata)
+        )
+        resumable_prior = (
+            prior_metadata.get("refinement_state") in {
+                "developing", "converged",
+            }
+            and prior_metadata.get("sensor_display_orientation")
+            == SENSOR_DISPLAY_ORIENTATION
+        )
+        prior_quality = dict(prior_metadata.get("atlas_quality", {}))
+        prior_linear = None
+        if (
+            resumable_prior
+            and
+            prior_record is not None
+            and prior_record.linear_path
+            and os.path.isfile(prior_record.linear_path)
+        ):
+            prior_linear = np.asarray(
+                np.load(prior_record.linear_path, allow_pickle=False),
+                np.float32,
+            )[..., :3].copy()
+        order_path = os.path.join(request_dir, "scene_order.json")
+        with open(order_path, "w", encoding="utf-8") as handle:
+            json.dump(package, handle, indent=2)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        command = [
+            sys.executable,
+            os.path.join(script_dir, "exposure_render_demo.py"),
+            "--scene-order", order_path,
+            "--scene-job", job_id,
+            "--integrator", "bdpt",
+            "--backend", "cpp",
+            "--frames", "1",
+            "--gpu-resident",
+            "--no-window",
+            "--save-files",
+            "--out-dir", request_dir,
+            "--bdpt-native-packages", "1",
+            "--no-convergence-drive-batches",
+        ]
+        environment = os.environ.copy()
+        # Amortize expensive scene/lens/GPU preparation across a large ray
+        # burst. This is a work quantum, not a lifetime target: the catalog
+        # keeps offering the asset until external image deltas converge.
+        environment["SPECTRAL_SENSOR_MAX_EPOCHS"] = str(
+            self.epochs_per_exposure
+        )
+        environment["SPECTRAL_SENSOR_CONTINUOUS"] = "1"
+        environment["SPECTRAL_SENSOR_TOP_K"] = str(self.sensor_top_k)
+        environment["SPECTRAL_SENSOR_STEPS_PER_LAYER"] = str(
+            self.steps_per_epoch
+        )
+        environment["SPECTRAL_SENSOR_SAMPLES_PER_NODE"] = str(
+            self.samples_per_node
+        )
+        environment["SPECTRAL_SENSOR_TARGETED_FRACTION"] = "0.75"
+        refinement_pass = max(
+            int(request.refinement_pass),
+            (
+                int(prior_metadata.get("refinement_pass", 0))
+                if resumable_prior else 0
+            ),
+        )
+        environment["SPECTRAL_EXPOSURE_SEED_OFFSET"] = str(
+            refinement_pass * 1_000_003
+        )
+        sum_path = os.path.join(request_dir, "0000_cpp_sum_linear.npy")
+        weight_path = os.path.join(
+            request_dir, "0000_cpp_exposure_weight.npy"
+        )
+        if (
+            refinement_pass > 0
+            and os.path.isfile(sum_path)
+            and os.path.isfile(weight_path)
+        ):
+            restore_sum_path = os.path.join(
+                request_dir, "restore_sensor_sum_native.npy"
+            )
+            restore_weight_path = os.path.join(
+                request_dir, "restore_sensor_weight_native.npy"
+            )
+            dirty_path = os.path.join(request_dir, "sensor_dirty_sites.npy")
+            np.save(
+                restore_sum_path,
+                _display_raster_to_native_square(
+                    np.load(sum_path, allow_pickle=False)
+                ),
+                allow_pickle=False,
+            )
+            np.save(
+                restore_weight_path,
+                _display_raster_to_native_square(
+                    np.load(weight_path, allow_pickle=False)
+                ),
+                allow_pickle=False,
+            )
+            np.save(dirty_path, np.empty(0, np.uint32))
+            environment["SPECTRAL_SENSOR_RESTORE_SUM"] = restore_sum_path
+            environment["SPECTRAL_SENSOR_RESTORE_WEIGHT"] = restore_weight_path
+            environment["SPECTRAL_SENSOR_DIRTY_SITES"] = dirty_path
+        log_path = os.path.join(request_dir, "render.log")
+        print(
+            f"[ink-atlas] rendering {request.target_kind.value} "
+            f"{request.token_asset.token!r} -> {request_dir}",
+            flush=True,
+        )
+        with open(log_path, "w", encoding="utf-8") as log:
+            executed_epochs = 0
+            process = subprocess.Popen(
+                command,
+                cwd=script_dir,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            with self._lock:
+                self._active_process = process
+            assert process.stdout is not None
+            try:
+                for line in process.stdout:
+                    log.write(line)
+                    log.flush()
+                    if "[sensor-refine] epoch " in line:
+                        executed_epochs += 1
+                    print(f"[ink-atlas] {line}", end="", flush=True)
+                return_code = process.wait()
+            finally:
+                with self._lock:
+                    if self._active_process is process:
+                        self._active_process = None
+            if return_code != 0:
+                raise subprocess.CalledProcessError(return_code, command)
+        linear_path = os.path.join(request_dir, "0000_cpp_linear.npy")
+        manifest_path = os.path.join(request_dir, "atlas_capture_manifest.json")
+        capture = request.capture
+        if capture is None:
+            raise RuntimeError("ink atlas render requires a capture contract")
+        if not os.path.isfile(linear_path) or not os.path.isfile(weight_path):
+            raise RuntimeError("ink atlas render did not produce linear/weight evidence")
+        linear_image = np.asarray(
+            np.load(linear_path, allow_pickle=False), np.float32
+        )[..., :3]
+        exposure_weight = np.asarray(
+            np.load(weight_path, allow_pickle=False), np.float32
+        )
+        alpha = token_alpha_mask(request.token_asset, capture)
+        quality = measure_sprite_exposure_quality(
+            linear_image,
+            exposure_weight,
+            alpha,
+            refinement_pass=refinement_pass + max(1, executed_epochs),
+            previous_image=prior_linear,
+            previous_stable_hold=int(prior_quality.get("stable_hold", 0)),
+        )
+        manifest = {
+            "schema_version": 1,
+            "target_key": request.target_key,
+            "condition_key": request.condition.condition_key,
+            "token": request.token_asset.token,
+            "font": request.token_asset.font.identity_payload(),
+            "capture": (
+                {}
+                if capture is None
+                else {
+                    "width": capture.width,
+                    "height": capture.height,
+                    "content_region": list(capture.content_region),
+                    "preserves_neighboring_light": True,
+                }
+            ),
+            "linear_path": linear_path,
+            "sum_linear_path": sum_path,
+            "exposure_weight_path": weight_path,
+            "preview_path": preview_path,
+            "quality": quality.as_metadata(),
+        }
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
+        sprite = extract_raytraced_sprite(
+            linear_image, request.token_asset, capture
+        )
+        sprite_path = sprite.save(
+            os.path.join(request_dir, "raytraced_sprite.npz")
+        )
+        record = self.catalog.complete(
+            request,
+            linear_path=linear_path,
+            preview_path=preview_path,
+            manifest_path=manifest_path,
+            width=capture.width,
+            height=capture.height,
+            samples=quality.refinement_pass,
+            metadata={
+                "bounded_background_render": True,
+                "refinement_state": (
+                    "converged" if quality.converged else "developing"
+                ),
+                "refinement_pass": quality.refinement_pass,
+                "epochs_per_exposure": self.epochs_per_exposure,
+                "sensor_top_k": self.sensor_top_k,
+                "steps_per_epoch": self.steps_per_epoch,
+                "samples_per_node": self.samples_per_node,
+                "camera_primary_rays_per_epoch": (
+                    self.sensor_top_k
+                    * self.steps_per_epoch
+                    * self.samples_per_node
+                ),
+                "sensor_display_orientation": SENSOR_DISPLAY_ORIENTATION,
+                "atlas_quality": quality.as_metadata(),
+                "sum_linear_path": sum_path,
+                "exposure_weight_path": weight_path,
+                "sprite_path": sprite_path,
+                "sprite_composition": (
+                    "premultiplied + (1-alpha)*destination + signed_additive"
+                ),
+            },
+        )
+        print(
+            f"[ink-atlas] refined {request.token_asset.token!r} "
+            f"pass={quality.refinement_pass} "
+            f"state={record.metadata['refinement_state']} "
+            f"stable={quality.stable_hold} "
+            f"record={record.record_key}",
+            flush=True,
+        )
+        with self._lock:
+            self._work_revision += 1
+            self._work_state = (
+                preview_path,
+                request.token_asset.token,
+                quality.refinement_pass,
+                False,
+            )
+        return record
 
 
 class SpectralTextRenderWorker:
@@ -1145,9 +1538,20 @@ class SpectralTextRenderWorker:
         self,
         render_function: RenderFunction,
         progress_observer: ProgressSink | None = None,
+        background_source: BackgroundRequestSource | None = None,
+        background_render_function: BackgroundRenderFunction | None = None,
     ):
         self._render_function = render_function
         self._progress_observer = progress_observer
+        if (background_source is None) != (background_render_function is None):
+            raise ValueError(
+                "background source and render function must be supplied together"
+            )
+        self._background_source = background_source
+        self._background_render_function = background_render_function
+        self._background_paused = False
+        self._background_error = ""
+        self._background_busy = False
         self._condition = threading.Condition()
         self._pending: tuple[
             int, str, dict[str, Any], dict[str, Any] | None
@@ -1175,6 +1579,11 @@ class SpectralTextRenderWorker:
         cancel = getattr(self._render_function, "cancel_current", None)
         if callable(cancel):
             cancel()
+        cancel_background = getattr(
+            self._background_render_function, "cancel_current", None
+        )
+        if callable(cancel_background):
+            cancel_background()
         with self._condition:
             self._submitted_sequence += 1
             sequence = self._submitted_sequence
@@ -1188,6 +1597,18 @@ class SpectralTextRenderWorker:
             self._condition.notify()
             return sequence
 
+    def wake_background(self) -> None:
+        """Retry/replan background work after new tokens or external recovery."""
+
+        with self._condition:
+            self._background_paused = False
+            self._background_error = ""
+            self._condition.notify_all()
+
+    def background_snapshot(self) -> tuple[bool, str]:
+        with self._condition:
+            return self._background_busy, self._background_error
+
     def snapshot(self) -> tuple[RenderedTextRevision | None, bool, str, int]:
         with self._condition:
             return self._latest, self._busy, self._error, self._submitted_sequence
@@ -1199,6 +1620,11 @@ class SpectralTextRenderWorker:
         cancel = getattr(self._render_function, "cancel_current", None)
         if callable(cancel):
             cancel()
+        cancel_background = getattr(
+            self._background_render_function, "cancel_current", None
+        )
+        if callable(cancel_background):
+            cancel_background()
         with self._condition:
             self._stopping = True
             self._condition.notify_all()
@@ -1206,16 +1632,34 @@ class SpectralTextRenderWorker:
 
     def _run(self) -> None:
         while True:
+            background_request: BakeRequest | None = None
             with self._condition:
                 while self._pending is None and not self._stopping:
+                    if (
+                        self._background_source is not None
+                        and not self._background_paused
+                    ):
+                        background_request = self._background_source()
+                        if background_request is not None:
+                            break
                     self._condition.wait()
                 if self._stopping:
                     return
-                sequence, text, order, next_scan_control = self._pending
-                self._pending = None
+                foreground = self._pending is not None
+                if foreground:
+                    sequence, text, order, next_scan_control = self._pending
+                    self._pending = None
+                    background_request = None
                 self._busy = True
+                self._background_busy = not foreground
                 self._error = ""
             try:
+                if not foreground:
+                    assert background_request is not None
+                    assert self._background_render_function is not None
+                    self._background_render_function(background_request)
+                    continue
+
                 def publish_progress(event: ExposureProgressEvent) -> None:
                     # Old revisions may finish expensive native work after a new
                     # edit has been submitted.  Keep their logs/artifacts, but do
@@ -1235,11 +1679,20 @@ class SpectralTextRenderWorker:
                     self._latest_sequence = sequence
             except Exception as exc:
                 with self._condition:
-                    if sequence == self._submitted_sequence and not self._stopping:
+                    if not foreground:
+                        # A foreground submission intentionally terminates an
+                        # atlas subprocess. Retry it after that foreground work.
+                        if self._pending is None and not self._stopping:
+                            self._background_error = (
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                            self._background_paused = True
+                    elif sequence == self._submitted_sequence and not self._stopping:
                         self._error = f"{type(exc).__name__}: {exc}"
             finally:
                 with self._condition:
                     self._busy = False
+                    self._background_busy = False
                     self._condition.notify_all()
 
 
@@ -1341,11 +1794,13 @@ def make_subprocess_renderer(
         print(f"[live] revision {sequence} process: {' '.join(command)}", flush=True)
         with open(log_path, "w", encoding="utf-8") as log:
             environment = os.environ.copy()
-            # A live camera keeps exposing until the window closes or edited
-            # content supersedes this revision. Zero means no authored epoch
-            # cap; the statistical scorer continues to order every GPU layer.
-            environment["SPECTRAL_SENSOR_MAX_EPOCHS"] = "0"
-            environment["SPECTRAL_SENSOR_CONTINUOUS"] = "1"
+            # Foreground work is urgent but bounded. It may stop earlier when
+            # the clarity discriminator accepts the frame; afterward the same
+            # render owner can manufacture one missing atlas asset.
+            environment["SPECTRAL_SENSOR_MAX_EPOCHS"] = str(
+                DEFAULT_LIVE_FOREGROUND_EPOCHS
+            )
+            environment["SPECTRAL_SENSOR_CONTINUOUS"] = "0"
             environment["SPECTRAL_SENSOR_TARGETED_FRACTION"] = str(
                 float(targeted_fraction)
             )
@@ -1611,6 +2066,43 @@ def _active_work_texture(
     return work
 
 
+def _ink_tokens_from_text(text: str) -> tuple[str, ...]:
+    """Exact non-whitespace sequences whose characters should seed the atlas."""
+
+    return tuple(dict.fromkeys(str(text).split()))
+
+
+def _ink_production_plan(
+    text: str,
+    catalog: RenderAssetCatalog,
+):
+    """Strict alphabet -> tokens -> token string production ladder."""
+
+    token_strings = tuple(dict.fromkeys(
+        (*FIXED_UI_TOKEN_STRINGS, str(text))
+    ))
+    tokens = tuple(dict.fromkeys((
+        *FIXED_IMAGE_ALPHABET,
+        *(
+            token
+            for token_string in token_strings
+            for token in _ink_tokens_from_text(token_string)
+        ),
+    )))
+    return plan_ink_atlas_bake(
+        tokens,
+        catalog,
+        token_strings=token_strings,
+        font=FIXED_IMAGE_FONT,
+    )
+
+
+def _total_scene_is_ready(
+    text: str, catalog: RenderAssetCatalog
+) -> bool:
+    return _ink_production_plan(text, catalog).next_request is None
+
+
 def run_window(
     output_root: str,
     initial_text: str,
@@ -1620,6 +2112,10 @@ def run_window(
     camera_profile: ColorScienceProfile,
     targeted_fraction: float = DEFAULT_TARGETED_FRACTION,
     priority_model_path: str = "",
+    atlas_epochs_per_exposure: int = DEFAULT_ATLAS_EPOCHS_PER_EXPOSURE,
+    atlas_sensor_top_k: int = DEFAULT_ATLAS_SENSOR_TOP_K,
+    atlas_steps_per_epoch: int = DEFAULT_ATLAS_STEPS_PER_EPOCH,
+    atlas_samples_per_node: int = DEFAULT_ATLAS_SAMPLES_PER_NODE,
 ) -> int:
     import pygame
 
@@ -1637,8 +2133,13 @@ def run_window(
         flush=True,
     )
     print(
-        "[live] recursive GPU exposure continues until the window closes or the "
-        "text changes; measured Monte Carlo noise/ambiguity orders each new layer",
+        "[live] strict production order: fixed-width alphabet cells, tokens, "
+        "complete token string, then total UI scene; "
+        f"atlas camera rays/epoch="
+        f"{int(atlas_sensor_top_k) * int(atlas_steps_per_epoch) * int(atlas_samples_per_node):,} "
+        f"({int(atlas_sensor_top_k)} nodes x "
+        f"{int(atlas_samples_per_node)} rays/node x "
+        f"{int(atlas_steps_per_epoch)} submissions)",
         flush=True,
     )
     print(
@@ -1667,13 +2168,41 @@ def run_window(
             object_ids = active_object_ids[0]
             expected_exposure_id = active_exposure_id[0]
         if object_ids and event.exposure_id == expected_exposure_id:
+            if event.sensor_sum_path:
+                _mark_sensor_display_orientation(event.sensor_sum_path)
             inventory.record_progress(PROGRAM_SCENE_ID, object_ids, event)
+
+    atlas_catalog = RenderAssetCatalog(os.path.join(
+        os.path.abspath(output_root), "ink_atlas", "catalog.json"
+    ))
+    atlas_composer = CachedTokenStringComposer(
+        atlas_catalog, font=FIXED_IMAGE_FONT
+    )
+    atlas_renderer = InkAtlasSubprocessRenderer(
+        output_root,
+        atlas_catalog,
+        epochs_per_exposure=atlas_epochs_per_exposure,
+        sensor_top_k=atlas_sensor_top_k,
+        steps_per_epoch=atlas_steps_per_epoch,
+        samples_per_node=atlas_samples_per_node,
+    )
+    atlas_lock = threading.Lock()
+    atlas_text = [str(initial_text)[:500]]
+
+    def next_atlas_request() -> BakeRequest | None:
+        with atlas_lock:
+            planned_text = atlas_text[0]
+        return _ink_production_plan(
+            planned_text, atlas_catalog
+        ).next_request
 
     worker = SpectralTextRenderWorker(
         make_subprocess_renderer(
             output_root, camera_profile, targeted_fraction, priority_model_path
         ),
         progress_observer=retain_progress,
+        background_source=next_atlas_request,
+        background_render_function=atlas_renderer,
     )
     text = str(initial_text)[:500]
     cursor = len(text)
@@ -1684,6 +2213,8 @@ def run_window(
     progress_event: ExposureProgressEvent | None = None
     texture = None
     priority_texture = None
+    atlas_work_texture = None
+    atlas_work_revision = -1
     photographed_region = program_display_region(scene_width, scene_height)
     ui_sensor_regions = program_ui_sensor_regions(
         scene_width,
@@ -1694,6 +2225,9 @@ def run_window(
     ray_control_hitboxes: dict[str, Any] = {}
     transition_restore: dict[str, str] = {}
     transition_dirty_slice: SensorPixelSlice | None = None
+    cached_overlay_key: tuple[Any, ...] | None = None
+    cached_overlay_texture = None
+    cached_overlay_used: tuple[str, ...] = ()
     running = True
 
     try:
@@ -1740,10 +2274,23 @@ def run_window(
                         cursor = min(len(text), cursor + 1)
                     elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                         text = text[:cursor] + "\n" + text[cursor:]
-                        cursor += 1
-                        dirty_at = time.monotonic()
+                    cursor += 1
+                    dirty_at = time.monotonic()
 
-            if text.strip() and text != submitted_text and time.monotonic() - dirty_at >= 1.0:
+            with atlas_lock:
+                atlas_text_changed = atlas_text[0] != text
+                if atlas_text_changed:
+                    atlas_text[0] = text
+            if atlas_text_changed:
+                worker.wake_background()
+            production_ready = _total_scene_is_ready(text, atlas_catalog)
+
+            if (
+                text.strip()
+                and text != submitted_text
+                and production_ready
+                and time.monotonic() - dirty_at >= 1.0
+            ):
                 next_revision = worker.snapshot()[3] + 1
                 scene = build_self_rendering_program_scene(
                     text,
@@ -1751,10 +2298,7 @@ def run_window(
                     display_height=scene_height,
                     work_width=display_width,
                     work_height=display_height,
-                    status_text=(
-                        f"EXPOSING REVISION {next_revision} - "
-                        "CONTINUOUS SENSOR REFINEMENT"
-                    ),
+                    status_text="SPECTRAL EXPOSURE ACTIVE",
                     revision=next_revision,
                 )
                 delta_restore: dict[str, str] = {}
@@ -1769,7 +2313,12 @@ def run_window(
                         if retained_object.object_id != "editor-text":
                             continue
                         for retained_product in retained_object.products:
-                            if retained_product.kind is DisplayProductKind.IMAGE:
+                            if (
+                                retained_product.kind is DisplayProductKind.IMAGE
+                                and _sensor_sum_has_current_orientation(
+                                    retained_product.sensor_sum_path
+                                )
+                            ):
                                 delta_restore = {
                                     "sensor_sum_path": retained_product.sensor_sum_path,
                                     "exposure_weight_path": (
@@ -1841,6 +2390,26 @@ def run_window(
                 progress_event = None
 
             latest, _busy, _error, _submitted_sequence = worker.snapshot()
+            (
+                current_work_revision,
+                current_work_path,
+                current_work_token,
+                current_work_pass,
+                current_work_active,
+            ) = atlas_renderer.work_snapshot()
+            if current_work_revision != atlas_work_revision:
+                if current_work_path and os.path.isfile(current_work_path):
+                    atlas_work_texture = pygame.image.load(
+                        current_work_path
+                    ).convert()
+                    print(
+                        "[ink-work] "
+                        f"asset={current_work_token!r} "
+                        f"pass={current_work_pass} "
+                        f"active={current_work_active}",
+                        flush=True,
+                    )
+                atlas_work_revision = current_work_revision
             newest_progress, _progress_layers = worker.progress_snapshot()
             if newest_progress is not None:
                 progress_key = (newest_progress.exposure_id, newest_progress.sequence)
@@ -1945,11 +2514,74 @@ def run_window(
             # Every panel, label, control, editor, and status pixel stays inside.
             width, height = scene_width, scene_height
             window.fill((15, 18, 19))
-            if texture is not None:
+            if texture is not None and production_ready:
                 window.blit(texture, (0, 0))
+            editor_destination = _sensor_product_window_rect(
+                ui_sensor_regions["editor-text"],
+                photographed_region,
+                width,
+                height,
+            )
+            catalog_state = atlas_catalog.snapshot()
+            overlay_key = (
+                text,
+                editor_destination[2],
+                editor_destination[3],
+                tuple(
+                    (
+                        record.record_key,
+                        str(record.metadata.get("sprite_path", "")),
+                    )
+                    for record in catalog_state
+                ),
+            )
+            if production_ready and overlay_key != cached_overlay_key:
+                composition = atlas_composer.compose(
+                    text,
+                    editor_destination[2],
+                    editor_destination[3],
+                )
+                cached_overlay_used = composition.used_tokens
+                # A blank composition is still meaningful: it clears stale
+                # ray-traced text when the editor becomes empty.
+                display_composition = process_linear_sensor_image(
+                    composition.linear_rgb, camera_profile
+                )
+                overlay_pixels = np.ascontiguousarray(
+                    np.clip(display_composition[..., :3], 0.0, 1.0)
+                    * 255.0,
+                    dtype=np.uint8,
+                )
+                cached_overlay_texture = pygame.surfarray.make_surface(
+                    overlay_pixels.swapaxes(0, 1)
+                )
+                print(
+                    "[ink-compose] "
+                    f"cached={list(composition.used_tokens)} "
+                    f"missing_tokens={list(composition.missing_tokens)} "
+                    f"missing_characters={list(composition.missing_characters)}",
+                    flush=True,
+                )
+                cached_overlay_key = overlay_key
+            # While the exact full-page revision is unavailable, replace only
+            # the editor region with the best cached token/glyph composition.
+            if (
+                production_ready
+                and
+                cached_overlay_texture is not None
+                and (latest is None or latest.text != text)
+            ):
+                window.blit(cached_overlay_texture, editor_destination[:2])
             panel_products = (
                 ("camera-panel", texture),
-                ("work-panel", priority_texture),
+                (
+                    "work-panel",
+                    (
+                        atlas_work_texture
+                        if atlas_work_texture is not None
+                        else priority_texture
+                    ),
+                ),
             )
             header_bottom = max(
                 region.y + region.height
@@ -1979,11 +2611,24 @@ def run_window(
                 )
                 panel_texture = _active_work_texture(
                     panel_texture,
-                    None if progress_event is None
-                    else progress_event.global_uv_bounds,
+                    (
+                        None
+                        if panel_id == "work-panel" and atlas_work_texture is not None
+                        else (
+                            None if progress_event is None
+                            else progress_event.global_uv_bounds
+                        )
+                    ),
                     destination[2],
                     destination[3],
-                    1 if progress_event is None else progress_event.sequence,
+                    (
+                        current_work_revision
+                        if panel_id == "work-panel" and atlas_work_texture is not None
+                        else (
+                            1 if progress_event is None
+                            else progress_event.sequence
+                        )
+                    ),
                 )
                 if panel_texture is None:
                     continue
@@ -2011,16 +2656,101 @@ def run_window(
     return 0
 
 
+def clear_camera_storage(output_root: str) -> tuple[str, ...]:
+    """Clear only this program's exposures, atlas, and retained UI inventory."""
+
+    root = os.path.abspath(str(output_root))
+    drive, tail = os.path.splitdrive(root)
+    if not tail.strip("\\/") or root == os.path.abspath(os.path.expanduser("~")):
+        raise ValueError("refusing to clear a filesystem or home-directory root")
+    if not os.path.isdir(root):
+        return ()
+
+    targets: list[str] = []
+    for entry in os.scandir(root):
+        if (
+            entry.name == "ink_atlas"
+            or entry.name in {
+                "display_inventory.json",
+                "display_inventory.json.tmp",
+            }
+            or re.fullmatch(r"revision_[0-9]+", entry.name)
+        ):
+            target = os.path.abspath(entry.path)
+            if os.path.commonpath((root, target)) != root or target == root:
+                raise ValueError(f"refusing camera-clear target: {target}")
+            targets.append(target)
+
+    removed: list[str] = []
+    for target in sorted(targets):
+        if os.path.isdir(target) and not os.path.islink(target):
+            shutil.rmtree(target)
+        else:
+            os.unlink(target)
+        removed.append(target)
+    return tuple(removed)
+
+
 def _args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", default="exposures/live_spectral_text")
+    parser.add_argument(
+        "--clear-camera",
+        action="store_true",
+        help=(
+            "Clear this demo's revision exposures, retained display inventory, "
+            "and ink/token cache before starting."
+        ),
+    )
+    parser.add_argument(
+        "--clear-camera-only",
+        action="store_true",
+        help="Clear this demo's camera storage and exit without opening a window.",
+    )
     parser.add_argument("--text", default=DEFAULT_TEXT)
     parser.add_argument("--display-width", type=int, default=DEFAULT_DISPLAY_WIDTH,
                         help="Exact width of the complete camera-rendered program preview.")
     parser.add_argument("--display-height", type=int, default=DEFAULT_DISPLAY_HEIGHT,
                         help="Exact height of the complete camera-rendered program preview.")
     parser.add_argument("--sensor-sweeps", type=int, default=DEFAULT_SENSOR_SWEEPS,
-                        help="Scene-order compatibility value; the live camera itself exposes continuously.")
+                        help="Scene-order compatibility value; live foreground work is clarity/cap bounded.")
+    parser.add_argument(
+        "--atlas-epochs-per-exposure",
+        type=int,
+        default=DEFAULT_ATLAS_EPOCHS_PER_EXPOSURE,
+        help=(
+            "Recursive sensor epochs executed per prepared atlas process "
+            f"(default: {DEFAULT_ATLAS_EPOCHS_PER_EXPOSURE}). This controls "
+            "the resumable work quantum, not convergence completion."
+        ),
+    )
+    parser.add_argument(
+        "--atlas-sensor-top-k",
+        type=int,
+        default=DEFAULT_ATLAS_SENSOR_TOP_K,
+        help=(
+            "Sensor mip nodes selected per atlas refinement submission "
+            f"(default: {DEFAULT_ATLAS_SENSOR_TOP_K}, maximum: 1024)."
+        ),
+    )
+    parser.add_argument(
+        "--atlas-steps-per-epoch",
+        type=int,
+        default=DEFAULT_ATLAS_STEPS_PER_EPOCH,
+        help=(
+            "Recursive sensor refinement submissions inside each atlas epoch "
+            f"(default: {DEFAULT_ATLAS_STEPS_PER_EPOCH})."
+        ),
+    )
+    parser.add_argument(
+        "--atlas-samples-per-node",
+        type=int,
+        default=DEFAULT_ATLAS_SAMPLES_PER_NODE,
+        help=(
+            "Actual camera rays generated per selected sensor node in each "
+            f"native atlas submission (default: {DEFAULT_ATLAS_SAMPLES_PER_NODE})."
+        ),
+    )
     parser.add_argument("--targeted-fraction", type=float,
                         default=DEFAULT_TARGETED_FRACTION,
                         help="Fraction of recursive GPU work selected by learned/measured value; the remainder guarantees broad coverage (default: 0.75).")
@@ -2045,6 +2775,25 @@ def main(argv: list[str] | None = None) -> int:
     args = _args(sys.argv[1:] if argv is None else argv)
     if not 0.0 <= float(args.targeted_fraction) <= 1.0:
         raise SystemExit("--targeted-fraction must be in [0, 1]")
+    if int(args.atlas_epochs_per_exposure) <= 0:
+        raise SystemExit("--atlas-epochs-per-exposure must be positive")
+    if not 64 <= int(args.atlas_sensor_top_k) <= 1024:
+        raise SystemExit("--atlas-sensor-top-k must be in [64, 1024]")
+    if int(args.atlas_steps_per_epoch) <= 0:
+        raise SystemExit("--atlas-steps-per-epoch must be positive")
+    if not 1 <= int(args.atlas_samples_per_node) <= 1024:
+        raise SystemExit("--atlas-samples-per-node must be in [1, 1024]")
+    if args.clear_camera or args.clear_camera_only:
+        removed = clear_camera_storage(args.out_dir)
+        print(
+            f"[camera-clear] root={os.path.abspath(args.out_dir)} "
+            f"removed={len(removed)}",
+            flush=True,
+        )
+        for path in removed:
+            print(f"[camera-clear] removed {path}", flush=True)
+    if args.clear_camera_only:
+        return 0
     camera_profile = ColorScienceProfile.spectral_sensor_srgb(
         sensor_white_level=args.camera_white_level,
         exposure_compensation_ev=args.camera_exposure_ev,
@@ -2076,6 +2825,10 @@ def main(argv: list[str] | None = None) -> int:
         camera_profile,
         args.targeted_fraction,
         args.priority_model,
+        args.atlas_epochs_per_exposure,
+        args.atlas_sensor_top_k,
+        args.atlas_steps_per_epoch,
+        args.atlas_samples_per_node,
     )
 
 

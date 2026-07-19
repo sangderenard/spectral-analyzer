@@ -446,7 +446,10 @@ class CachedTokenStringComposer:
         return record if sprite_path and os.path.isfile(sprite_path) else None
 
     def _pieces(
-        self, text: str
+        self,
+        text: str,
+        *,
+        character_tiles_only: bool = False,
     ) -> tuple[list[tuple[str, RenderedAssetRecord | None]], set[str], set[str]]:
         if not text:
             return [], set(), set()
@@ -461,7 +464,11 @@ class CachedTokenStringComposer:
             ) is not None
             for character in visible_characters
         )
-        if text.strip() and individual_glyphs_ready:
+        if (
+            not character_tiles_only
+            and text.strip()
+            and individual_glyphs_ready
+        ):
             exact = self._record(text, character=(len(text) == 1))
             if exact is not None:
                 return [(text, exact)], set(), set()
@@ -482,7 +489,8 @@ class CachedTokenStringComposer:
             )
             token_record = (
                 self._record(segment, character=(len(segment) == 1))
-                if segment_glyphs_ready else None
+                if segment_glyphs_ready and not character_tiles_only
+                else None
             )
             if token_record is not None:
                 pieces.append((segment, token_record))
@@ -503,34 +511,49 @@ class CachedTokenStringComposer:
         height: int,
         *,
         background_rgb: tuple[float, float, float] = (0.002, 0.002, 0.002),
+        character_tiles_only: bool = False,
     ) -> CachedStringComposition:
         if width <= 0 or height <= 0:
             raise ValueError("composition dimensions must be positive")
         canvas = np.broadcast_to(
             np.asarray(background_rgb, np.float64), (height, width, 3)
         ).copy()
-        pieces, missing_tokens, missing_characters = self._pieces(str(text))
+        pieces, missing_tokens, missing_characters = self._pieces(
+            str(text),
+            character_tiles_only=character_tiles_only,
+        )
         used: list[str] = []
         line_height = max(8, int(round(min(48.0, height * 0.42))))
         cell_advance = max(3, int(round(line_height * 0.72)))
         x = max(2, line_height // 6)
         y = max(1, line_height // 5)
+        line_start = x
         for token, record in pieces:
             if token.isspace():
                 for character in token:
                     if character == "\n":
-                        x = max(2, line_height // 6)
+                        x = line_start
                         y += line_height
                     else:
+                        if x + cell_advance > width and x > line_start:
+                            x = line_start
+                            y += line_height
                         x += cell_advance
                 continue
             cell_span = max(1, len(token)) * cell_advance
+            # Reserve and wrap the tile span before looking for image evidence.
+            # Missing/developing glyphs therefore occupy exactly the same cells
+            # they will use after a later catalog refresh.
+            if x + cell_span > width and x > line_start:
+                x = line_start
+                y += line_height
             if record is None:
                 x += cell_span
                 continue
             sprite = RayTracedSprite.load(str(record.metadata["sprite_path"]))
             alpha_points = np.argwhere(sprite.alpha > 0.01)
             if not alpha_points.size:
+                x += cell_span
                 continue
             y0, x0 = alpha_points.min(axis=0)
             y1, x1 = alpha_points.max(axis=0) + 1
@@ -545,9 +568,6 @@ class CachedTokenStringComposer:
                 fit = cell_span / target_width
                 target_width = cell_span
                 target_height = max(1, int(round(target_height * fit)))
-            if x + cell_span > width and x > 2:
-                x = max(2, line_height // 6)
-                y += line_height
             if y + target_height > height:
                 break
             draw_x = x + max(0, (cell_span - target_width) // 2)

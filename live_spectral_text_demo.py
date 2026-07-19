@@ -2103,6 +2103,16 @@ def _total_scene_is_ready(
     return _ink_production_plan(text, catalog).next_request is None
 
 
+def _fixed_image_alphabet_is_ready(catalog: RenderAssetCatalog) -> bool:
+    """Whether every provisional fixed-width glyph has image-converged."""
+
+    return plan_ink_atlas_bake(
+        FIXED_IMAGE_ALPHABET,
+        catalog,
+        font=FIXED_IMAGE_FONT,
+    ).next_request is None
+
+
 def run_window(
     output_root: str,
     initial_text: str,
@@ -2284,6 +2294,7 @@ def run_window(
             if atlas_text_changed:
                 worker.wake_background()
             production_ready = _total_scene_is_ready(text, atlas_catalog)
+            alphabet_ready = _fixed_image_alphabet_is_ready(atlas_catalog)
 
             if (
                 text.strip()
@@ -2527,19 +2538,25 @@ def run_window(
                 text,
                 editor_destination[2],
                 editor_destination[3],
+                alphabet_ready,
                 tuple(
                     (
                         record.record_key,
                         str(record.metadata.get("sprite_path", "")),
+                        int(record.metadata.get(
+                            "refinement_pass", record.samples
+                        )),
+                        str(record.metadata.get("refinement_state", "")),
                     )
                     for record in catalog_state
                 ),
             )
-            if production_ready and overlay_key != cached_overlay_key:
+            if overlay_key != cached_overlay_key:
                 composition = atlas_composer.compose(
                     text,
                     editor_destination[2],
                     editor_destination[3],
+                    character_tiles_only=not alphabet_ready,
                 )
                 cached_overlay_used = composition.used_tokens
                 # A blank composition is still meaningful: it clears stale
@@ -2566,8 +2583,6 @@ def run_window(
             # While the exact full-page revision is unavailable, replace only
             # the editor region with the best cached token/glyph composition.
             if (
-                production_ready
-                and
                 cached_overlay_texture is not None
                 and (latest is None or latest.text != text)
             ):

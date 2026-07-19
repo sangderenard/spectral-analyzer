@@ -137,6 +137,124 @@ def test_native_backend_readback_uses_passed_session_sweep_count():
     )
 
 
+def test_native_backend_pages_sensor_records_without_retracing_flash():
+    class FakeTracer:
+        def __init__(self):
+            self.flash_submissions = 0
+            self.flash_signals = 0
+            self.sensor_signals = 0
+            self.joins = 0
+
+        def submit_emissive_triangles(self, *args):
+            self.flash_submissions += 1
+            return 1
+
+        def signal_flash_dispatched(self):
+            self.flash_signals += 1
+
+        def begin_sensor_batching(self):
+            pass
+
+        def submit_sensor_sweep(self, **kwargs):
+            return kwargs["max_rays"]
+
+        def signal_sensor_dispatched(self):
+            self.sensor_signals += 1
+
+        def join_t5(self):
+            self.joins += 1
+
+        def end_sensor_batching(self):
+            pass
+
+        def get_sensor_image(self):
+            return np.ones((1, 1, 3), dtype=np.float32)
+
+    backend = CppExposureBackend.__new__(CppExposureBackend)
+    backend.tracer = FakeTracer()
+    backend._sensor_camera_desc = {"n_px": 250_001, "n_py": 1}
+    backend.cam = SimpleNamespace(width=250_001, height=1)
+    backend.max_bounces = 1
+    backend._gpu_resident = True
+    backend._native_sensor_image = None
+    backend._native_sensor_linear_image = None
+    backend.n_rays_accumulated = 0
+
+    backend.run_thick_lens_native_bdpt(
+        emitter_tri_ids=np.asarray([0], dtype=np.int32),
+        total_rays=1,
+        sensor_rays_per_batch=1_000_000,
+        n_aperture_samples=1,
+        max_children=1,
+        seed=1,
+    )
+
+    assert backend.tracer.flash_submissions == 1
+    assert backend.tracer.flash_signals == 2
+    assert backend.tracer.sensor_signals == 2
+    assert backend.tracer.joins == 2
+
+
+def test_recursive_sensor_steps_and_large_top_k_are_record_paged():
+    class FakeTracer:
+        def __init__(self):
+            self.flash_submissions = 0
+            self.flash_signals = 0
+            self.sensor_signals = 0
+            self.joins = 0
+            self.top_ks = []
+
+        def set_t5_pair_budget(self, _budget):
+            pass
+
+        def ensure_pipeline(self, **_kwargs):
+            pass
+
+        def begin_sensor_batching(self):
+            pass
+
+        def submit_emissive_triangles(self, *args):
+            self.flash_submissions += 1
+            return 1
+
+        def signal_flash_dispatched(self):
+            self.flash_signals += 1
+
+        def submit_sensor_mip_epoch(self, **kwargs):
+            self.top_ks.append(kwargs["top_k"])
+            return True
+
+        def signal_sensor_dispatched(self):
+            self.sensor_signals += 1
+
+        def join_t5(self):
+            self.joins += 1
+
+        def end_sensor_batching(self):
+            pass
+
+    backend = CppExposureBackend.__new__(CppExposureBackend)
+    backend.tracer = FakeTracer()
+    backend._sensor_mipmap_enabled = True
+    backend._sensor_camera_desc = {"n_px": 1, "n_py": 1}
+    backend._sensor_samples_per_node = 1024
+    backend.max_bounces = 8
+
+    backend.run_recursive_sensor_epoch(
+        top_k=512,
+        seed=7,
+        emitter_tri_ids=np.asarray([0], dtype=np.int32),
+        refinement_steps=2,
+    )
+
+    # 200k primary cap => at most floor(200000 / 1024) = 195 nodes/page.
+    assert backend.tracer.top_ks == [195, 195, 122, 195, 195, 122]
+    assert backend.tracer.flash_submissions == 1
+    assert backend.tracer.flash_signals == 6
+    assert backend.tracer.sensor_signals == 6
+    assert backend.tracer.joins == 6
+
+
 def test_small_sensor_can_require_more_spatial_units_than_forward_batches():
     units, plan = _native_bdpt_work_units(
         120, 120, 32, requested_packages=1, primary_ray_cap=200_000,

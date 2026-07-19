@@ -7916,6 +7916,8 @@ public:
     int    cached_max_bdpt_p      = 0;  /* 0 = use ps.cfg.bdpt_max_pdfs fallback       */
     int    cached_max_bdpt_o      = 0;  /* 0 = use ps.cfg.bdpt_max_optical fallback    */
     uint32_t bdpt_gpu_accum_cycle = 0;  /* GPU-resident BDPT record reset generation   */
+    /* First sensor page packs the light family once; later pages reuse it. */
+    int    retained_t5_light_vertices = 0;
     /* Pending BDPT record-cap raises, set when T5 detects overflow (requested
      * high-water > cap).  Applied at the next BDPT cycle start only — the
      * record SSBO section layout must never shift mid-cycle. */
@@ -8521,6 +8523,10 @@ public:
 
     void bind_ssbo(GLuint id, GLuint binding) {
         glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, id);
+    }
+
+    void reset_t5_sensor_paging() {
+        retained_t5_light_vertices = 0;
     }
 
     /* Return the hit SSBO that T1/T2/T3 should write to this bounce. */
@@ -10403,7 +10409,13 @@ public:
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         const int n_lv = (int)n_lv_raw;
         const int n_cv = nv - n_lv;
-        if (n_lv == 0 || n_cv == 0) {
+        const bool reuse_resident_light =
+            ps.bdpt_batching_mode
+            && n_lv == 0
+            && retained_t5_light_vertices > 0;
+        const int connect_n_lv = reuse_resident_light
+            ? retained_t5_light_vertices : n_lv;
+        if (connect_n_lv == 0 || n_cv == 0) {
             /* This pass cannot produce connections — but it MUST still count.
              * The T5 trigger only re-fires on an inflight zero-transition, so
              * a non-counted failure here leaves t5_fired < dispatched forever
@@ -10416,14 +10428,15 @@ public:
                 "(nv=%d light=%d cam=%d). Records are corrupt or were dropped "
                 "(check record-cap / SSBO allocation warnings above).\n",
                 T5_NATIVE_LABEL,
-                (n_lv == 0) ? "light " : "",
+                (connect_n_lv == 0) ? "light " : "",
                 (n_cv == 0) ? "camera" : "",
                 nv, n_lv, n_cv);
             fflush(stderr);
             return;
         }
-        fprintf(stderr, "[%s] stage sort-init done: light=%d cam=%d\n",
-                T5_NATIVE_LABEL, n_lv, n_cv);
+        fprintf(stderr, "[%s] stage sort-init done: light=%d cam=%d%s\n",
+                T5_NATIVE_LABEL, connect_n_lv, n_cv,
+                reuse_resident_light ? " [resident-light-page]" : "");
         fflush(stderr);
 
         /* ── Step 2: bitonic sort (npad/2 threads per step) ── */
@@ -10456,7 +10469,7 @@ public:
         fflush(stderr);
         /* Ensure t5_light and t5_cam are large enough for the sorted output. */
         {
-            const int need_lgv = n_lv * (int)T5_LGV_STRIDE;
+            const int need_lgv = connect_n_lv * (int)T5_LGV_STRIDE;
             const int need_cgv = n_cv * (int)T5_CGV_STRIDE;
             /* Linear headroom, not ×2: at the vertex cap the cam buffer is
              * already n_cv × 288 B (multi-GiB); doubling it is what pushed the
@@ -10584,6 +10597,13 @@ public:
         fprintf(stderr, "[%s] stage scatter-t5 queued; preparing connect\n",
                 T5_NATIVE_LABEL);
         fflush(stderr);
+        if (ps.bdpt_batching_mode && n_lv > 0) {
+            retained_t5_light_vertices = n_lv;
+            fprintf(stderr,
+                    "[%s] retained %d packed light vertices for sensor pages\n",
+                    T5_NATIVE_LABEL, retained_t5_light_vertices);
+            fflush(stderr);
+        }
 
         /* ── Step 5: T5 connection dispatch (writes to ssbo_sensor_rgb) ── */
         if (ps.sensor_res > 0)
@@ -10602,7 +10622,7 @@ public:
          * Tunable via RayTracer.set_t5_light_batch_size (0 = this default). */
         const uint32_t T5_LIGHT_BATCH_NT = t5_light_batch_size ? t5_light_batch_size : 1024u;
         const uint32_t T5_CAM_BATCH_NT   = t5_cam_batch_size   ? t5_cam_batch_size   : 8192u;
-        const uint32_t n_lv_u = (uint32_t)n_lv;
+        const uint32_t n_lv_u = (uint32_t)connect_n_lv;
         const uint32_t n_cv_u = (uint32_t)n_cv;
 
         T5GpuParams par{};
@@ -10853,7 +10873,7 @@ public:
         fprintf(stderr,
             "[T5-gpu-native] submitted: sensor=%dx%d verts(total/light/camera)=%d/%d/%d batch_caps(camera/light)=%u/%u dispatches=%u active_units=%zu deferred_units=%zu active_pairs=%llu deferred_pairs=%llu pair_cap=%llu->%llu max_chunk=%ux%u max_pairs=%llu max_ms=%.1f reductions=%u\n",
                 ps.sensor_res, ps.sensor_res,
-                nv, n_lv, n_cv, T5_CAM_BATCH_NT, T5_LIGHT_BATCH_NT,
+                nv, connect_n_lv, n_cv, T5_CAM_BATCH_NT, T5_LIGHT_BATCH_NT,
                 t5_stats.dispatches,
             t5_stats.active_units, t5_stats.deferred_units,
             (unsigned long long)t5_stats.active_pairs,
@@ -17224,6 +17244,8 @@ void ray_pipeline_begin_sensor_batching(RayPipelineState* ps)
     ps->bdpt_stash_sw.clear();
     ps->bdpt_stash_pdf.clear();
     ps->bdpt_stash_opt.clear();
+    if (ps->gpu_dispatch)
+        ps->gpu_dispatch->reset_t5_sensor_paging();
 }
 
 void ray_pipeline_end_sensor_batching(RayPipelineState* ps)
@@ -17235,6 +17257,8 @@ void ray_pipeline_end_sensor_batching(RayPipelineState* ps)
     ps->bdpt_stash_sw.clear();
     ps->bdpt_stash_pdf.clear();
     ps->bdpt_stash_opt.clear();
+    if (ps->gpu_dispatch)
+        ps->gpu_dispatch->reset_t5_sensor_paging();
 }
 
 void ray_pipeline_set_force_cpu_t5(RayPipelineState* ps, bool v)

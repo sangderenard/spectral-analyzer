@@ -42,6 +42,7 @@ def test_live_production_starts_with_fixed_width_alphabet_cells():
         request.token_asset.font.family for request in plan.requests
     } == {"DejaVu Sans Mono"}
     assert not demo._total_scene_is_ready("Actual light", catalog)
+    assert not demo._fixed_image_alphabet_is_ready(catalog)
 
 
 def test_live_cli_accepts_reusable_raytrained_priority_model():

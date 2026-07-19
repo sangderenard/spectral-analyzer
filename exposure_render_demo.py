@@ -1852,6 +1852,7 @@ class CppExposureBackend(ExposureBackend):
         self._sensor_mipmap_enabled = bool(
             self._gpu_resident and hasattr(self.tracer, "configure_sensor_mipmap")
         )
+        self._sensor_samples_per_node = 1
         if self._sensor_mipmap_enabled:
             # The live scheduler only advances at most 1024 nodes per internal
             # refinement step.  Reserving two million nodes up front also
@@ -1865,6 +1866,7 @@ class CppExposureBackend(ExposureBackend):
                 1,
                 int(os.environ.get("SPECTRAL_SENSOR_SAMPLES_PER_NODE", "32")),
             )
+            self._sensor_samples_per_node = sensor_samples_per_node
             self.tracer.configure_sensor_mipmap(
                 max_nodes=mip_nodes,
                 maximum_depth=7,
@@ -2023,42 +2025,78 @@ class CppExposureBackend(ExposureBackend):
         tri_ids = np.ascontiguousarray(emitter_tri_ids, dtype=np.int32).reshape(-1)
         if tri_ids.size <= 0:
             raise RuntimeError("recursive sensor exposure requires an emitter")
-        submitted_flash = int(self.tracer.submit_emissive_triangles(
-            tri_ids,
-            32_000,
-            1.0,
-            1.0,
-            max(1, int(self.max_bounces)),
-            0.0,
-            1,
-            int(seed),
-            True,
-            True,
-            _SHADER_DIR,
-            0.0, 0.0, 0.0, 0.0,
-        ))
-        if submitted_flash <= 0:
-            raise RuntimeError("recursive sensor exposure submitted no light paths")
-        self.tracer.signal_flash_dispatched()
-        for step in range(max(1, int(refinement_steps))):
-            ok = bool(self.tracer.submit_sensor_mip_epoch(
-                top_k=max(1, int(top_k)),
-                seed=_bounded_native_seed(int(seed) * 257 + step),
-                max_bounces=max(1, int(self.max_bounces)),
-                min_amplitude=0.0,
-                exposure_weight=1.0,
-                targeted_fraction=float(targeted_fraction),
+        requested_top_k = max(1, int(top_k))
+        samples_per_node = max(1, int(self._sensor_samples_per_node))
+        # With max_children=1, 200k camera primaries plus the retained flash
+        # family stay below the 6.875M vertex/PDF arena on the 12 GiB profile.
+        # Split selected-node work rather than lowering samples-per-node.
+        nodes_per_page = max(1, 200_000 // samples_per_node)
+        page_count = int(math.ceil(requested_top_k / nodes_per_page))
+        if page_count > 1 or int(refinement_steps) > 1:
+            print(
+                "  [sensor-refine] BDPT record paging "
+                f"steps={max(1, int(refinement_steps))} "
+                f"node-pages/step={page_count} nodes/page<={nodes_per_page} "
+                f"samples/node={samples_per_node}",
+                flush=True,
+            )
+
+        self.tracer.begin_sensor_batching()
+        try:
+            submitted_flash = int(self.tracer.submit_emissive_triangles(
+                tri_ids,
+                32_000,
+                1.0,
+                1.0,
+                max(1, int(self.max_bounces)),
+                0.0,
+                1,
+                int(seed),
+                True,
+                True,
+                _SHADER_DIR,
+                0.0, 0.0, 0.0, 0.0,
             ))
-            if not ok:
-                raise RuntimeError("GPU recursive sensor epoch failed")
-        self.tracer.signal_sensor_dispatched()
-        if hasattr(self.tracer, "in_flight_count"):
-            deadline = time.perf_counter() + 30.0
-            while time.perf_counter() < deadline:
-                if int(self.tracer.in_flight_count()) == 0:
-                    break
-                time.sleep(0.002)
-        self.tracer.join_t5()
+            if submitted_flash <= 0:
+                raise RuntimeError(
+                    "recursive sensor exposure submitted no light paths"
+                )
+            self.tracer.signal_flash_dispatched()
+            cycle = 0
+            for step in range(max(1, int(refinement_steps))):
+                nodes_remaining = requested_top_k
+                page = 0
+                while nodes_remaining > 0:
+                    page_top_k = min(nodes_per_page, nodes_remaining)
+                    if cycle > 0:
+                        # Logical flash-side marker: native batching retains
+                        # page zero's packed light rows, so no rays are relaunched.
+                        self.tracer.signal_flash_dispatched()
+                    ok = bool(self.tracer.submit_sensor_mip_epoch(
+                        top_k=page_top_k,
+                        seed=_bounded_native_seed(
+                            int(seed) * 65_537 + step * 257 + page
+                        ),
+                        max_bounces=max(1, int(self.max_bounces)),
+                        min_amplitude=0.0,
+                        exposure_weight=1.0,
+                        targeted_fraction=float(targeted_fraction),
+                    ))
+                    if not ok:
+                        raise RuntimeError("GPU recursive sensor epoch failed")
+                    self.tracer.signal_sensor_dispatched()
+                    if hasattr(self.tracer, "in_flight_count"):
+                        deadline = time.perf_counter() + 30.0
+                        while time.perf_counter() < deadline:
+                            if int(self.tracer.in_flight_count()) == 0:
+                                break
+                            time.sleep(0.002)
+                    self.tracer.join_t5()
+                    nodes_remaining -= page_top_k
+                    page += 1
+                    cycle += 1
+        finally:
+            self.tracer.end_sensor_batching()
 
     def reset_exposure(self) -> None:
         super().reset_exposure()
@@ -2476,7 +2514,12 @@ class CppExposureBackend(ExposureBackend):
                 f"native thick-lens BDPT sweep slice is empty "
                 f"(offset={slice_start} count={sweep_count} schedule={schedule_total})"
             )
-        sensor_batch = int(max(1, min(int(sensor_rays_per_batch), slice_total)))
+        # Page the record arena without shrinking the logical exposure. Flash
+        # paths are packed once and remain GPU-resident while camera pages cycle.
+        sensor_batch = int(max(
+            1,
+            min(int(sensor_rays_per_batch), slice_total, 200_000),
+        ))
         max_children = int(max(1, max_children))
         if hasattr(self.tracer, "set_max_children"):
             self.tracer.set_max_children(max_children)
@@ -2519,7 +2562,12 @@ class CppExposureBackend(ExposureBackend):
         self.tracer.begin_sensor_batching()
         try:
             pix_offset = slice_start
+            sensor_page = 0
             while pix_offset < slice_end:
+                if sensor_page > 0:
+                    # Advance the paired-cycle latch without retracing flash.
+                    # Native batching reuses page zero's packed light SSBO.
+                    self.tracer.signal_flash_dispatched()
                 n_submit = int(self.tracer.submit_sensor_sweep(
                     max_bounces=int(self.max_bounces),
                     min_amplitude=0.0,  # lab single-photon mode (see flash submit)
@@ -2534,19 +2582,20 @@ class CppExposureBackend(ExposureBackend):
                     break
                 submitted_sensor += n_submit
                 pix_offset += n_submit
+                self.tracer.signal_sensor_dispatched()
+                if hasattr(self.tracer, "in_flight_count"):
+                    deadline = time.perf_counter() + 10.0
+                    while time.perf_counter() < deadline:
+                        if int(self.tracer.in_flight_count()) == 0:
+                            break
+                        time.sleep(0.002)
+                self.tracer.join_t5()
+                sensor_page += 1
             if submitted_sensor < slice_total:
                 raise RuntimeError(
                     "native thick-lens BDPT sensor sweep did not cover its slice "
                     f"({submitted_sensor}/{slice_total}, slice {slice_start}..{slice_end})"
                 )
-            self.tracer.signal_sensor_dispatched()
-            if hasattr(self.tracer, "in_flight_count"):
-                deadline = time.perf_counter() + 10.0
-                while time.perf_counter() < deadline:
-                    if int(self.tracer.in_flight_count()) == 0:
-                        break
-                    time.sleep(0.002)
-            self.tracer.join_t5()
             latch = (self.tracer.get_bdpt_latch_state()
                      if hasattr(self.tracer, "get_bdpt_latch_state") else {})
             output_width, output_height = (
@@ -6019,7 +6068,15 @@ class ExposureSession:
                                 int(self.height),
                                 int(max(1, _bdpt_native_n_aperture_samples)),
                                 requested_packages=int(self.bdpt_native_packages),
-                                primary_ray_cap=200_000,
+                                # Camera record pages are now recycled inside
+                                # one native exposure while its light family
+                                # remains resident. Avoid repeating the flash
+                                # and setup as separate Python work units.
+                                primary_ray_cap=(
+                                    int(self.width)
+                                    * int(self.height)
+                                    * int(max(1, _bdpt_native_n_aperture_samples))
+                                ),
                             )
                             _bdpt_native_schedule = _native_bdpt_refinement_schedule(
                                 _bdpt_native_work_units,

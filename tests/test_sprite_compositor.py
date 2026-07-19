@@ -171,3 +171,21 @@ def test_cached_gestalt_is_hidden_until_its_individual_glyphs_exist(tmp_path):
     assert composition.used_tokens == ()
     assert composition.missing_tokens == ("AB",)
     assert composition.missing_characters == ("A", "B")
+
+
+def test_cached_string_composer_can_hold_fixed_character_tiles(tmp_path):
+    catalog = RenderAssetCatalog()
+    for token in ("A", "B", "AB"):
+        asset, _sprite, path, _image = _synthetic_sprite(token, tmp_path)
+        catalog.record(RenderedAssetRecord(
+            asset.asset_key,
+            DEFAULT_INK_CONDITION.condition_key,
+            DisplayProductKind.IMAGE,
+            metadata={"sprite_path": path},
+        ))
+
+    composition = CachedTokenStringComposer(catalog).compose(
+        "AB", 180, 64, character_tiles_only=True
+    )
+
+    assert composition.used_tokens == ("A", "B")

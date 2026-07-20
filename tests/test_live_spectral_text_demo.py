@@ -45,6 +45,41 @@ def test_live_production_starts_with_fixed_width_alphabet_cells():
     assert not demo._fixed_image_alphabet_is_ready(catalog)
 
 
+def test_custom_manifest_pipeline_drives_font_glyphs_tokens_and_scene_text():
+    manifest = demo.program_ui_manifest()
+    manifest.payload["render_pipeline"] = {
+        **manifest.payload["render_pipeline"],
+        "font": {
+            "mode": "monofont",
+            "family": "DejaVu Sans Mono",
+            "weight": "normal",
+            "style": "normal",
+        },
+        "glyph_alphabet": "AZ",
+        "static_tokens": ["CAMERA", "WORK"],
+    }
+    catalog = demo.RenderAssetCatalog()
+    plan = demo._ink_production_plan("ZAP", catalog, manifest)
+    scene = demo.build_self_rendering_program_scene(
+        "ZAP", display_width=320, display_height=180,
+        work_width=80, work_height=80, program_manifest=manifest,
+    )
+
+    planned_glyphs = {request.token_asset.token for request in plan.requests}
+    assert {"A", "Z"} <= planned_glyphs
+    assert {
+        request.target_kind for request in plan.requests
+    } == {demo.BakeTargetKind.ATLAS_GLYPH}
+    assert {
+        request.token_asset.font.weight for request in plan.requests
+    } == {"normal"}
+    text_objects = [
+        item for item in scene.objects
+        if item.primitive.kind is demo.DisplayPrimitiveKind.TEXT
+    ]
+    assert {item.font_weight for item in text_objects} == {"normal"}
+
+
 def test_live_cli_accepts_reusable_raytrained_priority_model():
     args = demo._args(["--priority-model", "learned.npz"])
     assert args.priority_model == "learned.npz"
@@ -66,6 +101,8 @@ def test_live_cli_defaults_to_large_ray_load_inside_each_atlas_epoch():
     assert args.atlas_sensor_top_k == 1024
     assert args.atlas_steps_per_epoch == 64
     assert args.atlas_samples_per_node == 1024
+    assert args.atlas_character_horizontal_spacing_px == -10
+    assert args.atlas_character_vertical_spacing_px == -10
     assert (
         args.atlas_sensor_top_k
         * args.atlas_steps_per_epoch
@@ -73,9 +110,48 @@ def test_live_cli_defaults_to_large_ray_load_inside_each_atlas_epoch():
     ) == 67_108_864
 
 
+def test_atlas_cache_uses_style_subtype_condition_object_layout(tmp_path):
+    from camera_software import (
+        BakeRequest,
+        BakeTargetKind,
+        DEFAULT_INK_CONDITION,
+        DisplayProductKind,
+        ink_token_asset,
+        render_style_key,
+    )
+
+    glyph = ink_token_asset("A")
+    default_request = BakeRequest(
+        glyph.asset_key,
+        BakeTargetKind.ATLAS_GLYPH,
+        DEFAULT_INK_CONDITION,
+        DisplayProductKind.IMAGE,
+        "atlas",
+        ("A",),
+        glyph,
+    )
+    other_condition = replace(DEFAULT_INK_CONDITION, azimuth_deg=90.0)
+    other_request = replace(default_request, condition=other_condition)
+
+    default_path = Path(demo._atlas_request_directory(str(tmp_path), default_request))
+    other_path = Path(demo._atlas_request_directory(str(tmp_path), other_request))
+
+    assert "render_objects" in default_path.parts
+    assert render_style_key(glyph).rsplit(":", 1)[-1] in default_path.parts
+    assert "subtypes" in default_path.parts
+    assert "glyph" in default_path.parts
+    assert default_path.parent == other_path.parent
+    assert default_path.name == DEFAULT_INK_CONDITION.condition_key.rsplit(":", 1)[-1]
+    assert other_path.name == other_condition.condition_key.rsplit(":", 1)[-1]
+    assert other_path != default_path
+
+
 def test_clear_camera_storage_removes_only_live_camera_artifacts(tmp_path):
     root = tmp_path / "live"
-    (root / "ink_atlas" / "glyph").mkdir(parents=True)
+    (root / "render_objects" / "style").mkdir(parents=True)
+    (root / "render_interfaces" / "assembly").mkdir(parents=True)
+    (root / "render_asset_catalog.json").write_text("{}", encoding="utf-8")
+    (root / "render_object_library.json").write_text("{}", encoding="utf-8")
     (root / "revision_0001" / "progress").mkdir(parents=True)
     (root / "revision_42").mkdir()
     (root / "display_inventory.json").write_text("{}", encoding="utf-8")
@@ -85,8 +161,11 @@ def test_clear_camera_storage_removes_only_live_camera_artifacts(tmp_path):
 
     removed = demo.clear_camera_storage(str(root))
 
-    assert len(removed) == 5
-    assert not (root / "ink_atlas").exists()
+    assert len(removed) == 8
+    assert not (root / "render_objects").exists()
+    assert not (root / "render_interfaces").exists()
+    assert not (root / "render_asset_catalog.json").exists()
+    assert not (root / "render_object_library.json").exists()
     assert not (root / "revision_0001").exists()
     assert not (root / "revision_42").exists()
     assert not (root / "display_inventory.json").exists()
@@ -312,20 +391,28 @@ def test_self_rendering_order_has_one_camera_and_all_ui_text_geometry():
         "editor-text",
         "camera-label",
         "work-label",
+        "asset-browser-label",
         "status-text",
+        "work-visual-pass",
+        "queue-pause-auto",
     ]
     assert {
         item["id"]: item["token"] for item in job["objects"]
     } == {
         "editor-text": "same camera",
         "camera-label": "CAMERA",
-        "work-label": "WORK VALUE",
+        "work-label": "WORK",
+        "asset-browser-label": "ASSETS / JOBS",
         "status-text": "SPECTRAL EXPOSURE ACTIVE",
+        "work-visual-pass": "VISUAL PASS",
+        "queue-pause-auto": "PAUSE AUTO",
     }
     plane_ids = {item["id"] for item in job["planes"]}
     assert "display-surface-editor-text" in plane_ids
     assert "display-surface-camera-label" in plane_ids
     assert "display-surface-work-label" in plane_ids
+    assert "display-surface-asset-browser-label" in plane_ids
+    assert "display-surface-asset-browser" in plane_ids
     assert "display-surface-status-text" in plane_ids
     assert "display-surface-window-minimize" in plane_ids
     assert "display-icon-window-minimize-bar" in plane_ids
@@ -355,7 +442,9 @@ def test_sensor_product_maps_into_shared_progressive_texture():
         products["window-close"], photographed, 200, 120
     )
     assert editor_rect[0] == 0
-    assert editor_rect[2] == 200
+    assert editor_rect[2] == (
+        products["camera-panel"].width + products["work-panel"].width
+    )
     assert editor_rect[1] > products["camera-panel"].y - photographed.y
     assert editor_rect[1] + editor_rect[3] <= photographed.height
     assert close_rect[0] + close_rect[2] <= photographed.width
@@ -506,12 +595,24 @@ def test_work_sized_scene_has_exact_camera_and_work_sensor_products():
     assert regions["editor-text"].y == (
         regions["camera-panel"].y + regions["camera-panel"].height
     )
-    assert regions["editor-text"].width == crop.width
+    assert regions["editor-text"].width == (
+        regions["camera-panel"].width + regions["work-panel"].width
+    )
+    assert regions["asset-browser"].x == (
+        regions["work-panel"].x + regions["work-panel"].width
+    )
+    assert regions["asset-browser"].width == (
+        crop.width - regions["editor-text"].width
+    )
+    assert regions["asset-browser"].y == regions["camera-panel"].y
+    assert regions["asset-browser"].y + regions["asset-browser"].height == (
+        crop.y + crop.height
+    )
     assert regions["status-text"].x == crop.x
     assert regions["status-text"].y == (
         regions["editor-text"].y + regions["editor-text"].height
     )
-    assert regions["status-text"].width == crop.width
+    assert regions["status-text"].width == regions["editor-text"].width
     assert (
         regions["status-text"].y + regions["status-text"].height
         == crop.y + crop.height
@@ -584,10 +685,14 @@ def test_work_sized_scene_has_exact_camera_and_work_sensor_products():
         "camera-panel",
         "program-backdrop",
         "work-panel",
+        "asset-browser",
         "camera-label",
         "work-label",
+        "asset-browser-label",
         "editor-text",
         "status-text",
+        "work-visual-pass",
+        "queue-pause-auto",
         "window-minimize",
         "window-maximize",
         "window-close",
@@ -597,8 +702,11 @@ def test_work_sized_scene_has_exact_camera_and_work_sensor_products():
     } == {
         "editor-text": "one camera renders this whole UI",
         "camera-label": "CAMERA",
-        "work-label": "WORK VALUE",
+        "work-label": "WORK",
+        "asset-browser-label": "ASSETS / JOBS",
         "status-text": "SPECTRAL EXPOSURE ACTIVE",
+        "work-visual-pass": "VISUAL PASS",
+        "queue-pause-auto": "PAUSE AUTO",
     }
 
 
@@ -901,4 +1009,23 @@ def test_render_owner_preempts_background_atlas_work_for_foreground_revision():
         assert worker.background_snapshot()[1] == ""
     finally:
         release_first.set()
+        worker.close()
+
+
+def test_background_queue_pause_is_explicit_and_resumable():
+    def render(sequence, text, order, next_scan_control, progress_sink):
+        return demo.RenderedTextRevision(
+            sequence, text, "image.png", "linear.npy", "manifest.json", 0.01
+        )
+
+    worker = demo.SpectralTextRenderWorker(render)
+    try:
+        assert not worker.background_is_paused()
+        worker.set_background_paused(True)
+        assert worker.background_is_paused()
+        worker.wake_background()
+        assert worker.background_is_paused()
+        assert worker.toggle_background_paused() is False
+        assert not worker.background_is_paused()
+    finally:
         worker.close()

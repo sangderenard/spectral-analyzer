@@ -40,6 +40,8 @@ from .render_assets import (
 
 
 SPRITE_SCHEMA_VERSION = 1
+DEFAULT_MONOFONT_HORIZONTAL_SPACING_PX = -10
+DEFAULT_MONOFONT_VERTICAL_SPACING_PX = -10
 
 
 def _inside_even_odd(points: np.ndarray, contours: list[np.ndarray]) -> np.ndarray:
@@ -384,9 +386,26 @@ class CachedTokenStringComposer:
         catalog: RenderAssetCatalog,
         *,
         font: FontAssetSpec | None = None,
+        horizontal_spacing_px: int = DEFAULT_MONOFONT_HORIZONTAL_SPACING_PX,
+        vertical_spacing_px: int = DEFAULT_MONOFONT_VERTICAL_SPACING_PX,
     ) -> None:
         self.catalog = catalog
         self.font = font or FontAssetSpec()
+        self.horizontal_spacing_px = int(horizontal_spacing_px)
+        self.vertical_spacing_px = int(vertical_spacing_px)
+
+    def _monofont_layout_metrics(self, height: int) -> tuple[int, int, int]:
+        """Return glyph height, character advance, and line advance in pixels."""
+
+        glyph_line_height = max(8, int(round(min(48.0, height * 0.42))))
+        worst_case_width = max(3, int(round(glyph_line_height * 0.72)))
+        character_advance = max(
+            1, worst_case_width + self.horizontal_spacing_px
+        )
+        line_advance = max(
+            1, glyph_line_height + self.vertical_spacing_px
+        )
+        return glyph_line_height, character_advance, line_advance
 
     def _record(
         self,
@@ -523,8 +542,9 @@ class CachedTokenStringComposer:
             character_tiles_only=character_tiles_only,
         )
         used: list[str] = []
-        line_height = max(8, int(round(min(48.0, height * 0.42))))
-        cell_advance = max(3, int(round(line_height * 0.72)))
+        line_height, cell_advance, line_advance = (
+            self._monofont_layout_metrics(height)
+        )
         x = max(2, line_height // 6)
         y = max(1, line_height // 5)
         line_start = x
@@ -533,11 +553,11 @@ class CachedTokenStringComposer:
                 for character in token:
                     if character == "\n":
                         x = line_start
-                        y += line_height
+                        y += line_advance
                     else:
                         if x + cell_advance > width and x > line_start:
                             x = line_start
-                            y += line_height
+                            y += line_advance
                         x += cell_advance
                 continue
             cell_span = max(1, len(token)) * cell_advance
@@ -546,7 +566,7 @@ class CachedTokenStringComposer:
             # they will use after a later catalog refresh.
             if x + cell_span > width and x > line_start:
                 x = line_start
-                y += line_height
+                y += line_advance
             if record is None:
                 x += cell_span
                 continue
@@ -564,31 +584,40 @@ class CachedTokenStringComposer:
             target_height = max(1, int(round(line_height * 0.78)))
             scale = target_height / max(1, y1 - y0)
             target_width = max(1, int(round((x1 - x0) * scale)))
-            if target_width > cell_span:
-                fit = cell_span / target_width
-                target_width = cell_span
-                target_height = max(1, int(round(target_height * fit)))
-            if y + target_height > height:
+            visible_width = min(target_width, cell_span)
+            visible_height = min(target_height, line_advance)
+            if y + visible_height > height:
                 break
-            draw_x = x + max(0, (cell_span - target_width) // 2)
+            source_x = max(0, (target_width - visible_width) // 2)
+            source_y = max(0, (target_height - visible_height) // 2)
+            draw_x = x + max(0, (cell_span - visible_width) // 2)
             zoom = (target_height / (y1 - y0), target_width / (x1 - x0))
             premul = ndimage.zoom(
                 sprite.premultiplied_rgb[y0:y1, x0:x1],
                 (*zoom, 1.0),
                 order=1,
-            )[:target_height, :target_width]
+            )[:target_height, :target_width][
+                source_y:source_y + visible_height,
+                source_x:source_x + visible_width,
+            ]
             alpha = ndimage.zoom(
                 sprite.alpha[y0:y1, x0:x1], zoom, order=1
-            )[:target_height, :target_width]
+            )[:target_height, :target_width][
+                source_y:source_y + visible_height,
+                source_x:source_x + visible_width,
+            ]
             additive = ndimage.zoom(
                 sprite.additive_rgb[y0:y1, x0:x1],
                 (*zoom, 1.0),
                 order=1,
-            )[:target_height, :target_width]
-            destination = canvas[
-                y:y + target_height, draw_x:draw_x + target_width
+            )[:target_height, :target_width][
+                source_y:source_y + visible_height,
+                source_x:source_x + visible_width,
             ]
-            canvas[y:y + target_height, draw_x:draw_x + target_width] = (
+            destination = canvas[
+                y:y + visible_height, draw_x:draw_x + visible_width
+            ]
+            canvas[y:y + visible_height, draw_x:draw_x + visible_width] = (
                 premul + (1.0 - alpha[..., None]) * destination + additive
             )
             used.append(token)
@@ -603,6 +632,8 @@ class CachedTokenStringComposer:
 
 __all__ = [
     "SPRITE_SCHEMA_VERSION",
+    "DEFAULT_MONOFONT_HORIZONTAL_SPACING_PX",
+    "DEFAULT_MONOFONT_VERTICAL_SPACING_PX",
     "token_alpha_mask",
     "SpriteExposureQuality",
     "measure_sprite_exposure_quality",

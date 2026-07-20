@@ -87,7 +87,6 @@ def test_sprite_quality_uses_coverage_and_image_stability_not_a_ray_count():
         alpha,
         refinement_pass=2,
         previous_image=image.copy(),
-        previous_stable_hold=2,
     )
 
     assert covered.composable
@@ -134,6 +133,49 @@ def test_cached_string_composer_accepts_empty_and_whitespace_editor_states():
         assert composition.missing_tokens == ()
         assert composition.missing_characters == ()
         assert composition.linear_rgb.shape == (32, 80, 3)
+
+
+def test_monofont_spacing_defaults_to_negative_ten_and_allows_cropping(tmp_path):
+    default = CachedTokenStringComposer(RenderAssetCatalog())
+    expanded = CachedTokenStringComposer(
+        RenderAssetCatalog(),
+        horizontal_spacing_px=3,
+        vertical_spacing_px=4,
+    )
+    cropped = CachedTokenStringComposer(
+        RenderAssetCatalog(),
+        horizontal_spacing_px=-1000,
+        vertical_spacing_px=-1000,
+    )
+
+    glyph_height, default_x, default_y = default._monofont_layout_metrics(64)
+    _, expanded_x, expanded_y = expanded._monofont_layout_metrics(64)
+    _, cropped_x, cropped_y = cropped._monofont_layout_metrics(64)
+
+    assert default.horizontal_spacing_px == -10
+    assert default.vertical_spacing_px == -10
+    assert expanded_x == default_x + 13
+    assert expanded_y == default_y + 14
+    assert cropped_x == 1
+    assert cropped_y == 1
+    assert glyph_height > cropped_y
+
+    catalog = RenderAssetCatalog()
+    asset, _sprite, path, _image = _synthetic_sprite("A", tmp_path)
+    catalog.record(RenderedAssetRecord(
+        asset.asset_key,
+        DEFAULT_INK_CONDITION.condition_key,
+        DisplayProductKind.IMAGE,
+        metadata={"sprite_path": path},
+    ))
+    clipped = CachedTokenStringComposer(
+        catalog,
+        horizontal_spacing_px=-1000,
+        vertical_spacing_px=-1000,
+    ).compose("A", 64, 64, character_tiles_only=True)
+
+    assert clipped.used_tokens == ("A",)
+    assert np.all(np.isfinite(clipped.linear_rgb))
 
 
 def test_cached_string_composer_prefers_exact_token_over_character_fallback(

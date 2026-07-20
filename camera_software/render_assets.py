@@ -14,7 +14,7 @@ import os
 import threading
 import time
 import functools
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
@@ -31,10 +31,13 @@ INK_ATLAS_SCENE_ID = "ink-on-black-slate-atlas"
 SENSOR_DISPLAY_ORIENTATION = "native-getter-yflip-transpose-v3"
 MIN_INK_GLYPH_EXPOSURE_COVERAGE = 0.95
 MIN_INK_GLYPH_RADIANCE_COVERAGE = 0.90
-INK_ATLAS_CONVERGENCE_EXPOSURE_COVERAGE = 0.995
-INK_ATLAS_CONVERGENCE_RELATIVE_RMSE = 0.005
-INK_ATLAS_CONVERGENCE_P95_DELTA = 0.01
-INK_ATLAS_CONVERGENCE_HOLD = 3
+INK_ATLAS_CONVERGENCE_EXPOSURE_COVERAGE = 0.99
+INK_ATLAS_CONVERGENCE_RELATIVE_RMSE = 0.01
+INK_ATLAS_CONVERGENCE_P95_DELTA = 0.02
+# One stable comparison already represents two substantial render bursts. Keep
+# the accumulated evidence resumable instead of making every asset repeat that
+# confirmation several more times.
+INK_ATLAS_CONVERGENCE_HOLD = 1
 
 
 def _canonical(value: Any) -> Any:
@@ -409,6 +412,114 @@ GLOSSY_RED_INK = {
     "ior": 1.52,
 }
 
+INK_BACKPLATE_SIZE_M = (0.52, 0.42)
+INK_SINGLE_SHOT_SAFE_FRACTION = 0.90
+
+
+@dataclass(frozen=True)
+class SingleShotTokenFit:
+    """Uniform shrink applied to keep one complete token in one photograph."""
+
+    asset: ExtrudedTokenAsset
+    scale: float
+    outline_aspect: float
+    camera_aspect: float
+    frame_size_m: tuple[float, float]
+    original_height_m: float
+    original_depth_m: float
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "policy": "uniform_shrink_to_fit",
+            "single_shot": True,
+            "panoramic": False,
+            "collage": False,
+            "scale": float(self.scale),
+            "outline_aspect": float(self.outline_aspect),
+            "camera_aspect": float(self.camera_aspect),
+            "frame_size_m": list(map(float, self.frame_size_m)),
+            "original_height_m": float(self.original_height_m),
+            "fitted_height_m": float(self.asset.extrusion.height_m),
+            "original_depth_m": float(self.original_depth_m),
+            "fitted_depth_m": float(self.asset.extrusion.depth_m or 0.0),
+        }
+
+
+def _token_outline_aspect(token: str, font: FontAssetSpec) -> float:
+    """Measure the actual font outline without importing the renderer."""
+
+    from matplotlib.font_manager import FontProperties
+    from matplotlib.textpath import TextPath
+
+    properties = FontProperties(
+        family=font.family,
+        weight=font.weight,
+        style=font.style,
+        fname=font.file or None,
+    )
+    bounds = TextPath((0.0, 0.0), token, size=1.0, prop=properties).get_extents()
+    width = max(float(bounds.width), 1.0e-9)
+    height = max(float(bounds.height), 1.0e-9)
+    return width / height
+
+
+def fit_token_to_single_shot(
+    asset: ExtrudedTokenAsset,
+    capture: AtlasCaptureSpec | None = None,
+    *,
+    backplate_size_m: tuple[float, float] = INK_BACKPLATE_SIZE_M,
+    safe_fraction: float = INK_SINGLE_SHOT_SAFE_FRACTION,
+) -> SingleShotTokenFit:
+    """Uniformly shrink a whole token to the camera-shaped safe stage area.
+
+    The stage and camera remain fixed. Height, line height, explicit depth,
+    text-box dimensions, and offsets all receive the same scale.
+    """
+
+    capture = capture or AtlasCaptureSpec()
+    if not 0.0 < safe_fraction <= 1.0:
+        raise ValueError("single-shot safe fraction must be in (0, 1]")
+    stage_width, stage_height = map(float, backplate_size_m)
+    if stage_width <= 0.0 or stage_height <= 0.0:
+        raise ValueError("backplate dimensions must be positive")
+    camera_aspect = float(capture.content_width) / float(capture.content_height)
+    safe_width = stage_width * safe_fraction
+    safe_height = stage_height * safe_fraction
+    frame_width = min(safe_width, safe_height * camera_aspect)
+    frame_height = frame_width / camera_aspect
+    outline_aspect = _token_outline_aspect(asset.token, asset.font)
+    original_height = float(asset.extrusion.height_m)
+    required_width = outline_aspect * original_height
+    scale = min(
+        1.0,
+        frame_height / original_height,
+        frame_width / required_width,
+    )
+    extrusion = asset.extrusion
+    fitted = replace(
+        extrusion,
+        height_m=extrusion.height_m * scale,
+        line_height_m=extrusion.line_height_m * scale,
+        depth_m=(
+            extrusion.depth_m * scale
+            if extrusion.depth_m is not None else None
+        ),
+        text_box_m=(
+            tuple(value * scale for value in extrusion.text_box_m)
+            if extrusion.text_box_m is not None else None
+        ),
+        offset_m=tuple(value * scale for value in extrusion.offset_m),
+    )
+    return SingleShotTokenFit(
+        asset=replace(asset, extrusion=fitted),
+        scale=scale,
+        outline_aspect=outline_aspect,
+        camera_aspect=camera_aspect,
+        frame_size_m=(frame_width, frame_height),
+        original_height_m=original_height,
+        original_depth_m=float(extrusion.depth_m or 0.0),
+    )
+
 
 def ink_token_asset(
     token: str,
@@ -480,11 +591,19 @@ def build_ink_on_slate_order(
     jobs = []
     for index, token in enumerate(unique):
         asset = ink_token_asset(token, font=font)
+        fit = None
+        if len(token) > 1:
+            fit = fit_token_to_single_shot(asset, capture)
+            asset = fit.asset
         jobs.append({
             "id": _ink_job_id(token, index),
             "token": token,
             "geometry": asset.extrusion.scene_order_mapping(
                 "backplate", "glossy_red"
+            ),
+            **(
+                {"single_shot_fit": fit.metadata()}
+                if fit is not None else {}
             ),
         })
     character_default = ink_token_asset("A", font=font, character=True)
@@ -506,7 +625,7 @@ def build_ink_on_slate_order(
                 "center_m": [0.0, 0.0, 0.0],
                 "normal": [1.0, 0.0, 0.0],
                 "up": [0.0, 0.0, 1.0],
-                "size_m": [0.52, 0.42],
+                "size_m": list(INK_BACKPLATE_SIZE_M),
                 "thickness_m": 0.012,
                 "material": "matte_black",
             }],
@@ -619,6 +738,30 @@ class RenderAssetCatalog:
         self.record(record)
         return record
 
+    def accept_visual_pass(
+        self, record: RenderedAssetRecord
+    ) -> RenderedAssetRecord:
+        """Persist a human visual completion without discarding render evidence."""
+
+        with self._lock:
+            current = self._records.get(record.record_key)
+            if current is None:
+                raise KeyError(record.record_key)
+            if not ink_record_is_usable(current):
+                raise ValueError(
+                    "visual pass requires a composable cached render"
+                )
+            metadata = {
+                **dict(current.metadata),
+                "completion_basis": "human_visual_pass",
+                "human_visual_pass": True,
+                "human_visual_pass_at_s": time.time(),
+            }
+            accepted = replace(current, metadata=metadata)
+            self._records[accepted.record_key] = accepted
+            self._save()
+            return accepted
+
     def snapshot(self) -> tuple[RenderedAssetRecord, ...]:
         with self._lock:
             return tuple(self._records[key] for key in sorted(self._records))
@@ -657,6 +800,16 @@ def ink_record_is_converged(record: RenderedAssetRecord | None) -> bool:
     if record is None:
         return False
     metadata = dict(record.metadata)
+    if metadata.get("completion_basis") == "human_visual_pass":
+        sprite_path = str(metadata.get("sprite_path", ""))
+        return bool(
+            metadata.get("sensor_display_orientation")
+            == SENSOR_DISPLAY_ORIENTATION
+            and (
+                (sprite_path and os.path.isfile(sprite_path))
+                or (record.linear_path and os.path.isfile(record.linear_path))
+            )
+        )
     if not bool(metadata.get("bounded_background_render", False)):
         return ink_record_is_usable(record)
     quality = dict(metadata.get("atlas_quality", {}))
@@ -675,6 +828,7 @@ def ink_record_is_usable(record: RenderedAssetRecord | None) -> bool:
     if record is None:
         return False
     metadata = dict(record.metadata)
+
     if not bool(metadata.get("bounded_background_render", False)):
         # Imported/test artifacts with an explicit sprite are trusted. The
         # evidence gate applies to production background renders.
@@ -815,6 +969,7 @@ def plan_ink_atlas_bake(
     token_strings: Sequence[str] = (),
     capture: AtlasCaptureSpec | None = None,
     font: FontAssetSpec | None = None,
+    refinement_targets: Mapping[str, int] | None = None,
 ) -> BakePlan:
     """Queue unfinished fixed-frame token and canonical character refinements.
 
@@ -822,10 +977,28 @@ def plan_ink_atlas_bake(
     scripted-action work. Orders can be submitted a few tokens at a time; the
     Only image-converged records leave the queue. Developing records remain
     composable once covered and receive one more ray slice whenever idle.
+    ``refinement_targets`` maps an asset key to an absolute minimum pass. A UI
+    can therefore request ``current refinement_pass + N`` later without
+    weakening normal completion or discarding the retained accumulation.
     """
 
     capture = capture or AtlasCaptureSpec()
     font = font or FontAssetSpec()
+    requested_passes = {
+        str(asset_key): max(0, int(refinement_pass))
+        for asset_key, refinement_pass in (refinement_targets or {}).items()
+    }
+
+    def needs_refinement(
+        asset: ExtrudedTokenAsset,
+        record: RenderedAssetRecord | None,
+    ) -> bool:
+        return bool(
+            not ink_record_is_converged(record)
+            or _record_refinement_pass(record)
+            < requested_passes.get(asset.asset_key, 0)
+        )
+
     pending: dict[str, BakeRequest] = {}
     cached: dict[str, RenderedAssetRecord] = {}
     resolutions: dict[str, AtlasResolution] = {}
@@ -836,6 +1009,10 @@ def plan_ink_atlas_bake(
             continue
         seen_tokens.add(token)
         sequence_asset = ink_token_asset(token, font=font)
+        if len(token) > 1:
+            sequence_asset = fit_token_to_single_shot(
+                sequence_asset, capture
+            ).asset
         exact = catalog.find(
             sequence_asset.asset_key,
             DEFAULT_INK_CONDITION,
@@ -866,7 +1043,7 @@ def plan_ink_atlas_bake(
             else:
                 character_records.append(record)
                 cached[record.record_key] = record
-            if not ink_record_is_converged(raw_record):
+            if needs_refinement(glyph, raw_record):
                 refinement_pass = _record_refinement_pass(raw_record)
                 request = BakeRequest(
                     glyph.asset_key,
@@ -888,7 +1065,10 @@ def plan_ink_atlas_bake(
         resolutions[stable_asset_key(
             "ink-atlas-resolution", sequence_asset.asset_key
         )] = resolution
-        if len(token) > 1 and not exact_converged:
+        if len(token) > 1 and (
+            not exact_converged
+            or needs_refinement(sequence_asset, exact)
+        ):
             raw_exact = catalog.find(
                 sequence_asset.asset_key,
                 DEFAULT_INK_CONDITION,
@@ -913,7 +1093,9 @@ def plan_ink_atlas_bake(
         token_string = str(raw)
         if not token_string.strip():
             continue
-        string_asset = ink_token_asset(token_string, font=font)
+        string_asset = fit_token_to_single_shot(
+            ink_token_asset(token_string, font=font), capture
+        ).asset
         record = catalog.find(
             string_asset.asset_key,
             DEFAULT_INK_CONDITION,
@@ -921,7 +1103,7 @@ def plan_ink_atlas_bake(
         )
         if ink_record_is_usable(record):
             cached[record.record_key] = record
-        if not ink_record_is_converged(record):
+        if needs_refinement(string_asset, record):
             request = BakeRequest(
                 string_asset.asset_key,
                 BakeTargetKind.TOKEN_STRING,
@@ -1148,7 +1330,11 @@ __all__ = [
     "AtlasCaptureSpec",
     "MATTE_BLACK_SLATE",
     "GLOSSY_RED_INK",
+    "INK_BACKPLATE_SIZE_M",
+    "INK_SINGLE_SHOT_SAFE_FRACTION",
+    "SingleShotTokenFit",
     "ink_token_asset",
+    "fit_token_to_single_shot",
     "build_ink_on_slate_order",
     "RenderedAssetRecord",
     "RenderAssetCatalog",

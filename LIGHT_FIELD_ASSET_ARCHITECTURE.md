@@ -71,6 +71,80 @@ committed through `RenderAssetCatalog.complete()`. The catalog is an atomic,
 versioned JSON manifest and records linear evidence separately from preview and
 composition paths.
 
+## Rich object library
+
+`RenderAssetCatalog` remains the low-level evidence and resume index. The
+`RenderObjectLibrary` is organized around reusable visual styles, rather than
+making every glyph a separate library object:
+
+```text
+style object
+  subtype sets
+    glyph
+      "A", "B", ... (partial sets are valid)
+    token
+      "CAMERA", "Actual light", ...
+  each subtype
+    condition (view/light/material/frame)
+      scene + image + sprite + light-field/resume evidence
+```
+
+A style identity contains the font source identity, material recipe/revision,
+and stage family. Text content is a subtype. Consequently one DejaVu Sans Mono
+red-ink object contains the currently completed alphabet and can steadily gain
+punctuation, other Unicode glyphs, words, and whole sequences without pretending
+that the set is complete.
+
+Every subtype archives the exact `scene_order.json` and digest; condition,
+camera, stage, lighting, material, exposure, geometry, and font specifications;
+the reusable scene object template; renderer summary/context/log; and every
+cached component in the render directory, including native sensor and resumable
+epoch files.
+
+All evidence lives canonically below:
+
+```text
+render_objects/<style>/subtypes/<glyph-or-token>/<subtype>/conditions/<condition>/
+```
+
+New jobs render directly there. Migration copies every old atlas component into
+that hierarchy, validates it, and repoints `RenderAssetCatalog`; old paths are
+migration inputs and are not part of the object API.
+
+The library resolves `scene`, `light_field`, and `image` views for a selected
+subtype. `compose_sprite()` chooses exact whole-token sprites and then glyph
+fallbacks. `compose_scene()` makes the same choice but returns scene-order 3-D
+objects, with placement offsets, ready to insert into a subsequent ray trace.
+Missing token and glyph subtype requests remain explicit in either composition.
+
+Missing historical stage details use the single fixed default condition and are
+marked as inferred. Unknown camera-simulator internals are not presented as
+exact; the resolved renderer summary remains attached as surviving provenance.
+
+### Terminal interface after-render
+
+The bakery has a final tier above reusable objects and composed scenes:
+
+```text
+interface assembly
+  revision history
+    after-render
+      exact whole-interface scene
+      final shared-camera image and linear sensor evidence
+      diagnostics, priority map, log, and composition manifest
+      references to every known style subtype used by each UI scene object
+```
+
+A foreground render is registered only after all UI elements have been placed
+in the shared 3-D scene and the camera exposure has completed. Its canonical
+location is
+`render_interfaces/<interface>/after_renders/<revision-render>/`. The original
+working revision is not the browser identity; `select_interface_after_render()`
+returns the latest terminal render by default or a specified historical render.
+This is the authoritative “what the complete interface looked like after ray
+tracing” tier, while component styles and subtype scenes remain available for
+editing and subsequent traces.
+
 ## Atlas behavior
 
 Sequence glyphs win when present. If a sequence is not ready, `CharacterAtlas`
@@ -130,13 +204,21 @@ alphabet cells. It proceeds to word tokens, then the editor and fixed UI token
 strings (`CAMERA`, `WORK VALUE`, and `SPECTRAL EXPOSURE ACTIVE`). The total UI
 scene is not submitted until those string orders converge.
 `InkAtlasSubprocessRenderer` runs that request through the unchanged
-scene-order renderer. Each prepared process executes one convergence epoch by
-default, but that epoch selects up to 1,024 sensor nodes for each of 64
-recursive refinement submissions. This is roughly 64 times the former
-per-epoch sensor-ray work (128 nodes × 8 submissions), amortizing font, scene,
-lens, pipeline, and upload preparation without changing the meaning of an
-epoch. It adds that epoch to the asset's restored sensor sum and weight, then
-overwrites its developing linear frame, sprite, manifest, and catalog record.
+scene-order renderer. Each prepared process executes 64 one-submission epochs
+by default. Every epoch selects up to 1,024 sensor nodes, publishes the current
+linear image to the work panel, and atomically checkpoints its sensor sum and
+exposure weight. The total burst retains the same 64-submission ray budget,
+while font, scene, lens, pipeline, and upload preparation remain amortized by
+the single prepared process. If interrupted, the next process restores the
+latest compatible epoch and executes only the unfinished portion of that
+burst. After the burst it overwrites the developing linear frame, sprite,
+manifest, and catalog record.
 Covered developing sprites may be composed immediately, while they remain
 queued least-refined-first until the body and neighboring-light region stays
-within the convergence tolerances across successive epochs.
+within the convergence tolerances across one complete image-to-image
+comparison. That comparison spans two substantial render bursts. The catalog
+keeps the accumulated sensor sum, exposure weight, and refinement pass after
+completion. A later asset browser can opt an object back into work by passing
+an absolute `refinement_targets[asset_key]` value (normally its current pass
+plus the user's requested number of passes); ordinary planning continues to
+leave completed objects alone.

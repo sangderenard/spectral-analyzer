@@ -51,6 +51,22 @@ from camera_software import (
     token_alpha_mask,
     measure_sprite_exposure_quality,
     CachedTokenStringComposer,
+    RenderObjectLibrary,
+    canonical_subtype_directory,
+    render_style_key,
+    DEFAULT_INK_CONDITION,
+    DEFAULT_MONOFONT_HORIZONTAL_SPACING_PX,
+    DEFAULT_MONOFONT_VERTICAL_SPACING_PX,
+    ControlLayoutDesign,
+    ProgramUILayout,
+    LayoutRenderPipeline,
+    PanelGeometryKind,
+    compose_layout_panel_rgba,
+    program_ui_manifest,
+    layout_render_pipeline,
+    program_frame_metrics as manifest_program_frame_metrics,
+    layout_program_ui,
+    OpenGLContextHost,
     process_linear_sensor_image,
     save_linear_sensor_image,
 )
@@ -71,19 +87,32 @@ SENSOR_CROP_SCALE = 5
 DEFAULT_EXTRUSION_DEPTH_RATIO = 0.08
 PROGRAM_SCENE_ID = "spectral-program-scene"
 PROGRAM_STATIC_GEOMETRY_REVISION = 7
+_DEFAULT_PROGRAM_MANIFEST = program_ui_manifest()
+_DEFAULT_LAYOUT_RENDER_PIPELINE = layout_render_pipeline(
+    _DEFAULT_PROGRAM_MANIFEST
+)
+# Compatibility names are derived views of the manifest contract, not a
+# second source of production truth.
 FIXED_IMAGE_ALPHABET = tuple(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    _DEFAULT_LAYOUT_RENDER_PIPELINE.glyph_alphabet
 )
 FIXED_IMAGE_FONT = FontAssetSpec(
-    family="DejaVu Sans Mono",
-    weight="bold",
-    style="normal",
+    family=_DEFAULT_LAYOUT_RENDER_PIPELINE.font_family,
+    weight=_DEFAULT_LAYOUT_RENDER_PIPELINE.font_weight,
+    style=_DEFAULT_LAYOUT_RENDER_PIPELINE.font_style,
 )
-FIXED_UI_TOKEN_STRINGS = (
-    "CAMERA",
-    "WORK VALUE",
-    "SPECTRAL EXPOSURE ACTIVE",
-)
+FIXED_UI_TOKEN_STRINGS = _DEFAULT_LAYOUT_RENDER_PIPELINE.static_tokens
+
+
+def _manifest_render_font(manifest: Any = None) -> FontAssetSpec:
+    pipeline = layout_render_pipeline(
+        manifest or _DEFAULT_PROGRAM_MANIFEST
+    )
+    return FontAssetSpec(
+        family=pipeline.font_family,
+        weight=pipeline.font_weight,
+        style=pipeline.font_style,
+    )
 # The native thick-camera sensor is square. Its exact 200x153 product readback
 # restores the UI aspect afterward, so the camera-facing world layout must use
 # one square physical frame or it is vertically compressed twice.
@@ -93,34 +122,11 @@ PROGRAM_SCENE_EXTENT_M = 0.375
 def _program_frame_metrics(
     work_width: int, work_height: int
 ) -> dict[str, int]:
-    """Derive the full UI frame around fixed-size preview panes."""
+    """Compatibility wrapper around the authoritative program manifest."""
 
-    preview_width = max(1, int(work_width))
-    preview_height = max(1, int(work_height))
-    frame_width = 2 * preview_width
-    scale = min(1.0, max(0.4, float(frame_width) / 480.0))
-    control_h = max(12, int(round(24.0 * scale)))
-    label_h = max(10, int(round(20.0 * scale)))
-    label_clearance_h = max(1, label_h // 2)
-    editor_h = max(24, int(round(preview_height * 0.35)))
-    status_h = max(12, int(round(18.0 * scale)))
-    frame_height = (
-        control_h + label_h + label_clearance_h
-        + preview_height + editor_h + status_h
+    return manifest_program_frame_metrics(
+        work_width, work_height, program_ui_manifest()
     )
-    return {
-        "frame_width": frame_width,
-        "frame_height": frame_height,
-        "preview_width": preview_width,
-        "preview_height": preview_height,
-        "control_h": control_h,
-        "label_h": label_h,
-        "label_clearance_h": label_clearance_h,
-        "editor_h": editor_h,
-        "status_h": status_h,
-    }
-
-
 def render_contract_summary(
     display_width: int,
     display_height: int,
@@ -332,7 +338,11 @@ def management_display_object(
 ) -> DisplayObjectSpec:
     """Create box/icon geometry that shares the program scene's fixed camera."""
 
-    if kind not in (DisplayPrimitiveKind.BOX, DisplayPrimitiveKind.ICON):
+    if kind not in (
+        DisplayPrimitiveKind.PLANE,
+        DisplayPrimitiveKind.BOX,
+        DisplayPrimitiveKind.ICON,
+    ):
         raise ValueError("management object kind must be box or icon")
     return DisplayObjectSpec(
         object_id=object_id,
@@ -360,102 +370,48 @@ def program_display_region(
     return SensorRegion(2 * width, 2 * height, width, height)
 
 
+def resolved_program_ui_layout(
+    display_width: int,
+    display_height: int,
+    *,
+    work_width: int | None = None,
+    work_height: int | None = None,
+    manifest: Any = None,
+) -> ProgramUILayout:
+    """Resolve the authoritative manifest inside the photographed crop."""
+
+    crop = program_display_region(display_width, display_height)
+    return layout_program_ui(
+        manifest or program_ui_manifest(),
+        crop.width,
+        crop.height,
+        origin=(crop.x, crop.y),
+        work_width=work_width,
+        work_height=work_height,
+    )
+
+
 def program_ui_sensor_regions(
     display_width: int,
     display_height: int,
     *,
     work_width: int | None = None,
     work_height: int | None = None,
+    manifest: Any = None,
 ) -> dict[str, SensorRegion]:
-    """Stable sensor-space layout for UI products photographed together."""
+    """Manifest-resolved sensor-space products photographed together."""
 
-    crop = program_display_region(display_width, display_height)
-
-    if work_width is None:
-        work_width = max(1, crop.width // 2)
-    if work_height is None:
-        work_height = max(1, crop.height // 2)
-    metrics = _program_frame_metrics(work_width, work_height)
-    left_width = min(crop.width, metrics["preview_width"])
-    right_width = min(crop.width - left_width, metrics["preview_width"])
-    control_h = min(metrics["control_h"], max(1, crop.height - 1))
-    label_h = min(metrics["label_h"], max(1, crop.height - control_h - 1))
-    panel_h = min(
-        metrics["preview_height"],
-        max(
-            1,
-            crop.height - control_h - label_h
-            - metrics["label_clearance_h"] - 1,
-        ),
+    layout = resolved_program_ui_layout(
+        display_width,
+        display_height,
+        work_width=work_width,
+        work_height=work_height,
+        manifest=manifest,
     )
-    remaining_h = max(
-        1,
-        crop.height - control_h - label_h
-        - metrics["label_clearance_h"] - panel_h,
-    )
-    status_h = min(metrics["status_h"], max(1, remaining_h))
-    editor_h = max(1, remaining_h - status_h)
-    label_margin = min(4, max(0, (left_width - 1) // 4))
-    control_margin = min(2, max(0, (crop.width - 1) // 24))
-    available_control_w = max(1, crop.width - 2 * control_margin)
-    control_gap = max(0, min(3, available_control_w // 20))
-    control_size = max(
-        1,
-        min(
-            14,
-            max(1, control_h - 2 * control_margin),
-            max(1, (available_control_w - 2 * control_gap) // 3),
-        ),
-    )
-    control_right = crop.x + crop.width - control_margin
-    close_x = control_right - control_size
-    maximize_x = close_x - control_gap - control_size
-    minimize_x = maximize_x - control_gap - control_size
-    label_y = crop.y + control_h
-    panel_y = label_y + label_h + metrics["label_clearance_h"]
-    editor_y = panel_y + panel_h
-    status_y = editor_y + editor_h
     return {
-        "program-backdrop": SensorRegion(
-            crop.x, crop.y, crop.width, crop.height
-        ),
-        "camera-panel": SensorRegion(crop.x, panel_y, left_width, panel_h),
-        "work-panel": SensorRegion(
-            crop.x + left_width, panel_y, right_width, panel_h
-        ),
-        "camera-label": SensorRegion(
-            crop.x + label_margin,
-            label_y,
-            max(1, left_width - 2 * label_margin),
-            label_h,
-        ),
-        "work-label": SensorRegion(
-            crop.x + left_width + label_margin,
-            label_y,
-            max(1, right_width - 2 * label_margin),
-            label_h,
-        ),
-        "editor-text": SensorRegion(
-            crop.x, editor_y, crop.width, editor_h
-        ),
-        "status-text": SensorRegion(
-            crop.x,
-            status_y,
-            crop.width,
-            status_h,
-        ),
-        "window-minimize": SensorRegion(
-            minimize_x, crop.y + control_margin, control_size, control_size
-        ),
-        "window-maximize": SensorRegion(
-            maximize_x, crop.y + control_margin, control_size, control_size
-        ),
-        "window-close": SensorRegion(
-            close_x, crop.y + control_margin, control_size, control_size
-        ),
+        key: SensorRegion(*rect)
+        for key, rect in layout.regions.items()
     }
-
-
 def _placement_for_sensor_region(
     sensor_region: SensorRegion,
     photographed_region: SensorRegion,
@@ -509,6 +465,73 @@ def _region_pixel_slice(
     return SensorPixelSlice(sensor_width, sensor_height, indices)
 
 
+def control_layout_scene_objects(
+    design: ControlLayoutDesign,
+    photographed_region: SensorRegion,
+    *,
+    sensor_width: int,
+    sensor_height: int,
+    revision: int = PROGRAM_STATIC_GEOMETRY_REVISION,
+    font: FontAssetSpec | None = None,
+) -> tuple[DisplayObjectSpec, ...]:
+    """Turn one knob layout into physical objects in the same UI photograph."""
+
+    font = font or FIXED_IMAGE_FONT
+    objects: list[DisplayObjectSpec] = []
+    for element in design.elements:
+        x, y, width, height = element.rect
+        region = SensorRegion(int(x), int(y), int(width), int(height))
+        if (
+            region.x < 0 or region.y < 0
+            or region.x + region.width > sensor_width
+            or region.y + region.height > sensor_height
+        ):
+            raise ValueError(f"control element {element.key!r} is outside the sensor")
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "-", element.key).strip("-")
+        object_id = f"control-layout-{safe_key}"
+        if element.kind == "panel":
+            primitive = DisplayPrimitive(DisplayPrimitiveKind.PLANE)
+            front_offset = 0.0001
+            thickness = 0.0015
+        else:
+            content = element.label
+            if element.kind == "knob":
+                metadata = design.knob_routes.get(element.route_key, {})
+                value = element.value
+                choices = list(metadata.get("choices", []) or [])
+                if choices and isinstance(value, (int, np.integer)):
+                    index = int(value)
+                    if 0 <= index < len(choices):
+                        value = choices[index]
+                content = f"{element.label}  {value}"
+            primitive = DisplayPrimitive(DisplayPrimitiveKind.TEXT, content=content)
+            front_offset = 0.0007
+            thickness = 0.0008
+        objects.append(DisplayObjectSpec(
+            object_id=object_id,
+            primitive=primitive,
+            placement=_placement_for_sensor_region(
+                region, photographed_region, thickness_m=thickness,
+                front_offset_m=front_offset,
+            ),
+            products=(DisplayProductRequest(DisplayProductKind.IMAGE, region),),
+            layout_rectangle=LayoutRectangle(
+                region,
+                BevelRegion(0.001, 0.0004, BevelProfile.CHAMFER),
+                (LayoutSeam.BEVEL,) * 4,
+            ),
+            material="text_surface",
+            surface_material="quiet_background",
+            font_family=font.family,
+            font_weight=font.weight,
+            font_style=font.style,
+            horizontal_align="left" if element.kind == "knob" else "center",
+            vertical_align="center",
+            revision=max(1, int(revision)),
+        ))
+    return tuple(objects)
+
+
 def build_self_rendering_program_scene(
     text: str,
     *,
@@ -518,15 +541,41 @@ def build_self_rendering_program_scene(
     work_height: int | None = None,
     status_text: str = "SPECTRAL EXPOSURE ACTIVE",
     revision: int = 1,
+    control_layout: ControlLayoutDesign | None = None,
+    program_manifest: Any = None,
 ) -> DisplaySceneSpec:
     """Build editor and window-control geometry for one physical photograph."""
 
-    regions = program_ui_sensor_regions(
+    manifest = program_manifest or program_ui_manifest()
+    program_layout = resolved_program_ui_layout(
         display_width,
         display_height,
         work_width=work_width,
         work_height=work_height,
+        manifest=manifest,
     )
+    regions = {
+        key: SensorRegion(*rect)
+        for key, rect in program_layout.regions.items()
+    }
+    program_font = _manifest_render_font(manifest)
+
+    def panel_primitive_kind(panel_id: str) -> DisplayPrimitiveKind:
+        geometry = program_layout.panel_geometry[panel_id]
+        return (
+            DisplayPrimitiveKind.PLANE
+            if geometry.kind is PanelGeometryKind.PLANE
+            else DisplayPrimitiveKind.BOX
+        )
+
+    def panel_bevel(panel_id: str) -> BevelRegion:
+        geometry = program_layout.panel_geometry[panel_id]
+        return BevelRegion(
+            geometry.bevel_width_m,
+            geometry.bevel_depth_m,
+            BevelProfile.CHAMFER,
+        )
+
     crop = program_display_region(display_width, display_height)
     base = build_program_display_scene(
         text,
@@ -535,14 +584,14 @@ def build_self_rendering_program_scene(
         revision=revision,
     )
     editor_region = regions["editor-text"]
-    backdrop_region = regions["program-backdrop"]
+    backdrop_region = regions[manifest.name]
     backdrop = DisplayObjectSpec(
-        object_id="program-backdrop",
-        primitive=DisplayPrimitive(DisplayPrimitiveKind.BOX),
+        object_id=manifest.name,
+        primitive=DisplayPrimitive(panel_primitive_kind(manifest.name)),
         placement=_placement_for_sensor_region(
             backdrop_region,
             crop,
-            thickness_m=0.001,
+            thickness_m=program_layout.panel_geometry[manifest.name].thickness_m,
             front_offset_m=-0.001,
         ),
         products=(
@@ -550,7 +599,7 @@ def build_self_rendering_program_scene(
         ),
         layout_rectangle=LayoutRectangle(
             backdrop_region,
-            BevelRegion(0.0, 0.0, BevelProfile.CHAMFER),
+            panel_bevel(manifest.name),
             (LayoutSeam.FLUSH,) * 4,
         ),
         revision=PROGRAM_STATIC_GEOMETRY_REVISION,
@@ -558,13 +607,14 @@ def build_self_rendering_program_scene(
     editor = replace(
         base.objects[0],
         object_id="editor-text",
-        font_family=FIXED_IMAGE_FONT.family,
-        font_weight=FIXED_IMAGE_FONT.weight,
-        font_style=FIXED_IMAGE_FONT.style,
+        font_family=program_font.family,
+        font_weight=program_font.weight,
+        font_style=program_font.style,
         horizontal_align="left",
         vertical_align="top",
         placement=_placement_for_sensor_region(
-            editor_region, crop, thickness_m=0.002
+            editor_region, crop,
+            thickness_m=program_layout.panel_geometry["editor-text"].thickness_m
         ),
         products=(
             DisplayProductRequest(
@@ -577,14 +627,18 @@ def build_self_rendering_program_scene(
         ),
         layout_rectangle=LayoutRectangle(
             editor_region,
-            BevelRegion(0.0015, 0.0005, BevelProfile.CHAMFER),
+            panel_bevel("editor-text"),
             (LayoutSeam.BEVEL,) * 4,
         ),
     )
     authored_text_objects = []
     for object_id, content in (
-        ("camera-label", "CAMERA"),
-        ("work-label", "WORK VALUE"),
+        ("camera-label", program_layout.labels["camera-label"]),
+        ("work-label", program_layout.labels["work-label"]),
+        (
+            "asset-browser-label",
+            program_layout.labels["asset-browser-label"],
+        ),
         ("status-text", str(status_text)),
     ):
         if object_id not in regions:
@@ -618,9 +672,9 @@ def build_self_rendering_program_scene(
             ),
             material="text_surface",
             surface_material="quiet_background",
-            font_family=FIXED_IMAGE_FONT.family,
-            font_weight=FIXED_IMAGE_FONT.weight,
-            font_style=FIXED_IMAGE_FONT.style,
+            font_family=program_font.family,
+            font_weight=program_font.weight,
+            font_style=program_font.style,
             horizontal_align=(
                 "left" if object_id == "status-text" else "center"
             ),
@@ -634,37 +688,43 @@ def build_self_rendering_program_scene(
         ))
     controls = []
     panels = []
-    for object_id in ("camera-panel", "work-panel"):
+    for object_id in ("camera-panel", "work-panel", "asset-browser"):
         if object_id not in regions:
             continue
         sensor_region = regions[object_id]
         panels.append(DisplayObjectSpec(
             object_id=object_id,
-            primitive=DisplayPrimitive(DisplayPrimitiveKind.BOX),
+            primitive=DisplayPrimitive(panel_primitive_kind(object_id)),
             placement=_placement_for_sensor_region(
-                sensor_region, crop, thickness_m=0.002
+                sensor_region,
+                crop,
+                thickness_m=program_layout.panel_geometry[object_id].thickness_m,
             ),
             products=(
                 DisplayProductRequest(DisplayProductKind.IMAGE, sensor_region),
             ),
             layout_rectangle=LayoutRectangle(
                 sensor_region,
-                BevelRegion(0.0015, 0.0005, BevelProfile.CHAMFER),
+                panel_bevel(object_id),
                 (LayoutSeam.BEVEL,) * 4,
             ),
             revision=PROGRAM_STATIC_GEOMETRY_REVISION,
         ))
-    for object_id, icon_name in (
-        ("window-minimize", "minimize"),
-        ("window-maximize", "maximize"),
-        ("window-close", "close"),
-    ):
+    for object_id, action in program_layout.actions.items():
+        if object_id not in regions:
+            continue
         sensor_region = regions[object_id]
+        primitive = (
+            DisplayPrimitive(
+                DisplayPrimitiveKind.TEXT, content=action.label
+            )
+            if action.label else DisplayPrimitive(
+                DisplayPrimitiveKind.ICON, icon_name=action.icon
+            )
+        )
         controls.append(DisplayObjectSpec(
             object_id=object_id,
-            primitive=DisplayPrimitive(
-                DisplayPrimitiveKind.ICON, icon_name=icon_name
-            ),
+            primitive=primitive,
             placement=_placement_for_sensor_region(
                 sensor_region,
                 crop,
@@ -674,6 +734,13 @@ def build_self_rendering_program_scene(
             products=(
                 DisplayProductRequest(DisplayProductKind.IMAGE, sensor_region),
             ),
+            material="control_surface",
+            surface_material="quiet_background",
+            font_family=program_font.family,
+            font_weight=program_font.weight,
+            font_style=program_font.style,
+            horizontal_align="center",
+            vertical_align="center",
             layout_rectangle=LayoutRectangle(
                 sensor_region,
                 BevelRegion(0.001, 0.0004, BevelProfile.CHAMFER),
@@ -682,9 +749,23 @@ def build_self_rendering_program_scene(
             # Controls retain their exposure when only editor content changes.
             revision=PROGRAM_STATIC_GEOMETRY_REVISION,
         ))
+    layout_objects = (
+        control_layout_scene_objects(
+            control_layout,
+            crop,
+            sensor_width=base.sensor_width,
+            sensor_height=base.sensor_height,
+            revision=revision,
+            font=program_font,
+        )
+        if control_layout is not None else ()
+    )
     return replace(
         base,
-        objects=(backdrop, editor, *panels, *authored_text_objects, *controls),
+        objects=(
+            backdrop, editor, *panels, *authored_text_objects, *controls,
+            *layout_objects,
+        ),
     )
 
 
@@ -992,7 +1073,10 @@ def build_display_scene_order(
                 }
             ),
         })
-        if spec.primitive.kind is DisplayPrimitiveKind.BOX:
+        if spec.primitive.kind in {
+            DisplayPrimitiveKind.PLANE,
+            DisplayPrimitiveKind.BOX,
+        }:
             continue
         if spec.primitive.kind is DisplayPrimitiveKind.ICON:
             planes.extend(_icon_stroke_planes(spec))
@@ -1214,6 +1298,8 @@ class RenderedTextRevision:
     diagnostic_image_path: str = ""
     orthographic_path: str = ""
     priority_overlay_path: str = ""
+    interface_assembly_key: str = ""
+    after_render_key: str = ""
 
 
 RenderFunction = Callable[
@@ -1223,6 +1309,73 @@ RenderFunction = Callable[
 BackgroundRenderFunction = Callable[[BakeRequest], Any]
 BackgroundRequestSource = Callable[[], BakeRequest | None]
 
+
+ATLAS_CHECKPOINT_SCHEMA_VERSION = 1
+
+
+def _write_atlas_checkpoint(path: str, payload: dict[str, Any]) -> None:
+    """Atomically publish one resumable, completed atlas epoch."""
+
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
+
+
+def _load_atlas_checkpoint(
+    path: str,
+    request: BakeRequest,
+    catalog_refinement_pass: int,
+) -> dict[str, Any] | None:
+    """Return a compatible checkpoint whose evidence files still exist."""
+
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            checkpoint = dict(json.load(handle))
+        completed = int(checkpoint.get("completed_epochs", 0))
+        target = int(checkpoint.get("target_refinement_pass", -1))
+        compatible = bool(
+            int(checkpoint.get("schema_version", -1))
+            == ATLAS_CHECKPOINT_SCHEMA_VERSION
+            and checkpoint.get("request_key") == request.request_key
+            and checkpoint.get("target_key") == request.target_key
+            and int(checkpoint.get("catalog_refinement_pass", -1))
+            == int(catalog_refinement_pass)
+            and completed > 0
+            and target >= int(catalog_refinement_pass) + completed
+        )
+        evidence_paths = tuple(
+            str(checkpoint.get(name, ""))
+            for name in (
+                "linear_accumulation_path",
+                "sensor_sum_path",
+                "exposure_weight_path",
+            )
+        )
+        if not compatible or not all(
+            evidence_path and os.path.isfile(evidence_path)
+            for evidence_path in evidence_paths
+        ):
+            return None
+        return checkpoint
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _atlas_request_directory(output_root: str, request: BakeRequest) -> str:
+    """Place every bake directly in its style/subtype/condition object."""
+
+    return canonical_subtype_directory(
+        output_root,
+        request.token_asset,
+        request.condition,
+        target_kind=request.target_kind.value,
+    )
 
 class InkAtlasSubprocessRenderer:
     """Advance one persistent atlas asset by one substantial resumable burst."""
@@ -1239,6 +1392,10 @@ class InkAtlasSubprocessRenderer:
     ) -> None:
         self.output_root = os.path.abspath(output_root)
         self.catalog = catalog
+        self.object_library = RenderObjectLibrary(os.path.join(
+            self.output_root, "render_object_library.json"
+        ))
+        self.object_library.migrate_catalog(self.catalog)
         self.epochs_per_exposure = max(1, int(epochs_per_exposure))
         self.sensor_top_k = max(64, min(1024, int(sensor_top_k)))
         self.steps_per_epoch = max(1, int(steps_per_epoch))
@@ -1249,6 +1406,8 @@ class InkAtlasSubprocessRenderer:
         self._active_process: subprocess.Popen[str] | None = None
         self._work_revision = 0
         self._work_state: tuple[str, str, int, bool] = ("", "", 0, False)
+        self._work_object_key = ""
+        self._visual_accept_requested = False
 
     def work_snapshot(self) -> tuple[int, str, str, int, bool]:
         """Latest individual asset shown by the UI work panel."""
@@ -1263,23 +1422,59 @@ class InkAtlasSubprocessRenderer:
                 active,
             )
 
+    def work_object_snapshot(self) -> tuple[int, str, str, int, bool]:
+        """Identity for scene/image/light-field views of the active object."""
+
+        with self._lock:
+            _path, token, refinement_pass, active = self._work_state
+            return (
+                self._work_revision,
+                self._work_object_key,
+                token,
+                refinement_pass,
+                active,
+            )
+
     def cancel_current(self) -> None:
         with self._lock:
             process = self._active_process
         if process is not None and process.poll() is None:
             process.terminate()
 
+    def request_active_visual_pass(self) -> bool:
+        """Accept the latest published epoch of the active automatic job."""
+
+        with self._lock:
+            process = self._active_process
+            current_path = self._work_state[0]
+            if (
+                process is None
+                or process.poll() is not None
+                or not current_path
+                or not os.path.isfile(current_path)
+            ):
+                return False
+            self._visual_accept_requested = True
+        process.terminate()
+        return True
+
     def __call__(self, request: BakeRequest):
         package = ink_order_for_request(request)
         job_id = str(package["jobs"][0]["id"])
-        short_key = request.target_key.rsplit(":", 1)[-1][:16]
-        request_dir = os.path.join(
-            self.output_root, "ink_atlas", f"{request.target_kind.value}_{short_key}"
-        )
+        request_dir = _atlas_request_directory(self.output_root, request)
         os.makedirs(request_dir, exist_ok=True)
         preview_path = os.path.join(request_dir, "0000_cpp.png")
+        sum_path = os.path.join(request_dir, "0000_cpp_sum_linear.npy")
+        weight_path = os.path.join(
+            request_dir, "0000_cpp_exposure_weight.npy"
+        )
+        checkpoint_path = os.path.join(
+            request_dir, "active_epoch_checkpoint.json"
+        )
         with self._lock:
+            self._visual_accept_requested = False
             self._work_revision += 1
+            self._work_object_key = render_style_key(request.token_asset)
             self._work_state = (
                 preview_path if os.path.isfile(preview_path) else "",
                 request.token_asset.token,
@@ -1312,7 +1507,50 @@ class InkAtlasSubprocessRenderer:
                 np.load(prior_record.linear_path, allow_pickle=False),
                 np.float32,
             )[..., :3].copy()
+        catalog_refinement_pass = max(
+            int(request.refinement_pass),
+            (
+                int(prior_metadata.get("refinement_pass", 0))
+                if resumable_prior else 0
+            ),
+        )
+        checkpoint = _load_atlas_checkpoint(
+            checkpoint_path, request, catalog_refinement_pass
+        )
+        restored_checkpoint_epochs = (
+            0 if checkpoint is None
+            else int(checkpoint["completed_epochs"])
+        )
+        refinement_pass = (
+            catalog_refinement_pass + restored_checkpoint_epochs
+        )
+        configured_epoch_count = max(
+            1, self.epochs_per_exposure * self.steps_per_epoch
+        )
+        target_refinement_pass = (
+            catalog_refinement_pass + configured_epoch_count
+            if checkpoint is None
+            else int(checkpoint["target_refinement_pass"])
+        )
+        remaining_epochs = target_refinement_pass - refinement_pass
+        if remaining_epochs <= 0:
+            # The parent may have been interrupted after the final checkpoint
+            # but before catalog commit. One more epoch safely completes the
+            # ordinary final-image/sprite path without discarding evidence.
+            target_refinement_pass = refinement_pass + 1
+            remaining_epochs = 1
+        if checkpoint is not None:
+            with self._lock:
+                self._work_revision += 1
+                self._work_state = (
+                    str(checkpoint["linear_accumulation_path"]),
+                    request.token_asset.token,
+                    refinement_pass,
+                    True,
+                )
+
         order_path = os.path.join(request_dir, "scene_order.json")
+        progress_dir = os.path.join(request_dir, "progress")
         with open(order_path, "w", encoding="utf-8") as handle:
             json.dump(package, handle, indent=2)
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1328,6 +1566,8 @@ class InkAtlasSubprocessRenderer:
             "--no-window",
             "--save-files",
             "--out-dir", request_dir,
+            "--progress-dir", progress_dir,
+            "--progress-exposure-id", request.request_key,
             "--bdpt-native-packages", "1",
             "--no-convergence-drive-batches",
         ]
@@ -1335,36 +1575,32 @@ class InkAtlasSubprocessRenderer:
         # Amortize expensive scene/lens/GPU preparation across a large ray
         # burst. This is a work quantum, not a lifetime target: the catalog
         # keeps offering the asset until external image deltas converge.
-        environment["SPECTRAL_SENSOR_MAX_EPOCHS"] = str(
-            self.epochs_per_exposure
-        )
+        # One native submission is one visible and resumable epoch. The total
+        # burst remains epochs_per_exposure * steps_per_epoch submissions.
+        environment["SPECTRAL_SENSOR_MAX_EPOCHS"] = str(remaining_epochs)
         environment["SPECTRAL_SENSOR_CONTINUOUS"] = "1"
         environment["SPECTRAL_SENSOR_TOP_K"] = str(self.sensor_top_k)
-        environment["SPECTRAL_SENSOR_STEPS_PER_LAYER"] = str(
-            self.steps_per_epoch
-        )
+        environment["SPECTRAL_SENSOR_STEPS_PER_LAYER"] = "1"
         environment["SPECTRAL_SENSOR_SAMPLES_PER_NODE"] = str(
             self.samples_per_node
         )
         environment["SPECTRAL_SENSOR_TARGETED_FRACTION"] = "0.75"
-        refinement_pass = max(
-            int(request.refinement_pass),
-            (
-                int(prior_metadata.get("refinement_pass", 0))
-                if resumable_prior else 0
-            ),
-        )
+        environment["SPECTRAL_PROGRESS_RETAIN_LAYERS"] = "2"
         environment["SPECTRAL_EXPOSURE_SEED_OFFSET"] = str(
             refinement_pass * 1_000_003
         )
-        sum_path = os.path.join(request_dir, "0000_cpp_sum_linear.npy")
-        weight_path = os.path.join(
-            request_dir, "0000_cpp_exposure_weight.npy"
+        restore_sum_source = (
+            str(checkpoint["sensor_sum_path"])
+            if checkpoint is not None else sum_path
+        )
+        restore_weight_source = (
+            str(checkpoint["exposure_weight_path"])
+            if checkpoint is not None else weight_path
         )
         if (
             refinement_pass > 0
-            and os.path.isfile(sum_path)
-            and os.path.isfile(weight_path)
+            and os.path.isfile(restore_sum_source)
+            and os.path.isfile(restore_weight_source)
         ):
             restore_sum_path = os.path.join(
                 request_dir, "restore_sensor_sum_native.npy"
@@ -1376,14 +1612,14 @@ class InkAtlasSubprocessRenderer:
             np.save(
                 restore_sum_path,
                 _display_raster_to_native_square(
-                    np.load(sum_path, allow_pickle=False)
+                    np.load(restore_sum_source, allow_pickle=False)
                 ),
                 allow_pickle=False,
             )
             np.save(
                 restore_weight_path,
                 _display_raster_to_native_square(
-                    np.load(weight_path, allow_pickle=False)
+                    np.load(restore_weight_source, allow_pickle=False)
                 ),
                 allow_pickle=False,
             )
@@ -1391,6 +1627,35 @@ class InkAtlasSubprocessRenderer:
             environment["SPECTRAL_SENSOR_RESTORE_SUM"] = restore_sum_path
             environment["SPECTRAL_SENSOR_RESTORE_WEIGHT"] = restore_weight_path
             environment["SPECTRAL_SENSOR_DIRTY_SITES"] = dirty_path
+        renderer_context_path = os.path.join(
+            request_dir, "render_context.json"
+        )
+        _write_atlas_checkpoint(renderer_context_path, {
+            "schema_version": 1,
+            "request": {
+                "request_key": request.request_key,
+                "target_key": request.target_key,
+                "target_kind": request.target_kind.value,
+                "condition": {
+                    "condition_key": request.condition.condition_key,
+                    "azimuth_deg": request.condition.azimuth_deg,
+                    "elevation_deg": request.condition.elevation_deg,
+                    "light_rig": request.condition.light_rig,
+                    "material_variant": request.condition.material_variant,
+                    "frame": request.condition.frame,
+                },
+                "product_kind": request.product_kind.value,
+                "scene_id": request.scene_id,
+                "object_ids": list(request.object_ids),
+            },
+            "command": command,
+            "cwd": script_dir,
+            "environment": {
+                key: value for key, value in sorted(environment.items())
+                if key.startswith("SPECTRAL_")
+            },
+            "created_at_s": time.time(),
+        })
         log_path = os.path.join(request_dir, "render.log")
         print(
             f"[ink-atlas] rendering {request.target_kind.value} "
@@ -1419,6 +1684,47 @@ class InkAtlasSubprocessRenderer:
                     log.flush()
                     if "[sensor-refine] epoch " in line:
                         executed_epochs += 1
+                    progress = ExposureProgressEvent.from_line(
+                        line.rstrip("\r\n")
+                    )
+                    if (
+                        progress is not None
+                        and progress.linear_accumulation_path
+                        and os.path.isfile(progress.linear_accumulation_path)
+                    ):
+                        completed_epochs = (
+                            restored_checkpoint_epochs
+                            + int(progress.completed_work)
+                        )
+                        if (
+                            progress.sensor_sum_path
+                            and progress.exposure_weight_path
+                            and os.path.isfile(progress.sensor_sum_path)
+                            and os.path.isfile(progress.exposure_weight_path)
+                        ):
+                            _write_atlas_checkpoint(checkpoint_path, {
+                                "schema_version": ATLAS_CHECKPOINT_SCHEMA_VERSION,
+                                "request_key": request.request_key,
+                                "target_key": request.target_key,
+                                "catalog_refinement_pass": catalog_refinement_pass,
+                                "completed_epochs": completed_epochs,
+                                "target_refinement_pass": target_refinement_pass,
+                                "linear_accumulation_path": (
+                                    progress.linear_accumulation_path
+                                ),
+                                "sensor_sum_path": progress.sensor_sum_path,
+                                "exposure_weight_path": (
+                                    progress.exposure_weight_path
+                                ),
+                            })
+                        with self._lock:
+                            self._work_revision += 1
+                            self._work_state = (
+                                progress.linear_accumulation_path,
+                                request.token_asset.token,
+                                catalog_refinement_pass + completed_epochs,
+                                True,
+                            )
                     print(f"[ink-atlas] {line}", end="", flush=True)
                 return_code = process.wait()
             finally:
@@ -1426,6 +1732,101 @@ class InkAtlasSubprocessRenderer:
                     if self._active_process is process:
                         self._active_process = None
             if return_code != 0:
+                with self._lock:
+                    visual_accept = self._visual_accept_requested
+                    self._visual_accept_requested = False
+                    current_path, current_token, current_pass, _active = (
+                        self._work_state
+                    )
+                    self._work_revision += 1
+                    self._work_state = (
+                        current_path, current_token, current_pass, False
+                    )
+                if visual_accept:
+                    checkpoint = _load_atlas_checkpoint(
+                        checkpoint_path, request, catalog_refinement_pass
+                    )
+                    if checkpoint is None:
+                        raise RuntimeError(
+                            "visual pass requested before the first epoch checkpoint"
+                        )
+                    accepted_linear = str(
+                        checkpoint["linear_accumulation_path"]
+                    )
+                    accepted_image = np.asarray(
+                        np.load(accepted_linear, allow_pickle=False),
+                        np.float32,
+                    )[..., :3]
+                    capture = request.capture
+                    if capture is None:
+                        raise RuntimeError(
+                            "visual pass requires an atlas capture contract"
+                        )
+                    sprite = extract_raytraced_sprite(
+                        accepted_image, request.token_asset, capture
+                    )
+                    sprite_path = sprite.save(os.path.join(
+                        request_dir, "raytraced_sprite.npz"
+                    ))
+                    accepted_manifest = os.path.join(
+                        request_dir, "atlas_capture_manifest.json"
+                    )
+                    _write_atlas_checkpoint(accepted_manifest, {
+                        "schema_version": 1,
+                        "target_key": request.target_key,
+                        "condition_key": request.condition.condition_key,
+                        "token": request.token_asset.token,
+                        "capture": {
+                            "width": capture.width,
+                            "height": capture.height,
+                            "content_region": list(capture.content_region),
+                        },
+                        "linear_path": accepted_linear,
+                        "completion_basis": "human_visual_pass",
+                    })
+                    record = self.catalog.complete(
+                        request,
+                        linear_path=accepted_linear,
+                        manifest_path=accepted_manifest,
+                        width=capture.width,
+                        height=capture.height,
+                        samples=int(current_pass),
+                        metadata={
+                            "bounded_background_render": True,
+                            "sensor_display_orientation": SENSOR_DISPLAY_ORIENTATION,
+                            "refinement_state": "developing",
+                            "refinement_pass": int(current_pass),
+                            "completion_basis": "human_visual_pass",
+                            "human_visual_pass": True,
+                            "human_visual_pass_at_s": time.time(),
+                            "atlas_quality": {
+                                "composable": True,
+                                "converged": False,
+                                "human_visual_pass": True,
+                            },
+                            "sprite_path": sprite_path,
+                            "sum_linear_path": str(
+                                checkpoint["sensor_sum_path"]
+                            ),
+                            "exposure_weight_path": str(
+                                checkpoint["exposure_weight_path"]
+                            ),
+                        },
+                    )
+                    self.object_library.adopt_record(
+                        record,
+                        scene_path=order_path,
+                        condition=request.condition,
+                        token=request.token_asset.token,
+                        tags=("human-visual-pass",),
+                        renderer_context_path=renderer_context_path,
+                    )
+                    print(
+                        f"[ink-atlas] human visual pass "
+                        f"{request.token_asset.token!r} pass={current_pass}",
+                        flush=True,
+                    )
+                    return record
                 raise subprocess.CalledProcessError(return_code, command)
         linear_path = os.path.join(request_dir, "0000_cpp_linear.npy")
         manifest_path = os.path.join(request_dir, "atlas_capture_manifest.json")
@@ -1497,9 +1898,14 @@ class InkAtlasSubprocessRenderer:
                 "sensor_top_k": self.sensor_top_k,
                 "steps_per_epoch": self.steps_per_epoch,
                 "samples_per_node": self.samples_per_node,
+                "checkpoint_epochs_per_exposure": configured_epoch_count,
+                "refinement_steps_per_checkpoint": 1,
                 "camera_primary_rays_per_epoch": (
+                    self.sensor_top_k * self.samples_per_node
+                ),
+                "camera_primary_rays_per_burst": (
                     self.sensor_top_k
-                    * self.steps_per_epoch
+                    * configured_epoch_count
                     * self.samples_per_node
                 ),
                 "sensor_display_orientation": SENSOR_DISPLAY_ORIENTATION,
@@ -1512,6 +1918,25 @@ class InkAtlasSubprocessRenderer:
                 ),
             },
         )
+        bundle = self.object_library.adopt_record(
+            record,
+            scene_path=order_path,
+            condition=request.condition,
+            object_kind=request.target_kind.value,
+            token=request.token_asset.token,
+            tags=("ink-on-slate", "ray-traced-ui-bakery"),
+            renderer_context_path=renderer_context_path,
+        )
+        print(
+            f"[object-library] object={bundle.object_key} "
+            f"modes={[mode.value for mode in bundle.available_view_modes]} "
+            f"manifest={bundle.manifest_path}",
+            flush=True,
+        )
+        try:
+            os.unlink(checkpoint_path)
+        except FileNotFoundError:
+            pass
         print(
             f"[ink-atlas] refined {request.token_asset.token!r} "
             f"pass={quality.refinement_pass} "
@@ -1550,6 +1975,7 @@ class SpectralTextRenderWorker:
         self._background_source = background_source
         self._background_render_function = background_render_function
         self._background_paused = False
+        self._background_user_paused = False
         self._background_error = ""
         self._background_busy = False
         self._condition = threading.Condition()
@@ -1597,13 +2023,40 @@ class SpectralTextRenderWorker:
             self._condition.notify()
             return sequence
 
+    def set_background_paused(self, paused: bool) -> None:
+        """Pause/resume only automatic queue resolution; keep checkpoints."""
+
+        paused = bool(paused)
+        with self._condition:
+            self._background_user_paused = paused
+            self._background_paused = paused
+            self._background_error = ""
+            self._condition.notify_all()
+        if paused:
+            cancel_background = getattr(
+                self._background_render_function, "cancel_current", None
+            )
+            if callable(cancel_background):
+                cancel_background()
+
+    def toggle_background_paused(self) -> bool:
+        with self._condition:
+            paused = not self._background_user_paused
+        self.set_background_paused(paused)
+        return paused
+
+    def background_is_paused(self) -> bool:
+        with self._condition:
+            return self._background_user_paused
+
     def wake_background(self) -> None:
         """Retry/replan background work after new tokens or external recovery."""
 
         with self._condition:
-            self._background_paused = False
-            self._background_error = ""
-            self._condition.notify_all()
+            if not self._background_user_paused:
+                self._background_paused = False
+                self._background_error = ""
+                self._condition.notify_all()
 
     def background_snapshot(self) -> tuple[bool, str]:
         with self._condition:
@@ -1683,9 +2136,10 @@ class SpectralTextRenderWorker:
                         # A foreground submission intentionally terminates an
                         # atlas subprocess. Retry it after that foreground work.
                         if self._pending is None and not self._stopping:
-                            self._background_error = (
-                                f"{type(exc).__name__}: {exc}"
-                            )
+                            if not self._background_paused:
+                                self._background_error = (
+                                    f"{type(exc).__name__}: {exc}"
+                                )
                             self._background_paused = True
                     elif sequence == self._submitted_sequence and not self._stopping:
                         self._error = f"{type(exc).__name__}: {exc}"
@@ -1701,8 +2155,17 @@ def make_subprocess_renderer(
     camera_profile: ColorScienceProfile,
     targeted_fraction: float = DEFAULT_TARGETED_FRACTION,
     priority_model_path: str = "",
+    object_library: RenderObjectLibrary | None = None,
+    layout_pipeline: LayoutRenderPipeline | None = None,
+    layout_contract: dict[str, Any] | None = None,
 ) -> RenderFunction:
     root = os.path.abspath(output_root)
+    final_pipeline = (
+        layout_pipeline or _DEFAULT_LAYOUT_RENDER_PIPELINE
+    )
+    final_library = object_library or RenderObjectLibrary(os.path.join(
+        root, "render_object_library.json"
+    ))
     script_dir = os.path.dirname(os.path.abspath(__file__))
     process_lock = threading.Lock()
     active_process: list[subprocess.Popen[str] | None] = [None]
@@ -1862,16 +2325,47 @@ def make_subprocess_renderer(
             f"tone={camera_profile.tone_curve_mode}",
             flush=True,
         )
-        return RenderedTextRevision(
-            sequence=sequence,
-            text=text,
+        elapsed_s = time.perf_counter() - started
+        final = final_library.register_interface_after_render(
+            PROGRAM_SCENE_ID,
+            sequence,
+            scene_path=order_path,
             image_path=camera_image_path,
             linear_path=linear_path,
             manifest_path=os.path.join(job_dir, "composition_manifest.json"),
-            elapsed_s=time.perf_counter() - started,
+            text=text,
+            display_name="Live spectral text interface",
             diagnostic_image_path=diagnostic_image_path,
             orthographic_path=flat_reference_path,
             priority_overlay_path=os.path.join(job_dir, "0000_cpp_priority.png"),
+            render_log_path=log_path,
+            metadata={
+                "tier": final_pipeline.tiers[-1].value,
+                "layout_render_pipeline": final_pipeline.mapping(),
+                "layout_contract": dict(layout_contract or {}),
+                "whole_token_policy": final_pipeline.whole_token_policy,
+                "final_policy": final_pipeline.final_policy,
+                "all_ui_elements_in_place": True,
+                "elapsed_s": elapsed_s,
+                "camera_profile": {
+                    "sensor_white_level": camera_profile.sensor_white_level,
+                    "exposure_compensation_ev": camera_profile.exposure_compensation_ev,
+                    "tone_curve_mode": camera_profile.tone_curve_mode,
+                },
+            },
+        )
+        return RenderedTextRevision(
+            sequence=sequence,
+            text=text,
+            image_path=final.image_path,
+            linear_path=final.linear_path,
+            manifest_path=final.manifest_path,
+            elapsed_s=elapsed_s,
+            diagnostic_image_path=final.artifact_paths.get("diagnostic_image", ""),
+            orthographic_path=final.artifact_paths.get("orthographic", ""),
+            priority_overlay_path=final.artifact_paths.get("priority_overlay", ""),
+            interface_assembly_key=final.assembly_key,
+            after_render_key=final.render_key,
         )
 
     setattr(render, "cancel_current", cancel_current)
@@ -1943,12 +2437,20 @@ def _window_regions(width: int, height: int) -> tuple[tuple[int, int, int, int],
     return (0, 0, width, canvas_height), (0, canvas_height, width, hud_height)
 
 
-def _initial_window_size(display_width: int, display_height: int) -> tuple[int, int]:
-    """Derive the photographed UI scene around fixed-size preview panes."""
+def _initial_window_size(
+    display_width: int,
+    display_height: int,
+    *,
+    manifest: Any = None,
+) -> tuple[int, int]:
+    """Derive the photographed UI scene from its manifest host columns."""
+
     work_width, work_height = int(display_width), int(display_height)
     if work_width <= 0 or work_height <= 0:
         raise ValueError("scan chunk dimensions must be positive")
-    metrics = _program_frame_metrics(work_width, work_height)
+    metrics = manifest_program_frame_metrics(
+        work_width, work_height, manifest or program_ui_manifest()
+    )
     return metrics["frame_width"], metrics["frame_height"]
 
 
@@ -2066,6 +2568,36 @@ def _active_work_texture(
     return work
 
 
+def _load_work_preview_surface(
+    path: str,
+    pygame: Any,
+    camera_profile: ColorScienceProfile,
+) -> Any:
+    """Load a completed/job preview for the manifest work viewport."""
+
+    source = str(path)
+    if not source or not os.path.isfile(source):
+        return None
+    if not source.lower().endswith(".npy"):
+        return pygame.image.load(source).convert()
+    linear = np.asarray(np.load(source, allow_pickle=False), np.float32)[..., :3]
+    rgb = np.maximum(linear, 0.0)
+    positive = np.mean(rgb, axis=2)
+    positive = positive[positive > 0.0]
+    white = (
+        float(np.percentile(positive, 99.0))
+        if positive.size else float(camera_profile.sensor_white_level)
+    )
+    profile = replace(
+        camera_profile, sensor_white_level=max(white, 1.0e-12)
+    )
+    display = process_linear_sensor_image(linear, profile)
+    pixels = np.ascontiguousarray(
+        np.clip(display[..., :3], 0.0, 1.0) * 255.0,
+        dtype=np.uint8,
+    )
+    return pygame.surfarray.make_surface(pixels.swapaxes(0, 1))
+
 def _ink_tokens_from_text(text: str) -> tuple[str, ...]:
     """Exact non-whitespace sequences whose characters should seed the atlas."""
 
@@ -2075,14 +2607,18 @@ def _ink_tokens_from_text(text: str) -> tuple[str, ...]:
 def _ink_production_plan(
     text: str,
     catalog: RenderAssetCatalog,
+    manifest: Any = None,
 ):
-    """Strict alphabet -> tokens -> token string production ladder."""
+    """Execute the manifest's monofont -> token -> interface ladder."""
 
+    effective_manifest = manifest or _DEFAULT_PROGRAM_MANIFEST
+    pipeline = layout_render_pipeline(effective_manifest)
+    font = _manifest_render_font(effective_manifest)
     token_strings = tuple(dict.fromkeys(
-        (*FIXED_UI_TOKEN_STRINGS, str(text))
+        (*pipeline.static_tokens, str(text))
     ))
     tokens = tuple(dict.fromkeys((
-        *FIXED_IMAGE_ALPHABET,
+        *tuple(pipeline.glyph_alphabet),
         *(
             token
             for token_string in token_strings
@@ -2093,26 +2629,33 @@ def _ink_production_plan(
         tokens,
         catalog,
         token_strings=token_strings,
-        font=FIXED_IMAGE_FONT,
+        font=font,
     )
 
 
 def _total_scene_is_ready(
-    text: str, catalog: RenderAssetCatalog
+    text: str,
+    catalog: RenderAssetCatalog,
+    manifest: Any = None,
 ) -> bool:
-    return _ink_production_plan(text, catalog).next_request is None
-
-
-def _fixed_image_alphabet_is_ready(catalog: RenderAssetCatalog) -> bool:
-    """Whether every provisional fixed-width glyph has image-converged."""
-
-    return plan_ink_atlas_bake(
-        FIXED_IMAGE_ALPHABET,
-        catalog,
-        font=FIXED_IMAGE_FONT,
+    return _ink_production_plan(
+        text, catalog, manifest
     ).next_request is None
 
 
+def _fixed_image_alphabet_is_ready(
+    catalog: RenderAssetCatalog,
+    manifest: Any = None,
+) -> bool:
+    """Whether the manifest's complete monofont tier has converged."""
+
+    effective_manifest = manifest or _DEFAULT_PROGRAM_MANIFEST
+    pipeline = layout_render_pipeline(effective_manifest)
+    return plan_ink_atlas_bake(
+        tuple(pipeline.glyph_alphabet),
+        catalog,
+        font=_manifest_render_font(effective_manifest),
+    ).next_request is None
 def run_window(
     output_root: str,
     initial_text: str,
@@ -2126,11 +2669,21 @@ def run_window(
     atlas_sensor_top_k: int = DEFAULT_ATLAS_SENSOR_TOP_K,
     atlas_steps_per_epoch: int = DEFAULT_ATLAS_STEPS_PER_EPOCH,
     atlas_samples_per_node: int = DEFAULT_ATLAS_SAMPLES_PER_NODE,
+    atlas_character_horizontal_spacing_px: int = (
+        DEFAULT_MONOFONT_HORIZONTAL_SPACING_PX
+    ),
+    atlas_character_vertical_spacing_px: int = (
+        DEFAULT_MONOFONT_VERTICAL_SPACING_PX
+    ),
+    program_manifest_override: Any = None,
+    parent_gl_context: Any = None,
+    gl_context_factory: Callable[[Any], Any] | None = None,
 ) -> int:
     import pygame
 
+    manifest = program_manifest_override or program_ui_manifest()
     scene_width, scene_height = _initial_window_size(
-        display_width, display_height
+        display_width, display_height, manifest=manifest
     )
     print(
         "[live] " + render_contract_summary(
@@ -2145,11 +2698,11 @@ def run_window(
     print(
         "[live] strict production order: fixed-width alphabet cells, tokens, "
         "complete token string, then total UI scene; "
-        f"atlas camera rays/epoch="
+        f"atlas camera rays/burst="
         f"{int(atlas_sensor_top_k) * int(atlas_steps_per_epoch) * int(atlas_samples_per_node):,} "
-        f"({int(atlas_sensor_top_k)} nodes x "
-        f"{int(atlas_samples_per_node)} rays/node x "
-        f"{int(atlas_steps_per_epoch)} submissions)",
+        f"({int(atlas_steps_per_epoch)} visible/resumable epochs x "
+        f"{int(atlas_sensor_top_k)} nodes x "
+        f"{int(atlas_samples_per_node)} rays/node)",
         flush=True,
     )
     print(
@@ -2165,6 +2718,23 @@ def run_window(
     window = pygame.display.set_mode((scene_width, scene_height))
     pygame.display.set_caption("Spectral text surface")
     clock = pygame.time.Clock()
+    from render_work_browser import RenderWorkBrowser
+
+    runtime_layout = resolved_program_ui_layout(
+        scene_width,
+        scene_height,
+        work_width=display_width,
+        work_height=display_height,
+        manifest=manifest,
+    )
+    context_host = OpenGLContextHost(
+        parent_gl_context, owned_factory=gl_context_factory
+    )
+    viewport_contexts = {
+        key: context_host.acquire(request)
+        for key, request in runtime_layout.context_requests.items()
+    }
+    work_browser = RenderWorkBrowser("WORK / ASSETS")
 
     inventory = DisplaySceneInventory(os.path.join(
         os.path.abspath(output_root), "display_inventory.json"
@@ -2183,10 +2753,13 @@ def run_window(
             inventory.record_progress(PROGRAM_SCENE_ID, object_ids, event)
 
     atlas_catalog = RenderAssetCatalog(os.path.join(
-        os.path.abspath(output_root), "ink_atlas", "catalog.json"
+        os.path.abspath(output_root), "render_asset_catalog.json"
     ))
     atlas_composer = CachedTokenStringComposer(
-        atlas_catalog, font=FIXED_IMAGE_FONT
+        atlas_catalog,
+        font=_manifest_render_font(manifest),
+        horizontal_spacing_px=atlas_character_horizontal_spacing_px,
+        vertical_spacing_px=atlas_character_vertical_spacing_px,
     )
     atlas_renderer = InkAtlasSubprocessRenderer(
         output_root,
@@ -2203,17 +2776,69 @@ def run_window(
         with atlas_lock:
             planned_text = atlas_text[0]
         return _ink_production_plan(
-            planned_text, atlas_catalog
+            planned_text, atlas_catalog, manifest
         ).next_request
 
     worker = SpectralTextRenderWorker(
         make_subprocess_renderer(
-            output_root, camera_profile, targeted_fraction, priority_model_path
+            output_root, camera_profile, targeted_fraction, priority_model_path,
+            object_library=atlas_renderer.object_library,
+            layout_pipeline=layout_render_pipeline(manifest),
+            layout_contract=runtime_layout.mapping(),
         ),
         progress_observer=retain_progress,
         background_source=next_atlas_request,
         background_render_function=atlas_renderer,
     )
+
+    def accept_selected_visual_pass() -> str:
+        payload = work_browser.selected_payload
+        kind = str(payload.get("kind", ""))
+        if kind == "active" or not payload:
+            if atlas_renderer.request_active_visual_pass():
+                return "active epoch accepted at its latest checkpoint"
+        record_key = ""
+        if kind == "asset":
+            subtype = payload.get("subtype")
+            artifacts = tuple(getattr(subtype, "artifacts", ()))
+            if artifacts:
+                record_key = max(
+                    artifacts,
+                    key=lambda item: (
+                        int(getattr(item, "samples", 0)),
+                        float(getattr(item, "created_at_s", 0.0)),
+                    ),
+                ).record_key
+        elif kind == "job":
+            request = payload.get("request")
+            if request is not None:
+                record = atlas_catalog.find(
+                    request.target_key,
+                    request.condition,
+                    request.product_kind,
+                )
+                record_key = "" if record is None else record.record_key
+        selected_record = next(
+            (
+                record for record in atlas_catalog.snapshot()
+                if record.record_key == record_key
+            ),
+            None,
+        )
+        if selected_record is None:
+            if atlas_renderer.request_active_visual_pass():
+                return "active epoch accepted at its latest checkpoint"
+            return "select cached work, or wait for its first epoch checkpoint"
+        accepted = atlas_catalog.accept_visual_pass(selected_record)
+        try:
+            atlas_renderer.object_library.accept_visual_pass(
+                accepted.record_key
+            )
+        except KeyError:
+            atlas_renderer.object_library.migrate_catalog(atlas_catalog)
+        worker.wake_background()
+        return f"accepted cached work {accepted.target_key}"
+
     text = str(initial_text)[:500]
     cursor = len(text)
     submitted_text = ""
@@ -2225,45 +2850,90 @@ def run_window(
     priority_texture = None
     atlas_work_texture = None
     atlas_work_revision = -1
+    browser_preview_texture = None
+    browser_preview_path = ""
     photographed_region = program_display_region(scene_width, scene_height)
-    ui_sensor_regions = program_ui_sensor_regions(
+    ui_sensor_regions = {
+        key: SensorRegion(*rect)
+        for key, rect in runtime_layout.regions.items()
+    }
+    browser_window_rect = _sensor_product_window_rect(
+        ui_sensor_regions["asset-browser"],
+        photographed_region,
         scene_width,
         scene_height,
-        work_width=display_width,
-        work_height=display_height,
     )
+    pre_render_panel_surfaces: list[tuple[tuple[int, int, int, int], Any]] = []
+    pre_render_primitives = {
+        **runtime_layout.panel_primitives,
+        **runtime_layout.action_primitives,
+    }
+    for panel_id, primitive in pre_render_primitives.items():
+        if panel_id not in ui_sensor_regions:
+            continue
+        region = ui_sensor_regions[panel_id]
+        destination = _sensor_product_window_rect(
+            region, photographed_region, scene_width, scene_height
+        )
+        rgba = compose_layout_panel_rgba(
+            primitive,
+            destination[2],
+            destination[3],
+        )
+        panel_surface = pygame.image.frombuffer(
+            rgba.tobytes(), (destination[2], destination[3]), "RGBA"
+        ).convert_alpha()
+        pre_render_panel_surfaces.append((destination, panel_surface))
     ray_control_hitboxes: dict[str, Any] = {}
     transition_restore: dict[str, str] = {}
     transition_dirty_slice: SensorPixelSlice | None = None
     cached_overlay_key: tuple[Any, ...] | None = None
     cached_overlay_texture = None
     cached_overlay_used: tuple[str, ...] = ()
+    cached_layout_text_key: tuple[Any, ...] | None = None
+    cached_layout_text_surfaces: list[
+        tuple[tuple[int, int, int, int], Any]
+    ] = []
     running = True
 
     try:
         while running:
             for event in pygame.event.get():
+                if event.type != pygame.QUIT:
+                    browser_action = work_browser.handle_event(
+                        event, browser_window_rect
+                    )
+                    if browser_action is not None:
+                        continue
                 if event.type == pygame.QUIT:
                     running = False
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    if (
-                        "window-close" in ray_control_hitboxes
-                        and ray_control_hitboxes["window-close"].collidepoint(event.pos)
-                    ):
+                    action_key = next(
+                        (
+                            key for key, hitbox in ray_control_hitboxes.items()
+                            if hitbox.collidepoint(event.pos)
+                        ),
+                        "",
+                    )
+                    if action_key == "window-close":
                         running = False
-                    elif (
-                        "window-minimize" in ray_control_hitboxes
-                        and ray_control_hitboxes["window-minimize"].collidepoint(event.pos)
-                    ):
+                    elif action_key == "window-minimize":
                         pygame.display.iconify()
-                    elif (
-                        "window-maximize" in ray_control_hitboxes
-                        and ray_control_hitboxes["window-maximize"].collidepoint(event.pos)
-                    ):
-                        # The authored UI exposes the control geometrically, but
-                        # work viewports are a fixed acquisition contract and
-                        # must never be resized by presentation state.
+                    elif action_key == "window-maximize":
+                        # Acquisition dimensions remain a camera contract.
                         pass
+                    elif action_key == "work-visual-pass":
+                        print(
+                            f"[layout-action] {accept_selected_visual_pass()}",
+                            flush=True,
+                        )
+                    elif action_key == "queue-pause-auto":
+                        paused = worker.toggle_background_paused()
+                        print(
+                            "[layout-action] automatic queue resolution "
+                            + ("paused" if paused else "resumed"),
+                            flush=True,
+                        )
                 elif event.type == pygame.TEXTINPUT:
                     text = (text[:cursor] + event.text + text[cursor:])[:500]
                     cursor = min(len(text), cursor + len(event.text))
@@ -2293,8 +2963,13 @@ def run_window(
                     atlas_text[0] = text
             if atlas_text_changed:
                 worker.wake_background()
-            production_ready = _total_scene_is_ready(text, atlas_catalog)
-            alphabet_ready = _fixed_image_alphabet_is_ready(atlas_catalog)
+            production_plan = _ink_production_plan(
+                text, atlas_catalog, manifest
+            )
+            production_ready = production_plan.next_request is None
+            alphabet_ready = _fixed_image_alphabet_is_ready(
+                atlas_catalog, manifest
+            )
 
             if (
                 text.strip()
@@ -2311,6 +2986,7 @@ def run_window(
                     work_height=display_height,
                     status_text="SPECTRAL EXPOSURE ACTIVE",
                     revision=next_revision,
+                    program_manifest=manifest,
                 )
                 delta_restore: dict[str, str] = {}
                 for retained_scene in inventory.snapshot():
@@ -2410,9 +3086,37 @@ def run_window(
             ) = atlas_renderer.work_snapshot()
             if current_work_revision != atlas_work_revision:
                 if current_work_path and os.path.isfile(current_work_path):
-                    atlas_work_texture = pygame.image.load(
-                        current_work_path
-                    ).convert()
+                    if current_work_path.lower().endswith(".npy"):
+                        linear_work = np.asarray(
+                            np.load(current_work_path, allow_pickle=False),
+                            np.float32,
+                        )[..., :3]
+                        work_rgb = np.maximum(linear_work, 0.0)
+                        work_luma = np.mean(work_rgb, axis=2)
+                        work_positive = work_luma[work_luma > 0.0]
+                        work_white = (
+                            float(np.percentile(work_positive, 99.0))
+                            if work_positive.size
+                            else float(camera_profile.sensor_white_level)
+                        )
+                        work_profile = replace(
+                            camera_profile,
+                            sensor_white_level=max(work_white, 1.0e-12),
+                        )
+                        display_work = process_linear_sensor_image(
+                            linear_work, work_profile
+                        )
+                        work_pixels = np.ascontiguousarray(
+                            np.clip(display_work[..., :3], 0.0, 1.0) * 255.0,
+                            dtype=np.uint8,
+                        )
+                        atlas_work_texture = pygame.surfarray.make_surface(
+                            work_pixels.swapaxes(0, 1)
+                        )
+                    else:
+                        atlas_work_texture = pygame.image.load(
+                            current_work_path
+                        ).convert()
                     print(
                         "[ink-work] "
                         f"asset={current_work_token!r} "
@@ -2420,7 +3124,40 @@ def run_window(
                         f"active={current_work_active}",
                         flush=True,
                     )
+                elif current_work_active:
+                    # Do not present the preceding asset while this one has
+                    # started but has not published its first integration yet.
+                    atlas_work_texture = None
                 atlas_work_revision = current_work_revision
+            (
+                _object_revision,
+                active_work_object_key,
+                _object_token,
+                _object_pass,
+                _object_active,
+            ) = atlas_renderer.work_object_snapshot()
+            work_browser.sync(
+                production_plan.requests,
+                atlas_renderer.object_library.snapshot(),
+                atlas_renderer.object_library.interface_snapshot(),
+                active=(
+                    active_work_object_key,
+                    current_work_token,
+                    current_work_pass,
+                    current_work_active,
+                ),
+            )
+            selected_preview_path = work_browser.selected_preview_path
+            if selected_preview_path != browser_preview_path:
+                browser_preview_texture = None
+                if selected_preview_path:
+                    try:
+                        browser_preview_texture = _load_work_preview_surface(
+                            selected_preview_path, pygame, camera_profile
+                        )
+                    except (OSError, ValueError):
+                        browser_preview_texture = None
+                browser_preview_path = selected_preview_path
             newest_progress, _progress_layers = worker.progress_snapshot()
             if newest_progress is not None:
                 progress_key = (newest_progress.exposure_id, newest_progress.sequence)
@@ -2525,6 +3262,8 @@ def run_window(
             # Every panel, label, control, editor, and status pixel stays inside.
             width, height = scene_width, scene_height
             window.fill((15, 18, 19))
+            for panel_destination, panel_surface in pre_render_panel_surfaces:
+                window.blit(panel_surface, panel_destination[:2])
             if texture is not None and production_ready:
                 window.blit(texture, (0, 0))
             editor_destination = _sensor_product_window_rect(
@@ -2534,22 +3273,69 @@ def run_window(
                 height,
             )
             catalog_state = atlas_catalog.snapshot()
+            catalog_signature = tuple(
+                (
+                    record.record_key,
+                    str(record.metadata.get("sprite_path", "")),
+                    int(record.metadata.get(
+                        "refinement_pass", record.samples
+                    )),
+                    str(record.metadata.get("refinement_state", "")),
+                    str(record.metadata.get("completion_basis", "")),
+                )
+                for record in catalog_state
+            )
+            layout_text_key = (
+                tuple(runtime_layout.authored_text.items()),
+                tuple(
+                    (key, tuple(runtime_layout.regions[key]))
+                    for key in runtime_layout.authored_text
+                ),
+                alphabet_ready,
+                catalog_signature,
+            )
+            if layout_text_key != cached_layout_text_key:
+                cached_layout_text_surfaces = []
+                for object_id, content in runtime_layout.authored_text.items():
+                    destination = _sensor_product_window_rect(
+                        ui_sensor_regions[object_id],
+                        photographed_region,
+                        width,
+                        height,
+                    )
+                    composition = atlas_composer.compose(
+                        content,
+                        destination[2],
+                        destination[3],
+                        character_tiles_only=not alphabet_ready,
+                    )
+                    display_composition = process_linear_sensor_image(
+                        composition.linear_rgb, camera_profile
+                    )
+                    prototype_pixels = np.ascontiguousarray(
+                        np.clip(display_composition[..., :3], 0.0, 1.0)
+                        * 255.0,
+                        dtype=np.uint8,
+                    )
+                    prototype_surface = pygame.surfarray.make_surface(
+                        prototype_pixels.swapaxes(0, 1)
+                    ).convert()
+                    prototype_surface.set_colorkey(
+                        prototype_surface.get_at((0, 0))[:3]
+                    )
+                    cached_layout_text_surfaces.append((
+                        destination, prototype_surface
+                    ))
+                cached_layout_text_key = layout_text_key
+            if latest is None or latest.text != text:
+                for destination, prototype_surface in cached_layout_text_surfaces:
+                    window.blit(prototype_surface, destination[:2])
             overlay_key = (
                 text,
                 editor_destination[2],
                 editor_destination[3],
                 alphabet_ready,
-                tuple(
-                    (
-                        record.record_key,
-                        str(record.metadata.get("sprite_path", "")),
-                        int(record.metadata.get(
-                            "refinement_pass", record.samples
-                        )),
-                        str(record.metadata.get("refinement_state", "")),
-                    )
-                    for record in catalog_state
-                ),
+                catalog_signature,
             )
             if overlay_key != cached_overlay_key:
                 composition = atlas_composer.compose(
@@ -2587,24 +3373,30 @@ def run_window(
                 and (latest is None or latest.text != text)
             ):
                 window.blit(cached_overlay_texture, editor_destination[:2])
+            selected_work_texture = (
+                browser_preview_texture
+                if browser_preview_texture is not None
+                else (
+                    atlas_work_texture
+                    if atlas_work_texture is not None
+                    else priority_texture
+                )
+            )
             panel_products = (
                 ("camera-panel", texture),
-                (
-                    "work-panel",
-                    (
-                        atlas_work_texture
-                        if atlas_work_texture is not None
-                        else priority_texture
-                    ),
-                ),
+                ("work-panel", selected_work_texture),
+            )
+            first_panel_y = min(
+                ui_sensor_regions[key].y
+                for key in ("camera-panel", "work-panel", "asset-browser")
             )
             header_bottom = max(
                 region.y + region.height
-                for object_id, region in ui_sensor_regions.items()
-                if object_id in {
-                    "camera-label", "work-label",
-                    "window-minimize", "window-maximize", "window-close",
-                }
+                for region in ui_sensor_regions.values()
+                if (
+                    region.y < first_panel_y
+                    and region.y + region.height <= first_panel_y
+                )
             )
             for panel_id, panel_texture in panel_products:
                 panel_region = ui_sensor_regions[panel_id]
@@ -2628,7 +3420,10 @@ def run_window(
                     panel_texture,
                     (
                         None
-                        if panel_id == "work-panel" and atlas_work_texture is not None
+                        if panel_id == "work-panel" and (
+                            browser_preview_texture is not None
+                            or atlas_work_texture is not None
+                        )
                         else (
                             None if progress_event is None
                             else progress_event.global_uv_bounds
@@ -2638,7 +3433,10 @@ def run_window(
                     destination[3],
                     (
                         current_work_revision
-                        if panel_id == "work-panel" and atlas_work_texture is not None
+                        if panel_id == "work-panel" and (
+                            browser_preview_texture is not None
+                            or atlas_work_texture is not None
+                        )
                         else (
                             1 if progress_event is None
                             else progress_event.sequence
@@ -2649,12 +3447,14 @@ def run_window(
                     continue
                 window.blit(panel_texture, destination[:2])
 
+            # The manifest reserves this host; the repository's specialized
+            # ScrollableSubpanelList owns all list rendering and interaction.
+            work_browser.render(window, browser_window_rect)
+
             # Controls remain part of the camera-rendered scene. Only their
             # sensor-space rectangles are reused for pointer hit testing.
             ray_control_hitboxes.clear()
-            for object_id in (
-                "window-close", "window-maximize", "window-minimize",
-            ):
+            for object_id in runtime_layout.actions:
                 destination = _sensor_product_window_rect(
                     ui_sensor_regions[object_id],
                     photographed_region,
@@ -2666,13 +3466,14 @@ def run_window(
             clock.tick(60)
     finally:
         worker.close()
+        context_host.close()
         pygame.key.stop_text_input()
         pygame.quit()
     return 0
 
 
 def clear_camera_storage(output_root: str) -> tuple[str, ...]:
-    """Clear only this program's exposures, atlas, and retained UI inventory."""
+    """Clear this program's exposures, object bakery, and UI inventory."""
 
     root = os.path.abspath(str(output_root))
     drive, tail = os.path.splitdrive(root)
@@ -2684,7 +3485,12 @@ def clear_camera_storage(output_root: str) -> tuple[str, ...]:
     targets: list[str] = []
     for entry in os.scandir(root):
         if (
-            entry.name == "ink_atlas"
+            entry.name in {
+                "render_objects",
+                "render_interfaces",
+                "render_asset_catalog.json",
+                "render_object_library.json",
+            }
             or entry.name in {
                 "display_inventory.json",
                 "display_inventory.json.tmp",
@@ -2734,9 +3540,9 @@ def _args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=DEFAULT_ATLAS_EPOCHS_PER_EXPOSURE,
         help=(
-            "Recursive sensor epochs executed per prepared atlas process "
-            f"(default: {DEFAULT_ATLAS_EPOCHS_PER_EXPOSURE}). This controls "
-            "the resumable work quantum, not convergence completion."
+            "Groups of visible/resumable sensor epochs per prepared atlas "
+            f"process (default: {DEFAULT_ATLAS_EPOCHS_PER_EXPOSURE}). Each "
+            "group contains --atlas-steps-per-epoch one-submission epochs."
         ),
     )
     parser.add_argument(
@@ -2753,8 +3559,8 @@ def _args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=DEFAULT_ATLAS_STEPS_PER_EPOCH,
         help=(
-            "Recursive sensor refinement submissions inside each atlas epoch "
-            f"(default: {DEFAULT_ATLAS_STEPS_PER_EPOCH})."
+            "Visible, atomically checkpointed one-submission epochs in each "
+            f"atlas work group (default: {DEFAULT_ATLAS_STEPS_PER_EPOCH})."
         ),
     )
     parser.add_argument(
@@ -2764,6 +3570,30 @@ def _args(argv: list[str]) -> argparse.Namespace:
         help=(
             "Actual camera rays generated per selected sensor node in each "
             f"native atlas submission (default: {DEFAULT_ATLAS_SAMPLES_PER_NODE})."
+        ),
+    )
+    parser.add_argument(
+        "--atlas-character-horizontal-spacing-px",
+        "--monofont-horizontal-spacing-px",
+        dest="atlas_character_horizontal_spacing_px",
+        type=int,
+        default=DEFAULT_MONOFONT_HORIZONTAL_SPACING_PX,
+        help=(
+            "Horizontal pixels added to each worst-case monospace character "
+            f"cell (default: {DEFAULT_MONOFONT_HORIZONTAL_SPACING_PX}; "
+            "negative values crop)."
+        ),
+    )
+    parser.add_argument(
+        "--atlas-character-vertical-spacing-px",
+        "--monofont-vertical-spacing-px",
+        dest="atlas_character_vertical_spacing_px",
+        type=int,
+        default=DEFAULT_MONOFONT_VERTICAL_SPACING_PX,
+        help=(
+            "Vertical pixels added to each worst-case monospace line cell "
+            f"(default: {DEFAULT_MONOFONT_VERTICAL_SPACING_PX}; "
+            "negative values crop)."
         ),
     )
     parser.add_argument("--targeted-fraction", type=float,
@@ -2844,6 +3674,8 @@ def main(argv: list[str] | None = None) -> int:
         args.atlas_sensor_top_k,
         args.atlas_steps_per_epoch,
         args.atlas_samples_per_node,
+        args.atlas_character_horizontal_spacing_px,
+        args.atlas_character_vertical_spacing_px,
     )
 
 

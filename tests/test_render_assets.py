@@ -1,7 +1,9 @@
+import json
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from camera_software import (
     BakeTargetKind,
@@ -23,6 +25,7 @@ from camera_software import (
     ink_order_for_request,
     plan_ink_atlas_bake,
     plan_display_scene_bake,
+    render_style_key,
 )
 import live_spectral_text_demo as demo
 
@@ -185,8 +188,35 @@ def test_ink_order_preserves_accepted_scene_and_adds_padded_capture():
     assert glyph["geometry"]["profile"] == "circular"
     assert glyph["geometry"]["depth_m"] == 0.032
     assert glyph["geometry"]["embed_fraction"] == 0.5
-    assert token["geometry"]["depth_m"] == 0.028
-    assert token["geometry"]["height_m"] == 0.13
+    fit = token["single_shot_fit"]
+    assert fit["policy"] == "uniform_shrink_to_fit"
+    assert fit["single_shot"] is True
+    assert fit["panoramic"] is False
+    assert fit["collage"] is False
+    assert 0.0 < fit["scale"] <= 1.0
+    assert token["geometry"]["height_m"] == pytest.approx(
+        0.13 * fit["scale"]
+    )
+    assert token["geometry"]["depth_m"] == pytest.approx(
+        0.028 * fit["scale"]
+    )
+
+
+def test_whole_word_is_uniformly_shrunk_inside_camera_aspect_frame():
+    import scene_orders
+
+    package = build_ink_on_slate_order(("actually",))
+    (job,) = scene_orders.resolved_jobs(package)
+    fit = job["single_shot_fit"]
+
+    fitted_width = fit["outline_aspect"] * job["geometry"]["height_m"]
+    assert fit["scale"] < 1.0
+    assert fitted_width <= fit["frame_size_m"][0] + 1.0e-12
+    assert job["geometry"]["height_m"] <= fit["frame_size_m"][1]
+    assert job["planes"][0]["size_m"] == [0.52, 0.42]
+    assert job["geometry"]["depth_m"] / fit["original_depth_m"] == pytest.approx(
+        fit["scale"]
+    )
 
 
 def test_ink_atlas_accepts_trickled_tokens_and_only_queues_missing_work():
@@ -409,11 +439,37 @@ def test_atlas_executor_restores_and_overwrites_until_image_converges(
         def __init__(self, command, **kwargs):
             launched.append((command, dict(kwargs["env"])))
             epochs = int(kwargs["env"]["SPECTRAL_SENSOR_MAX_EPOCHS"])
-            self.stdout = [
-                f"  [sensor-refine] epoch {index}/{epochs}\n"
-                for index in range(1, epochs + 1)
-            ]
             out_dir = command[command.index("--out-dir") + 1]
+            progress_dir = Path(
+                command[command.index("--progress-dir") + 1]
+            )
+            progress_dir.mkdir(parents=True, exist_ok=True)
+            progress_path = progress_dir / "active.npy"
+            progress_sum_path = progress_dir / "active_sum.npy"
+            progress_weight_path = progress_dir / "active_weight.npy"
+            np.save(progress_path, np.ones((128, 128, 3), np.float32))
+            np.save(progress_sum_path, np.ones((128, 128, 3), np.float32))
+            np.save(progress_weight_path, np.ones((128, 128), np.float32))
+            self.stdout = []
+            for index in range(1, epochs + 1):
+                progress = demo.ExposureProgressEvent(
+                    exposure_id=command[
+                        command.index("--progress-exposure-id") + 1
+                    ],
+                    sequence=index,
+                    kind=demo.ExposureProgressKind.LAYER_AVAILABLE,
+                    region=demo.SensorRegion(0, 0, 128, 128),
+                    pass_index=index,
+                    completed_work=index,
+                    total_work=epochs,
+                    linear_accumulation_path=str(progress_path),
+                    sensor_sum_path=str(progress_sum_path),
+                    exposure_weight_path=str(progress_weight_path),
+                )
+                self.stdout.extend([
+                    f"  [sensor-refine] epoch {index}/{epochs}\n",
+                    progress.to_line() + "\n",
+                ])
             np.save(
                 str(Path(out_dir) / "0000_cpp_linear.npy"),
                 np.ones((128, 128, 3), np.float32),
@@ -446,10 +502,13 @@ def test_atlas_executor_restores_and_overwrites_until_image_converges(
     first_command, first_environment = launched[0]
     assert "exposure_render_demo.py" in " ".join(first_command)
     assert "--scene-order" in first_command
-    assert first_environment["SPECTRAL_SENSOR_MAX_EPOCHS"] == "1"
+    assert "--progress-dir" in first_command
+    assert "--progress-exposure-id" in first_command
+    assert first_environment["SPECTRAL_PROGRESS_RETAIN_LAYERS"] == "2"
+    assert first_environment["SPECTRAL_SENSOR_MAX_EPOCHS"] == "64"
     assert first_environment["SPECTRAL_SENSOR_CONTINUOUS"] == "1"
     assert first_environment["SPECTRAL_SENSOR_TOP_K"] == "1024"
-    assert first_environment["SPECTRAL_SENSOR_STEPS_PER_LAYER"] == "64"
+    assert first_environment["SPECTRAL_SENSOR_STEPS_PER_LAYER"] == "1"
     assert first_environment["SPECTRAL_SENSOR_SAMPLES_PER_NODE"] == "1024"
     assert "SPECTRAL_SENSOR_RESTORE_SUM" not in first_environment
     for _command, environment in launched[1:]:
@@ -466,21 +525,142 @@ def test_atlas_executor_restores_and_overwrites_until_image_converges(
     assert record.metadata["bounded_background_render"] is True
     assert record.metadata["refinement_state"] == "converged"
     assert record.metadata["atlas_quality"]["converged"] is True
-    assert record.samples == 4
+    assert record.samples == 256
     assert [item.linear_path for item in records] == [record.linear_path] * 4
     assert record.metadata["sprite_path"].endswith("raytraced_sprite.npz")
     assert record.metadata["capture"]["content_region"] == [24, 24, 80, 80]
     work_revision, work_path, work_token, work_pass, active = (
         renderer.work_snapshot()
     )
-    assert work_revision > 0
+    assert work_revision >= 264
     assert work_path == record.preview_path
     assert work_token == "A"
-    assert work_pass == 4
+    assert work_pass == 256
     assert not active
+    (
+        object_revision,
+        work_object_key,
+        object_token,
+        object_pass,
+        object_active,
+    ) = renderer.work_object_snapshot()
+    assert object_revision == work_revision
+    style_key = render_style_key(request.token_asset)
+    assert work_object_key == style_key
+    assert object_token == "A"
+    assert object_pass == 256
+    assert not object_active
+    bundle = renderer.object_library.find(style_key)
+    assert bundle is not None
+    subtype = renderer.object_library.find_subtype(style_key, "A", kind="glyph")
+    assert subtype is not None
+    assert subtype.scenes[0].renderer_context_path.endswith(
+        "render_context.json"
+    )
+    assert Path(bundle.manifest_path).is_file()
     assert catalog.find(
         request.target_key, request.condition, request.product_kind
     ) == record
+
+
+def test_atlas_executor_resumes_from_each_published_epoch(tmp_path, monkeypatch):
+    catalog = RenderAssetCatalog(str(tmp_path / "catalog.json"))
+    request = plan_ink_atlas_bake(("A",), catalog).next_request
+    assert request is not None
+    launches = []
+
+    class Process:
+        def __init__(self, command, **kwargs):
+            environment = dict(kwargs["env"])
+            launches.append((command, environment))
+            attempt = len(launches)
+            epoch_goal = int(environment["SPECTRAL_SENSOR_MAX_EPOCHS"])
+            completed = 3 if attempt == 1 else epoch_goal
+            out_dir = Path(command[command.index("--out-dir") + 1])
+            progress_dir = Path(command[command.index("--progress-dir") + 1])
+            progress_dir.mkdir(parents=True, exist_ok=True)
+            linear = progress_dir / f"active_{attempt}.npy"
+            sensor_sum = progress_dir / f"sum_{attempt}.npy"
+            weight = progress_dir / f"weight_{attempt}.npy"
+            np.save(linear, np.ones((128, 128, 3), np.float32))
+            np.save(sensor_sum, np.full((128, 128, 3), attempt, np.float32))
+            np.save(weight, np.full((128, 128), attempt, np.float32))
+            event = demo.ExposureProgressEvent(
+                exposure_id=command[
+                    command.index("--progress-exposure-id") + 1
+                ],
+                sequence=1,
+                kind=demo.ExposureProgressKind.LAYER_AVAILABLE,
+                region=demo.SensorRegion(0, 0, 128, 128),
+                pass_index=completed,
+                completed_work=completed,
+                total_work=epoch_goal,
+                linear_accumulation_path=str(linear),
+                sensor_sum_path=str(sensor_sum),
+                exposure_weight_path=str(weight),
+            )
+            self.stdout = [
+                f"  [sensor-refine] epoch {index}/{epoch_goal}\n"
+                for index in range(1, completed + 1)
+            ] + [event.to_line() + "\n"]
+            self.return_code = 1 if attempt == 1 else 0
+            if self.return_code == 0:
+                np.save(
+                    out_dir / "0000_cpp_linear.npy",
+                    np.ones((128, 128, 3), np.float32),
+                )
+                np.save(
+                    out_dir / "0000_cpp_sum_linear.npy",
+                    np.ones((128, 128, 3), np.float32),
+                )
+                np.save(
+                    out_dir / "0000_cpp_exposure_weight.npy",
+                    np.ones((128, 128), np.float32),
+                )
+
+        def wait(self):
+            return self.return_code
+
+        def poll(self):
+            return self.return_code
+
+        def terminate(self):
+            pass
+
+    monkeypatch.setattr(demo.subprocess, "Popen", Process)
+    renderer = demo.InkAtlasSubprocessRenderer(str(tmp_path), catalog)
+
+    with pytest.raises(demo.subprocess.CalledProcessError):
+        renderer(request)
+
+    work_revision, work_path, work_token, work_pass, active = (
+        renderer.work_snapshot()
+    )
+    assert work_revision >= 3
+    assert work_path.endswith("active_1.npy")
+    assert work_token == "A"
+    assert work_pass == 3
+    assert not active
+
+    request_dir = Path(launches[0][0][launches[0][0].index("--out-dir") + 1])
+    checkpoint_path = request_dir / "active_epoch_checkpoint.json"
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert checkpoint["completed_epochs"] == 3
+    assert checkpoint["target_refinement_pass"] == 64
+
+    record = renderer(request)
+
+    second_environment = launches[1][1]
+    assert second_environment["SPECTRAL_SENSOR_MAX_EPOCHS"] == "61"
+    assert second_environment["SPECTRAL_SENSOR_STEPS_PER_LAYER"] == "1"
+    assert second_environment["SPECTRAL_SENSOR_RESTORE_SUM"].endswith(
+        "restore_sensor_sum_native.npy"
+    )
+    assert second_environment["SPECTRAL_SENSOR_RESTORE_WEIGHT"].endswith(
+        "restore_sensor_weight_native.npy"
+    )
+    assert record.samples == 64
+    assert not checkpoint_path.exists()
 
 
 def test_atlas_plan_refines_the_least_developed_glyph_first():
@@ -512,3 +692,75 @@ def test_atlas_plan_refines_the_least_developed_glyph_first():
     assert next_request is not None
     assert next_request.token_asset.token == "B"
     assert next_request.refinement_pass == 2
+
+
+def test_atlas_plan_can_resume_a_converged_asset_to_a_requested_pass():
+    catalog = RenderAssetCatalog()
+    request = plan_ink_atlas_bake(("A",), catalog).next_request
+    assert request is not None
+    catalog.complete(
+        request,
+        samples=4,
+        metadata={
+            "bounded_background_render": True,
+            "sensor_display_orientation": SENSOR_DISPLAY_ORIENTATION,
+            "refinement_state": "converged",
+            "refinement_pass": 4,
+            "atlas_quality": {
+                "composable": True,
+                "converged": True,
+                "glyph_exposure_coverage": 1.0,
+                "glyph_radiance_coverage": 1.0,
+            },
+        },
+    )
+
+    assert plan_ink_atlas_bake(("A",), catalog).next_request is None
+    resumed = plan_ink_atlas_bake(
+        ("A",),
+        catalog,
+        refinement_targets={request.target_key: 6},
+    ).next_request
+
+    assert resumed is not None
+    assert resumed.target_key == request.target_key
+    assert resumed.refinement_pass == 4
+
+
+def test_human_visual_pass_finishes_queue_but_allows_later_requested_passes(tmp_path):
+    catalog = RenderAssetCatalog(str(tmp_path / "catalog.json"))
+    plan = plan_ink_atlas_bake(("A",), catalog)
+    request = plan.next_request
+    assert request is not None
+    linear_path = tmp_path / "A_linear.npy"
+    np.save(linear_path, np.ones((4, 4, 3), np.float32))
+    record = catalog.complete(
+        request,
+        linear_path=str(linear_path),
+        samples=3,
+        metadata={
+            "bounded_background_render": True,
+            "sensor_display_orientation": SENSOR_DISPLAY_ORIENTATION,
+            "refinement_state": "developing",
+            "refinement_pass": 3,
+            "atlas_quality": {
+                "composable": True,
+                "converged": False,
+                "glyph_exposure_coverage": 1.0,
+                "glyph_radiance_coverage": 1.0,
+            },
+        },
+    )
+    assert plan_ink_atlas_bake(("A",), catalog).next_request is not None
+
+    accepted = catalog.accept_visual_pass(record)
+
+    assert accepted.metadata["completion_basis"] == "human_visual_pass"
+    assert plan_ink_atlas_bake(("A",), catalog).requests == ()
+    later = plan_ink_atlas_bake(
+        ("A",),
+        catalog,
+        refinement_targets={request.token_asset.asset_key: 4},
+    )
+    assert later.next_request is not None
+    assert later.next_request.refinement_pass == 3

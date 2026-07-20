@@ -36,6 +36,8 @@ def _finite_tuple(value: Iterable[float], size: int, name: str) -> tuple[float, 
 
 class DisplayPrimitiveKind(str, Enum):
     TEXT = "text"
+    PLANE = "plane"
+    # Volumetric rectangular/slab panel; retained inventories also use this.
     BOX = "box"
     ICON = "icon"
 
@@ -174,9 +176,12 @@ class DisplayPrimitive:
     def authored_text(self) -> str:
         if self.kind is DisplayPrimitiveKind.TEXT:
             text = self.content
-        elif self.kind is DisplayPrimitiveKind.BOX:
-            # A box is physical layout geometry. Its optional label is metadata,
-            # not an instruction to manufacture a glyph on its face.
+        elif self.kind in {
+            DisplayPrimitiveKind.PLANE,
+            DisplayPrimitiveKind.BOX,
+        }:
+            # Plane and volume panels are physical background/embed geometry.
+            # Their optional labels are metadata, not foreground glyphs.
             return self.label.strip()
         else:
             try:
@@ -227,7 +232,10 @@ class DisplayObjectSpec:
             raise ValueError("display object id must be non-empty")
         if self.revision <= 0 or not self.products:
             raise ValueError("display object revision and product list must be positive")
-        if self.primitive.kind is not DisplayPrimitiveKind.BOX:
+        if self.primitive.kind not in {
+            DisplayPrimitiveKind.PLANE,
+            DisplayPrimitiveKind.BOX,
+        }:
             self.primitive.authored_text()
         horizontal_align = str(self.horizontal_align).strip().lower()
         vertical_align = str(self.vertical_align).strip().lower()

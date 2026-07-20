@@ -109,7 +109,7 @@ def _positive(value: Any, name: str, allow_zero: bool = False) -> float:
 def _validate_resolved_job(job: dict[str, Any]) -> None:
     supported = {
         "id", "token", "image", "camera", "exposure", "flash", "font",
-        "planes", "materials", "geometry", "objects"
+        "planes", "materials", "geometry", "objects", "single_shot_fit"
     }
     unknown = sorted(set(job) - supported)
     if unknown:

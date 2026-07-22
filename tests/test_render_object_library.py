@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 from camera_software import (
     DEFAULT_INK_CONDITION,
@@ -104,6 +105,57 @@ def test_style_object_archives_glyph_as_canonical_subtype(tmp_path):
     assert scene_view.subtype_key == subtype.subtype_key
     assert image_view.primary_path == subtype.artifacts[0].preview_path
     assert RenderObjectLibrary(str(library_path)).find(bundle.object_key) is not None
+
+
+def test_layout_nine_slice_is_one_parametric_library_scene_with_nine_instances(
+    tmp_path,
+):
+    from camera_software import (
+        build_layout_object_work_manifest,
+        layout_program_ui,
+        program_ui_manifest,
+    )
+
+    layout = layout_program_ui(
+        program_ui_manifest(), 360, 180, work_width=100, work_height=100
+    )
+    manifest = build_layout_object_work_manifest(layout, str(tmp_path))
+    library = RenderObjectLibrary(str(tmp_path / "library.json"))
+
+    bundles = library.register_parametric_layout_manifest(manifest)
+
+    assert {bundle.object_key for bundle in bundles} == {
+        "layout-panel-style:bakery-slate",
+        "layout-control-style:bakery-slate",
+    }
+    panel = library.find("layout-panel-style:bakery-slate")
+    assert panel is not None
+    assert panel.object_kind == "layout_design_object"
+    assert panel.style_spec["parameterization"] == (
+        "representative-square-nine-slice"
+    )
+    assert len(panel.subtypes) == 1
+    subtype = panel.subtypes[0]
+    assert subtype.kind == "parametric_layout"
+    assert len(subtype.scenes) == 1
+    scene = json.loads(
+        Path(subtype.scenes[0].scene_path).read_text(encoding="utf-8")
+    )
+    assert scene["scene_kind"] == "parametric_layout_object"
+    assert set(scene["defaults"]["parameters"]["patches"]) == {
+        "center", "top", "right", "bottom", "left",
+        "top_left", "top_right", "bottom_right", "bottom_left",
+    }
+    assert len(scene["jobs"]) > 1
+    assert all(
+        job["geometry"]["sampling_policy"]
+        == "repeat_square_tiles_clip_partial_terminal_tile"
+        and job["geometry"]["physical_pixel_aspect"] == 1.0
+        for job in scene["jobs"][1:]
+    )
+    assert len(manifest.objects[1].subtypes[0].consumers) > 9
+    restored = RenderObjectLibrary(str(tmp_path / "library.json"))
+    assert restored.find(panel.object_key).subtypes[0].scenes
 
 
 def test_style_object_grows_condition_collection_without_overwrite(tmp_path):
@@ -227,3 +279,88 @@ def test_final_interface_after_render_is_canonical_and_traces_component_subtypes
     assert Path(assembly.manifest_path).is_file()
     restored = RenderObjectLibrary(str(tmp_path / "object_library.json"))
     assert restored.select_interface_after_render("complete-ui").render_key == final.render_key
+
+
+def test_complete_window_manifest_harvests_condition_indexed_panel_crop(tmp_path):
+    library = RenderObjectLibrary(str(tmp_path / "object_library.json"))
+    revision = tmp_path / "revision"
+    revision.mkdir()
+    scene = revision / "scene_order.json"
+    scene.write_text(json.dumps({
+        "schema_version": 1,
+        "defaults": {
+            "image": {
+                "width": 40, "height": 20,
+                "region": {"x": 10, "y": 5, "width": 20, "height": 10},
+            },
+            "camera": {"focal_mm": 35.0},
+            "flash": {"intensity_scale": 1.0},
+            "exposure": {"time_s": 1 / 60, "iso": 100},
+            "materials": {"panel": {"roughness": 0.8}},
+            "window_element_manifest": {"complete": True},
+            "planes": [{
+                "id": "panel-plane",
+                "scene_object_id": "work-panel",
+                "library_object_key": "layout-panel-style:test",
+                "library_subtype_key": "representative-square",
+                "sensor_region_px": {"x": 15, "y": 7, "width": 8, "height": 4},
+            }],
+            "objects": [],
+        },
+        "jobs": [{"id": "interface"}],
+    }), encoding="utf-8")
+    image = revision / "camera.png"
+    Image.new("RGBA", (20, 10), (20, 40, 60, 255)).save(image)
+    linear = revision / "linear.npy"
+    np.save(linear, np.ones((10, 20, 3), np.float32))
+
+    final = library.register_interface_after_render(
+        "complete-window", 1,
+        scene_path=str(scene), image_path=str(image), linear_path=str(linear),
+    )
+
+    assembly = library.find_interface(final.assembly_key)
+    assert assembly is not None
+    assert len(assembly.panel_harvests) == 1
+    harvest = assembly.panel_harvests[0]
+    assert harvest.crop_rect_px == (15, 7, 8, 4)
+    assert Image.open(harvest.image_path).size == (8, 4)
+    assert np.load(harvest.linear_path).shape == (4, 8, 3)
+    restored = RenderObjectLibrary(str(tmp_path / "object_library.json"))
+    assert restored.find_panel_harvest(
+        harvest.object_key,
+        harvest.subtype_key,
+        content_signature=harvest.content_signature,
+        condition_signature=harvest.condition_signature,
+    ) is not None
+
+
+def test_interface_version_deletion_is_explicit_and_keeps_other_versions(tmp_path):
+    library = RenderObjectLibrary(str(tmp_path / "object_library.json"))
+    finals = []
+    for revision_number in (1, 2):
+        revision = tmp_path / f"revision_{revision_number:04d}"
+        revision.mkdir()
+        scene = revision / "scene_order.json"
+        scene.write_text(json.dumps({
+            "schema_version": 1,
+            "defaults": {"objects": []},
+            "jobs": [{"id": "live_paragraph"}],
+        }), encoding="utf-8")
+        image = revision / "camera.png"
+        image.write_bytes(b"camera")
+        linear = revision / "linear.npy"
+        np.save(linear, np.ones((2, 2, 3), np.float32))
+        finals.append(library.register_interface_after_render(
+            "versioned-ui", revision_number,
+            scene_path=str(scene), image_path=str(image), linear_path=str(linear),
+            metadata={"source_revision_dir": str(revision)},
+        ))
+
+    deleted = library.delete_interface_after_render(
+        "versioned-ui", render_key=finals[-1].render_key
+    )
+    assert deleted.render_key == finals[-1].render_key
+    assert library.select_interface_after_render("versioned-ui").render_key == finals[0].render_key
+    assert not (tmp_path / "revision_0002").exists()
+    assert (tmp_path / "revision_0001").exists()

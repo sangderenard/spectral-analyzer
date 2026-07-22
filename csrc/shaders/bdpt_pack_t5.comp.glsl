@@ -48,7 +48,7 @@ layout(std430, binding = 5) readonly buffer MatBandBuf  { float mat_bands[];  };
 
 #define BDPT_VERTEX_STRIDE 28
 #define MAX_BANDS          32
-#define T5_LGV_STRIDE      56
+#define T5_LGV_STRIDE      57
 #define T5_CGV_STRIDE      72
 #define MAT_FULL_BANDS     32
 #define MAT_BAND_STRIDE    12
@@ -177,6 +177,7 @@ void main() {
         t5_light[ob + 53] = optical_jacobian;
         t5_light[ob + 54] = edge_fwd;
         t5_light[ob + 55] = edge_bwd;
+        t5_light[ob + 56] = uintBitsToFloat(0u);
     } else {
         /* ── Camera vertex → ssbo_t5_cam[(P - n_lv) * T5_CGV_STRIDE] ── */
         int ob = (P - n_lv) * T5_CGV_STRIDE;

@@ -604,6 +604,7 @@ struct PyRayTracer
     uint32_t    _sensor_mipmap_max_nodes = 0;
     uint32_t    _sensor_mipmap_max_depth = 0;
     uint32_t    _sensor_mipmap_samples_per_epoch = 0;
+    uint32_t    _sensor_mipmap_subdivision_axis = 3;
     bool        _sensor_priority_network_enabled = false;
     std::array<float, SENSOR_PRIORITY_NETWORK_PARAMS>
                 _sensor_priority_network_params{};
@@ -630,6 +631,7 @@ struct PyRayTracer
             cfg.sensor_mipmap_max_nodes = _sensor_mipmap_max_nodes;
             cfg.sensor_mipmap_max_depth = _sensor_mipmap_max_depth;
             cfg.sensor_mipmap_samples_per_epoch = _sensor_mipmap_samples_per_epoch;
+            cfg.sensor_mipmap_subdivision_axis = _sensor_mipmap_subdivision_axis;
             cfg.sensor_priority_network_enabled = _sensor_priority_network_enabled;
             cfg.sensor_priority_network_params = _sensor_priority_network_params;
             cfg.sensor_requested_priority_map = _sensor_requested_priority_map;
@@ -700,6 +702,46 @@ struct PyRayTracer
 
         _n_bands = static_cast<int>(ifh.size);
         _n_tris  = n_tri;
+        if (n_tri < 0)
+            throw std::invalid_argument("n_tri must be non-negative");
+        if (mat_n_mats < 1)
+            throw std::invalid_argument("mat_n_mats must be positive");
+        if (_n_bands < 1 || _n_bands > MAX_SPECTRAL_BANDS)
+            throw std::invalid_argument("freq_hz must contain 1..MAX_SPECTRAL_BANDS values");
+        if (iv.size < static_cast<py::ssize_t>(n_tri) * 9)
+            throw std::invalid_argument("verts is smaller than n_tri * 3 * 3");
+        if (in_.size < static_cast<py::ssize_t>(n_tri) * 3)
+            throw std::invalid_argument("normals is smaller than n_tri * 3");
+        if (imi.size < static_cast<py::ssize_t>(n_tri))
+            throw std::invalid_argument("mat_idx is smaller than n_tri");
+        const py::ssize_t required_mat_floats =
+            static_cast<py::ssize_t>(mat_n_mats) * MAX_SPECTRAL_BANDS * 12;
+        if (imb.size < required_mat_floats)
+            throw std::invalid_argument(
+                "mat_buf is smaller than mat_n_mats * MAX_SPECTRAL_BANDS * 12");
+        if (iaa.size != ifh.size)
+            throw std::invalid_argument("atmo_abs and freq_hz must have the same length");
+        if (!(verts.flags() & py::array::c_style)
+            || !(normals.flags() & py::array::c_style)
+            || !(mat_idx.flags() & py::array::c_style)
+            || !(mat_buf.flags() & py::array::c_style)
+            || !(freq_hz.flags() & py::array::c_style)
+            || !(atmo_abs.flags() & py::array::c_style))
+            throw std::invalid_argument("RayTracer constructor arrays must be C-contiguous");
+
+        const double* freq_ptr = static_cast<const double*>(ifh.ptr);
+        const double* abs_ptr  = static_cast<const double*>(iaa.ptr);
+        for (int b = 0; b < _n_bands; ++b) {
+            if (!std::isfinite(freq_ptr[b]) || freq_ptr[b] <= 0.0)
+                throw std::invalid_argument("freq_hz values must be finite and positive");
+            if (!std::isfinite(abs_ptr[b]) || abs_ptr[b] < 0.0)
+                throw std::invalid_argument("atmo_abs values must be finite and non-negative");
+        }
+        const int* mat_ptr = static_cast<const int*>(imi.ptr);
+        for (int i = 0; i < n_tri; ++i) {
+            if (mat_ptr[i] < 0 || mat_ptr[i] >= mat_n_mats)
+                throw std::invalid_argument("mat_idx contains an out-of-range material index");
+        }
         _freq_hz.assign(static_cast<const double*>(ifh.ptr),
                 static_cast<const double*>(ifh.ptr) + _n_bands);
 
@@ -722,6 +764,33 @@ struct PyRayTracer
     ~PyRayTracer() {
         if (_pipeline) { ray_pipeline_destroy(_pipeline); _pipeline = nullptr; }
         ray_tracer_destroy(handle); handle = nullptr;
+    }
+
+    void configure_spectral_luts(
+        py::array_t<int, py::array::c_style | py::array::forcecast> lane_lut_index,
+        py::array_t<int, py::array::c_style | py::array::forcecast> profile_offsets,
+        py::array_t<double, py::array::c_style | py::array::forcecast> frequency_knots_hz,
+        py::array_t<double, py::array::c_style | py::array::forcecast> density)
+    {
+        auto lanes = lane_lut_index.request();
+        auto offsets = profile_offsets.request();
+        auto frequencies = frequency_knots_hz.request();
+        auto weights = density.request();
+        if (lanes.ndim != 1 || lanes.size != _n_bands)
+            throw std::invalid_argument("lane_lut_index must have one entry per active lane");
+        if (offsets.ndim != 1 || offsets.size < 2)
+            throw std::invalid_argument("profile_offsets must contain n_profiles + 1 entries");
+        if (frequencies.ndim != 1 || weights.ndim != 1 || frequencies.size != weights.size)
+            throw std::invalid_argument("spectral LUT frequency and density arrays must have equal length");
+        const int n_profiles = static_cast<int>(offsets.size) - 1;
+        if (!ray_tracer_set_spectral_luts(
+                handle,
+                static_cast<const int*>(lanes.ptr), _n_bands,
+                static_cast<const int*>(offsets.ptr), n_profiles,
+                static_cast<const double*>(frequencies.ptr),
+                static_cast<const double*>(weights.ptr),
+                static_cast<int>(frequencies.size)))
+            throw std::invalid_argument("invalid continuous spectral LUT configuration");
     }
 
     py::dict build_frequency_sidecar(
@@ -1760,7 +1829,12 @@ struct PyRayTracer
         double               interaction_target_x = 0.0,
         double               interaction_target_y = 0.0,
         double               interaction_target_z = 0.0,
-        double               interaction_target_r = 0.0)
+        double               interaction_target_r = 0.0,
+        int                  launch_mode = 0,
+        double               launch_dir_x = -1.0,
+        double               launch_dir_y = 0.0,
+        double               launch_dir_z = 0.0,
+        double               launch_divergence_rad = 0.0)
     {
         auto ids = tri_ids.request();
         if (ids.ndim != 1)
@@ -1792,6 +1866,11 @@ struct PyRayTracer
             interaction_target_y,
             interaction_target_z,
             interaction_target_r,
+            launch_mode,
+            launch_dir_x,
+            launch_dir_y,
+            launch_dir_z,
+            launch_divergence_rad,
             static_cast<uint32_t>(seed));
     }
 
@@ -2280,12 +2359,15 @@ struct PyRayTracer
 
     void configure_sensor_mipmap(uint32_t max_nodes = 65536u,
                                  uint32_t maximum_depth = 8u,
-                                 uint32_t samples_per_epoch = 9u) {
+                                 uint32_t samples_per_epoch = 9u,
+                                 uint32_t subdivision_axis = 3u) {
         if (_pipeline)
             throw std::runtime_error(
                 "configure_sensor_mipmap must be called before pipeline creation");
-        if (max_nodes < 10u)
-            throw std::invalid_argument("sensor mipmap requires at least 10 nodes");
+        if (subdivision_axis != 2u && subdivision_axis != 3u)
+            throw std::invalid_argument("sensor mipmap subdivision_axis must be 2 or 3");
+        if (max_nodes < 1u + subdivision_axis * subdivision_axis)
+            throw std::invalid_argument("sensor mipmap node pool cannot hold one subdivision");
         if (maximum_depth == 0u || maximum_depth > 20u)
             throw std::invalid_argument("sensor mipmap maximum_depth must be in [1, 20]");
         if (samples_per_epoch == 0u)
@@ -2294,6 +2376,7 @@ struct PyRayTracer
         _sensor_mipmap_max_nodes = max_nodes;
         _sensor_mipmap_max_depth = maximum_depth;
         _sensor_mipmap_samples_per_epoch = samples_per_epoch;
+        _sensor_mipmap_subdivision_axis = subdivision_axis;
     }
 
     void configure_sensor_priority_network(
@@ -5715,6 +5798,15 @@ atmo_abs : float64 array (n_bands,)
              py::arg("freq_hz"),
              py::arg("speed_m_s") = 343.0,
              py::arg("atmo_abs"))
+        .def("configure_spectral_luts", &PyRayTracer::configure_spectral_luts,
+             py::arg("lane_lut_index"), py::arg("profile_offsets"),
+             py::arg("frequency_knots_hz"), py::arg("density"),
+R"doc(Enable per-ray continuous frequency transport.
+
+Each payload lane contains an index into the profile table.  A frequency/PDF
+is sampled once when a root ray is launched and the resolved state is retained
+by every child bounce.  LUT CDFs are validated and cached by the native tracer.
+)doc")
         .def("trace",    &PyRayTracer::trace,
              py::arg("src_pos"),
              py::arg("src_dir"),
@@ -6118,6 +6210,11 @@ Call drain_records() to collect output records.)doc")
              py::arg("interaction_target_y") = 0.0,
              py::arg("interaction_target_z") = 0.0,
              py::arg("interaction_target_r") = 0.0,
+             py::arg("launch_mode") = 0,
+             py::arg("launch_dir_x") = -1.0,
+             py::arg("launch_dir_y") = 0.0,
+             py::arg("launch_dir_z") = 0.0,
+             py::arg("launch_divergence_rad") = 0.0,
 R"doc(Non-blocking native forward-light submit.
 Builds emissive UV domains from the supplied triangles, fills each domain with
 a complete Mortonized UV/angle ray budget, creates RayIntents from mat_buf band emission,
@@ -6223,9 +6320,11 @@ changing the pose changes world-space ray origins and focusing geometry.)doc")
              py::arg("max_nodes") = 65536u,
              py::arg("maximum_depth") = 8u,
              py::arg("samples_per_epoch") = 9u,
-R"doc(Enable sparse recursive 3x3 sensor-mipmap storage before pipeline creation.
+             py::arg("subdivision_axis") = 3u,
+R"doc(Enable sparse recursive n-by-n sensor-mipmap storage before pipeline creation.
 Allocates a bounded GPU node pool; scheduling explicitly distinguishes sampling
-from 3x3 subdivision, and retained leaves continue independent epochs.)doc")
+from subdivision, and retained leaves continue independent epochs. n=2 is a
+quadtree; n=3 preserves the nine-child rule-of-thirds hierarchy.)doc")
         .def("configure_sensor_priority_network",
              &PyRayTracer::configure_sensor_priority_network,
              py::arg("parameters"),
@@ -7454,10 +7553,11 @@ GL_TEXTURE_3D (RGBA32F). Returns 0 if GPU field display is unavailable.)doc")
              },
              py::arg("weights"),
              py::arg("mode") = 0,
-             R"doc(Upload per-band RGB weights for the GPU UV blit shader.
+             R"doc(Upload per-band RGB sensor/display weights for GPU spectral
+sensor deposition, GPU BDPT T5 accumulation, and the UV blit shader.
 weights : float32 ndarray of shape (n_bands, 3) — each row is [r, g, b] weight
-          for mapping one spectral band's magnitude to sRGB.  Typically from
-          _wavelength_to_rgb_weights(freq_hz).
+          for mapping one spectral lane's magnitude to output RGB. Continuous
+          cohorts include their Monte-Carlo PDF correction in these weights.
 mode    : 0 = combined (fwd+sensor), 1 = forward only, 2 = sensor only.)doc")
     ;
 

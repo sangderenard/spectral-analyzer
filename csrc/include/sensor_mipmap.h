@@ -19,7 +19,10 @@ enum SensorMipNodeFlags : uint32_t {
 };
 
 static constexpr uint32_t SENSOR_MIP_NO_NODE = 0xFFFFFFFFu;
-static constexpr uint32_t SENSOR_MIP_BRANCHING = 9u;
+static constexpr uint32_t SENSOR_MIP_BRANCHING_EVEN = 4u;
+static constexpr uint32_t SENSOR_MIP_BRANCHING_ODD = 9u;
+/* Compatibility/default: the rule-of-thirds hierarchy remains nine-way. */
+static constexpr uint32_t SENSOR_MIP_BRANCHING = SENSOR_MIP_BRANCHING_ODD;
 static constexpr uint32_t SENSOR_PRIORITY_NETWORK_HIDDEN = 8u;
 static constexpr uint32_t SENSOR_PRIORITY_NETWORK_PARAMS = 305u;
 

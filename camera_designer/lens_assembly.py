@@ -224,6 +224,7 @@ class LensAssemblySpec:
         # LUT state
         self._transfer_grid: Optional[np.ndarray]  = None
         self._transfer_grid_noodles: int           = 0
+        self._baked_ep = None  # retired CPU endpoint retained for ABI callers
         self._manifold_ctx_id: int                 = -1
 
         # ── Registration GIDs (set by register()) ─────────────────────────────
@@ -294,6 +295,48 @@ class LensAssemblySpec:
         self._cached_acceptance_params = None  # invalidate when optics changes
         if mode is not None:
             self.mode = mode
+
+    def bake_lut(
+        self,
+        endpoint,
+        tracer=None,
+        *,
+        n_rays: int = 65_536,
+        n_grid: int = 32,
+        verbose: bool = True,
+    ) -> None:
+        """Bake the exact compound prescription into the canonical LUT payload.
+
+        The former Python endpoint tracer was removed; compatibility callers
+        now provide an object carrying ``preset`` and the algebraic CompoundLens
+        performs the bake directly.  ``tracer`` is accepted for API stability.
+        """
+
+        del tracer
+        from camera_designer.compound_optics import CompoundLens
+
+        preset = getattr(endpoint, "preset", None)
+        if preset is None:
+            raise ValueError("LUT baking requires endpoint.preset")
+        optics = CompoundLens.from_preset(preset)
+        grid = max(2, int(n_grid))
+        direction_count = max(1, int(n_rays) // max(1, grid * grid))
+        payload, source_count = optics.build_transfer_lut(
+            n_u=grid,
+            n_v=grid,
+            n_directions=direction_count,
+        )
+        self.set_optics(optics)
+        self._transfer_grid = np.ascontiguousarray(payload, np.float32)
+        self._transfer_grid_noodles = int(source_count)
+        self._baked_ep = None
+        self.mode = self.MODE_LUT
+        if verbose:
+            print(
+                f"[assembly] LUT baked grid={grid} rays={int(n_rays)} "
+                f"source_samples={int(source_count)}",
+                flush=True,
+            )
 
     def require_optics(self):
         """Return the canonical compound-lens model or raise a clear error."""

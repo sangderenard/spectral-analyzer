@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 from .progressive_exposure import (
     ExposureProgressEvent,
@@ -119,8 +119,8 @@ class FixedSceneCamera:
     target_m: tuple[float, float, float]
     focus_target_m: tuple[float, float, float]
     up: tuple[float, float, float] = (0.0, 0.0, 1.0)
-    focal_mm: float = 35.0
-    aperture_mm: float = 25.0
+    focal_mm: float = 82.5
+    aperture_mm: float = 20.625
 
     def __post_init__(self) -> None:
         position = _finite_tuple(self.position_m, 3, "position_m")
@@ -223,6 +223,9 @@ class DisplayObjectSpec:
     font_style: str = "normal"
     horizontal_align: str = "center"
     vertical_align: str = "center"
+    surface_object_key: str = ""
+    surface_subtype_key: str = ""
+    surface_parameters: Mapping[str, Any] = field(default_factory=dict)
     revision: int = 1
     enabled: bool = True
 

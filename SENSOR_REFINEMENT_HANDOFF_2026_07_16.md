@@ -262,7 +262,7 @@ SPECTRAL_SENSOR_PRIORITY_MODEL        exported .npz model path
 SPECTRAL_SENSOR_TARGETED_FRACTION     default 0.75
 SPECTRAL_SENSOR_STEPS_PER_LAYER       default 8 at <=128 resolution, else 4
 SPECTRAL_SENSOR_MAX_EPOCHS            0 means unlimited
-SPECTRAL_SENSOR_CONTINUOUS            true for live exposure
+SPECTRAL_SENSOR_PERSISTENT_EPOCHS     true for live multi-epoch sensor work
 SPECTRAL_PROGRESS_RETAIN_LAYERS       live default 3
 ```
 

@@ -578,6 +578,24 @@ struct MatSpectralCache {
     std::vector<int>    reactive_dst_band; /* [mat * n_bands + b] */
 };
 
+/* Continuous spectral lookup cache.  Lanes contain profile indices; the
+ * profile CDF is built once here and reused by every launch.  The resolved
+ * frequency is stored on RayIntent and is never looked up again on a child. */
+struct SpectralLutCache {
+    bool enabled = false;
+    std::vector<int> lane_lut_index;
+    std::vector<int> profile_offsets;
+    std::vector<double> frequency_hz;
+    std::vector<double> density;
+    std::vector<double> cdf;       /* normalized CDF at every knot */
+    std::vector<double> integral;  /* one normalization per profile */
+    /* 255 reusable samples per active lane.  The lane is the LUT lookup
+     * signal; sample identity chooses a stable entry whose frequency/PDF is
+     * shared by camera and light roots and then carried for the whole path. */
+    std::vector<double> sample_frequency_hz;
+    std::vector<float> sample_pdf;
+};
+
 /* ── Per-scene PBR / enamel / texture-stack surface cache ────────────────────
  * Populated by rt_build_surf_cache() from pbr_chunk (N×16), enamel_chunk (N×8)
  * and tex_stack_chunk (N×16) after ray_tracer_set_surface_chunks().
@@ -622,6 +640,7 @@ struct RayTracerState {
     std::vector<float>          mat_buf;
     int                         mat_n_mats = 0;
     MatSpectralCache            mat_cache;     /* precomputed spectral lookups */
+    SpectralLutCache            spectral_lut_cache;
     /* ── PBR / enamel / texture-stack chunks (set via ray_tracer_set_surface_chunks) ─ */
     std::vector<float>          pbr_chunk;       /* (mat_n_mats, 16) PBRBaseRecord   */
     std::vector<float>          enamel_chunk;    /* (mat_n_mats,  8) EnamelRecord    */
@@ -1961,8 +1980,8 @@ static bool accumulate_field_capture_segments_regular_threaded(
             std::lock_guard<std::mutex> lk(locks[static_cast<size_t>(cell) & (N_LOCKS - 1)]);
             for (int b = 0; b < bands; ++b) {
                 const int64_t off = 2 * (static_cast<int64_t>(b) * n_cells + cell);
-                data[off + 0] += row[26 + b] * w;
-                data[off + 1] += row[42 + b] * w;
+                data[off + 0] += row[28 + b] * w;
+                data[off + 1] += row[28 + MAX_SPECTRAL_BANDS + b] * w;
             }
         };
 
@@ -2260,6 +2279,244 @@ RayTracerState* ray_tracer_create(
 
     rt_build_mat_cache(*st);
     return st;
+}
+
+static inline double mat_field_at_frequency(
+    const RayTracerState& st, int mat_idx, int lane, double frequency_hz, int field)
+{
+    if (!st.spectral_lut_cache.enabled || !(frequency_hz > 0.0))
+        return static_cast<double>(mat_band_record(st, mat_idx, lane)[field]);
+    /* MatBuf's 32 rows are the cached material LUT in continuous mode. */
+    int last = 0;
+    while (last + 1 < MAX_SPECTRAL_BANDS
+           && mat_band_record(st, mat_idx, last + 1)[0] > 0.0f)
+        ++last;
+    if (last == 0) return static_cast<double>(mat_band_record(st, mat_idx, 0)[field]);
+    const bool increasing = mat_band_record(st, mat_idx, last)[0]
+                          >= mat_band_record(st, mat_idx, 0)[0];
+    int lo = 0;
+    if (increasing) {
+        while (lo + 1 < last && mat_band_record(st, mat_idx, lo + 1)[0] < frequency_hz) ++lo;
+    } else {
+        while (lo + 1 < last && mat_band_record(st, mat_idx, lo + 1)[0] > frequency_hz) ++lo;
+    }
+    const int hi = std::min(last, lo + 1);
+    const float* a = mat_band_record(st, mat_idx, lo);
+    const float* b = mat_band_record(st, mat_idx, hi);
+    if (lo == hi || std::abs(static_cast<double>(b[0]) - a[0]) <= 1.0e-20)
+        return static_cast<double>(a[field]);
+    const double t = std::max(0.0, std::min(1.0,
+        (frequency_hz - static_cast<double>(a[0]))
+        / (static_cast<double>(b[0]) - static_cast<double>(a[0]))));
+    return static_cast<double>(a[field])
+         + t * (static_cast<double>(b[field]) - static_cast<double>(a[field]));
+}
+
+static inline double ray_frequency(const RayTracerState& st, const RayIntent& ray, int lane)
+{
+    return ray.spectral_resolved && ray.spectral_frequency_hz > 0.0
+        ? ray.spectral_frequency_hz
+        : st.freq_hz_vec[std::max(0, std::min(st.n_bands - 1, lane))];
+}
+
+static inline double mat_n_real_for_ray(
+    const RayTracerState& st, int mat_idx, int lane, const RayIntent& ray)
+{
+    return mat_field_at_frequency(st, mat_idx, lane, ray_frequency(st, ray, lane), 7);
+}
+
+static inline double mat_n_imag_for_ray(
+    const RayTracerState& st, int mat_idx, int lane, const RayIntent& ray)
+{
+    return mat_field_at_frequency(st, mat_idx, lane, ray_frequency(st, ray, lane), 8);
+}
+
+static inline double medium_n_real_for_ray(
+    const RayTracerState& st, int mat_idx, int lane, const RayIntent& ray)
+{
+    if (mat_idx < 0) return 1.0;
+    const double n = mat_n_real_for_ray(st, mat_idx, lane, ray);
+    return n > EPS ? n : 1.0;
+}
+
+static inline cd mat_refl_for_ray(
+    const RayTracerState& st, int mat_idx, int lane, const RayIntent& ray)
+{
+    const double frequency = ray_frequency(st, ray, lane);
+    const double nr = mat_field_at_frequency(st, mat_idx, lane, frequency, 7);
+    const double ni = mat_field_at_frequency(st, mat_idx, lane, frequency, 8);
+    const cd n(nr, ni), one(1.0, 0.0);
+    const cd fresnel = (one - n) / (one + n);
+    if (ni > 0.1) return fresnel;
+    const double mag = mat_field_at_frequency(st, mat_idx, lane, frequency, 2);
+    const double phase = std::abs(fresnel) > 1.0e-12 ? std::arg(fresnel) : 0.0;
+    return std::polar(mag, phase);
+}
+
+static inline uint32_t rt_spectral_mix32(uint32_t x);
+static bool rt_resolve_lut_quantile(
+    const SpectralLutCache& cache, int profile, double u,
+    double& frequency_hz, float& pdf);
+
+int ray_tracer_set_spectral_luts(
+    RayTracerState* st,
+    const int* lane_lut_index,
+    int n_lanes,
+    const int* profile_offsets,
+    int n_profiles,
+    const double* frequency_knots_hz,
+    const double* density,
+    int n_knots)
+{
+    if (!st) return 0;
+    auto& cache = st->spectral_lut_cache;
+    cache = SpectralLutCache{};
+    if (n_profiles == 0) return 1;
+    if (!lane_lut_index || !profile_offsets || !frequency_knots_hz || !density
+        || n_lanes != st->n_bands || n_profiles < 1 || n_knots < 2)
+        return 0;
+    if (profile_offsets[0] != 0 || profile_offsets[n_profiles] != n_knots)
+        return 0;
+    for (int lane = 0; lane < n_lanes; ++lane)
+        if (lane_lut_index[lane] < 0 || lane_lut_index[lane] >= n_profiles)
+            return 0;
+
+    cache.lane_lut_index.assign(lane_lut_index, lane_lut_index + n_lanes);
+    cache.profile_offsets.assign(profile_offsets, profile_offsets + n_profiles + 1);
+    cache.frequency_hz.assign(frequency_knots_hz, frequency_knots_hz + n_knots);
+    cache.density.assign(density, density + n_knots);
+    cache.cdf.assign(static_cast<size_t>(n_knots), 0.0);
+    cache.integral.assign(static_cast<size_t>(n_profiles), 0.0);
+    for (int p = 0; p < n_profiles; ++p) {
+        const int begin = profile_offsets[p], end = profile_offsets[p + 1];
+        if (end - begin < 2) return 0;
+        double area = 0.0;
+        cache.cdf[static_cast<size_t>(begin)] = 0.0;
+        for (int i = begin; i + 1 < end; ++i) {
+            const double f0 = frequency_knots_hz[i], f1 = frequency_knots_hz[i + 1];
+            const double d0 = density[i], d1 = density[i + 1];
+            if (!std::isfinite(f0) || !std::isfinite(f1) || f0 <= 0.0 || f1 <= f0
+                || !std::isfinite(d0) || !std::isfinite(d1) || d0 < 0.0 || d1 < 0.0)
+                return 0;
+            area += 0.5 * (d0 + d1) * (f1 - f0);
+            cache.cdf[static_cast<size_t>(i + 1)] = area;
+        }
+        if (!std::isfinite(area) || area <= 0.0) return 0;
+        cache.integral[static_cast<size_t>(p)] = area;
+        for (int i = begin; i < end; ++i)
+            cache.cdf[static_cast<size_t>(i)] /= area;
+        cache.cdf[static_cast<size_t>(end - 1)] = 1.0;
+    }
+    cache.sample_frequency_hz.resize(static_cast<size_t>(n_lanes) * 255u);
+    cache.sample_pdf.resize(static_cast<size_t>(n_lanes) * 255u);
+    for (int lane = 0; lane < n_lanes; ++lane) {
+        const int profile = cache.lane_lut_index[static_cast<size_t>(lane)];
+        for (uint32_t sample_id = 1u; sample_id <= 255u; ++sample_id) {
+            const uint32_t key = (static_cast<uint32_t>(lane) << 8) | sample_id;
+            const double u = static_cast<double>(rt_spectral_mix32(key) >> 8)
+                           * (1.0 / 16777216.0);
+            const size_t slot = static_cast<size_t>(lane) * 255u + sample_id - 1u;
+            if (!rt_resolve_lut_quantile(
+                    cache, profile, u,
+                    cache.sample_frequency_hz[slot], cache.sample_pdf[slot]))
+                return 0;
+        }
+    }
+    cache.enabled = true;
+    return 1;
+}
+
+static inline uint64_t rt_spectral_mix64(uint64_t x)
+{
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+static inline uint32_t rt_spectral_mix32(uint32_t x)
+{
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    return x ^ (x >> 16);
+}
+
+static bool rt_resolve_lut_quantile(
+    const SpectralLutCache& cache, int profile, double u,
+    double& frequency_hz, float& pdf)
+{
+    const int begin = cache.profile_offsets[static_cast<size_t>(profile)];
+    const int end = cache.profile_offsets[static_cast<size_t>(profile + 1)];
+    auto first = cache.cdf.begin() + begin;
+    auto last = cache.cdf.begin() + end;
+    int i = static_cast<int>(std::upper_bound(first, last, u) - cache.cdf.begin()) - 1;
+    i = std::max(begin, std::min(end - 2, i));
+    while (i + 1 < end && cache.cdf[static_cast<size_t>(i + 1)] <= cache.cdf[static_cast<size_t>(i)]) ++i;
+    if (i + 1 >= end) return false;
+    const double f0 = cache.frequency_hz[static_cast<size_t>(i)];
+    const double f1 = cache.frequency_hz[static_cast<size_t>(i + 1)];
+    const double d0 = cache.density[static_cast<size_t>(i)];
+    const double d1 = cache.density[static_cast<size_t>(i + 1)];
+    const double total = cache.integral[static_cast<size_t>(profile)];
+    const double target_area = (u - cache.cdf[static_cast<size_t>(i)]) * total;
+    const double width = f1 - f0;
+    const double slope = (d1 - d0) / width;
+    double offset = 0.0;
+    if (std::abs(slope) <= 1.0e-30) offset = target_area / std::max(d0, 1.0e-300);
+    else {
+        const double disc = std::max(0.0, d0*d0 + 2.0*slope*target_area);
+        const double r0 = (-d0 + std::sqrt(disc)) / slope;
+        const double r1 = (-d0 - std::sqrt(disc)) / slope;
+        offset = (r0 >= 0.0 && r0 <= width) ? r0 : r1;
+    }
+    offset = std::max(0.0, std::min(width, offset));
+    frequency_hz = f0 + offset;
+    pdf = static_cast<float>((d0 + slope*offset) / total);
+    return frequency_hz > 0.0 && pdf > 0.0f;
+}
+
+static inline uint32_t rt_spectral_sample_id(uint64_t ordinal)
+{
+    return static_cast<uint32_t>(ordinal % 255u) + 1u;
+}
+
+static inline uint64_t rt_spectral_cache_key(int lane, uint32_t sample_id)
+{
+    return (static_cast<uint64_t>(static_cast<uint32_t>(lane)) << 8)
+         | static_cast<uint64_t>(sample_id & 0xffu);
+}
+
+static bool rt_resolve_ray_frequency(
+    const RayTracerState& st, RayIntent& ray, int lane, uint64_t sample_key)
+{
+    if (ray.spectral_resolved) return true;
+    const auto& cache = st.spectral_lut_cache;
+    if (!cache.enabled) return false;
+    if (lane < 0 || lane >= static_cast<int>(cache.lane_lut_index.size())) return false;
+    const int profile = cache.lane_lut_index[static_cast<size_t>(lane)];
+    const uint32_t sample_id = static_cast<uint32_t>(sample_key) & 0xffu;
+    if (sample_id >= 1u && sample_id <= 255u) {
+        const size_t slot = static_cast<size_t>(lane) * 255u + sample_id - 1u;
+        if (slot < cache.sample_frequency_hz.size() && slot < cache.sample_pdf.size()) {
+            ray.spectral_frequency_hz = cache.sample_frequency_hz[slot];
+            ray.spectral_pdf = cache.sample_pdf[slot];
+            ray.spectral_lut_index = static_cast<int16_t>(profile);
+            ray.spectral_lane_id = static_cast<uint8_t>(lane);
+            ray.spectral_resolved = 1u;
+            return true;
+        }
+    }
+    /* Match the GLSL root launcher exactly: a cached sample identity resolves
+     * to the same LUT quantile on CPU and GPU. */
+    const uint32_t bits = rt_spectral_mix32(static_cast<uint32_t>(sample_key));
+    const double u = static_cast<double>(bits >> 8) * (1.0 / 16777216.0);
+    if (!rt_resolve_lut_quantile(
+            cache, profile, u, ray.spectral_frequency_hz, ray.spectral_pdf))
+        return false;
+    ray.spectral_lut_index = static_cast<int16_t>(profile);
+    ray.spectral_lane_id = static_cast<uint8_t>(lane);
+    ray.spectral_resolved = 1u;
+    return true;
 }
 
 void ray_tracer_destroy(RayTracerState* st)
@@ -7724,9 +7981,11 @@ struct RayPipelineState {
      * gpu_skip_record_readback production mode is active. */
     mutable std::mutex        sensor_gpu_mu;
     std::vector<uint32_t>     sensor_accum_gpu;   /* 3 × res² float-CAS uint32 shadow */
+    std::vector<uint32_t>     sensor_preview_gpu; /* presentation-only mip mosaic */
     std::vector<uint32_t>     sensor_weight_gpu;  /* res² adaptive exposure weights */
     std::vector<float>        sensor_learned_priority_gpu; /* res² NN work values */
     mutable double            sensor_peak_gpu[3]  = {1e-30, 1e-30, 1e-30};
+    mutable double            sensor_preview_peak_gpu[3] = {1e-30, 1e-30, 1e-30};
 
     /* Set by ray_pipeline_destroy before set_done(); checked by T5 inner loop
      * and gpu_dispatch thread_main to exit without finishing in-flight work. */
@@ -7889,7 +8148,7 @@ public:
     /* HIT_STRIDE_BYTES: floats-per-record × sizeof(float).
      * Matches dispatch_t1_t2_t3's local HIT_STRIDE = 27 + 2*MAX_SPECTRAL_BANDS. */
     static constexpr int HIT_STRIDE_BYTES =
-        (27 + 2 * MAX_SPECTRAL_BANDS) * static_cast<int>(sizeof(float));
+        (29 + 2 * MAX_SPECTRAL_BANDS) * static_cast<int>(sizeof(float));
 
     GLuint prog_t1 = 0, prog_t2 = 0, prog_t3 = 0, prog_t4 = 0;
     GLuint prog_field_accum = 0, prog_field_resolve = 0;
@@ -8000,6 +8259,7 @@ public:
     GLuint prog_sensor_mip_accumulate = 0;
     GLuint prog_sensor_mip_rollup = 0;
     GLuint prog_sensor_mip_raygen = 0;
+    GLuint prog_sensor_mip_preview = 0;
     GLuint prog_sensor_priority_infer = 0;
     GLuint ssbo_sensor_mip_nodes = 0;
     GLuint ssbo_sensor_mip_direct_sum = 0;
@@ -8013,13 +8273,16 @@ public:
     GLuint ssbo_sensor_mip_work = 0;
     GLuint ssbo_sensor_mip_lineage = 0;
     GLuint ssbo_sensor_mip_schedule = 0;
+    GLuint ssbo_sensor_spectral_lut = 0;
     GLuint ssbo_sensor_mip_priority_features = 0;
     GLuint ssbo_sensor_mip_sample_spectra = 0;
+    GLuint ssbo_sensor_mip_preview_rgb = 0;
     GLuint ssbo_sensor_learned_priority = 0;
     GLuint ssbo_sensor_requested_priority = 0;
     GLuint ssbo_sensor_priority_network_params = 0;
     uint32_t sensor_mip_max_nodes = 0;
     uint32_t sensor_mip_max_depth = 0;
+    uint32_t sensor_mip_subdivision_axis = 3;
     uint32_t sensor_mip_n_bands = 0;
     uint32_t sensor_mip_lineage_capacity = 0;
 
@@ -8276,11 +8539,14 @@ public:
             || !prog_sensor_mip_score
             || !prog_sensor_mip_accumulate
             || !prog_sensor_mip_rollup
+            || !prog_sensor_mip_preview
             || !prog_sensor_mip_raygen
             || cfg.sensor_mipmap_max_nodes < 10u || n_bands <= 0)
             return false;
         sensor_mip_max_nodes = cfg.sensor_mipmap_max_nodes;
         sensor_mip_max_depth = cfg.sensor_mipmap_max_depth;
+        sensor_mip_subdivision_axis =
+            cfg.sensor_mipmap_subdivision_axis == 2u ? 2u : 3u;
         sensor_mip_n_bands = static_cast<uint32_t>(std::min(n_bands, MAX_SPECTRAL_BANDS));
         const size_t spectral_words = static_cast<size_t>(sensor_mip_max_nodes)
                                     * static_cast<size_t>(sensor_mip_n_bands);
@@ -8306,7 +8572,7 @@ public:
                             (GLsizeiptr)(spectral_words * sizeof(uint32_t)))
             || !ensure_ssbo(ssbo_sensor_mip_rollup_evidence,
                             (GLsizeiptr)(sensor_mip_max_nodes * sizeof(uint32_t)))
-            || !ensure_ssbo(ssbo_sensor_mip_control, 8 * sizeof(uint32_t))
+            || !ensure_ssbo(ssbo_sensor_mip_control, 9 * sizeof(uint32_t))
             || !ensure_ssbo(ssbo_sensor_mip_completed,
                             (GLsizeiptr)(sensor_mip_max_nodes * sizeof(uint32_t)))
             || !ensure_ssbo(ssbo_sensor_mip_frontier,
@@ -8335,10 +8601,10 @@ public:
         root.direct_moment_offset = 0u;
         root.rollup_moment_offset = 0u;
         root.child_slot = SENSOR_MIP_NO_NODE;
-        uint32_t control[8] = {
+        uint32_t control[9] = {
             1u, 0u, 1u, 0u,
             sensor_mip_max_nodes, sensor_mip_max_depth, sensor_mip_n_bands,
-            cfg.sensor_mipmap_samples_per_epoch,
+            cfg.sensor_mipmap_samples_per_epoch, sensor_mip_subdivision_axis,
         };
         const uint32_t root_id = 0u;
         const std::vector<uint32_t> zero_spectral(spectral_words, 0u);
@@ -8572,6 +8838,12 @@ public:
         }
         glc_BufferSubData(
             GL_SHADER_STORAGE_BUFFER, 0, sz, initial_rgb.data());
+        if (!ssbo_sensor_mip_preview_rgb)
+            glc_GenBuffers(1, &ssbo_sensor_mip_preview_rgb);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_preview_rgb);
+        glc_BufferData(GL_SHADER_STORAGE_BUFFER, sz, nullptr, GL_DYNAMIC_COPY);
+        std::vector<uint32_t> zero_preview(3u * pixels, 0u);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sz, zero_preview.data());
         if (!ssbo_sensor_weight) glc_GenBuffers(1, &ssbo_sensor_weight);
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_weight);
         glc_BufferData(GL_SHADER_STORAGE_BUFFER, weight_sz, nullptr, GL_DYNAMIC_COPY);
@@ -8640,7 +8912,7 @@ public:
     void dispatch_terminal_splat(RayPipelineState& ps, int max_children, int nb) {
         if (!prog_sensor_splat || ps.sensor_res <= 0 || !ssbo_sensor_rgb || !ssbo_splat_indirect)
             return;
-        static constexpr int INTENT_STRIDE_VAL = 20 + 2 * MAX_SPECTRAL_BANDS;
+        static constexpr int INTENT_STRIDE_VAL = 22 + 2 * MAX_SPECTRAL_BANDS;
         const int term_float_base = max_children * INTENT_STRIDE_VAL;
 
         glc_UseProgram(prog_sensor_splat);
@@ -8699,6 +8971,50 @@ public:
         glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     }
 
+    void dispatch_sensor_mip_preview(RayPipelineState& ps) {
+        if (!ps.cfg.sensor_mipmap_enabled || !prog_sensor_mip_preview
+                || !ssbo_sensor_mip_preview_rgb || sensor_rgb_res <= 0
+                || !ssbo_sensor_mip_nodes) return;
+        const uint32_t res = static_cast<uint32_t>(sensor_rgb_res);
+        const uint32_t pixels = res * res;
+        glc_UseProgram(prog_sensor_mip_preview);
+        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_sensor_mip_nodes);
+        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_sensor_mip_direct_sum);
+        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_sensor_mip_direct_weight);
+        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssbo_sensor_mip_rollup_mean);
+        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo_sensor_mip_rollup_evidence);
+        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, ssbo_sensor_mip_control);
+        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo_sensor_mip_preview_rgb);
+        GLint u = glc_GetUniformLocation(prog_sensor_mip_preview, "sensor_res");
+        if (u >= 0) glc_Uniform1ui(u, res);
+        u = glc_GetUniformLocation(prog_sensor_mip_preview, "n_bands");
+        if (u >= 0) glc_Uniform1ui(u, sensor_mip_n_bands);
+        u = glc_GetUniformLocation(prog_sensor_mip_preview, "rgb_w");
+        if (u >= 0) {
+            float physical[MAX_SPECTRAL_BANDS * 3] = {};
+            const int active = std::max(1, std::min(
+                static_cast<int>(sensor_mip_n_bands), MAX_SPECTRAL_BANDS));
+            if (blit_n_bands_stored > 0) {
+                std::copy_n(blit_rgb_weights.data(),
+                    std::min<size_t>(blit_rgb_weights.size(),
+                                     MAX_SPECTRAL_BANDS * 3u), physical);
+            } else {
+                for (int band = 0; band < active; ++band) {
+                    double wr = 0.0, wg = 0.0, wb = 0.0;
+                    band_to_display_rgb(band, active,
+                        ps.st ? ps.st->freq_hz_vec : Eigen::VectorXd{}, wr, wg, wb);
+                    physical[band * 3 + 0] = static_cast<float>(wr);
+                    physical[band * 3 + 1] = static_cast<float>(wg);
+                    physical[band * 3 + 2] = static_cast<float>(wb);
+                }
+            }
+            glc_Uniform3fv(u, MAX_SPECTRAL_BANDS, physical);
+        }
+        glc_DispatchCompute((pixels + 63u) / 64u, 1u, 1u);
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        glc_UseProgram(0);
+    }
+
     /* Download ssbo_sensor_rgb to the CPU shadow (ps.sensor_accum_gpu).
      * Rate-limited: call at most once per shadow_interval_s from the GPU thread. */
     void refresh_sensor_gpu_shadow(RayPipelineState& ps) {
@@ -8708,12 +9024,22 @@ public:
         std::vector<uint32_t> tmp(3u * pix2);
         std::vector<uint32_t> weight_tmp;
         std::vector<float> learned_tmp;
+        std::vector<uint32_t> preview_tmp;
 
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_rgb);
         glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
                              (GLsizeiptr)(3u * pix2 * sizeof(uint32_t)),
                              tmp.data());
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        if (ps.cfg.sensor_mipmap_enabled && prog_sensor_mip_preview) {
+            dispatch_sensor_mip_preview(ps);
+            preview_tmp.resize(3u * pix2);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_mip_preview_rgb);
+            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                 (GLsizeiptr)(3u * pix2 * sizeof(uint32_t)),
+                                 preview_tmp.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
         if (ps.cfg.sensor_mipmap_enabled && ssbo_sensor_weight) {
             weight_tmp.resize(pix2);
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_weight);
@@ -8735,13 +9061,16 @@ public:
         double pr = 1e-30, pg = 1e-30, pb = 1e-30;
         double sum_rgb = 0.0, peak_rgb = 1e-30;
         size_t lit_px = 0;
+        const uint32_t* display_src = preview_tmp.empty()
+            ? tmp.data() : preview_tmp.data();
+        const bool display_is_mip = !preview_tmp.empty();
         for (size_t i = 0; i < pix2; ++i) {
             float fr, fg, fb;
-            std::memcpy(&fr, &tmp[i],          sizeof(float));
-            std::memcpy(&fg, &tmp[i + pix2],   sizeof(float));
-            std::memcpy(&fb, &tmp[i + 2*pix2], sizeof(float));
+            std::memcpy(&fr, &display_src[i],          sizeof(float));
+            std::memcpy(&fg, &display_src[i + pix2],   sizeof(float));
+            std::memcpy(&fb, &display_src[i + 2*pix2], sizeof(float));
             float exposure = 1.0f;
-            if (!weight_tmp.empty()) {
+            if (!display_is_mip && !weight_tmp.empty()) {
                 std::memcpy(&exposure, &weight_tmp[i], sizeof(float));
                 exposure = (std::isfinite(exposure) && exposure > 0.0f)
                     ? exposure : 0.0f;
@@ -8765,7 +9094,8 @@ public:
             if (now - last_log >= std::chrono::seconds(1)) {
                 const double hot_frac = (sum_rgb > 0.0) ? (peak_rgb / sum_rgb) : 0.0;
                 fprintf(stderr,
-                        "[T5-shadow] lit_px=%zu sum=%.3e peak=%.3e hot_frac=%.6f peaks=(%.3e %.3e %.3e)\n",
+                        "[T5-shadow] source=%s lit_px=%zu sum=%.3e peak=%.3e hot_frac=%.6f peaks=(%.3e %.3e %.3e)\n",
+                        display_is_mip ? "mip-mosaic" : "sensor",
                         lit_px, sum_rgb, peak_rgb, hot_frac, pr, pg, pb);
                 fflush(stderr);
                 last_log = now;
@@ -8774,11 +9104,17 @@ public:
 
         std::lock_guard<std::mutex> lk(ps.sensor_gpu_mu);
         ps.sensor_accum_gpu   = std::move(tmp);
+        ps.sensor_preview_gpu = std::move(preview_tmp);
         ps.sensor_weight_gpu  = std::move(weight_tmp);
         ps.sensor_learned_priority_gpu = std::move(learned_tmp);
         ps.sensor_peak_gpu[0] = pr;
         ps.sensor_peak_gpu[1] = pg;
         ps.sensor_peak_gpu[2] = pb;
+        if (display_is_mip) {
+            ps.sensor_preview_peak_gpu[0] = pr;
+            ps.sensor_preview_peak_gpu[1] = pg;
+            ps.sensor_preview_peak_gpu[2] = pb;
+        }
     }
 
     /* ── Pass E: service a pending debug readback job ─────────────────────── *
@@ -8798,9 +9134,9 @@ public:
         }
         try {
             std::vector<float> result;
-            static constexpr int HIT_STRIDE_DBG = 27 + 2 * MAX_SPECTRAL_BANDS;
-            static constexpr int INTENT_STRIDE_DBG = 20 + 2 * MAX_SPECTRAL_BANDS;
-            static constexpr int TERMINAL_STRIDE_DBG = 26 + 2 * MAX_SPECTRAL_BANDS;
+            static constexpr int HIT_STRIDE_DBG = 29 + 2 * MAX_SPECTRAL_BANDS;
+            static constexpr int INTENT_STRIDE_DBG = 22 + 2 * MAX_SPECTRAL_BANDS;
+            static constexpr int TERMINAL_STRIDE_DBG = 28 + 2 * MAX_SPECTRAL_BANDS;
             static constexpr int BDPT_VERTEX_STRIDE_DBG = 28;
 
             if (job->kind == DbgKind::HITS && ssbo_hit != 0) {
@@ -9223,9 +9559,9 @@ public:
                 glc_DispatchCompute(job->top_k, 1u, 1u);
                 glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-                static constexpr int INTENT_STRIDE = 20 + 2 * MAX_SPECTRAL_BANDS;
-                static constexpr int COMBINED_STRIDE = (20 + 2 * MAX_SPECTRAL_BANDS)
-                                                     + (26 + 2 * MAX_SPECTRAL_BANDS);
+                static constexpr int INTENT_STRIDE = 22 + 2 * MAX_SPECTRAL_BANDS;
+                static constexpr int COMBINED_STRIDE = (22 + 2 * MAX_SPECTRAL_BANDS)
+                                                     + (28 + 2 * MAX_SPECTRAL_BANDS);
                 if ((int)max_samples > cap_intents) {
                     cap_intents = (int)max_samples + (int)max_samples / 8;
                     ensure_ssbo(ssbo_intent,
@@ -9270,6 +9606,58 @@ public:
                 uu("sensor_res", (uint32_t)std::max(1, ps.sensor_res));
                 uu("n_bands", sensor_mip_n_bands); uu("max_bounces", job->max_bounces);
                 uu("epoch_seed", job->seed);
+                {
+                    const auto& lut = ps.st->spectral_lut_cache;
+                    const bool enabled = lut.enabled;
+                    static constexpr size_t LUT_LANE_BASE = 0u;
+                    static constexpr size_t LUT_PROFILE_OFFSET_BASE =
+                        LUT_LANE_BASE + MAX_SPECTRAL_BANDS;
+                    static constexpr size_t LUT_FREQUENCY_BASE =
+                        LUT_PROFILE_OFFSET_BASE + 33u;
+                    static constexpr size_t LUT_DENSITY_BASE =
+                        LUT_FREQUENCY_BASE + 256u;
+                    static constexpr size_t LUT_CDF_BASE =
+                        LUT_DENSITY_BASE + 256u;
+                    static constexpr size_t LUT_INTEGRAL_BASE =
+                        LUT_CDF_BASE + 256u;
+                    static constexpr size_t LUT_WORD_COUNT =
+                        LUT_INTEGRAL_BASE + 32u;
+                    if (enabled && (lut.frequency_hz.size() > 256u
+                                    || lut.integral.size() > 32u))
+                        throw std::runtime_error(
+                            "GPU continuous spectral LUT exceeds 256 knots or 32 profiles");
+                    uu("continuous_lut_enabled", enabled ? 1u : 0u);
+                    uu("spectral_lut_knot_count", static_cast<uint32_t>(lut.frequency_hz.size()));
+                    uu("spectral_lut_profile_count", static_cast<uint32_t>(lut.integral.size()));
+                    std::vector<uint32_t> packed_lut(LUT_WORD_COUNT, 0u);
+                    if (enabled) {
+                        auto pack_ints = [&](size_t base, const std::vector<int>& values) {
+                            for (size_t i = 0; i < values.size(); ++i)
+                                std::memcpy(&packed_lut[base + i], &values[i], sizeof(uint32_t));
+                        };
+                        auto pack_floats = [&](size_t base, const auto& values) {
+                            for (size_t i = 0; i < values.size(); ++i) {
+                                const float value = static_cast<float>(values[i]);
+                                std::memcpy(&packed_lut[base + i], &value, sizeof(uint32_t));
+                            }
+                        };
+                        pack_ints(LUT_LANE_BASE, lut.lane_lut_index);
+                        pack_ints(LUT_PROFILE_OFFSET_BASE, lut.profile_offsets);
+                        pack_floats(LUT_FREQUENCY_BASE, lut.frequency_hz);
+                        pack_floats(LUT_DENSITY_BASE, lut.density);
+                        pack_floats(LUT_CDF_BASE, lut.cdf);
+                        pack_floats(LUT_INTEGRAL_BASE, lut.integral);
+                    }
+                    ensure_ssbo(ssbo_sensor_spectral_lut,
+                        (GLsizeiptr)(packed_lut.size() * sizeof(uint32_t)));
+                    glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_spectral_lut);
+                    glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                        (GLsizeiptr)(packed_lut.size() * sizeof(uint32_t)),
+                        packed_lut.data());
+                    glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                    glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 7,
+                                       ssbo_sensor_spectral_lut);
+                }
                 glc_DispatchCompute((max_samples + 63u) / 64u, 1u, 1u);
                 glc_MemoryBarrier(GL_ALL_BARRIER_BITS);
                 glc_UseProgram(0);
@@ -9331,6 +9719,10 @@ public:
                     glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
                 }
                 glc_UseProgram(0);
+                /* Epoch previews must observe this epoch, not whichever
+                 * in-flight splat happened to satisfy the 20 Hz timer before
+                 * accumulation and rollup completed. */
+                refresh_sensor_gpu_shadow(ps);
                 result.control[0] = 1u;
             }
             if (!job->run_epoch) {
@@ -10140,6 +10532,7 @@ public:
         const int64_t bdpt_spectral_base_f = (int64_t)max_v * BDPT_VERTEX_STRIDE_F;
         const int64_t bdpt_pdf_base_f = bdpt_spectral_base_f + (int64_t)max_s * BDPT_SPECTRAL_STRIDE_F;
         const int64_t bdpt_optical_base_f = bdpt_pdf_base_f + (int64_t)max_p * BDPT_PDF_STRIDE_F;
+        const uint32_t no_requested = no_raw;
         uint32_t nv_raw = std::min(bdpt_counts[0], (uint32_t)max_v);
         uint32_t ns_raw = std::min(bdpt_counts[1], (uint32_t)max_s);
         uint32_t np_raw = std::min(bdpt_counts[2], (uint32_t)max_p);
@@ -10201,6 +10594,40 @@ public:
                     T5_NATIVE_LABEL, bdpt_counts[2], max_p,
                     (unsigned long long)dropped, pend_max_bdpt_p);
             fflush(stderr);
+        }
+        if (no_requested > (uint32_t)max_o) {
+            const uint64_t dropped =
+                (uint64_t)no_requested - (uint64_t)max_o;
+            ps.bdpt_overflow_optical.fetch_add(
+                dropped, std::memory_order_relaxed);
+            grow_pending(pend_max_bdpt_o, no_requested);
+            fprintf(stderr,
+                    "[%s] WARNING: optical-record OVERFLOW — requested %u, "
+                    "cap %d, DROPPED %llu. Auto-raising bdpt_max_optical to "
+                    "%d at the next cycle (budget-permitting).\n",
+                    T5_NATIVE_LABEL, no_requested, max_o,
+                    (unsigned long long)dropped, pend_max_bdpt_o);
+            fflush(stderr);
+        }
+
+        const bool record_overflow =
+            bdpt_counts[0] > (uint32_t)max_v
+            || bdpt_counts[1] > (uint32_t)max_s
+            || bdpt_counts[2] > (uint32_t)max_p
+            || no_requested > (uint32_t)max_o;
+        if (record_overflow) {
+            /* Never publish a knowingly incomplete spectral estimator.  Cap
+             * growth remains scheduled for the next cycle, but this pass is
+             * consumed as a failed page instead of connecting flat-luminance
+             * fallback rows and presenting a plausible grey image. */
+            run_guard.status = "FAILED-RECORD-OVERFLOW";
+            fprintf(stderr,
+                    "[%s] PASS REJECTED — record arena overflow; no T5 output "
+                    "was accumulated. Retry after the scheduled cap policy or "
+                    "with smaller outer exposure pages.\n",
+                    T5_NATIVE_LABEL);
+            fflush(stderr);
+            return;
         }
 
         /* CPU-side launch records (emissive sources, and any camera/software
@@ -10265,6 +10692,7 @@ public:
                 row[4] = sw.wavelength_or_center;
                 row[5] = sw.band_pdf;
                 row[6] = sw.sensor_rgb_weight;
+                row[7] = rt_u32_as_f32(sw.spectral_sample_id);
             }
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
             glc_BufferSubData(GL_SHADER_STORAGE_BUFFER,
@@ -10354,6 +10782,36 @@ public:
                 T5_NATIVE_LABEL, nv_raw, ns_raw, np_raw, no_raw,
                 cpu_v.size(), cpu_sw.size(), cpu_pdf.size(), cpu_opt.size());
         fflush(stderr);
+
+        /* Exact-camera proof. These counters are incremented only by the
+         * PARAMETRIC_LENS camera traversal in ray_refine.comp.glsl. Reading
+         * them here adds no new pipeline synchronization: T5 already reads
+         * the record counts immediately above. */
+        {
+            uint32_t lens[12] = {};
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_counter);
+            glc_GetBufferSubData(
+                GL_SHADER_STORAGE_BUFFER,
+                (GLintptr)(12 * sizeof(uint32_t)),
+                (GLsizeiptr)(12 * sizeof(uint32_t)), lens);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            const uint32_t exited = lens[7];
+            const double mean_surfaces = exited > 0
+                ? (double)lens[8] / (double)exited : 0.0;
+            const uint32_t min_surfaces = exited > 0 ? lens[9] : 0u;
+            fprintf(stderr,
+                "[%s-lens] lens_paths_attempted=%u "
+                "lens_surface_intersections=%u lens_refractions=%u "
+                "lens_stop_passes=%u lens_aperture_rejections=%u "
+                "lens_hood_rejections=%u lens_tir_events=%u "
+                "lens_paths_exited_front=%u lens_surfaces_mean=%.3f "
+                "lens_surfaces_min=%u lens_surfaces_max=%u "
+                "lens_absorber_rejections=%u\n",
+                T5_NATIVE_LABEL,
+                lens[0], lens[1], lens[2], lens[3], lens[4], lens[5],
+                lens[6], exited, mean_surfaces, min_surfaces, lens[10], lens[11]);
+            fflush(stderr);
+        }
 
         const int nv = (int)nv_raw;
         const int ns = (int)ns_raw;
@@ -10654,14 +11112,20 @@ public:
             ensure_ssbo(ssbo_t5_spectral, (GLsizeiptr)(cap_t5_spectral * sizeof(float)));
         }
         std::vector<float> spectral_weights((size_t)nsw);
-        for (int band = 0; band < nb_gpu; ++band) {
-            double wr = 0.0, wg = 0.0, wb = 0.0;
-            band_to_display_rgb(band, nb_gpu,
-                                ps.st ? ps.st->freq_hz_vec : Eigen::VectorXd{},
-                                wr, wg, wb);
-            spectral_weights[(size_t)band * 3 + 0] = (float)wr;
-            spectral_weights[(size_t)band * 3 + 1] = (float)wg;
-            spectral_weights[(size_t)band * 3 + 2] = (float)wb;
+        if (blit_n_bands_stored >= nb_gpu) {
+            std::copy_n(
+                blit_rgb_weights.data(), (size_t)nsw,
+                spectral_weights.data());
+        } else {
+            for (int band = 0; band < nb_gpu; ++band) {
+                double wr = 0.0, wg = 0.0, wb = 0.0;
+                band_to_display_rgb(band, nb_gpu,
+                                    ps.st ? ps.st->freq_hz_vec : Eigen::VectorXd{},
+                                    wr, wg, wb);
+                spectral_weights[(size_t)band * 3 + 0] = (float)wr;
+                spectral_weights[(size_t)band * 3 + 1] = (float)wg;
+                spectral_weights[(size_t)band * 3 + 2] = (float)wb;
+            }
         }
         if (ssbo_t5_spectral && !spectral_weights.empty()) {
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_spectral);
@@ -11616,6 +12080,11 @@ public:
                          "sensor_mip_rollup.comp.glsl: %s", err);
                 return false;
             }
+            if (!load("sensor_mip_preview.comp.glsl", prog_sensor_mip_preview)) {
+                snprintf(ctx.error, sizeof(ctx.error),
+                         "sensor_mip_preview.comp.glsl: %s", err);
+                return false;
+            }
             if (!load("sensor_mip_raygen.comp.glsl", prog_sensor_mip_raygen)) {
                 snprintf(ctx.error, sizeof(ctx.error),
                          "sensor_mip_raygen.comp.glsl: %s", err);
@@ -11872,7 +12341,7 @@ public:
          * [0..7]: existing hit/miss/wave/refine counters + T3 indirect args
          * [8]   : nc (child count for next T1, written by post_t3_prep)
          * [9..11]: T1 indirect dispatch args {ceil(nc/64), 1, 1} */
-        ensure_ssbo(ssbo_counter, 12 * sizeof(uint32_t));
+        ensure_ssbo(ssbo_counter, 24 * sizeof(uint32_t));
 
         /* T3 meta SSBO: [0]=intent_count [1]=terminal_count [2..2+nm-1]=eps_flags
          * Allocate as 2+nm uints.  Counters are zeroed before each dispatch;
@@ -12180,13 +12649,13 @@ public:
         }
 
         /* ── Ensure intent SSBO is large enough (INTENT_STRIDE = 20 + 2*MAX_SPECTRAL_BANDS floats) */
-        static constexpr int INTENT_STRIDE = 20 + 2 * MAX_SPECTRAL_BANDS;
+        static constexpr int INTENT_STRIDE = 22 + 2 * MAX_SPECTRAL_BANDS;
         if (n > cap_intents) {
             cap_intents = n + n / 8;   /* linear headroom — see ensure_hit_ssbos */
             /* Allocate with combined (CHILD+TERMINAL) stride so ssbo_intent and
              * ssbo_child_int can be freely ping-ponged without a resize after swap. */
-            static constexpr int COMBINED_STRIDE = (20 + 2 * MAX_SPECTRAL_BANDS)
-                                                 + (26 + 2 * MAX_SPECTRAL_BANDS);
+            static constexpr int COMBINED_STRIDE = (22 + 2 * MAX_SPECTRAL_BANDS)
+                                                 + (28 + 2 * MAX_SPECTRAL_BANDS);
             ensure_ssbo(ssbo_intent, (GLsizeiptr)(cap_intents * COMBINED_STRIDE * sizeof(float)));
         }
 
@@ -12213,17 +12682,19 @@ public:
             row[15] = rt_u32_as_f32((uint32_t)ri.color_flag);
             row[16] = ri.priority;
             row[17] = ri.sensor_origin_y; row[18] = ri.sensor_origin_z;
-            row[19] = rt_u32_as_f32((uint32_t)ri.bdpt_subpath_id); /* bdpt_subpath_id in _pad */
+            row[19] = static_cast<float>(ri.spectral_frequency_hz);
+            row[20] = ri.spectral_pdf;
+            row[21] = rt_u32_as_f32((uint32_t)ri.bdpt_subpath_id);
             const int bands = std::min(nb, MAX_SPECTRAL_BANDS);
             if (ri.amp_n_bands > 0) {
                 /* Scalar fast-path: all bands carry (amp_scalar, 0i) — no heap pointer.
                  * fill_n + memset are SIMD-vectorized by the compiler. */
-                std::fill_n(&row[20], bands, ri.amp_scalar);
-                std::memset(&row[20 + MAX_SPECTRAL_BANDS], 0, (size_t)bands * sizeof(float));
+                std::fill_n(&row[22], bands, ri.amp_scalar);
+                std::memset(&row[22 + MAX_SPECTRAL_BANDS], 0, (size_t)bands * sizeof(float));
             } else {
                 const std::complex<double>* acd = ri.amp.data();
-                float* re_dst = &row[20];
-                float* im_dst = &row[20 + MAX_SPECTRAL_BANDS];
+                float* re_dst = &row[22];
+                float* im_dst = &row[22 + MAX_SPECTRAL_BANDS];
                 for (int b = 0; b < bands; ++b) {
                     re_dst[b] = (float)acd[b].real();
                     im_dst[b] = (float)acd[b].imag();
@@ -12239,7 +12710,7 @@ public:
          * are already GPU-resident in INTENT_STRIDE format — no upload needed. */
 
         /* ── Ensure hit SSBOs (double-buffered; HIT_STRIDE_BYTES is a class constant) */
-        static constexpr int HIT_STRIDE = 27 + 2 * MAX_SPECTRAL_BANDS;
+        static constexpr int HIT_STRIDE = 29 + 2 * MAX_SPECTRAL_BANDS;
         static_assert(HIT_STRIDE * (int)sizeof(float) == HIT_STRIDE_BYTES, "HIT_STRIDE mismatch");
         ensure_hit_ssbos(n * 4);  /* grows both ssbo_hit and ssbo_hit_b if needed */
 
@@ -12284,8 +12755,9 @@ public:
         {
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_counter);
             if (first_gen && reset_bdpt_records) {
-                uint32_t zeros[8] = {};
-                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 8 * sizeof(uint32_t), zeros);
+                uint32_t zeros[24] = {};
+                zeros[21] = 0xFFFFFFFFu; /* atomicMin identity */
+                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 24 * sizeof(uint32_t), zeros);
             } else {
                 uint32_t z4[4] = {};
                 glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 4 * sizeof(uint32_t), z4);
@@ -12429,8 +12901,8 @@ public:
         const bool use_gpu_resident = ps.cfg.gpu_skip_record_readback && prog_post_t3_prep != 0;
 
         int n_hits = 0;  /* populated from counter readback in debug mode; 0 in production */
-        static constexpr int CHILD_STRIDE    = 20 + 2 * MAX_SPECTRAL_BANDS;  /* INTENT_STRIDE: 20 + 2*MAX_SPECTRAL_BANDS */
-        static constexpr int TERMINAL_STRIDE = 26 + 2 * MAX_SPECTRAL_BANDS;  /* 26 + 2*MAX_SPECTRAL_BANDS */
+        static constexpr int CHILD_STRIDE    = 22 + 2 * MAX_SPECTRAL_BANDS;
+        static constexpr int TERMINAL_STRIDE = 28 + 2 * MAX_SPECTRAL_BANDS;
         /* Size child buffer for worst-case (all n intents hit and spawn children). */
         int max_children = n * ps.cfg.max_children + 1;
         if (max_children > cap_children) {
@@ -12741,11 +13213,19 @@ public:
                 const int iz = (int)((soz + ps.sensor_half_h) * inv_h);
                 if (iy < 0 || iy >= res || iz < 0 || iz >= res) continue;
                 double cr = 0.0, cg = 0.0, cb = 0.0;
+                const double spectral_frequency_hz = rec[26];
+                const double spectral_pdf = std::max(1.0e-30, static_cast<double>(rec[27]));
                 for (int b = 0; b < nb && b < MAX_SPECTRAL_BANDS; ++b) {
-                    const double re = (double)rec[26 + b], im = (double)rec[26 + MAX_SPECTRAL_BANDS + b];
+                    const double re = (double)rec[28 + b], im = (double)rec[28 + MAX_SPECTRAL_BANDS + b];
                     const double amp = std::sqrt(re*re + im*im);
                     double wr, wg, wb;
-                    band_to_display_rgb(b, nb, st.freq_hz_vec, wr, wg, wb);
+                    if (spectral_frequency_hz > 0.0) {
+                        Eigen::VectorXd exact(1); exact[0] = spectral_frequency_hz;
+                        band_to_display_rgb(0, 1, exact, wr, wg, wb);
+                        wr /= spectral_pdf; wg /= spectral_pdf; wb /= spectral_pdf;
+                    } else {
+                        band_to_display_rgb(b, nb, st.freq_hz_vec, wr, wg, wb);
+                    }
                     cr += amp * wr; cg += amp * wg; cb += amp * wb;
                 }
                 /* Scale down backward-sensor splat so it doesn't swamp the scene.
@@ -12862,8 +13342,8 @@ public:
                         rec.sensor_origin_z = row[24];
                         rec.n_bands = bands;
                         for (int b = 0; b < bands; ++b) {
-                            rec.amp_re[b] = row[26 + b];
-                            rec.amp_im[b] = row[26 + MAX_SPECTRAL_BANDS + b];
+                            rec.amp_re[b] = row[28 + b];
+                            rec.amp_im[b] = row[28 + MAX_SPECTRAL_BANDS + b];
                         }
                         strike_batch.push_back(std::move(rec));
                     }
@@ -12873,7 +13353,7 @@ public:
                         const V3d seg_s(row[9], row[10], row[11]);
                         const V3d hit_p(row[0], row[1],  row[2]);
                         for (int b = 0; b < bands; ++b)
-                            amp_tmp[b] = std::complex<double>(row[26 + b], row[26 + MAX_SPECTRAL_BANDS + b]);
+                            amp_tmp[b] = std::complex<double>(row[28 + b], row[28 + MAX_SPECTRAL_BANDS + b]);
                         for (int b = bands; b < nb; ++b)
                             amp_tmp[b] = cd(0.0, 0.0);
                         accumulate_field_capture_segment(*ps.st, seg_s, hit_p, amp_tmp);
@@ -13018,6 +13498,7 @@ public:
                     sw.wavelength_or_center = row[4];
                     sw.band_pdf             = row[5];
                     sw.sensor_rgb_weight    = row[6];
+                    memcpy(&sw.spectral_sample_id, row + 7, 4);
                     ps.push_bdpt_spectral(sw);
                 }
             }
@@ -14123,14 +14604,15 @@ static void pipeline_intersector(RayPipelineState& ps)
             for (int b = 0; b < nb; ++b) {
                 double n_re = 1.0, n_im = 0.0;
                 if (intent.medium_mat_idx >= 0) {
-                    n_re = mat_n_real(st, intent.medium_mat_idx, b);
-                    n_im = mat_n_imag(st, intent.medium_mat_idx, b);
+                    n_re = mat_n_real_for_ray(st, intent.medium_mat_idx, b, intent);
+                    n_im = mat_n_imag_for_ray(st, intent.medium_mat_idx, b, intent);
                     if (n_re < 1.0) n_re = 1.0;
                 }
-                double k_med  = st.k_real[b] * n_re;
+                const double frequency_hz = ray_frequency(st, intent, b);
+                double k_med  = TWO_PI * frequency_hz / st.speed_m_s * n_re;
                 double alpha  = st.atmo_abs[b];
                 if (intent.medium_mat_idx >= 0)
-                    alpha += TWO_PI * st.freq_hz_vec[b] * n_im / st.speed_m_s;
+                    alpha += TWO_PI * frequency_hz * n_im / st.speed_m_s;
                 double atten  = std::exp(-alpha * t_hit);
                 /* Backward (sensor-cast) rays are importance-sampling paths, not
                  * physical power carriers — skip 1/r² spherical spread so they
@@ -14699,7 +15181,16 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                         const double re = amp[b].real(), im = amp[b].imag();
                         const double a  = std::sqrt(re*re + im*im);
                         double wr, wg, wb;
-                        band_to_display_rgb(b, nb, st.freq_hz_vec, wr, wg, wb);
+                        if (hr.ray.spectral_resolved) {
+                            Eigen::VectorXd exact(1);
+                            exact[0] = hr.ray.spectral_frequency_hz;
+                            band_to_display_rgb(0, 1, exact, wr, wg, wb);
+                            const double inv_pdf = 1.0 / std::max(1.0e-30,
+                                static_cast<double>(hr.ray.spectral_pdf));
+                            wr *= inv_pdf; wg *= inv_pdf; wb *= inv_pdf;
+                        } else {
+                            band_to_display_rgb(b, nb, st.freq_hz_vec, wr, wg, wb);
+                        }
                         cr += a * wr; cg += a * wg; cb += a * wb;
                     }
                     const size_t px0 = static_cast<size_t>(iy * res + iz);
@@ -14783,26 +15274,34 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                 sw.band_id            = static_cast<uint16_t>(_b);
                 sw.beta_re            = static_cast<float>(child_amp[_b].real());
                 sw.beta_im            = static_cast<float>(child_amp[_b].imag());
-                sw.wavelength_or_center = (_b < (int)st.freq_hz_vec.size())
-                    ? static_cast<float>(st.freq_hz_vec[static_cast<size_t>(_b)]) : 0.0f;
-                sw.band_pdf           = (nb > 0) ? 1.0f / static_cast<float>(nb) : 1.0f;
+                sw.wavelength_or_center = hr.ray.spectral_resolved
+                    ? static_cast<float>(hr.ray.spectral_frequency_hz)
+                    : ((_b < (int)st.freq_hz_vec.size())
+                        ? static_cast<float>(st.freq_hz_vec[static_cast<size_t>(_b)]) : 0.0f);
+                sw.band_pdf           = hr.ray.spectral_resolved
+                    ? hr.ray.spectral_pdf / static_cast<float>(std::max(1, nb))
+                    : ((nb > 0) ? 1.0f / static_cast<float>(nb) : 1.0f);
                 sw.sensor_rgb_weight  = tp;
+                sw.spectral_sample_id = hr.ray.spectral_resolved
+                    ? (hr.ray.bdpt_subpath_id & 0xffu) : 0u;
                 bdpt_spectral_batch.push_back(std::move(sw));
             }
         };
 
         const bool mat_transmissive = tri_material_is_transmissive(st, tri);
         const bool front_face       = (in_dir.dot(tri.normal) < 0.0);
+        const int spectral_lane = hr.ray.spectral_resolved
+            ? static_cast<int>(hr.ray.spectral_lane_id) : 0;
 
         if (mat_transmissive) {
             int medium_from = -1, medium_to = -1;
             const bool has_pair = tri_boundary_media(tri, front_face,
                                                      medium_from, medium_to);
-            const double n1 = has_pair ? medium_n_real(st, medium_from)
+            const double n1 = has_pair ? medium_n_real_for_ray(st, medium_from, spectral_lane, hr.ray)
                 : ((hr.ray.medium_mat_idx >= 0)
-                   ? mat_n_real(st, hr.ray.medium_mat_idx) : 1.0);
-            const double n2 = has_pair ? medium_n_real(st, medium_to)
-                : (front_face ? mat_n_real(st, tri.mat_idx) : 1.0);
+                   ? mat_n_real_for_ray(st, hr.ray.medium_mat_idx, spectral_lane, hr.ray) : 1.0);
+            const double n2 = has_pair ? medium_n_real_for_ray(st, medium_to, spectral_lane, hr.ray)
+                : (front_face ? mat_n_real_for_ray(st, tri.mat_idx, spectral_lane, hr.ray) : 1.0);
             const double cos_i = std::max(0.0, -in_dir.dot(hit_n));
             V3d   refracted;
             const bool can_refract = snell_refract(in_dir, hit_n, n1, n2, refracted);
@@ -14935,11 +15434,11 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                      * — dividing the beta by a PDF here double-counts and biases
                      * the estimator.  Change one only if you change the other. */
                     for (int b = 0; b < nb; ++b) {
-                        const double n1b = has_pair ? medium_n_real(st, medium_from, b)
+                        const double n1b = has_pair ? medium_n_real_for_ray(st, medium_from, b, hr.ray)
                             : ((hr.ray.medium_mat_idx >= 0)
-                               ? mat_n_real(st, hr.ray.medium_mat_idx, b) : 1.0);
-                        const double n2b = has_pair ? medium_n_real(st, medium_to, b)
-                            : (front_face ? mat_n_real(st, tri.mat_idx, b) : 1.0);
+                               ? mat_n_real_for_ray(st, hr.ray.medium_mat_idx, b, hr.ray) : 1.0);
+                        const double n2b = has_pair ? medium_n_real_for_ray(st, medium_to, b, hr.ray)
+                            : (front_face ? mat_n_real_for_ray(st, tri.mat_idx, b, hr.ray) : 1.0);
                         const double s2 = (n1b/n2b)*(n1b/n2b)*(1.0 - cos_i*cos_i);
                         double Rb;
                         if (s2 > 1.0) {
@@ -14949,7 +15448,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                             Rb = fresnel_R(cos_i, ctb, n1b, n2b);
                         }
                         if (b == 0) R0 = Rb;
-                        ra[b] *= std::sqrt(Rb) * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+                        ra[b] *= std::sqrt(Rb) * mat_refl_for_ray(st, tri.mat_idx, b, hr.ray);
                     }
                     emit_scatter(reflect_dir, ra, BDPT_DOMAIN_SOLID_ANGLE,
                                  static_cast<float>(R0), static_cast<float>(R0),
@@ -14959,11 +15458,11 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                 /* One transmitted child per active, non-TIR band. */
                 for (int b = 0; b < nb; ++b) {
                     if (std::abs(amp[b]) <= 0.0) continue;     /* inactive band */
-                    const double n1b = has_pair ? medium_n_real(st, medium_from, b)
+                    const double n1b = has_pair ? medium_n_real_for_ray(st, medium_from, b, hr.ray)
                         : ((hr.ray.medium_mat_idx >= 0)
-                           ? mat_n_real(st, hr.ray.medium_mat_idx, b) : 1.0);
-                    const double n2b = has_pair ? medium_n_real(st, medium_to, b)
-                        : (front_face ? mat_n_real(st, tri.mat_idx, b) : 1.0);
+                           ? mat_n_real_for_ray(st, hr.ray.medium_mat_idx, b, hr.ray) : 1.0);
+                    const double n2b = has_pair ? medium_n_real_for_ray(st, medium_to, b, hr.ray)
+                        : (front_face ? mat_n_real_for_ray(st, tri.mat_idx, b, hr.ray) : 1.0);
                     V3d refracted_b;
                     if (!snell_refract(in_dir, hit_n, n1b, n2b, refracted_b))
                         continue;                             /* TIR: reflected above */
@@ -14983,7 +15482,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                 /* TIR (band 0): pure reflection (delta lobe). */
                 VXcd ra = amp;
                 for (int b = 0; b < nb; ++b)
-                    ra[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+                    ra[b] *= mat_refl_for_ray(st, tri.mat_idx, b, hr.ray);
                 emit_scatter(reflect_dir, ra, BDPT_DOMAIN_SOLID_ANGLE, 1.0f, 1.0f,
                              BDPT_PDF_FLAG_DELTA_SPECULAR);
                 enqueue_child(make_child(reflect_dir, ra));
@@ -14998,7 +15497,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                 if (U01(rng) < R) {
                     VXcd ra = amp;
                     for (int b = 0; b < nb; ++b)
-                        ra[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+                        ra[b] *= mat_refl_for_ray(st, tri.mat_idx, b, hr.ray);
                     emit_scatter(reflect_dir, ra, BDPT_DOMAIN_SOLID_ANGLE,
                                  static_cast<float>(R), static_cast<float>(R),
                                  BDPT_PDF_FLAG_DELTA_SPECULAR);
@@ -15048,7 +15547,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             }
             VXcd na = amp;
             for (int b = 0; b < nb; ++b)
-                na[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+                na[b] *= mat_refl_for_ray(st, tri.mat_idx, b, hr.ray);
             if (tri.flags & MAT_FLAG_REACTIVE)
                 apply_reactive_shift_cached(na, st.mat_cache, tri.mat_idx);
 
@@ -15363,6 +15862,46 @@ void ray_pipeline_submit(
     const int    max_q   = ps->cfg.max_intent_queue;
     const double min_amp = ps->cfg.min_amplitude;
 
+    auto resolve_root_spectrum = [&](RayIntent& ri, int ordinal) {
+        if (!ps->st || !ps->st->spectral_lut_cache.enabled || ri.spectral_resolved)
+            return;
+        int lane = 0;
+        double strongest = -1.0;
+        const int nb = ps->st->n_bands;
+        if (ri.amp_n_bands <= 0 && ri.amp.size() > 0) {
+            bool uniform = nb > 1 && ri.amp.size() >= nb;
+            for (int b = 0; b < nb && b < ri.amp.size(); ++b) {
+                const double a = std::norm(ri.amp[b]);
+                if (a > strongest) { strongest = a; lane = b; }
+                if (b > 0 && std::abs(a - std::norm(ri.amp[0])) > 1.0e-24)
+                    uniform = false;
+            }
+            if (uniform)
+                lane = static_cast<int>(rt_spectral_mix64(
+                    ri.tag ^ static_cast<uint64_t>(ordinal)) % static_cast<uint64_t>(std::max(1, nb)));
+        } else {
+            /* Scalar camera primaries distribute lookup signals over lanes;
+             * each individual path still receives exactly one frequency. */
+            lane = static_cast<int>(rt_spectral_mix64(
+                ri.tag ^ static_cast<uint64_t>(ordinal)) % static_cast<uint64_t>(std::max(1, nb)));
+        }
+        const uint32_t sample_id = ri.bdpt_subpath_id != 0u
+            ? (ri.bdpt_subpath_id & 0xffu)
+            : rt_spectral_sample_id(static_cast<uint64_t>(ordinal));
+        const uint64_t key = rt_spectral_cache_key(lane, sample_id);
+        if (rt_resolve_ray_frequency(*ps->st, ri, lane, key)
+            && (ri.amp_n_bands > 0 || (ri.amp.size() >= nb && nb > 1))) {
+            /* Continuous transport is one resolved frequency per path.  Turn
+             * the scalar fast path into one active lookup lane and compensate
+             * for uniform lane selection; descendants preserve this vector. */
+            const cd source = ri.amp_n_bands > 0 ? cd(ri.amp_scalar, 0.0) : ri.amp[lane];
+            ri.amp = VXcd::Zero(nb);
+            ri.amp[lane] = source * static_cast<double>(std::max(1, nb));
+            ri.amp_scalar = 0.0f;
+            ri.amp_n_bands = 0;
+        }
+    };
+
     /* Fast path: unbounded queue, no high-priority rays — common for sensor sweeps.
      * Batch all intents into a single push_many so the queue takes one mutex lock
      * and emits one notify_one instead of N (eliminates 1M+ lock cycles per sweep). */
@@ -15377,6 +15916,7 @@ void ray_pipeline_submit(
             batch.reserve(static_cast<size_t>(n_intents));
             for (int i = 0; i < n_intents; ++i) {
                 RayIntent ri = intents[i];
+                resolve_root_spectrum(ri, i);
                 if (min_amp > ri.min_amplitude) ri.min_amplitude = min_amp;
                 if ((ri.color_flag & 1u) != 0u) ++n_sensor; else ++n_flash;
                 batch.push_back(std::move(ri));
@@ -15394,6 +15934,7 @@ void ray_pipeline_submit(
     /* Slow path: bounded queue, high-priority items, or mixed batch. */
     for (int i = 0; i < n_intents; ++i) {
         RayIntent ri = intents[i];
+        resolve_root_spectrum(ri, i);
         if (min_amp > ri.min_amplitude) ri.min_amplitude = min_amp;
         const uint8_t color_flag = ri.color_flag;
         ps->in_flight.fetch_add(1, std::memory_order_release);
@@ -15430,6 +15971,11 @@ int ray_pipeline_submit_emissive_triangles(
     double            interaction_target_y,
     double            interaction_target_z,
     double            interaction_target_r,
+    int               launch_mode,
+    double            launch_dir_x,
+    double            launch_dir_y,
+    double            launch_dir_z,
+    double            launch_divergence_rad,
     uint32_t          seed)
 {
     if (!ps || !ps->st || !tri_ids || n_tris <= 0 || rays_per_tri <= 0)
@@ -15722,7 +16268,23 @@ int ray_pipeline_submit_emissive_triangles(
                                 static_cast<double>(seed) * 0.013,
                                 dx, dy, au, av);
             V3d dir;
-            if (has_target) {
+            if (launch_mode == 1) {
+                V3d axis(launch_dir_x, launch_dir_y, launch_dir_z);
+                if (axis.squaredNorm() <= 1.0e-24)
+                    axis = emit_n;
+                axis.normalize();
+                const double divergence = std::max(0.0, launch_divergence_rad);
+                if (divergence > 0.0) {
+                    V3d helper = std::abs(axis.z()) < 0.9
+                        ? V3d(0.0, 0.0, 1.0) : V3d(0.0, 1.0, 0.0);
+                    V3d tangent = axis.cross(helper).normalized();
+                    V3d bitangent = tangent.cross(axis).normalized();
+                    const double angular_scale = std::tan(divergence);
+                    dir = (axis + angular_scale * (tangent * dx + bitangent * dy)).normalized();
+                } else {
+                    dir = axis;
+                }
+            } else if (has_target) {
                 const V3d target(interaction_target_x,
                                  interaction_target_y + interaction_target_r * dx,
                                  interaction_target_z + interaction_target_r * dy);
@@ -15753,8 +16315,16 @@ int ray_pipeline_submit_emissive_triangles(
              * bands and compensate by nb.  The expectation is the original
              * full spectrum, while each path retains its exact band IOR. */
             const int sampled_band = static_cast<int>(seq++ % static_cast<uint64_t>(nb));
+            RayIntent ri{};
+            const uint32_t spectral_sample_id = rt_spectral_sample_id(seq);
+            if (st.spectral_lut_cache.enabled) {
+                const uint64_t spectral_key = rt_spectral_cache_key(
+                    sampled_band, spectral_sample_id);
+                rt_resolve_ray_frequency(st, ri, sampled_band, spectral_key);
+            }
             for (int b = 0; b < nb; ++b) {
-                const double e = std::max(0.0, static_cast<double>(mat_band_record(st, mat, b)[5]));
+                const double e = std::max(0.0,
+                    mat_field_at_frequency(st, mat, b, ray_frequency(st, ri, b), 5));
                 const double a = (b == sampled_band)
                     ? scale * domain.geom_area * e * static_cast<double>(nb)
                         / static_cast<double>(std::max(1, n_domain))
@@ -15763,7 +16333,6 @@ int ray_pipeline_submit_emissive_triangles(
                 emit_sum += a;
             }
             if (!(emit_sum > 0.0)) continue;
-            RayIntent ri{};
             ri.pos = origin + dir * (EPS * 200.0);
             ri.dir = dir;
             /* Use scalar fast-path when all bands have equal real amplitude and zero imag.
@@ -15787,9 +16356,10 @@ int ray_pipeline_submit_emissive_triangles(
             ri.color_flag = 0u;
             ri.bounces_left = max_bounces;
             ri.min_amplitude = min_amplitude;
-            uint32_t sid = ps->bdpt_next_subpath_id.fetch_add(1u, std::memory_order_relaxed);
-            if (sid == 0u)
-                sid = ps->bdpt_next_subpath_id.fetch_add(1u, std::memory_order_relaxed);
+            uint32_t sid_raw = ps->bdpt_next_subpath_id.fetch_add(1u, std::memory_order_relaxed);
+            if (sid_raw == 0u)
+                sid_raw = ps->bdpt_next_subpath_id.fetch_add(1u, std::memory_order_relaxed);
+            uint32_t sid = ((sid_raw & 0x007fffffu) << 8) | spectral_sample_id;
 
             V3d bdpt_emit_n = emit_n;
             if (bdpt_emit_n.dot(dir) < 0.0)
@@ -15847,10 +16417,16 @@ int ray_pipeline_submit_emissive_triangles(
                 sw.band_id              = static_cast<uint16_t>(b);
                 sw.beta_re              = static_cast<float>(emit[static_cast<size_t>(b)].real());
                 sw.beta_im              = static_cast<float>(emit[static_cast<size_t>(b)].imag());
-                sw.wavelength_or_center = (b < static_cast<int>(st.freq_hz_vec.size()))
-                    ? static_cast<float>(st.freq_hz_vec[static_cast<size_t>(b)]) : 0.0f;
-                sw.band_pdf             = (nb > 0) ? 1.0f / static_cast<float>(nb) : 1.0f;
+                sw.wavelength_or_center = (ri.spectral_resolved && b == sampled_band)
+                    ? static_cast<float>(ri.spectral_frequency_hz)
+                    : ((b < static_cast<int>(st.freq_hz_vec.size()))
+                        ? static_cast<float>(st.freq_hz_vec[static_cast<size_t>(b)]) : 0.0f);
+                sw.band_pdf             = (ri.spectral_resolved && b == sampled_band)
+                    ? ri.spectral_pdf / static_cast<float>(std::max(1, nb))
+                    : ((nb > 0) ? 1.0f / static_cast<float>(nb) : 1.0f);
                 sw.sensor_rgb_weight    = 1.0f;
+                sw.spectral_sample_id   = ri.spectral_resolved
+                    ? spectral_sample_id : 0u;
                 ps->push_bdpt_spectral(sw);
             }
 
@@ -16290,10 +16866,9 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
         ri.min_amplitude = min_amplitude;
         ri.sensor_origin_y = static_cast<float>(y);
         ri.sensor_origin_z = static_cast<float>(z);
-        uint32_t sid = ps->bdpt_next_subpath_id.fetch_add(1u, std::memory_order_relaxed);
-        sid = 0x80000000u | (sid & 0x7FFFFFFFu);
-        if (sid == 0u)
-            sid = 0x80000001u;
+        const uint32_t sample_id = rt_spectral_sample_id(intents.size());
+        uint32_t sid_raw = ps->bdpt_next_subpath_id.fetch_add(1u, std::memory_order_relaxed);
+        uint32_t sid = 0x80000000u | ((sid_raw & 0x007fffffu) << 8) | sample_id;
         ri.bdpt_subpath_id = sid;
         ri.bdpt_vertex = 0u;
         ri.bdpt_stream = BDPT_SIDE_SENSOR;
@@ -16501,12 +17076,16 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
 
     /* Build spectral beta LUT: key = subpath_id<<32 | vertex_index<<16 | band_id */
     std::unordered_map<uint64_t, std::complex<float>> beta_lut;
+    std::unordered_map<uint64_t, uint32_t> spectral_sample_lut;
     beta_lut.reserve(sweights.size());
+    spectral_sample_lut.reserve(sweights.size());
     for (const auto& sw : sweights) {
         const uint64_t k = ((uint64_t)sw.subpath_id << 32)
                          | ((uint64_t)sw.vertex_index << 16)
                          | (uint64_t)sw.band_id;
         beta_lut[k] = {sw.beta_re, sw.beta_im};
+        spectral_sample_lut[((uint64_t)sw.subpath_id << 32)
+                          | (uint64_t)sw.vertex_index] = sw.spectral_sample_id;
     }
 
     /* Build PDF LUT: key = subpath_id<<32 | vertex_index.  The value keeps
@@ -16550,7 +17129,7 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
     std::mutex connection_flush_mu;
 
     /* ── Build T5ConnContext (all helper methods live here) ────────────────── */
-    T5ConnContext ctx{beta_lut, pdf_lut, optical_lut, ps,
+    T5ConnContext ctx{beta_lut, spectral_sample_lut, pdf_lut, optical_lut, ps,
                      n_bands, res, inv_w, inv_h, t5_min_geom, t5_freq_hz,
                      connection_flush_mu};
 
@@ -16729,6 +17308,12 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
             p[LGV_EDGE_FWD_AREA] = get_edge_fwd(lr, nxt);
             p[LGV_EDGE_BWD_AREA] = get_edge_bwd(lr, nxt);
         }
+        {
+            const uint64_t sk = ((uint64_t)lr.subpath_id << 32) | lr.vertex_index;
+            const auto sit = spectral_sample_lut.find(sk);
+            const uint32_t sample_id = sit == spectral_sample_lut.end() ? 0u : sit->second;
+            std::memcpy(&p[56], &sample_id, sizeof(uint32_t));
+        }
         /* else: edge_fwd_area / edge_bwd_area stay 0.0f (last vert in subpath) */
     }
 
@@ -16835,6 +17420,12 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                     const BdptVertexRecord& nxt = *csp->v[ci + 1u];
                     p[CGV_EDGE_FWD_AREA] = get_edge_fwd(c, nxt);
                     p[CGV_EDGE_BWD_AREA] = get_edge_bwd(c, nxt);
+                }
+                {
+                    const uint64_t sk = ((uint64_t)c.subpath_id << 32) | c.vertex_index;
+                    const auto sit = spectral_sample_lut.find(sk);
+                    const uint32_t sample_id = sit == spectral_sample_lut.end() ? 0u : sit->second;
+                    std::memcpy(&p[62], &sample_id, sizeof(uint32_t));
                 }
                 /* else: edge_fwd_area / edge_bwd_area stay 0.0f (last vert in subpath) */
                 /* [46..55] remain 0.0f */
@@ -17143,11 +17734,17 @@ static void band_to_display_rgb(int b, int n_bands,
                                  const Eigen::VectorXd& freq_hz_vec,
                                  double& wr, double& wg, double& wb)
 {
-    if (n_bands <= 1 || b < 0 || b >= n_bands) { wr = wg = wb = 1.0; return; }
+    if (b < 0 || b >= n_bands) { wr = wg = wb = 1.0; return; }
     double wl_nm = 550.0;
     if (b < (int)freq_hz_vec.size() && freq_hz_vec[b] > 0.0) {
         constexpr double C = 299792458.0;
         wl_nm = std::max(380.0, std::min(700.0, (C / freq_hz_vec[b]) * 1.0e9));
+    } else if (n_bands <= 1) {
+        /* An actually achromatic scalar has no frequency signal.  A one-lane
+         * continuous exposure does, and must therefore reach the spectral
+         * locus above instead of being forced to white. */
+        wr = wg = wb = 1.0;
+        return;
     } else {
         const double t = static_cast<double>(b) / static_cast<double>(n_bands - 1);
         wl_nm = 380.0 + t * 320.0;
@@ -17428,8 +18025,12 @@ void ray_pipeline_configure_sensor_image(
     {
         std::lock_guard<std::mutex> lk_gpu(ps->sensor_gpu_mu);
         ps->sensor_accum_gpu.clear();
+        ps->sensor_preview_gpu.clear();
         ps->sensor_weight_gpu.clear();
-        for (int _c = 0; _c < 3; ++_c) ps->sensor_peak_gpu[_c] = 1e-30;
+        for (int _c = 0; _c < 3; ++_c) {
+            ps->sensor_peak_gpu[_c] = 1e-30;
+            ps->sensor_preview_peak_gpu[_c] = 1e-30;
+        }
     }
     /* Request GPU buffer clear (executed on GPU thread via flag, avoids cross-thread GL calls). */
     if (ps->gpu_dispatch && ps->cfg.gpu_skip_record_readback)
@@ -17461,9 +18062,14 @@ void ray_pipeline_get_sensor_image(
         if (!ps->sensor_accum_gpu.empty()
                 && (int)ps->sensor_accum_gpu.size() >= (int)(3 * pix))
         {
-            const double* peak = ps->sensor_peak_gpu;
-            const uint32_t* src = ps->sensor_accum_gpu.data();
-            const uint32_t* weights = ps->sensor_weight_gpu.size() >= pix
+            const bool use_mip_preview = ps->cfg.sensor_mipmap_enabled
+                && ps->sensor_preview_gpu.size() >= 3u * pix;
+            const double* peak = use_mip_preview
+                ? ps->sensor_preview_peak_gpu : ps->sensor_peak_gpu;
+            const uint32_t* src = use_mip_preview
+                ? ps->sensor_preview_gpu.data() : ps->sensor_accum_gpu.data();
+            const uint32_t* weights = !use_mip_preview
+                && ps->sensor_weight_gpu.size() >= pix
                 ? ps->sensor_weight_gpu.data() : nullptr;
             auto normalized = [&](float value, size_t index) -> float {
                 if (!weights) return value;
@@ -17515,7 +18121,8 @@ void ray_pipeline_get_sensor_image(
             }
             if (ps->cfg.t5_profile) {
                 fprintf(stderr,
-                        "[sensor-readback] source=gpu-shadow lit=%zu/%zu exposure_p99=%.3e peaks=(%.3e %.3e %.3e) fired=%u running=%d\n",
+                        "[sensor-readback] source=%s lit=%zu/%zu exposure_p99=%.3e peaks=(%.3e %.3e %.3e) fired=%u running=%d\n",
+                        use_mip_preview ? "mip-mosaic" : "gpu-shadow",
                         dbg_lit, pix, common_peak, peak[0], peak[1], peak[2],
                         ps->bdpt_t5_fired.load(std::memory_order_acquire),
                         ps->bdpt_connection_running.load(std::memory_order_acquire) ? 1 : 0);

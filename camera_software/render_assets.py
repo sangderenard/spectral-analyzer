@@ -24,13 +24,19 @@ from .display_scene import (
     DisplayProductKind,
     DisplaySceneSpec,
 )
+from .convergence_metrics import convergence_metric
 
 
 RENDER_ASSET_SCHEMA_VERSION = 1
 INK_ATLAS_SCENE_ID = "ink-on-black-slate-atlas"
-SENSOR_DISPLAY_ORIENTATION = "native-getter-yflip-transpose-v3"
+SENSOR_DISPLAY_ORIENTATION = "native-right-up-to-display-down-right-v4"
 MIN_INK_GLYPH_EXPOSURE_COVERAGE = 0.95
 MIN_INK_GLYPH_RADIANCE_COVERAGE = 0.90
+# Live composition is intentionally opportunistic: the first finite,
+# illuminated evidence may replace a placeholder while the same asset keeps
+# refining toward the much stricter composable/converged milestones below.
+LIVE_INK_GLYPH_EXPOSURE_COVERAGE = 1.0e-4
+LIVE_INK_GLYPH_RADIANCE_COVERAGE = 1.0e-4
 INK_ATLAS_CONVERGENCE_EXPOSURE_COVERAGE = 0.99
 INK_ATLAS_CONVERGENCE_RELATIVE_RMSE = 0.01
 INK_ATLAS_CONVERGENCE_P95_DELTA = 0.02
@@ -823,7 +829,7 @@ def ink_record_is_converged(record: RenderedAssetRecord | None) -> bool:
 
 
 def ink_record_is_usable(record: RenderedAssetRecord | None) -> bool:
-    """Allow covered developing sprites while rejecting nearly-empty warmups."""
+    """Allow the first finite, nonempty developing sprite into live composition."""
 
     if record is None:
         return False
@@ -841,11 +847,11 @@ def ink_record_is_usable(record: RenderedAssetRecord | None) -> bool:
     return bool(
         metadata.get("sensor_display_orientation")
         == SENSOR_DISPLAY_ORIENTATION
-        and quality.get("composable", False)
+        and quality.get("finite", quality.get("composable", False))
         and float(quality.get("glyph_exposure_coverage", 0.0))
-        >= MIN_INK_GLYPH_EXPOSURE_COVERAGE
+        >= LIVE_INK_GLYPH_EXPOSURE_COVERAGE
         and float(quality.get("glyph_radiance_coverage", 0.0))
-        >= MIN_INK_GLYPH_RADIANCE_COVERAGE
+        >= LIVE_INK_GLYPH_RADIANCE_COVERAGE
     )
 
 
@@ -934,6 +940,8 @@ class BakeRequest:
     token_asset: ExtrudedTokenAsset | None = None
     capture: AtlasCaptureSpec | None = None
     refinement_pass: int = 0
+    convergence: float = 0.0
+    priority_need: float = 1.0
 
     @property
     def request_key(self) -> str:
@@ -960,6 +968,18 @@ class BakePlan:
         """One bounded unit the continually running renderer may take."""
 
         return self.requests[0] if self.requests else None
+
+    @property
+    def normalized_priorities(self) -> Mapping[str, float]:
+        """The exact scheduling share advertised to work-list consumers."""
+
+        total = sum(max(0.0, request.priority_need) for request in self.requests)
+        if total <= 0.0:
+            return {request.request_key: 0.0 for request in self.requests}
+        return {
+            request.request_key: max(0.0, request.priority_need) / total
+            for request in self.requests
+        }
 
 
 def plan_ink_atlas_bake(
@@ -1136,11 +1156,35 @@ def plan_ink_atlas_bake(
             for key, request in pending.items()
             if request.target_kind is BakeTargetKind.TOKEN_SEQUENCE
         }
+    scheduled: list[BakeRequest] = []
+    for request in pending.values():
+        record = catalog.find(
+            request.target_key, request.condition, request.product_kind
+        )
+        metadata = {} if record is None else dict(record.metadata)
+        quality = dict(metadata.get("atlas_quality", {}) or {})
+        convergence = convergence_metric(
+            quality,
+            completion_basis=str(metadata.get("completion_basis", "")),
+            refinement_pass=request.refinement_pass,
+        )
+        # The pass divisor is the persistent fairness term: once this asset has
+        # received a packet, an equally unresolved peer becomes more needy.
+        # The floor keeps already-good assets eligible for eventual refinement.
+        priority_need = max(0.02, 1.0 - convergence) / float(
+            1 + max(0, request.refinement_pass)
+        )
+        scheduled.append(replace(
+            request,
+            convergence=convergence,
+            priority_need=priority_need,
+        ))
     ordered = sorted(
-        pending.values(),
+        scheduled,
         key=lambda request: (
             0 if request.target_kind is BakeTargetKind.ATLAS_GLYPH else 1,
             0 if request.target_kind is BakeTargetKind.TOKEN_SEQUENCE else 1,
+            -request.priority_need,
             request.refinement_pass,
             "" if request.token_asset is None else request.token_asset.token,
             request.request_key,
@@ -1316,6 +1360,8 @@ __all__ = [
     "SENSOR_DISPLAY_ORIENTATION",
     "MIN_INK_GLYPH_EXPOSURE_COVERAGE",
     "MIN_INK_GLYPH_RADIANCE_COVERAGE",
+    "LIVE_INK_GLYPH_EXPOSURE_COVERAGE",
+    "LIVE_INK_GLYPH_RADIANCE_COVERAGE",
     "INK_ATLAS_CONVERGENCE_EXPOSURE_COVERAGE",
     "INK_ATLAS_CONVERGENCE_RELATIVE_RMSE",
     "INK_ATLAS_CONVERGENCE_P95_DELTA",

@@ -27,7 +27,7 @@
  * side from the same buffer — no second shader needed.
  *
  * ── Bindings (share T5's vertex SSBOs; add two of our own) ──────────────────
- *   0  T5LightVertBuf  light_verts[]   readonly   stride T5_LGV_STRIDE = 56
+ *   0  T5LightVertBuf  light_verts[]   readonly   stride T5_LGV_STRIDE = 57
  *   1  T5CamVertBuf    cam_verts[]     readonly   stride T5_CGV_STRIDE = 72
  *   9  BatchScoreBuf   scores[]        writeonly   4 floats per (c,b)
  * ───────────────────────────────────────────────────────────────────────────*/
@@ -35,7 +35,7 @@
 layout(local_size_x = 64) in;
 
 /* ── Strides / field offsets (mirror t5_full_connect.comp.glsl) ───────────── */
-#define T5_LGV_STRIDE   56
+#define T5_LGV_STRIDE   57
 #define T5_CGV_STRIDE   72
 #define CGV_BAND_BASE   22
 #define LGV_BAND_BASE   16

@@ -147,7 +147,7 @@ typedef struct {
     float    wavelength_or_center;  /* wavelength (m) or band center frequency (Hz) */
     float    band_pdf;              /* probability of selecting this band */
     float    sensor_rgb_weight;     /* camera sensitivity weight for display */
-    uint8_t  _pad[4];               /* padding to 32 bytes (2 × 16) */
+    uint32_t spectral_sample_id;     /* 0=fixed; otherwise shared cached LUT sample */
 #ifdef __cplusplus
 };
 #else

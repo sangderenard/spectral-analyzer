@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import hashlib
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -49,6 +49,7 @@ class RebuiltCameraArtifact:
     machined_sensor_center: np.ndarray
     machined_sensor_right: np.ndarray
     machined_sensor_up: np.ndarray
+    manifest: dict[str, Any]
     provenance: CameraOpticalProvenance
 
     @classmethod
@@ -64,6 +65,7 @@ class RebuiltCameraArtifact:
         sensor_right: Sequence[float] = (0.0, 1.0, 0.0),
         sensor_up: Sequence[float] = (0.0, 0.0, 1.0),
         diffraction_model: str = "disabled",
+        manifest: Mapping[str, Any] | None = None,
     ) -> "RebuiltCameraArtifact":
         groups = tuple(
             (
@@ -115,6 +117,7 @@ class RebuiltCameraArtifact:
             machined_sensor_center=center.copy(),
             machined_sensor_right=right.copy(),
             machined_sensor_up=up.copy(),
+            manifest=dict(manifest or {}),
             provenance=provenance,
         )
 

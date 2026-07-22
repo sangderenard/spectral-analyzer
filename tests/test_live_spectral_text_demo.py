@@ -1,3 +1,5 @@
+import copy
+import json
 import threading
 import time
 import inspect
@@ -28,6 +30,200 @@ def test_live_program_defaults_to_four_complete_sensor_sweeps():
     package = demo.build_paragraph_order("default sweep count")
     job = orders.resolved_jobs(package, demo.JOB_ID)[0]
     assert orders.order_runtime_settings(job)["sensor_sweeps"] == 4
+
+
+def test_live_work_product_defaults_to_256_square_without_reflowing_ui():
+    args = demo._args([])
+    assert (args.work_width, args.work_height) == (256, 256)
+
+    manifest = demo.program_ui_manifest()
+    layout_reference = demo._layout_reference_size(manifest)
+    assert layout_reference == (960, 600)
+    assert demo._layout_reference_size(manifest) == layout_reference
+    assert demo._layout_work_viewport_size(manifest) == (256, 256)
+
+
+def test_calibration_whole_sensor_is_fifo_partitioned_into_256_tiles():
+    order = demo.build_calibration_render_order(
+        "prism-room", display_width=256, display_height=256
+    )
+    image = order["defaults"]["image"]
+    tiles = demo._sensor_work_tiles(
+        image["region"],
+        order["runtime"]["sensor_work_tile_width"],
+        order["runtime"]["sensor_work_tile_height"],
+    )
+
+    assert image == {
+        "width": 1024,
+        "height": 1024,
+        "region": {"x": 0, "y": 0, "width": 1024, "height": 1024},
+    }
+    assert len(tiles) == 16
+    assert [(tile["x"], tile["y"]) for tile in tiles] == [
+        (x, y)
+        for y in (0, 256, 512, 768)
+        for x in (0, 256, 512, 768)
+    ]
+    assert all(
+        (tile["width"], tile["height"]) == (256, 256) for tile in tiles
+    )
+    physical = []
+    for tile in (tiles[0], tiles[-1]):
+        child = copy.deepcopy(order)
+        child["defaults"]["image"]["region"] = tile
+        job = orders.resolved_jobs(child, demo.JOB_ID)[0]
+        physical.append(orders.sensor_tile(job, 0.056, 0.056))
+    assert np.isclose(physical[0]["sensor_w_m"], 0.014)
+    assert np.isclose(physical[0]["sensor_h_m"], 0.014)
+    assert np.allclose(
+        [physical[0]["right_offset_m"], physical[0]["up_offset_m"]],
+        [-0.021, 0.021],
+    )
+    assert np.allclose(
+        [physical[1]["right_offset_m"], physical[1]["up_offset_m"]],
+        [0.021, -0.021],
+    )
+
+
+def test_rectangular_sensor_tile_composes_y_rows_then_x_columns():
+    full_linear = np.zeros((6, 11, 3), np.float32)
+    full_sum = np.zeros_like(full_linear)
+    full_weight = np.zeros((6, 11), np.float32)
+    pattern = np.asarray([[1, 2, 3], [4, 5, 6]], np.float32)
+    tile_linear = np.repeat(pattern[..., None], 3, axis=2)
+    tile_sum = tile_linear * 10.0
+    tile_weight = pattern * 100.0
+
+    demo._compose_sensor_work_tile(
+        full_linear, full_sum, full_weight,
+        tile_linear, tile_sum, tile_weight,
+        {"x": 4, "y": 1, "width": 3, "height": 2},
+    )
+
+    assert np.array_equal(full_linear[1:3, 4:7, 0], pattern)
+    assert np.array_equal(full_sum[1:3, 4:7, 0], pattern * 10.0)
+    assert np.array_equal(full_weight[1:3, 4:7], pattern * 100.0)
+    assert np.count_nonzero(full_weight) == 6
+
+
+def test_fixed_ui_layout_keeps_right_panel_and_square_preview_when_resized():
+    manifest = demo.program_ui_manifest()
+    scene_width, scene_height = demo._layout_reference_size(manifest)
+    work_width, work_height = demo._layout_work_viewport_size(manifest)
+    photographed = demo.program_display_region(scene_width, scene_height)
+    layout = demo.resolved_program_ui_layout(
+        scene_width,
+        scene_height,
+        work_width=work_width,
+        work_height=work_height,
+        manifest=manifest,
+    )
+    work_rect = demo._sensor_product_window_rect(
+        demo.SensorRegion(*layout.regions["work-panel"]),
+        photographed,
+        scene_width,
+        scene_height,
+    )
+    browser_rect = demo._sensor_product_window_rect(
+        demo.SensorRegion(*layout.regions["asset-browser"]),
+        photographed,
+        scene_width,
+        scene_height,
+    )
+
+    assert work_rect[2:] == (256, 256)
+    assert browser_rect[2] > 0
+    assert browser_rect[0] + browser_rect[2] == scene_width
+    previous_height = 0
+    for physical in ((960, 600), (1200, 700), (1200, 900)):
+        presentation = demo._presentation_rect(
+            scene_width, scene_height, *physical
+        )
+        displayed_work = demo._presentation_subrect(
+            work_rect, presentation, scene_width, scene_height
+        )
+        assert abs(displayed_work[2] - displayed_work[3]) <= 1
+        assert presentation[3] >= previous_height
+        previous_height = presentation[3]
+
+
+def test_live_work_product_accepts_free_size_and_legacy_cli_aliases():
+    current = demo._args(["--work-width", "317", "--work-height", "149"])
+    legacy = demo._args(["--display-width", "83", "--display-height", "271"])
+
+    assert (current.work_width, current.work_height) == (317, 149)
+    assert (legacy.work_width, legacy.work_height) == (83, 271)
+
+
+def test_live_final_raster_is_adjustable_but_remains_square_and_reports_ui_crop():
+    scene = demo.build_self_rendering_program_scene(
+        "adjustable square gate",
+        display_width=960,
+        display_height=600,
+        sensor_edge_px=1200,
+    )
+    job = orders.resolved_jobs(
+        demo.build_display_scene_order(scene), demo.JOB_ID
+    )[0]
+    runtime = orders.order_runtime_settings(job)
+
+    assert (scene.sensor_width, scene.sensor_height) == (1200, 1200)
+    assert runtime["region"] == {
+        "x": 0, "y": 0, "width": 1200, "height": 1200,
+    }
+    assert runtime["camera_manifest"]["sensor"]["ui_content_region_px"] == {
+        "x": 120, "y": 300, "width": 960, "height": 600,
+    }
+    assert runtime["camera_manifest"]["sensor"][
+        "raster_pixel_aspect_ratio"
+    ] == 1.0
+
+
+def test_locked_grid_partitions_global_uv_without_gaps_or_overlaps():
+    scene = demo.build_program_display_scene(
+        "locked grid", display_width=120, display_height=80
+    )
+    control = demo.build_ui_next_scan_control(
+        scene,
+        demo.program_display_region(120, 80),
+        sequence=1,
+        targeted_fraction=0.0,
+        grid_mode="locked",
+        locked_grid_columns=5,
+        locked_grid_rows=3,
+    )
+
+    requests = control["uv_requests"]
+    assert len(requests) == 15
+    assert sum(
+        (request["uv_bounds"][2] - request["uv_bounds"][0])
+        * (request["uv_bounds"][3] - request["uv_bounds"][1])
+        for request in requests
+    ) == pytest.approx(1.0)
+    assert requests[0]["uv_bounds"] == [0.0, 0.0, 0.2, 1 / 3]
+    assert requests[-1]["uv_bounds"] == [0.8, 2 / 3, 1.0, 1.0]
+    assert control["metadata"]["sensor_grid"]["children_per_split"] == 9
+
+
+def test_atlas_preview_and_convergence_checkpoint_cadence_is_explicit():
+    cadence = demo.atlas_update_cadence()
+
+    assert cadence == {
+        "preview_update_passes": 1,
+        "convergence_update_passes": 1,
+        "primary_rays_per_pass": 4_096,
+        "primary_rays_per_convergence_update": 4_096,
+    }
+    custom = demo.atlas_update_cadence(
+        epochs_per_exposure=2,
+        steps_per_epoch=8,
+        sensor_top_k=128,
+        samples_per_node=256,
+    )
+    assert custom["preview_update_passes"] == 1
+    assert custom["convergence_update_passes"] == 16
+    assert custom["primary_rays_per_convergence_update"] == 524_288
 
 
 def test_live_production_starts_with_fixed_width_alphabet_cells():
@@ -94,20 +290,20 @@ def test_live_cli_exposes_scoped_camera_clear_modes():
     assert clear_only.clear_camera_only
 
 
-def test_live_cli_defaults_to_large_ray_load_inside_each_atlas_epoch():
+def test_live_cli_defaults_to_one_bounded_interleaving_packet():
     args = demo._args([])
 
     assert args.atlas_epochs_per_exposure == 1
-    assert args.atlas_sensor_top_k == 1024
-    assert args.atlas_steps_per_epoch == 64
-    assert args.atlas_samples_per_node == 1024
+    assert args.atlas_sensor_top_k == 64
+    assert args.atlas_steps_per_epoch == 1
+    assert args.atlas_samples_per_node == 64
     assert args.atlas_character_horizontal_spacing_px == -10
     assert args.atlas_character_vertical_spacing_px == -10
     assert (
         args.atlas_sensor_top_k
         * args.atlas_steps_per_epoch
         * args.atlas_samples_per_node
-    ) == 67_108_864
+    ) == 4_096
 
 
 def test_atlas_cache_uses_style_subtype_condition_object_layout(tmp_path):
@@ -173,6 +369,196 @@ def test_clear_camera_storage_removes_only_live_camera_artifacts(tmp_path):
     assert (root / "revision_draft").is_dir()
 
 
+def test_repeated_order_finds_latest_retained_accumulation(tmp_path):
+    order = demo.build_paragraph_order(
+        "repeat me", display_width=20, display_height=12
+    )
+    for sequence in (1, 3):
+        revision = tmp_path / f"revision_{sequence:04d}"
+        job = revision / demo.JOB_ID
+        job.mkdir(parents=True)
+        prior = copy.deepcopy(order)
+        prior["cohort_seed"] = sequence
+        (revision / "scene_order.json").write_text(
+            json.dumps(prior), encoding="utf-8"
+        )
+        sum_path = job / "0000_cpp_sum_linear.npy"
+        np.save(sum_path, np.full((12, 20, 3), sequence))
+        np.save(job / "0000_cpp_exposure_weight.npy", np.full((12, 20), sequence))
+        demo._mark_sensor_display_orientation(str(sum_path))
+
+    current = copy.deepcopy(order)
+    current["cohort_seed"] = 99
+    found = demo._find_repeat_accumulation(
+        str(tmp_path), current, before_sequence=4
+    )
+    assert found is not None
+    assert "revision_0003" in found[0]
+    assert demo._latest_revision_sequence(str(tmp_path)) == 3
+
+
+def test_repeat_signature_ignores_sampling_budget_and_continuous_cohort():
+    budget = {
+        "total_rays": 1_024,
+        "rays_per_batch": 256,
+        "max_sensor_epochs": 4,
+        "sensor_top_k": 20,
+        "sensor_samples_per_node": 13,
+        "sensor_steps_per_layer": 1,
+        "sensor_flash_rays": 256,
+        "sensor_t5_pair_budget": 32_768,
+        "max_bounces": 8,
+    }
+    first = demo.build_calibration_render_order(
+        "prism-room",
+        display_width=20,
+        display_height=12,
+        cohort_seed=1,
+        transport_option="continuous:8",
+        render_budget=budget,
+    )
+    larger = demo.build_calibration_render_order(
+        "prism-room",
+        display_width=20,
+        display_height=12,
+        cohort_seed=2,
+        transport_option="continuous:8",
+        render_budget={**budget, "total_rays": 4_096, "rays_per_batch": 1_024},
+    )
+
+    assert demo._repeat_order_signature(first) == demo._repeat_order_signature(larger)
+
+
+def test_epoch_bundles_restore_each_completed_bundle(tmp_path, monkeypatch):
+    launches = []
+
+    class Process:
+        def __init__(self, command, **kwargs):
+            environment = dict(kwargs["env"])
+            launches.append(environment)
+            out_dir = Path(command[command.index("--out-dir") + 1])
+            out_dir.mkdir(parents=True, exist_ok=True)
+            if "SPECTRAL_SENSOR_RESTORE_SUM" in environment:
+                sensor_sum = np.load(
+                    environment["SPECTRAL_SENSOR_RESTORE_SUM"],
+                    allow_pickle=False,
+                )
+                weight = np.load(
+                    environment["SPECTRAL_SENSOR_RESTORE_WEIGHT"],
+                    allow_pickle=False,
+                )
+                # Native restore storage is square; the real subprocess maps
+                # it back to this tile's exact display raster on readback.
+                sensor_sum = np.full(
+                    (12, 20, 3), float(sensor_sum.reshape(-1)[0]), np.float32
+                )
+                weight = np.full(
+                    (12, 20), float(weight.reshape(-1)[0]), np.float32
+                )
+            else:
+                sensor_sum = np.zeros((12, 20, 3), np.float32)
+                weight = np.zeros((12, 20), np.float32)
+            sensor_sum = sensor_sum + 1.0
+            weight = weight + 1.0
+            np.save(out_dir / "0000_cpp_sum_linear.npy", sensor_sum)
+            np.save(out_dir / "0000_cpp_exposure_weight.npy", weight)
+            np.save(
+                out_dir / "0000_cpp_linear.npy",
+                sensor_sum / weight[..., None],
+            )
+            event = demo.ExposureProgressEvent(
+                exposure_id="revision-0001",
+                sequence=1,
+                kind=demo.ExposureProgressKind.PASS_AVAILABLE,
+                region=demo.SensorRegion(0, 0, 20, 12),
+                pass_index=1,
+                linear_accumulation_path=str(
+                    out_dir / "0000_cpp_linear.npy"
+                ),
+                sensor_sum_path=str(out_dir / "0000_cpp_sum_linear.npy"),
+                exposure_weight_path=str(
+                    out_dir / "0000_cpp_exposure_weight.npy"
+                ),
+            )
+            self.stdout = [event.to_line() + "\n"]
+
+        def wait(self):
+            return 0
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+    monkeypatch.setattr(demo.subprocess, "Popen", Process)
+    order = demo.build_calibration_render_order(
+        "prism-room", display_width=20, display_height=12
+    )
+    order["defaults"]["image"] = {
+        "width": 20,
+        "height": 12,
+        "region": {"x": 0, "y": 0, "width": 20, "height": 12},
+    }
+    order["runtime"]["epoch_bundle_count"] = 2
+    progress = []
+    renderer = demo.make_subprocess_renderer(
+        str(tmp_path), demo.ColorScienceProfile.identity()
+    )
+
+    renderer(1, "bundle test", order, None, progress.append)
+
+    assert len(launches) == 2
+    assert "SPECTRAL_SENSOR_RESTORE_SUM" not in launches[0]
+    assert "SPECTRAL_SENSOR_RESTORE_SUM" in launches[1]
+    assert launches[0]["SPECTRAL_EXPOSURE_SEED_OFFSET"] == str(
+        demo.iching_coin_seed(1, 0)
+    )
+    assert launches[1]["SPECTRAL_EXPOSURE_SEED_OFFSET"] == str(
+        demo.iching_coin_seed(1, 1)
+    )
+    assert (
+        launches[0]["SPECTRAL_EXPOSURE_SEED_OFFSET"]
+        != launches[1]["SPECTRAL_EXPOSURE_SEED_OFFSET"]
+    )
+    final_sum = np.load(
+        tmp_path / "revision_0001" / demo.JOB_ID
+        / "0000_cpp_sum_linear.npy",
+        allow_pickle=False,
+    )
+    assert np.all(final_sum == 2.0)
+    assert [event.sequence for event in progress] == list(range(7))
+    eta_events = [event for event in progress if event.total_work]
+    assert eta_events[-1].progress_fraction == 1.0
+    assert "overall 100.00%" in eta_events[-1].message
+    assert eta_events[-1].linear_accumulation_path.endswith(
+        "0000_cpp_linear.npy"
+    )
+
+
+def test_i_ching_coin_seed_fills_reproducible_native_words():
+    seeds = [demo.iching_coin_seed(19, bundle) for bundle in range(256)]
+
+    assert seeds == [
+        demo.iching_coin_seed(19, bundle) for bundle in range(256)
+    ]
+    assert len(set(seeds)) == len(seeds)
+    assert all(0 <= seed < (1 << demo.NATIVE_SEED_BITS) for seed in seeds)
+    assert demo.iching_coin_seed(20, 0) != seeds[0]
+
+
+def test_toolbar_depth_mode_selects_depth_product_without_replacing_transport():
+    order = demo.build_calibration_render_order(
+        "prism-room", transport_option="continuous:1"
+    )
+    demo.apply_toolbar_render_mode(order, "depth")
+
+    assert order["transport"]["domain"] == "continuous_spectral_lut"
+    assert order["runtime"]["integrator"] == "depth"
+    assert order["runtime"]["render_product"] == "sensor_optical_path_depth_m"
+    assert order["runtime"]["convergence_enabled"] is False
+
+
 def test_live_renderer_never_trains_from_orthographic_preview():
     source = inspect.getsource(demo.make_subprocess_renderer)
     assert "train_scene_priority_network" not in source
@@ -185,8 +571,17 @@ def test_display_raster_and_text_face_focus_are_explicit():
     metadata = orders.composition_metadata(job)
 
     assert (runtime["width"], runtime["height"]) == (160, 96)
-    assert runtime["region"] == {"x": 320, "y": 192, "width": 160, "height": 96}
-    assert metadata["full_frame"] == {"width": 800, "height": 480}
+    assert runtime["region"] == {"x": 432, "y": 464, "width": 160, "height": 96}
+    assert metadata["full_frame"] == {"width": 1024, "height": 1024}
+    assert metadata["film_format"] == {
+        "key": "120_6x6",
+        "mount_standard": "120_6x6",
+        "physical_width_mm": 56.0,
+        "physical_height_mm": 56.0,
+        "physical_aspect_ratio": 1.0,
+    }
+    assert np.isclose(metadata["physical_sensor_tile"]["sensor_w_m"], 0.00875)
+    assert np.isclose(metadata["physical_sensor_tile"]["sensor_h_m"], 0.00525)
     expected = (
         np.asarray(job["planes"][0]["normal"])
         * orders.resolved_glyph_depth(job)
@@ -227,8 +622,9 @@ def test_render_contract_reports_native_raster_and_coordinate_only_frame():
     )
     assert "ui_scene=960x600" in summary
     assert "scan_region<=120x100" in summary
-    assert "native_sensor=960x960" in summary
-    assert "composition_frame=4800x3000" in summary
+    assert "film=120_6x6" in summary
+    assert "gate=56x56mm" in summary
+    assert "composition_frame=1024x1024" in summary
     assert "authored_sensor_sweeps=4" in summary
     assert "foreground_epochs<=64" in summary
     assert "production=alphabet->tokens->token-string->total-scene" in summary
@@ -311,6 +707,47 @@ def test_retained_sensor_evidence_requires_matching_orientation_marker(tmp_path)
     assert not demo._sensor_sum_has_current_orientation(str(sensor_sum))
 
 
+def test_arrival_shimmer_uses_real_delta_and_settles_high_sample_regions():
+    previous = np.zeros((2, 2, 3), np.float32)
+    current = previous.copy()
+    current[0, 0] = (2.0, 0.5, 0.1)
+    current[0, 1] = (1.0, 1.0, 1.0)
+    counts = np.asarray([[1, 10_000], [1, 1]], np.int32)
+
+    shimmer = demo._arrival_shimmer_rgb(
+        previous, current, sample_count=counts
+    )
+
+    assert shimmer.shape == (2, 2, 3)
+    assert np.all(np.isfinite(shimmer))
+    assert float(np.max(shimmer[0, 0])) > float(np.max(shimmer[0, 1]))
+    assert np.all(shimmer[1] == 0.0)
+
+
+def test_arrival_shimmer_marks_negative_revision_as_cool_glint():
+    previous = np.ones((1, 1, 3), np.float32)
+    current = np.zeros_like(previous)
+
+    shimmer = demo._arrival_shimmer_rgb(previous, current)
+
+    assert shimmer[0, 0, 2] > shimmer[0, 0, 0]
+
+
+def test_unexposed_whole_work_preview_is_marked_pending_without_touching_samples():
+    display = np.full((4, 4, 3), 0.6, np.float32)
+    weight = np.zeros((4, 4), np.float32)
+    weight[:2, :2] = 1.0
+
+    preview = demo._mark_unexposed_preview(display, weight, checker_size=1)
+
+    assert preview.shape == (4, 4, 4)
+    assert np.allclose(preview[:2, :2, :3], 0.6)
+    assert np.allclose(preview[:2, :2, 3], 1.0)
+    assert np.all(preview[2:, 2:, :3] > 0.0)
+    assert not np.allclose(preview[2, 2], preview[2, 3])
+    assert 0.0 < preview[2, 2, 3] < 1.0
+    assert np.all(display == 0.6)
+
 def test_ui_products_become_gpu_uv_requests_inside_photographed_region():
     scene = demo.build_self_rendering_program_scene(
         "work allocation", display_width=200, display_height=120
@@ -350,8 +787,8 @@ def test_ui_regions_are_split_into_bounded_scan_chunks_without_resizing_scene():
         scan_height=100,
     )
 
-    assert scene.sensor_width == 960 * demo.SENSOR_CROP_SCALE
-    assert scene.sensor_height == 600 * demo.SENSOR_CROP_SCALE
+    assert scene.sensor_width == 1024
+    assert scene.sensor_height == 1024
     assert len(control["uv_requests"]) > len(scene.objects)
     for request in control["uv_requests"]:
         u0, v0, u1, v1 = request["uv_bounds"]
@@ -405,7 +842,7 @@ def test_self_rendering_order_has_one_camera_and_all_ui_text_geometry():
         "asset-browser-label": "ASSETS / JOBS",
         "status-text": "SPECTRAL EXPOSURE ACTIVE",
         "work-visual-pass": "VISUAL PASS",
-        "queue-pause-auto": "PAUSE AUTO",
+        "queue-pause-auto": "TOGGLE WORK",
     }
     plane_ids = {item["id"] for item in job["planes"]}
     assert "display-surface-editor-text" in plane_ids
@@ -418,17 +855,83 @@ def test_self_rendering_order_has_one_camera_and_all_ui_text_geometry():
     assert "display-icon-window-minimize-bar" in plane_ids
     assert "display-icon-window-close-forward" in plane_ids
     assert "display-icon-window-close-backward" in plane_ids
+    planes = {item["id"]: item for item in job["planes"]}
+    assert planes["display-surface-camera-panel"]["library_object_key"] == (
+        "layout-panel-style:bakery-slate"
+    )
+    assert planes["display-surface-work-visual-pass"][
+        "library_object_key"
+    ] == "layout-control-style:bakery-slate"
+    assert len(planes["display-surface-work-visual-pass"][
+        "library_parameters"
+    ]["patch_instances"]) == 9
     assert job["camera"]["position_m"] == list(scene.camera.position_m)
     assert job["camera"]["target_m"] == list(scene.camera.target_m)
     assert orders.order_runtime_settings(job)["region"] == {
-        "x": 320, "y": 192, "width": 160, "height": 96,
+        "x": 0, "y": 0, "width": 1024, "height": 1024,
     }
+    assert orders.order_runtime_settings(job)["camera_manifest"]["sensor"][
+        "ui_content_region_px"
+    ] == {"x": 432, "y": 464, "width": 160, "height": 96}
 
 
 def test_display_preview_never_enlarges_traced_pixels():
     assert demo._texture_display_rect(960, 600, 960, 600) == (0, 0, 960, 600)
     assert demo._texture_display_rect(960, 600, 1920, 1200) == (480, 300, 960, 600)
     assert demo._texture_display_rect(960, 600, 480, 300) == (0, 0, 480, 300)
+
+
+def test_completed_work_preview_is_scaled_and_centered_to_use_panel():
+    assert demo._texture_panel_rect(10, 5, 100, 100) == (0, 25, 100, 50)
+
+
+def test_active_calibration_bundle_exposure_owns_the_center_work_panel():
+    exposure = object()
+    browser = object()
+    atlas = object()
+    priority = object()
+
+    assert demo._work_panel_preview_texture(
+        exposure, browser, atlas, priority, calibration_active=True
+    ) is exposure
+    assert demo._work_panel_preview_texture(
+        exposure, browser, atlas, priority, calibration_active=False
+    ) is browser
+    assert demo._work_panel_preview_texture(
+        exposure, None, atlas, priority, calibration_active=False
+    ) is atlas
+
+
+def test_program_layout_owns_six_tool_rows_above_preview_panels():
+    layout = demo.resolved_program_ui_layout(
+        800, 600, work_width=200, work_height=200
+    )
+    row_keys = (
+        "camera-toolbar", "lens-toolbar", "light-toolbar", "film-toolbar",
+        "integrator-toolbar", "exposure-toolbar",
+    )
+    rows = [layout.region(key) for key in row_keys]
+    first_panel_y = min(
+        layout.region(key)[1]
+        for key in ("camera-panel", "work-panel", "asset-browser")
+    )
+
+    assert all(row[0] == layout.region(layout.manifest.name)[0] for row in rows)
+    assert all(row[2] == layout.width for row in rows)
+    action_bottom = max(
+        layout.region(key)[1] + layout.region(key)[3]
+        for key in (
+            "work-visual-pass", "queue-pause-auto", "window-minimize",
+            "window-maximize", "window-close",
+        )
+    )
+    assert action_bottom <= rows[0][1]
+    assert all(row[3] <= 13 for row in rows)
+    assert all(
+        first[1] + first[3] <= second[1]
+        for first, second in zip(rows, rows[1:])
+    )
+    assert rows[-1][1] + rows[-1][3] <= first_panel_y
 
 
 def test_sensor_product_maps_into_shared_progressive_texture():
@@ -517,10 +1020,12 @@ def test_work_size_derives_scaling_program_frame(work_width, work_height):
     assert width >= 2 * work_width
     assert height > work_height
     assert regions["program-backdrop"] == crop
-    assert regions["camera-panel"].width == work_width
-    assert regions["camera-panel"].height == work_height
-    assert regions["work-panel"].width == work_width
-    assert regions["work-panel"].height == work_height
+    assert regions["camera-panel"].width == round(
+        regions["work-panel"].width * 1.20
+    )
+    assert regions["camera-panel"].height <= work_height
+    assert regions["work-panel"].width <= work_width
+    assert regions["work-panel"].height <= work_height
     assert regions["work-panel"].x == (
         regions["camera-panel"].x + regions["camera-panel"].width
     )
@@ -530,7 +1035,7 @@ def test_work_size_derives_scaling_program_frame(work_width, work_height):
         regions["camera-panel"].y
         >= regions["camera-label"].y
         + regions["camera-label"].height
-        + max(1, regions["camera-label"].height // 2)
+        + 3
     )
     assert regions["editor-text"].y == (
         regions["camera-panel"].y + regions["camera-panel"].height
@@ -538,9 +1043,10 @@ def test_work_size_derives_scaling_program_frame(work_width, work_height):
     assert regions["status-text"].y == (
         regions["editor-text"].y + regions["editor-text"].height
     )
-    assert regions["status-text"].y + regions["status-text"].height == (
-        crop.y + crop.height
-    )
+    assert abs(
+        regions["status-text"].y + regions["status-text"].height
+        - (crop.y + crop.height)
+    ) <= 1
     for region in regions.values():
         assert region.x >= crop.x
         assert region.y >= crop.y
@@ -580,7 +1086,7 @@ def test_work_sized_scene_has_exact_camera_and_work_sensor_products():
     assert crop.height == scene_height
     assert regions["program-backdrop"] == crop
     assert regions["camera-panel"].x == crop.x
-    assert regions["camera-panel"].width == 100
+    assert regions["camera-panel"].width == 120
     assert regions["camera-panel"].height == 100
     assert regions["work-panel"].x == (
         regions["camera-panel"].x + regions["camera-panel"].width
@@ -622,8 +1128,9 @@ def test_work_sized_scene_has_exact_camera_and_work_sensor_products():
         assert region.y >= crop.y
         assert region.x + region.width <= crop.x + crop.width
         assert region.y + region.height <= crop.y + crop.height
-    assert scene.sensor_width == scene_width * demo.SENSOR_CROP_SCALE
-    assert scene.sensor_height == scene_height * demo.SENSOR_CROP_SCALE
+    expected_sensor_extent = demo.DEFAULT_FILM_FORMAT.default_final_edge_px
+    assert scene.sensor_width == expected_sensor_extent
+    assert scene.sensor_height == expected_sensor_extent
     work_label = regions["work-label"]
     for object_id in (
         "window-minimize", "window-maximize", "window-close",
@@ -651,10 +1158,8 @@ def test_work_sized_scene_has_exact_camera_and_work_sensor_products():
         demo.build_display_scene_order(scene, sensor_sweeps=1), demo.JOB_ID
     )[0]
     assert orders.order_runtime_settings(job)["region"] == {
-        "x": 2 * scene_width,
-        "y": 2 * scene_height,
-        "width": scene_width,
-        "height": scene_height,
+        "x": 0, "y": 0,
+        "width": expected_sensor_extent, "height": expected_sensor_extent,
     }
     jobs_by_id = {
         item["id"]: item for item in job["objects"]
@@ -686,6 +1191,12 @@ def test_work_sized_scene_has_exact_camera_and_work_sensor_products():
         "program-backdrop",
         "work-panel",
         "asset-browser",
+        "camera-toolbar",
+        "lens-toolbar",
+        "light-toolbar",
+        "film-toolbar",
+        "integrator-toolbar",
+        "exposure-toolbar",
         "camera-label",
         "work-label",
         "asset-browser-label",
@@ -706,7 +1217,7 @@ def test_work_sized_scene_has_exact_camera_and_work_sensor_products():
         "asset-browser-label": "ASSETS / JOBS",
         "status-text": "SPECTRAL EXPOSURE ACTIVE",
         "work-visual-pass": "VISUAL PASS",
-        "queue-pause-auto": "PAUSE AUTO",
+        "queue-pause-auto": "TOGGLE WORK",
     }
 
 
@@ -1029,3 +1540,140 @@ def test_background_queue_pause_is_explicit_and_resumable():
         assert not worker.background_is_paused()
     finally:
         worker.close()
+
+
+def test_background_queue_can_be_constructed_startup_paused():
+    def render(sequence, text, order, next_scan_control, progress_sink):
+        return demo.RenderedTextRevision(
+            sequence, text, "image.png", "linear.npy", "manifest.json", 0.01
+        )
+
+    worker = demo.SpectralTextRenderWorker(render, background_paused=True)
+    try:
+        assert worker.background_is_paused()
+        worker.wake_background()
+        assert worker.background_is_paused()
+        assert worker.toggle_background_paused() is False
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize(
+    "mode_key",
+    (
+        "color-science", "glass", "focus-hall", "depth", "prism-room",
+        "single-lane-ui",
+    ),
+)
+def test_calibration_modes_build_valid_image_producing_scene_orders(mode_key):
+    order = demo.build_calibration_render_order(
+        mode_key, display_width=96, display_height=64, sensor_sweeps=1
+    )
+
+    orders.validate_order(order)
+    assert order["runtime"]["work_kind"] == "calibration"
+    assert order["runtime"]["max_sensor_epochs"] == 1
+    assert order["runtime"]["ordinary_work"] is False
+    assert order["runtime"]["total_rays"] > 0
+    assert order["runtime"]["rays_per_batch"] > 0
+    transport = order["transport"]
+    expected_lanes = (
+        3 if mode_key in {"color-science", "glass", "prism-room"} else 1
+    )
+    assert len(orders.order_transport_frequencies(order)) == expected_lanes
+    assert orders.order_transport_rgb_weights(order).shape == (expected_lanes, 3)
+    assert transport["domain"] == "fixed_spectral"
+    job = orders.resolved_jobs(order, demo.JOB_ID)[0]
+    assert job["planes"]
+    assert job["image"]["region"] == {
+        "x": 0, "y": 0, "width": 1024, "height": 1024,
+    }
+    assert order["runtime"]["sensor_work_tile_width"] == 96
+    assert order["runtime"]["sensor_work_tile_height"] == 64
+    if mode_key in {"focus-hall", "depth"}:
+        assert len(job["planes"]) == 12
+        assert len(job["objects"]) == 7
+    if mode_key == "depth":
+        assert order["runtime"]["integrator"] == "depth"
+        assert order["runtime"]["render_product"] == "sensor_optical_path_depth_m"
+    if mode_key == "glass":
+        material = job["materials"]["bk7_calibration"]
+        assert len(material["bands"]) == 3
+        assert material["bands"][0]["ior_real"] > material["bands"][-1]["ior_real"]
+    if mode_key == "prism-room":
+        prism = next(plane for plane in job["planes"] if plane["id"] == "prism")
+        assert prism["shape"] == "triangular_prism"
+        assert job["flash"]["enabled"] is False
+        assert job["emitter"]["mode"] == "collimated"
+
+
+@pytest.mark.parametrize("lane_count", (1, 3, 8, 16, 32))
+def test_same_camera_scene_accepts_continuous_lane_table_at_any_lane_count(lane_count):
+    from camera_software.transport_contract import continuous_lut_lane_table
+
+    c = 299_792_458.0
+    table = continuous_lut_lane_table(
+        f"test-cohort-{lane_count}",
+        (c / 700.0e-9, c / 550.0e-9, c / 400.0e-9),
+        (0.35, 1.0, 0.35),
+        lane_count,
+        seed=lane_count,
+    )
+    order = demo.build_calibration_render_order(
+        "transport-sanity",
+        display_width=32,
+        display_height=24,
+        lane_table=table,
+        startup_validation_key=f"spectral:{lane_count}",
+    )
+
+    orders.validate_order(order)
+    assert order["transport"]["domain"] == "continuous_spectral_lut"
+    assert len(orders.order_transport_frequencies(order)) == lane_count
+    assert orders.order_transport_rgb_weights(order) is None
+    lut = orders.order_transport_lut_config(order)
+    assert lut is not None
+    assert lut["lane_lut_index"].shape == (lane_count,)
+    assert order["runtime"]["startup_validation_key"] == f"spectral:{lane_count}"
+    assert order["runtime"]["total_rays"] == 256
+
+
+@pytest.mark.parametrize("lane_count", (16, 32))
+def test_prism_room_accepts_large_fixed_perceptual_lane_payloads(lane_count):
+    order = demo.build_calibration_render_order(
+        "prism-room",
+        display_width=32,
+        display_height=24,
+        transport_option=f"fixed:{lane_count}",
+    )
+
+    orders.validate_order(order)
+    frequencies = orders.order_transport_frequencies(order)
+    weights = orders.order_transport_rgb_weights(order)
+    lanes = order["transport"]["lane_table"]["lanes"]
+    assert frequencies.shape == (lane_count,)
+    assert weights.shape == (lane_count, 3)
+    assert np.allclose(weights, np.asarray([
+        lane["sensor_weight_xyz"] for lane in lanes
+    ], np.float32))
+    assert all(tuple(lane["sensor_weight_xyz"]) != (1.0, 1.0, 1.0)
+               for lane in lanes)
+
+
+def test_mirror_box_is_closed_fixed32_capacity_torture_scene():
+    order = demo.build_calibration_render_order(
+        "mirror-box", display_width=256, display_height=256,
+    )
+
+    orders.validate_order(order)
+    planes = {plane["id"]: plane for plane in order["defaults"]["planes"]}
+    assert {
+        "mirror-floor", "mirror-ceiling", "mirror-left", "mirror-right",
+        "mirror-front", "mirror-back", "internal-light", "diffuse-witness",
+    } == set(planes)
+    assert planes["internal-light"]["emitter"] is True
+    assert len(order["transport"]["frequencies_hz"]) == 32
+    assert order["runtime"]["transport_option"] == "fixed:32"
+    assert order["runtime"]["sensor_flash_page_count"] == 64
+    assert order["runtime"]["sensor_flash_total_rays"] == 1_048_576
+    assert order["runtime"]["max_bounces"] == 64

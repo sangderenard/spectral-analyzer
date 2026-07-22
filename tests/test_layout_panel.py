@@ -6,6 +6,7 @@ from camera_software import (
     PanelPatchFill,
     PanelPatchRole,
     compose_layout_panel_rgba,
+    layout_panel_composition_trace,
     layout_panel_primitive_from_mapping,
 )
 
@@ -40,6 +41,23 @@ def test_nine_slice_places_four_corners_four_sides_and_center():
     assert tuple(image[15, 0]) == colors[PanelPatchRole.BOTTOM_LEFT]
     assert tuple(image[15, 5]) == colors[PanelPatchRole.BOTTOM]
     assert tuple(image[15, 19]) == colors[PanelPatchRole.BOTTOM_RIGHT]
+
+
+def test_rasterizer_exposes_the_exact_patch_geometry_used_by_scene_work():
+    primitive = _colored_primitive()
+    trace = layout_panel_composition_trace(primitive, 20, 16)
+
+    assert trace.effective_border_px == (3, 2, 4, 5)
+    assert len(trace.patches) == 9
+    assert next(
+        item.target_rect_px for item in trace.patches
+        if item.role is PanelPatchRole.CENTER
+    ) == (3, 2, 13, 9)
+    assert all(
+        item.mapping()["uv_transform"]
+        == "repeat_square_tiles_clip_partial_terminal_tile"
+        for item in trace.patches
+    )
 
 
 def test_panel_contract_supports_independent_render_object_patch_assets():

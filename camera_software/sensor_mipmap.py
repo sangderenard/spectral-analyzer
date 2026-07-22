@@ -39,18 +39,28 @@ class SensorUvBounds:
         v_ok = self.v0 <= v < self.v1 or (self.v1 == 1.0 and v == 1.0)
         return bool(u_ok and v_ok)
 
-    def subdivide_3x3(self) -> tuple["SensorUvBounds", ...]:
-        du = (self.u1 - self.u0) / 3.0
-        dv = (self.v1 - self.v0) / 3.0
+    def subdivide(self, axis: int = 3) -> tuple["SensorUvBounds", ...]:
+        """Partition this node into an exact n×n UV lattice."""
+
+        n = int(axis)
+        if n not in {2, 3}:
+            raise ValueError("sensor subdivision axis must be 2 or 3")
+        du = (self.u1 - self.u0) / n
+        dv = (self.v1 - self.v0) / n
         children = []
-        for row in range(3):
-            for column in range(3):
+        for row in range(n):
+            for column in range(n):
                 u0 = self.u0 + column * du
                 v0 = self.v0 + row * dv
-                u1 = self.u1 if column == 2 else self.u0 + (column + 1) * du
-                v1 = self.v1 if row == 2 else self.v0 + (row + 1) * dv
+                u1 = self.u1 if column == n - 1 else self.u0 + (column + 1) * du
+                v1 = self.v1 if row == n - 1 else self.v0 + (row + 1) * dv
                 children.append(SensorUvBounds(u0, v0, u1, v1))
         return tuple(children)
+
+    def subdivide_3x3(self) -> tuple["SensorUvBounds", ...]:
+        """Compatibility spelling for the traditional nine-child mode."""
+
+        return self.subdivide(3)
 
 
 @dataclass
@@ -130,13 +140,18 @@ class SensorMipNode:
 
 
 class SparseSensorMipmap:
-    """Executable reference for the GPU sparse 9-way sensor hierarchy."""
+    """Executable reference for the GPU sparse n-tree sensor hierarchy."""
 
-    def __init__(self, n_bands: int, *, maximum_depth: int) -> None:
+    def __init__(
+        self, n_bands: int, *, maximum_depth: int, subdivision_axis: int = 3
+    ) -> None:
         if maximum_depth < 0:
             raise ValueError("maximum_depth must be non-negative")
         self.n_bands = int(n_bands)
         self.maximum_depth = int(maximum_depth)
+        self.subdivision_axis = int(subdivision_axis)
+        if self.subdivision_axis not in {2, 3}:
+            raise ValueError("subdivision_axis must be 2 or 3")
         self.nodes: dict[int, SensorMipNode] = {}
         self.samples: list[SensorMipSample] = []
         self._next_node_id = 0
@@ -162,7 +177,7 @@ class SparseSensorMipmap:
         return node_id
 
     def complete_work(self, node_id: int, *, subdivide: bool = False) -> tuple[int, ...]:
-        """Complete one node epoch and optionally materialize its 3x3 children."""
+        """Complete one node epoch and optionally materialize its n×n children."""
         node = self.nodes[node_id]
         node.completed_epochs += 1
         if not subdivide or node.level >= self.maximum_depth:
@@ -171,7 +186,9 @@ class SparseSensorMipmap:
             return node.children
         node.children = tuple(
             self._allocate(node_id, slot, node.level + 1, bounds)
-            for slot, bounds in enumerate(node.bounds.subdivide_3x3())
+            for slot, bounds in enumerate(
+                node.bounds.subdivide(self.subdivision_axis)
+            )
         )
         return node.children
 
@@ -255,7 +272,9 @@ class SparseSensorMipmap:
         while parent_id is not None:
             parent = self.nodes[parent_id]
             estimates = [self.resolved_estimate(child_id) for child_id in parent.children]
-            if len(estimates) == 9 and all(estimate.valid for estimate in estimates):
+            expected_children = self.subdivision_axis * self.subdivision_axis
+            if (len(estimates) == expected_children
+                    and all(estimate.valid for estimate in estimates)):
                 areas = np.asarray([
                     self.nodes[child_id].bounds.area / parent.bounds.area
                     for child_id in parent.children
@@ -270,3 +289,35 @@ class SparseSensorMipmap:
             else:
                 parent.rolled = None
             parent_id = parent.parent_id
+
+    def reconstruct_preview(self, width: int, height: int) -> np.ndarray:
+        """Resolve an ancestor-fallback mosaic without changing accumulation.
+
+        A materialized child replaces only its own UV rectangle when it has
+        evidence.  Otherwise the pixel retains the nearest valid ancestor.
+        This mirrors the GPU presentation shader and is intentionally a view,
+        not another sampling or rollup operation.
+        """
+        width, height = int(width), int(height)
+        if width <= 0 or height <= 0:
+            raise ValueError("preview dimensions must be positive")
+        image = np.zeros((height, width, self.n_bands), dtype=np.float64)
+        for y in range(height):
+            v = (y + 0.5) / height
+            for x in range(width):
+                u = (x + 0.5) / width
+                node = self.nodes[self.root_id]
+                inherited = np.zeros(self.n_bands, dtype=np.float64)
+                while True:
+                    estimate = self.resolved_estimate(node.node_id)
+                    if estimate.valid:
+                        inherited = estimate.mean
+                    if not node.children:
+                        break
+                    node = next(
+                        self.nodes[child_id]
+                        for child_id in node.children
+                        if self.nodes[child_id].bounds.contains(u, v)
+                    )
+                image[y, x] = inherited
+        return image

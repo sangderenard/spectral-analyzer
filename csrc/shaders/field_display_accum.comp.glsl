@@ -33,8 +33,8 @@ void add_voxel(int x, int y, int z, float w, int row) {
     int n_cells = nx * ny * nz;
     int bands = min(n_bands, MAX_BANDS);
     for (int b = 0; b < bands; ++b) {
-        float re = hit[row + 26 + b] * w;
-        float im = hit[row + 26 + MAX_BANDS + b] * w;
+        float re = hit[row + 28 + b] * w;
+        float im = hit[row + 28 + MAX_BANDS + b] * w;
         int ire = int(clamp(round(re * fixed_scale), -2147480000.0, 2147480000.0));
         int iim = int(clamp(round(im * fixed_scale), -2147480000.0, 2147480000.0));
         int base = 2 * (b * n_cells + cell);

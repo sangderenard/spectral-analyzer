@@ -130,6 +130,7 @@ struct T5ConnContext {
     /* ── LUT references (non-owning; lifetime == enclosing function scope) */
     const std::unordered_map<uint64_t, std::complex<float>>&
         beta_lut;
+    const std::unordered_map<uint64_t, uint32_t>& spectral_sample_lut;
     const std::unordered_map<uint64_t, std::vector<BdptPdfRecord>>&
         pdf_lut;
     const std::unordered_map<uint64_t, std::vector<BdptOpticalEventRecord>>&
@@ -160,6 +161,7 @@ struct T5ConnContext {
     /* ── Constructor ──────────────────────────────────────────────────── */
     T5ConnContext(
         const std::unordered_map<uint64_t, std::complex<float>>&              bl,
+        const std::unordered_map<uint64_t, uint32_t>&                         sl,
         const std::unordered_map<uint64_t, std::vector<BdptPdfRecord>>&       pl,
         const std::unordered_map<uint64_t, std::vector<BdptOpticalEventRecord>>& ol,
         RayPipelineState*      pipeline_state,
@@ -170,12 +172,27 @@ struct T5ConnContext {
         float  min_geom,
         const Eigen::VectorXd& fhz,
         std::mutex&            mu)
-        : beta_lut(bl), pdf_lut(pl), optical_lut(ol)
+        : beta_lut(bl), spectral_sample_lut(sl), pdf_lut(pl), optical_lut(ol)
         , ps(pipeline_state)
         , n_bands(nb), res(r), inv_w(iw), inv_h(ih), t5_min_geom(min_geom)
         , t5_freq_hz(fhz)
         , conn_mu(mu)
     {}
+
+    uint32_t spectral_sample_for(const BdptVertexRecord& v) const
+    {
+        const uint64_t k = ((uint64_t)v.subpath_id << 32) | v.vertex_index;
+        auto it = spectral_sample_lut.find(k);
+        return it == spectral_sample_lut.end() ? 0u : it->second;
+    }
+
+    bool spectral_samples_compatible(
+        const BdptVertexRecord& camera, const BdptVertexRecord& light) const
+    {
+        const uint32_t c = spectral_sample_for(camera);
+        const uint32_t l = spectral_sample_for(light);
+        return (c == 0u && l == 0u) || (c != 0u && c == l);
+    }
 
     /* ─── LUT queries ─────────────────────────────────────────────────── */
 
@@ -600,6 +617,7 @@ struct T5ConnContext {
         const BdptVertexRecord& l = *light.v[li];
         if (!vertex_connectable(l))  return;
         if (!light.prefix_valid[li]) return;
+        if (!spectral_samples_compatible(c, l)) return;
 
         const float dx    = l.pos[0] - c.pos[0];
         const float dy    = l.pos[1] - c.pos[1];

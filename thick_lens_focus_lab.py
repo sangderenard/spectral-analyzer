@@ -983,6 +983,8 @@ class LensConfig:
     radius_back: float
     ior: float
     glass: str = "N-BK7"  # Sellmeier catalog key for measured dispersion (B.3b)
+    conic_front: float = 0.0
+    conic_back: float = 0.0
 
     @property
     def x_front(self) -> float:
@@ -1681,6 +1683,9 @@ class SceneConfig:
     ring_light_thickness_m: float = 0.006  # axial housing depth behind the emissive face
     ring_light_emission: float = 200.0     # emission scale (relative to source material)
     ring_light_n_sectors: int = 72         # angular tessellation segments
+    diagnostic_pentaprism_enabled: bool = False
+    diagnostic_pentaprism_size_m: float = 0.012
+    diagnostic_pickoff_reflectance: float = 0.30
     flash_modifier: FlashModifierConfig = field(default_factory=FlashModifierConfig)
     camera_light_burst: CameraLightBurstConfig = field(default_factory=CameraLightBurstConfig)
     # Exit pupil / field stop aperture between last lens and sensor. When enabled
@@ -1691,6 +1696,7 @@ class SceneConfig:
     exit_pupil_thickness: float = 0.0003  # 0.3 mm — blade aperture
     lens_hood_front_radius: float = 0.115  # legacy override; ignored when camera_barrel_r is set
     camera_barrel_r: float = 0.0           # outer barrel radius (m); auto-set from lens design
+    lens_hood_min_half_field_deg: float = 0.0  # explicit specialty-lens scene-side field
     focus_distance_m: float = 0.0          # object focus distance override (m); 0 = use design default
     # Optional supplementary macro lens (close focus helper): inserted at the front
     # to extend working distance and achieve extreme magnification.
@@ -1721,12 +1727,21 @@ class SceneConfig:
 
 
 def _scene_lenses(scene: SceneConfig) -> List[LensConfig]:
+    import dataclasses as _dc
+
     design = getattr(scene, "optical_design", None)
+    if (
+        design is not None
+        and getattr(scene, "_exact_fixed_back_design_id", None) == id(design)
+    ):
+        # The finite-surface refinement has already materialised this exact
+        # solved object into scene.lens_stack.  Reapplying SolvedOpticalTrain
+        # would restore the thin proposal and unnecessarily solve it again.
+        design = None
     if design is not None:
         try:
             solved = design
             if hasattr(design, "form") and not hasattr(design, "groups"):
-                import dataclasses as _dc
                 from camera_software.optical_design import solve_four_group_zoom_surrogate
 
                 # ── Physical camera placement from scene geometry ──────────────
@@ -1800,6 +1815,17 @@ def _scene_lenses(scene: SceneConfig) -> List[LensConfig]:
             if hasattr(solved, "apply_to_scene"):
                 scene.optical_design = solved
                 solved.apply_to_scene(scene)
+                # Scene-order camera manifests may select a measured glass.
+                # Preserve the solved geometry while making that spectral
+                # material selection authoritative for exact transport.
+                _camera_manifest = getattr(scene, "resolved_camera_manifest", {}) or {}
+                _lens_manifest = dict(_camera_manifest.get("lens", {}))
+                _glass_name = str(_lens_manifest.get("glass", "N-BK7") or "N-BK7")
+                if getattr(scene, "lens_stack", None):
+                    scene.lens_stack = [
+                        _dc.replace(item, glass=_glass_name)
+                        for item in scene.lens_stack
+                    ]
                 print(
                     "[optical-design]",
                     f"form={getattr(getattr(solved, 'spec', None), 'form', 'unknown')}",
@@ -1823,6 +1849,14 @@ def _scene_lenses(scene: SceneConfig) -> List[LensConfig]:
                         f"camera_barrel_r={scene.camera_barrel_r*1e3:.1f}mm",
                         flush=True,
                     )
+                # The thin-group solution is only a proposal.  Convert its
+                # requested powers into physically valid finite singlets, then
+                # solve the group air spaces against the fixed film plane and
+                # requested exact EFL.  Failure is explicit: the camera back is
+                # never moved to rescue an incompatible lens.
+                _solve_exact_lens_positions_for_fixed_sensor(scene)
+                solved = scene.optical_design
+                groups = getattr(solved, "groups", ())
                 if len(groups) >= 3 and getattr(scene, "iris_aperture", None) is None:
                     g2 = groups[1]
                     g3 = groups[2]
@@ -1847,7 +1881,19 @@ def _scene_lenses(scene: SceneConfig) -> List[LensConfig]:
                         f"r_inner={ap_r*1e3:.2f}mm",
                         flush=True,
                     )
-                _sync_scene_sensor_to_exact_focus(scene)
+                try:
+                    _exact_optics = _compound_lens_from_stack(
+                        list(getattr(scene, "lens_stack", []) or []),
+                        getattr(scene, "iris_aperture", None),
+                    )
+                    scene.entrance_pupil_x, scene.entrance_pupil_radius = (
+                        float(value) for value in _exact_optics.entrance_pupil
+                    )
+                    scene.exit_pupil_x, scene.exit_pupil_radius = (
+                        float(value) for value in _exact_optics.exit_pupil
+                    )
+                except Exception:
+                    pass
         except Exception as exc:
             print(f"[optical-design] solve/apply failed: {exc}", flush=True)
             scene.optical_design = None
@@ -1869,7 +1915,6 @@ def _scene_lenses(scene: SceneConfig) -> List[LensConfig]:
         gap = float(getattr(scene, "min_air_gap_m", 0.006) if hasattr(scene, "min_air_gap_m") else 0.006)
         thick = float(getattr(macro_cfg, "thickness", 0.012))
         macro_center = g1_front - gap - thick * 0.5
-        import dataclasses as _dc
         placed_macro = _dc.replace(macro_cfg, center_x=round(macro_center, 5))
         lenses = [placed_macro] + lenses
         print(
@@ -1881,50 +1926,6 @@ def _scene_lenses(scene: SceneConfig) -> List[LensConfig]:
         )
 
     return lenses
-
-
-def _sync_scene_sensor_to_exact_focus(scene: SceneConfig) -> None:
-    """Place the sensor at the exact compound-lens paraxial focus.
-
-    The first-order design solver works with thin paraxial groups.  The visible
-    and traced camera uses finite-thickness conic surfaces, and group radii can
-    be clamped for manufacturable sag.  Those clamps change optical power, so
-    the solver image distance is only a proposal.  This final sync keeps the
-    moving camera back at the focus plane of the physical `CompoundLens`.
-    """
-    try:
-        optics = _compound_lens_from_stack(
-            list(getattr(scene, "lens_stack", []) or []),
-            getattr(scene, "iris_aperture", None),
-        )
-        exact_x = _paraxial_image_x(optics, float(scene.object_plane.x))
-    except Exception:
-        return
-    if not math.isfinite(exact_x):
-        return
-    min_sensor_x = max(
-        (float(l.x_back) for l in getattr(scene, "lens_stack", []) or []),
-        default=float(getattr(scene, "exit_pupil_x", 0.0)),
-    ) + 1.0e-3
-    max_sensor_x = float(getattr(scene, "x_max", exact_x + 1.0))
-    if exact_x <= min_sensor_x or exact_x >= max_sensor_x:
-        return
-
-    plate = getattr(scene, "image_plate", None)
-    if plate is not None and hasattr(plate, "x"):
-        old_x = float(plate.x)
-        new_x = round(float(exact_x), 6)
-        if abs(old_x - new_x) > 1.0e-7:
-            plate.x = new_x
-            scene.screen_x = new_x
-            scene.tube_x1 = float(max(float(scene.tube_x1), new_x))
-            print(
-                "[exact-focus-sync]",
-                f"sensor_x={new_x:.6f}",
-                f"delta={(new_x - old_x)*1e3:+.2f}mm",
-                f"f_eff_exact={float(optics.f_eff)*1e3:.1f}mm",
-                flush=True,
-            )
 
 
 def _auto_fit_scene_view_to_mesh(scene: SceneConfig, tri_arr: np.ndarray) -> None:
@@ -2030,7 +2031,7 @@ def _compound_lens_from_scene(
                 n_before=n_air,
                 n_after=n_glass,
                 aperture_r=float(cfg.aperture_radius),
-                conic_k=0.0,
+                conic_k=float(cfg.conic_front),
                 n_before_spectral=n_air_spectral,
                 n_after_spectral=n_glass_spectral,
             ),
@@ -2043,7 +2044,7 @@ def _compound_lens_from_scene(
                 n_before=n_glass,
                 n_after=n_air,
                 aperture_r=float(cfg.aperture_radius),
-                conic_k=0.0,
+                conic_k=float(cfg.conic_back),
                 n_before_spectral=n_glass_spectral,
                 n_after_spectral=n_air_spectral,
             ),
@@ -2056,6 +2057,20 @@ def _compound_lens_from_scene(
             CompoundApertureStop(
                 x_pos=float(iris.x_pos),
                 r_clear=float(iris.r_inner),
+                n_medium=n_air,
+            ),
+        ))
+
+    exit_pupil_radius = float(getattr(scene, "exit_pupil_radius", 0.0))
+    exit_pupil_x = float(getattr(scene, "exit_pupil_x", 0.0))
+    if exit_pupil_radius > 0.0 and not (
+        iris is not None and bool(getattr(iris, "enabled", False))
+    ):
+        elements.append((
+            exit_pupil_x,
+            CompoundApertureStop(
+                x_pos=exit_pupil_x,
+                r_clear=exit_pupil_radius,
                 n_medium=n_air,
             ),
         ))
@@ -2090,7 +2105,8 @@ def _compound_lens_from_stack(
             x_pos=float(cfg.x_front),
             R_curvature=float(cfg.radius_front),
             n_before=n_air, n_after=n_glass,
-            aperture_r=float(cfg.aperture_radius), conic_k=0.0,
+            aperture_r=float(cfg.aperture_radius),
+            conic_k=float(cfg.conic_front),
             n_before_spectral=n_air_spectral,
             n_after_spectral=n_glass_spectral,
         )))
@@ -2098,7 +2114,8 @@ def _compound_lens_from_stack(
             x_pos=float(cfg.x_back),
             R_curvature=-float(cfg.radius_back),
             n_before=n_glass, n_after=n_air,
-            aperture_r=float(cfg.aperture_radius), conic_k=0.0,
+            aperture_r=float(cfg.aperture_radius),
+            conic_k=float(cfg.conic_back),
             n_before_spectral=n_glass_spectral,
             n_after_spectral=n_air_spectral,
         )))
@@ -2148,6 +2165,211 @@ def _paraxial_image_x(compound_lens: "CompoundLens", object_x: float) -> float:
         return float("inf")
     v = -Bt / Dt
     return float(x_last + v)
+
+
+def _solve_exact_lens_positions_for_fixed_sensor(scene: SceneConfig) -> bool:
+    """Fit generated finite glass and air spaces to a fixed camera back.
+
+    The semantic solver proposes ideal thin-group powers.  This refinement
+    realizes those powers as legal finite singlets, then redistributes the
+    internal air spaces to satisfy exact EFL and fixed-sensor focus together.
+    Explicit hardware prescriptions remain authoritative and are not altered.
+    """
+    solved = getattr(scene, "optical_design", None)
+    spec = getattr(solved, "spec", None)
+    groups = list(getattr(solved, "groups", ()) or ())
+    lenses = list(getattr(scene, "lens_stack", ()) or ())
+    if spec is None or len(groups) != 4 or len(lenses) != 4:
+        return False
+    if (
+        getattr(spec, "group_radius_front_m", None) is not None
+        or getattr(spec, "group_radius_back_m", None) is not None
+        or bool(getattr(spec, "lock_group_positions", False))
+        or bool(getattr(spec, "lock_group_powers", False))
+    ):
+        print("[exact-fixed-back] authored hardware retained; refinement skipped", flush=True)
+        return False
+
+    corrected = []
+    edge_thickness = 0.006
+    for lens, group in zip(lenses, groups):
+        target_f = float(group.focal_length_m)
+        sign = 1.0 if target_f >= 0.0 else -1.0
+        target_abs_f = abs(target_f)
+        aperture = float(lens.aperture_radius)
+
+        def _candidate(radius_abs: float):
+            radius_abs = float(max(radius_abs, aperture * (1.0 + 1.0e-8)))
+            thickness = float(lens.thickness)
+            if sign > 0.0:
+                sag = radius_abs - math.sqrt(max(
+                    0.0, radius_abs * radius_abs - aperture * aperture
+                ))
+                thickness = max(thickness, 2.0 * sag + edge_thickness)
+            signed_radius = sign * radius_abs
+            return replace(
+                lens,
+                thickness=float(thickness),
+                radius_front=float(signed_radius),
+                radius_back=float(signed_radius),
+            )
+
+        lo = aperture * (1.0 + 1.0e-7)
+        hi = max(1.0, 2.0 * lo)
+        for _ in range(24):
+            if abs(float(_compound_lens_from_stack(
+                [_candidate(hi)], None
+            ).f_eff)) >= target_abs_f:
+                break
+            hi *= 2.0
+        else:
+            print("[exact-fixed-back] unable to bracket generated group power", flush=True)
+            return False
+        for _ in range(64):
+            mid = 0.5 * (lo + hi)
+            exact_f = abs(float(_compound_lens_from_stack(
+                [_candidate(mid)], None
+            ).f_eff))
+            if exact_f < target_abs_f:
+                lo = mid
+            else:
+                hi = mid
+        corrected.append(_candidate(0.5 * (lo + hi)))
+
+    sensor_x = float(scene.image_plate.x)
+    object_x = float(scene.object_plane.x)
+    target_efl = float(spec.target_focal_length_m)
+    first_x = float(corrected[0].center_x)
+    pair_steps = [
+        0.5 * (float(a.thickness) + float(b.thickness))
+        + float(spec.min_air_gap_m)
+        for a, b in zip(corrected, corrected[1:])
+    ]
+    last_x_max = (
+        sensor_x - float(spec.sensor_clearance_m)
+        - 0.5 * float(corrected[-1].thickness)
+    )
+    available = last_x_max - first_x - sum(pair_steps)
+    if available < -1.0e-9:
+        print(
+            "[exact-fixed-back] no legal group-spacing envelope",
+            f"shortfall={-available*1e3:.2f}mm",
+            flush=True,
+        )
+        return False
+    available = max(0.0, available)
+
+    def _placed(logits: np.ndarray):
+        values = np.concatenate((np.asarray(logits, dtype=np.float64), [0.0]))
+        weights = np.exp(values - float(np.max(values)))
+        slack = available * weights / float(np.sum(weights))
+        xs = [first_x]
+        for index, step in enumerate(pair_steps):
+            xs.append(xs[-1] + step + float(slack[index]))
+        return [replace(lens, center_x=float(x)) for lens, x in zip(corrected, xs)]
+
+    focal_scale = max(1.0e-5, float(spec.focal_length_tolerance_m))
+    focus_scale = 1.0e-4
+    iris_radius = float(target_efl / (2.0 * max(float(spec.f_number), 0.1)))
+
+    def _score(logits: np.ndarray):
+        placed = _placed(logits)
+        trial_iris = IrisApertureConfig(
+            enabled=True,
+            x_pos=0.5 * (placed[1].center_x + placed[2].center_x),
+            r_inner=iris_radius,
+            r_outer=1.5 * iris_radius,
+            n_blades=6,
+        )
+        optics = _compound_lens_from_stack(placed, trial_iris)
+        efl = float(optics.f_eff)
+        focus_x = float(_paraxial_image_x(optics, object_x))
+        if not math.isfinite(efl) or not math.isfinite(focus_x):
+            return float("inf"), efl, focus_x, placed, optics
+        # Two constraints leave one spacing degree of freedom.  Use it to
+        # avoid a nearly afocal rear train whose exit pupil explodes to metres
+        # in radius and makes backward pupil sampling impractical.
+        pupil_radius = abs(float(optics.exit_pupil[1]))
+        pupil_scale = max(4.0 * iris_radius, 1.0e-5)
+        score = (
+            ((efl - target_efl) / focal_scale) ** 2
+            + ((focus_x - sensor_x) / focus_scale) ** 2
+            + 1.0 * (pupil_radius / pupil_scale) ** 2
+        )
+        return float(score), efl, focus_x, placed, optics
+
+    best = None
+    seeds = (-8.0, -4.0, 0.0, 4.0, 8.0)
+    for a in seeds:
+        for b in seeds:
+            for c in seeds:
+                logits = np.array([a, b, c], dtype=np.float64)
+                result = _score(logits)
+                if best is None or result[0] < best[0]:
+                    best = (*result, logits)
+    assert best is not None
+    score, efl, focus_x, placed, optics, logits = best
+    for step in (2.0, 1.0, 0.5, 0.25, 0.1, 0.05, 0.02, 0.01,
+                 0.005, 0.002, 0.001, 0.0005, 0.0002, 0.0001):
+        improved = True
+        refinements = 0
+        while improved and refinements < 500:
+            refinements += 1
+            improved = False
+            for axis in range(3):
+                for direction in (-1.0, 1.0):
+                    trial = logits.copy()
+                    trial[axis] += direction * step
+                    candidate = _score(trial)
+                    if candidate[0] + 1.0e-14 < score:
+                        score, efl, focus_x, placed, optics = candidate
+                        logits = trial
+                        improved = True
+
+    focus_error = focus_x - sensor_x
+    focal_error = efl - target_efl
+    if (
+        abs(focal_error) > float(spec.focal_length_tolerance_m)
+        or abs(focus_error) > 5.0e-6
+    ):
+        print(
+            "[exact-fixed-back] solve failed",
+            f"f={efl*1e3:.3f}/{target_efl*1e3:.3f}mm",
+            f"focus_error={focus_error*1e3:+.3f}mm",
+            flush=True,
+        )
+        return False
+
+    scene.lens_stack = placed
+    updated_groups = tuple(
+        replace(
+            group,
+            x_m=float(lens.center_x),
+            thickness_m=float(lens.thickness),
+            radius_front_m=float(lens.radius_front),
+            radius_back_m=float(lens.radius_back),
+        )
+        for group, lens in zip(groups, placed)
+    )
+    scene.optical_design = replace(
+        solved,
+        groups=updated_groups,
+        effective_focal_length_m=float(efl),
+        image_distance_m=float(sensor_x - placed[-1].x_back),
+        sensor_error_m=float(focus_error),
+        matrix=np.asarray(optics._paraxial_matrix(), dtype=np.float64),
+    )
+    scene._exact_fixed_back_design_id = id(scene.optical_design)
+    gaps_mm = [(b.x_front - a.x_back) * 1.0e3 for a, b in zip(placed, placed[1:])]
+    print(
+        "[exact-fixed-back]",
+        f"sensor_x={sensor_x:.6f}",
+        f"f={efl*1e3:.3f}/{target_efl*1e3:.3f}mm",
+        f"focus_error={focus_error*1e3:+.4f}mm",
+        f"gaps_mm=({','.join(f'{value:.2f}' for value in gaps_mm)})",
+        flush=True,
+    )
+    return True
 
 
 def _solver_focal_plane_x(scene) -> float:
@@ -2427,10 +2649,17 @@ def _import_subject_scene(
 def _lens_is_valid(lens: LensConfig, min_edge_thickness: float = 0.004) -> bool:
     if lens.thickness <= 0.0 or lens.aperture_radius <= 0.0:
         return False
-    if abs(lens.radius_front) <= lens.aperture_radius or abs(lens.radius_back) <= lens.aperture_radius:
-        return False
     r = np.asarray([0.0, lens.aperture_radius], dtype=np.float64)
-    return bool(np.all(_lens_back_x(lens, r) - _lens_front_x(lens, r) >= min_edge_thickness))
+    try:
+        front = _lens_front_x(lens, r)
+        back = _lens_back_x(lens, r)
+    except ValueError:
+        return False
+    return bool(
+        np.all(np.isfinite(front))
+        and np.all(np.isfinite(back))
+        and np.all(back - front >= min_edge_thickness)
+    )
 
 
 @dataclass
@@ -3301,18 +3530,32 @@ def _build_thin_disc_element_oriented(
         if entry_tri_ids is not None: entry_tri_ids.append(idx_c1)
 
 
+def _conic_sag(r: np.ndarray, radius: float, conic_k: float) -> np.ndarray:
+    """Exact rotational-conic sag used by both mesh proxies and transport."""
+
+    radial = np.asarray(r, dtype=np.float64)
+    R = float(radius)
+    if abs(R) < 1.0e-12:
+        return np.zeros_like(radial)
+    radicand = 1.0 - (1.0 + float(conic_k)) * np.square(radial / R)
+    if np.any(radicand < -1.0e-10):
+        raise ValueError(
+            "conic aperture extends beyond the real branch of the surface"
+        )
+    root = np.sqrt(np.maximum(0.0, radicand))
+    return np.square(radial) / (R * (1.0 + root))
+
+
 def _lens_front_x(lens: LensConfig, r: np.ndarray) -> np.ndarray:
-    R = float(lens.radius_front)
-    c = lens.x_front + R
-    s = 1.0 if R >= 0.0 else -1.0
-    return c - s * np.sqrt(np.maximum(0.0, R * R - r * r))
+    return float(lens.x_front) + _conic_sag(
+        r, float(lens.radius_front), float(lens.conic_front)
+    )
 
 
 def _lens_back_x(lens: LensConfig, r: np.ndarray) -> np.ndarray:
-    R = float(lens.radius_back)
-    c = lens.x_back - R
-    s = 1.0 if R >= 0.0 else -1.0
-    return c + s * np.sqrt(np.maximum(0.0, R * R - r * r))
+    return float(lens.x_back) + _conic_sag(
+        r, -float(lens.radius_back), float(lens.conic_back)
+    )
 
 
 def _build_lens_mesh(
@@ -3656,6 +3899,57 @@ def _build_scene_mesh(
             ),
         ),
     )
+    _pickoff_r = float(np.clip(
+        getattr(scene, "diagnostic_pickoff_reflectance", 0.30), 0.0, 1.0
+    ))
+    idx_diagnostic_pickoff = db.register(
+        "diagnostic_beam_splitter",
+        Material(
+            name="diagnostic_beam_splitter",
+            domain="em_optical",
+            albedo=[1.0, 1.0, 1.0],
+            roughness=0.0,
+            metallic=0.0,
+            emission_rgb=[0.0, 0.0, 0.0],
+            ior=1.0,
+            transmission=1.0 - _pickoff_r,
+            gl_opacity=0.24,
+            spectral_bands=_make_sidecar_spectral_bands(
+                sidecar,
+                reflectance=_pickoff_r,
+                transmittance=1.0 - _pickoff_r,
+                diffuse_frac=0.0,
+                emission_scale=0.0,
+                ior_real=1.0,
+                ior_imag=0.0,
+            ),
+        ),
+    )
+    # The exterior is deliberately not perfect aperture black. It remains a
+    # light-tight opaque body, but carries enough spectral reflection to exist
+    # in mirrors and glossy scene surfaces as a physical camera object.
+    idx_camera_body = db.register(
+        "camera_body_charcoal",
+        Material(
+            name="camera_body_charcoal",
+            domain="em_optical",
+            albedo=[0.12, 0.13, 0.15],
+            roughness=0.28,
+            metallic=0.35,
+            emission_rgb=[0.0, 0.0, 0.0],
+            ior=1.48,
+            transmission=0.0,
+            spectral_bands=_make_sidecar_spectral_bands(
+                sidecar,
+                reflectance=0.16,
+                transmittance=0.0,
+                diffuse_frac=0.38,
+                emission_scale=0.0,
+                ior_real=1.48,
+                ior_imag=0.0,
+            ),
+        ),
+    )
 
     tris: List[np.ndarray] = []
     mats: List[int] = []
@@ -3869,6 +4163,14 @@ def _build_scene_mesh(
             _r_entrance = float(first_lens.aperture_radius)
             # tan of the widest scene-side acceptance angle the hood must pass
             _tan_accept = (_r_entrance + _r_field) / _z_obj
+            _authored_half_field = float(getattr(
+                scene, "lens_hood_min_half_field_deg", 0.0
+            ))
+            if _authored_half_field > 0.0:
+                _tan_accept = max(
+                    _tan_accept,
+                    math.tan(math.radians(min(_authored_half_field, 89.0))),
+                )
 
             hood_depth = float(min(0.030, max(0.010, 0.35 * _r_entrance)))
             hood_x0 = float(first_lens.x_front - hood_depth)
@@ -4056,6 +4358,52 @@ def _build_scene_mesh(
                 float(lens.radius_back),
             ))
 
+        if bool(getattr(scene, "diagnostic_pentaprism_enabled", False)):
+            from camera_software.specialty_optics import build_pentaprism_diagnostic
+
+            _diagnostic_size = float(max(
+                0.004, getattr(scene, "diagnostic_pentaprism_size_m", 0.012)
+            ))
+            _pickoff_x = 0.5 * (
+                float(last_lens.x_back) + float(scene.image_plate.x)
+            )
+            _diagnostic = build_pentaprism_diagnostic(
+                pickoff_center_m=(_pickoff_x, 0.0, 0.0),
+                prism_gap_m=0.15 * _diagnostic_size,
+                prism_size_m=_diagnostic_size,
+                prism_depth_m=0.80 * _diagnostic_size,
+                receiver_gap_m=0.15 * _diagnostic_size,
+            )
+            _diagnostic_materials = {
+                "diagnostic_beam_splitter": idx_diagnostic_pickoff,
+                "entrance_glass": idx_lens,
+                "exit_glass": idx_lens,
+                "silvered_reflector_1": idx_silver,
+                "silvered_reflector_2": idx_silver,
+                "blackened_prism_face": idx_aperture_black,
+                "blackened_prism_side": idx_aperture_black,
+                "instrument_receiver": idx_stage_grey,
+            }
+            for _triangle, _role in zip(
+                _diagnostic.triangles, _diagnostic.roles
+            ):
+                _tri_id = len(tris)
+                _append_tri(
+                    tris, mats,
+                    _triangle[0], _triangle[1], _triangle[2],
+                    _diagnostic_materials[_role],
+                )
+                if _role == "instrument_receiver":
+                    object_tri_ids.append(_tri_id)
+            print(
+                "[diagnostic-pentaprism]",
+                f"pickoff_x={_pickoff_x:.4f}",
+                f"size={_diagnostic_size * 1e3:.1f}mm",
+                f"triangles={len(_diagnostic.roles)}",
+                f"split={_pickoff_r:.3f}",
+                flush=True,
+            )
+
         if bool(getattr(scene, "include_legacy_stage", False)):
             # Legacy post-lens bellows.  The default camera-only path uses the
             # sensor enclosure's aperture-to-sensor frustum as the single rear cone.
@@ -4134,7 +4482,7 @@ def _build_scene_mesh(
         n_theta=96,
         tri_list=tris,
         mat_ids=mats,
-        mat_idx=idx_aperture_black,
+        mat_idx=idx_camera_body,
         tri_ids=camera_barrel_tri_ids,
     )
     camera_body_tri_ids.extend(camera_barrel_tri_ids)
@@ -4142,7 +4490,7 @@ def _build_scene_mesh(
     camera_rear_cap_tri_ids: list = []
     _build_baffle_annulus(
         _x_ap, _tube_r, _hull_r_ap, 96,
-        tris, mats, idx_aperture_black,
+        tris, mats, idx_camera_body,
         tri_ids=camera_rear_cap_tri_ids,
         thickness=0.0,
     )
@@ -4151,7 +4499,7 @@ def _build_scene_mesh(
     camera_front_cap_tri_ids: list = []
     _build_baffle_annulus(
         _x_sensor, _sensor_r, _hull_r_sensor, 96,
-        tris, mats, idx_aperture_black,
+        tris, mats, idx_camera_body,
         tri_ids=camera_front_cap_tri_ids,
         thickness=0.0,
     )
@@ -5830,7 +6178,7 @@ class ForwardCppLensBench:
         self.tri_kind = tri_kind
         
         # Build material buffer early so we can extract indices for diagnostics
-        mat_buf = db.build_mat_buf().astype(np.float32, copy=False)
+        mat_buf = db.build_mat_buf(freq_hz=self.freq_hz).astype(np.float32, copy=False)
         mat_n_mats = int(mat_buf.shape[0] // MAX_SPECTRAL_BANDS)
 
         # ─── Diagnostic: Material Buffer Verification ─────────────────────────
@@ -6054,7 +6402,7 @@ class ForwardCppLensBench:
             "back_mean_x": float(np.mean(normals[lens_back_ids, 0])) if lens_back_ids.size > 0 else 0.0,
         }
 
-        mat_buf = db.build_mat_buf().astype(np.float32, copy=False)
+        mat_buf = db.build_mat_buf(freq_hz=self.freq_hz).astype(np.float32, copy=False)
         mat_n_mats = int(mat_buf.shape[0] // MAX_SPECTRAL_BANDS)
 
         self.tracer = _sk.RayTracer(
@@ -6530,7 +6878,14 @@ class ForwardCppLensBench:
             mount_standard="120_6x6",
             frame_w_mm=float(sensor_w_mm),
             frame_h_mm=float(sensor_h_mm),
-            image_circle_mm=float(sensor_w_mm * 0.5 * math.sqrt(2.0)),
+            # BackGeometrySpec stores a diameter.  A square gate's diagonal is
+            # the minimum image-circle diameter; retain the authored physical
+            # plate when it provides a small nominal-format margin (80 mm for
+            # the 79.196 mm diagonal of a 56 x 56 mm gate).
+            image_circle_mm=float(max(
+                2.0 * float(plate.radius) * 1.0e3,
+                math.hypot(sensor_w_mm, sensor_h_mm),
+            )),
         )
         _sb_profile = SensorBackProfile(
             geometry=_sb_geom,

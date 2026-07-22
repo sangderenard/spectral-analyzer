@@ -1,0 +1,575 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "image": {
+      "width": 320,
+      "height": 320,
+      "region": {
+        "x": 128,
+        "y": 128,
+        "width": 64,
+        "height": 64
+      }
+    },
+    "camera": {
+      "focal_mm": 35.0,
+      "aperture_mm": 25.0,
+      "position_m": [
+        3.0,
+        -2.0,
+        1.0
+      ],
+      "target_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "focus_target_m": [
+        -0.006688971514774433,
+        0.0044593143431828075,
+        -0.0022296571715914038
+      ],
+      "up": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "focus_distance_m": 3.75
+    },
+    "exposure": {
+      "time_s": 0.016666666666666666,
+      "iso": 100.0,
+      "sensor_sweeps": 1,
+      "t5_pair_budget": 20000000
+    },
+    "flash": {
+      "intensity_scale": 1.0
+    },
+    "font": {
+      "family": "DejaVu Sans",
+      "weight": "bold",
+      "style": "normal"
+    },
+    "planes": [
+      {
+        "id": "focus-card-0",
+        "center_m": [
+          1.02378200722594,
+          -0.2738921935980413,
+          0.2783946468364541
+        ],
+        "normal": [
+          0.8017837257372732,
+          -0.5345224838248488,
+          0.2672612419124244
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          0.46,
+          0.22
+        ],
+        "thickness_m": 0.012,
+        "material": "focus_card_light"
+      },
+      {
+        "id": "focus-card-1",
+        "center_m": [
+          0.30645787662999213,
+          -0.6549991605196602,
+          0.17149015007148438
+        ],
+        "normal": [
+          0.8017837257372732,
+          -0.5345224838248488,
+          0.2672612419124244
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          0.46,
+          0.22
+        ],
+        "thickness_m": 0.012,
+        "material": "focus_card_dark"
+      },
+      {
+        "id": "focus-card-2",
+        "center_m": [
+          0.46127322665875115,
+          0.18524318987424443,
+          0.07794871540213577
+        ],
+        "normal": [
+          0.8017837257372732,
+          -0.5345224838248488,
+          0.2672612419124244
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          0.46,
+          0.22
+        ],
+        "thickness_m": 0.012,
+        "material": "focus_card_light"
+      },
+      {
+        "id": "focus-card-3",
+        "center_m": [
+          -0.2535305588350014,
+          -0.3658030666371577,
+          -0.0022296571715913977
+        ],
+        "normal": [
+          0.8017837257372732,
+          -0.5345224838248488,
+          0.2672612419124244
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          0.46,
+          0.22
+        ],
+        "thickness_m": 0.012,
+        "material": "focus_card_dark"
+      },
+      {
+        "id": "focus-card-4",
+        "center_m": [
+          -0.021057181334709796,
+          0.5909263249640451,
+          -0.09577109184094001
+        ],
+        "normal": [
+          0.8017837257372732,
+          -0.5345224838248488,
+          0.2672612419124244
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          0.46,
+          0.22
+        ],
+        "thickness_m": 0.012,
+        "material": "focus_card_light"
+      },
+      {
+        "id": "focus-card-5",
+        "center_m": [
+          -0.9337865531605858,
+          0.003571399819072507,
+          -0.21603865070153105
+        ],
+        "normal": [
+          0.8017837257372732,
+          -0.5345224838248488,
+          0.2672612419124244
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          0.46,
+          0.22
+        ],
+        "thickness_m": 0.012,
+        "material": "focus_card_dark"
+      },
+      {
+        "id": "focus-card-6",
+        "center_m": [
+          -0.784011893336217,
+          1.1836923293925428,
+          -0.3630323337533643
+        ],
+        "normal": [
+          0.8017837257372732,
+          -0.5345224838248488,
+          0.2672612419124244
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          0.46,
+          0.22
+        ],
+        "thickness_m": 0.012,
+        "material": "focus_card_light"
+      },
+      {
+        "id": "hall-floor",
+        "center_m": [
+          0.05539080152326564,
+          -0.036927201015510294,
+          -0.8324906150191891
+        ],
+        "normal": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "up": [
+          -0.8017837257372732,
+          0.5345224838248488,
+          -0.2672612419124244
+        ],
+        "size_m": [
+          2.4,
+          5.8
+        ],
+        "thickness_m": 0.03,
+        "material": "focus_hall_shell"
+      },
+      {
+        "id": "hall-ceiling",
+        "center_m": [
+          -0.30930386227399614,
+          0.2062025748493309,
+          0.7478529281022788
+        ],
+        "normal": [
+          0.22237479499833038,
+          -0.14824986333222026,
+          -0.9636241116594316
+        ],
+        "up": [
+          -0.8017837257372732,
+          0.5345224838248488,
+          -0.2672612419124244
+        ],
+        "size_m": [
+          2.4,
+          5.8
+        ],
+        "thickness_m": 0.03,
+        "material": "focus_hall_shell"
+      },
+      {
+        "id": "hall-left",
+        "center_m": [
+          -0.7482207501476219,
+          -0.8472586427414749,
+          -0.042318843458455144
+        ],
+        "normal": [
+          0.5547001962252291,
+          0.8320502943378438,
+          -1.3877787807814457e-17
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          5.8,
+          1.64
+        ],
+        "thickness_m": 0.03,
+        "material": "focus_hall_shell"
+      },
+      {
+        "id": "hall-right",
+        "center_m": [
+          0.4943076893968914,
+          1.0165340165752954,
+          -0.04231884345845517
+        ],
+        "normal": [
+          -0.5547001962252291,
+          -0.8320502943378438,
+          1.3877787807814457e-17
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          5.8,
+          1.64
+        ],
+        "thickness_m": 0.03,
+        "material": "focus_hall_shell"
+      },
+      {
+        "id": "hall-end",
+        "center_m": [
+          -1.369721305268139,
+          0.9131475368454258,
+          -0.4565737684227129
+        ],
+        "normal": [
+          0.8017837257372732,
+          -0.5345224838248488,
+          0.2672612419124244
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          2.24,
+          1.64
+        ],
+        "thickness_m": 0.03,
+        "material": "focus_hall_shell"
+      }
+    ],
+    "materials": {
+      "quiet_background": {
+        "albedo_rgb": [
+          0.018,
+          0.021,
+          0.022
+        ],
+        "reflectivity": 0.065,
+        "diffusion": 0.98,
+        "absorption": 0.92,
+        "roughness": 0.98,
+        "metallic": 0.0
+      },
+      "text_surface": {
+        "albedo_rgb": [
+          0.82,
+          0.76,
+          0.62
+        ],
+        "reflectivity": 0.58,
+        "diffusion": 0.72,
+        "absorption": 0.25,
+        "roughness": 0.3,
+        "metallic": 0.0,
+        "ior": 1.5
+      },
+      "focus_card_light": {
+        "albedo_rgb": [
+          0.82,
+          0.84,
+          0.88
+        ],
+        "reflectivity": 0.82,
+        "diffusion": 0.92,
+        "absorption": 0.08,
+        "roughness": 0.82
+      },
+      "focus_card_dark": {
+        "albedo_rgb": [
+          0.2,
+          0.23,
+          0.29
+        ],
+        "reflectivity": 0.32,
+        "diffusion": 0.9,
+        "absorption": 0.62,
+        "roughness": 0.88
+      },
+      "focus_hall_shell": {
+        "albedo_rgb": [
+          0.28,
+          0.3,
+          0.34
+        ],
+        "reflectivity": 0.38,
+        "diffusion": 0.94,
+        "absorption": 0.55,
+        "roughness": 0.9
+      }
+    },
+    "geometry": {
+      "embed_plane": "focus-card-0",
+      "height_m": 0.055,
+      "line_height_m": 0.055,
+      "line_spacing": 1.22,
+      "text_box_m": [
+        0.31,
+        0.18
+      ],
+      "horizontal_align": "center",
+      "vertical_align": "center",
+      "extrusion_depth_ratio": 0.08,
+      "embed_fraction": 0.25,
+      "offset_m": [
+        0.0,
+        0.0
+      ],
+      "profile": "straight",
+      "outline_subdivisions": 4,
+      "cap_grid": 64,
+      "material": "text_surface"
+    },
+    "objects": [
+      {
+        "id": "distance-label-0",
+        "token": "2.70 m",
+        "embed_plane": "focus-card-0",
+        "geometry": {
+          "text_box_m": [
+            0.39,
+            0.14
+          ],
+          "line_height_m": 0.06,
+          "height_m": 0.06,
+          "material": "text_surface"
+        }
+      },
+      {
+        "id": "distance-label-1",
+        "token": "3.10 m",
+        "embed_plane": "focus-card-1",
+        "geometry": {
+          "text_box_m": [
+            0.39,
+            0.14
+          ],
+          "line_height_m": 0.06,
+          "height_m": 0.06,
+          "material": "text_surface"
+        }
+      },
+      {
+        "id": "distance-label-2",
+        "token": "3.45 m",
+        "embed_plane": "focus-card-2",
+        "geometry": {
+          "text_box_m": [
+            0.39,
+            0.14
+          ],
+          "line_height_m": 0.06,
+          "height_m": 0.06,
+          "material": "text_surface"
+        }
+      },
+      {
+        "id": "distance-label-3",
+        "token": "3.75 m",
+        "embed_plane": "focus-card-3",
+        "geometry": {
+          "text_box_m": [
+            0.39,
+            0.14
+          ],
+          "line_height_m": 0.06,
+          "height_m": 0.06,
+          "material": "text_surface"
+        }
+      },
+      {
+        "id": "distance-label-4",
+        "token": "4.10 m",
+        "embed_plane": "focus-card-4",
+        "geometry": {
+          "text_box_m": [
+            0.39,
+            0.14
+          ],
+          "line_height_m": 0.06,
+          "height_m": 0.06,
+          "material": "text_surface"
+        }
+      },
+      {
+        "id": "distance-label-5",
+        "token": "4.55 m",
+        "embed_plane": "focus-card-5",
+        "geometry": {
+          "text_box_m": [
+            0.39,
+            0.14
+          ],
+          "line_height_m": 0.06,
+          "height_m": 0.06,
+          "material": "text_surface"
+        }
+      },
+      {
+        "id": "distance-label-6",
+        "token": "5.10 m",
+        "embed_plane": "focus-card-6",
+        "geometry": {
+          "text_box_m": [
+            0.39,
+            0.14
+          ],
+          "line_height_m": 0.06,
+          "height_m": 0.06,
+          "material": "text_surface"
+        }
+      }
+    ]
+  },
+  "jobs": [
+    {
+      "id": "live_paragraph",
+      "token": ""
+    }
+  ],
+  "runtime": {
+    "work_kind": "calibration",
+    "max_sensor_epochs": 1,
+    "ordinary_work": false,
+    "convergence_enabled": false,
+    "total_rays": 4096,
+    "rays_per_batch": 4096,
+    "sensor_samples_per_node": 2,
+    "sensor_steps_per_layer": 1,
+    "sensor_flash_rays": 4096,
+    "sensor_t5_pair_budget": 262144,
+    "focus_distance_m": 3.75
+  },
+  "transport": {
+    "domain": "fixed_spectral",
+    "frequencies_hz": [
+      510231362896634.9
+    ],
+    "wavelengths_nm": [
+      587.5618000000001
+    ],
+    "lane_table": {
+      "abi_version": 1,
+      "domain": "fixed_spectral",
+      "cohort_id": "focus-reference",
+      "lanes": [
+        {
+          "lane_id": 0,
+          "identity": "wavelength:587.562nm",
+          "frequency_hz": 510231362896634.9,
+          "sampling_pdf": 1.0,
+          "proposal_profile_key": "",
+          "sample_u": null,
+          "sensor_weight_xyz": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      ]
+    },
+    "calibration_mode": "focus-hall"
+  }
+}

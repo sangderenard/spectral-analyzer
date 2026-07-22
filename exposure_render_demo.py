@@ -60,6 +60,8 @@ CLI
 from __future__ import annotations
 
 import argparse
+import hashlib
+import copy
 import gc
 import faulthandler
 import json
@@ -75,7 +77,7 @@ import tracemalloc
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from types import SimpleNamespace
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 import numpy as np
 
@@ -188,17 +190,17 @@ def _bounded_native_seed(value: int) -> int:
 
 
 def _native_sensor_to_display(img: np.ndarray) -> np.ndarray:
-    """Transpose the C++ sensor getter output into display convention.
+    """Convert native physical-right/up storage to top-left display rows/cols.
 
-    The C++ getters have already converted native [y, z] storage to an HWC
-    array and reversed native y via `out_y = res - 1 - y`. Python only swaps
-    getter axes so Z becomes display rows and out_y becomes display columns.
-    No conditional or additional mirror operation belongs here.
+    Native accumulation is indexed ``[right, up]``. The C++ getter reverses
+    ``right`` before returning ``[reversed_right, up]``. A transpose restores
+    the axis roles, then both directions must be reversed so display columns
+    increase rightward and display rows increase downward.
     """
     a = np.asarray(img)
     if a.ndim != 3 or a.shape[0] != a.shape[1]:
         return a
-    return np.ascontiguousarray(a.transpose(1, 0, 2))
+    return np.ascontiguousarray(a.transpose(1, 0, 2)[::-1, ::-1])
 
 
 def _native_sensor_tile_to_display(img: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -244,6 +246,48 @@ def _native_sensor_linear_output(backend: Any, display_image: np.ndarray) -> np.
     return linear.copy()
 
 
+def _native_sensor_accumulation_output(backend: Any) -> np.ndarray | None:
+    """Return valid linear sensor evidence, including sum/weight fallback.
+
+    The developed native image can be empty after a GPU-resident T5 pass even
+    though its persistent sensor sum and exposure weights contain the completed
+    integral.  Never replace that evidence with a synthetic black frame.
+    """
+
+    linear_value = getattr(backend, "_native_sensor_linear_image", None)
+    linear = None if linear_value is None else np.asarray(linear_value, np.float32)
+    if (
+        linear is not None
+        and linear.ndim == 3
+        and linear.shape[2] >= 3
+        and np.all(np.isfinite(linear[..., :3]))
+        and np.any(linear[..., :3] != 0.0)
+    ):
+        return np.ascontiguousarray(linear[..., :3])
+
+    sum_value = getattr(backend, "_native_sensor_sum_linear", None)
+    weight_value = getattr(backend, "_native_sensor_exposure_weight", None)
+    if sum_value is None or weight_value is None:
+        return None
+    sensor_sum = np.asarray(sum_value, np.float32)
+    exposure_weight = np.asarray(weight_value, np.float32)
+    if (
+        sensor_sum.ndim != 3
+        or sensor_sum.shape[2] < 3
+        or exposure_weight.shape != sensor_sum.shape[:2]
+        or not np.all(np.isfinite(sensor_sum[..., :3]))
+        or not np.all(np.isfinite(exposure_weight))
+        or not np.any(exposure_weight > 0.0)
+    ):
+        return None
+    result = np.zeros(sensor_sum.shape[:2] + (3,), np.float32)
+    np.divide(
+        sensor_sum[..., :3], exposure_weight[..., None], out=result,
+        where=exposure_weight[..., None] > 0.0,
+    )
+    return np.ascontiguousarray(np.maximum(result, 0.0))
+
+
 from camera_exposure_budget import (
     CameraOptics,
     FilmExposure,
@@ -260,6 +304,7 @@ from bdpt_integrator import CAMERA_MODE_APERTURE_CONE
 from material_db import MaterialDatabase, MAX_SPECTRAL_BANDS
 from sensor_film_db import SensorFilmDatabase, MAX_SENSOR_FILM_SLOTS
 from camera_software.text_clarity import MonteCarloClarityDiscriminator
+from camera_software.film_format import DEFAULT_FILM_FORMAT
 
 # Borrow scene authoring verbatim from the basic-rasterizer harness.
 import test_basic_gl_cpp_window as scene_mod   # noqa: E402
@@ -426,11 +471,11 @@ def _build_flat_sensor_geometry(optics: CameraOptics,
 # Scientific defaults — grounded in real photographic conventions.
 # ─────────────────────────────────────────────────────────────────────────────
 DEFAULT_OPTICS = CameraOptics(
-    focal_mm           = 35.0,
-    aperture_mm        = 25.0,         # f/1.4
+    focal_mm           = 82.5,
+    aperture_mm        = 20.625,       # f/4 on the default 6x6 rig
     pixel_pitch_um     = 8.4,
-    sensor_w_mm        = 36.0,
-    sensor_h_mm        = 24.0,
+    sensor_w_mm        = DEFAULT_FILM_FORMAT.frame_width_mm,
+    sensor_h_mm        = DEFAULT_FILM_FORMAT.frame_height_mm,
     lens_transmission  = 0.95,
 )
 
@@ -460,19 +505,29 @@ _SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "
 ENABLE_EXPOSURE_PROFILING = False
 
 
-def _active_frequency_sidecar(tll: Any, freq_hz: np.ndarray) -> Any:
+def _active_frequency_sidecar(
+    tll: Any,
+    freq_hz: np.ndarray,
+    spectral_model: Optional[Mapping[str, Any]] = None,
+) -> Any:
     """Build optical material bands in the tracer's exact active-band order."""
     freq = np.asarray(freq_hz, np.float64).reshape(-1)
     if freq.size <= 0 or np.any(~np.isfinite(freq)) or np.any(freq <= 0.0):
         raise ValueError("active spectral frequencies must be finite and positive")
     wavelength_nm = C_LIGHT / freq * 1.0e9
-    template = tll.FreeFrequencySidecar.lazy_prepare(int(freq.size))
-    order = np.argsort(np.asarray(template.wavelength_nm, np.float64))
-    weight = np.interp(
-        wavelength_nm,
-        np.asarray(template.wavelength_nm, np.float64)[order],
-        np.asarray(template.weight, np.float64)[order],
-    )
+    if spectral_model is None:
+        template = tll.FreeFrequencySidecar.lazy_prepare(int(freq.size))
+        order = np.argsort(np.asarray(template.wavelength_nm, np.float64))
+        weight = np.interp(
+            wavelength_nm,
+            np.asarray(template.wavelength_nm, np.float64)[order],
+            np.asarray(template.weight, np.float64)[order],
+        )
+    else:
+        from camera_software.camera_manifest import sample_spectral_model
+        weight = np.asarray(
+            sample_spectral_model(spectral_model, wavelength_nm), np.float64
+        )
     return tll.FreeFrequencySidecar.from_prepared(wavelength_nm, weight)
 
 
@@ -653,6 +708,7 @@ class TracerScene:
     camera_tri_groups: Optional[dict[str, np.ndarray]] = None
     film_plane_pose: Optional[FilmPlanePose] = None
     optical_camera: Optional[Any] = None
+    emitter_launch_profile: Optional[dict[str, Any]] = None
 
     @property
     def total_emissive_power_W(self) -> float:
@@ -789,6 +845,9 @@ def apply_next_site_scan(scene: TracerScene, command: Any, *,
 # the replaceable subject geometry and authored materials differ.
 _ORDERED_THICK_LENS_SCENE: Optional[TracerScene] = None
 _ORDERED_SCENE_JOB: Optional[dict[str, Any]] = None
+_ORDERED_TRANSPORT_RGB_WEIGHTS: Optional[np.ndarray] = None
+_ORDERED_TRANSPORT_LUT: Optional[dict[str, np.ndarray]] = None
+_ORDERED_MATERIAL_LUT_GRID: Optional[np.ndarray] = None
 _ORDERED_TILE_OUTPUT: Optional[tuple[int, int]] = None
 _NEXT_SITE_SCAN_COMMAND: Optional[Any] = None
 
@@ -950,9 +1009,26 @@ def _lab_object_distance_for_sensor_focus(scene: Any, sensor_focus_m: float) -> 
     return 0.5 * (low + high)
 
 
-def _ordered_lab_scene_for_sensor_focus(tll: Any, sensor_focus_m: float) -> Any:
+def _apply_camera_manifest_to_lab_scene(
+    tll: Any, scene: Any, manifest: Mapping[str, Any]
+) -> Any:
+    """Compatibility wrapper for the public camera-preparation API."""
+
+    from camera_software.camera_preparation import (
+        apply_camera_manifest_to_lab_scene,
+    )
+    return apply_camera_manifest_to_lab_scene(scene, manifest)
+
+
+def _ordered_lab_scene_for_sensor_focus(
+    tll: Any,
+    sensor_focus_m: float,
+    camera_manifest: Optional[Mapping[str, Any]] = None,
+) -> Any:
     """Configure a fresh lab scene whose physical sensor conjugate matches the order."""
     initial = tll.SceneConfig()
+    if camera_manifest is not None:
+        _apply_camera_manifest_to_lab_scene(tll, initial, camera_manifest)
     proposed_object_distance_m = _lab_object_distance_for_sensor_focus(
         initial, sensor_focus_m
     )
@@ -960,6 +1036,8 @@ def _ordered_lab_scene_for_sensor_focus(tll: Any, sensor_focus_m: float) -> Any:
     physical_error_m = 0.0
     for _ in range(4):
         probe = tll.SceneConfig()
+        if camera_manifest is not None:
+            _apply_camera_manifest_to_lab_scene(tll, probe, camera_manifest)
         probe.focus_distance_m = corrected_object_distance_m
         probe.x_max = max(
             float(probe.x_max),
@@ -975,6 +1053,8 @@ def _ordered_lab_scene_for_sensor_focus(tll: Any, sensor_focus_m: float) -> Any:
             break
 
     scene = tll.SceneConfig()
+    if camera_manifest is not None:
+        _apply_camera_manifest_to_lab_scene(tll, scene, camera_manifest)
     scene.focus_distance_m = corrected_object_distance_m
     scene.x_max = max(
         float(scene.x_max),
@@ -1009,7 +1089,10 @@ def _make_rebuilt_lab_camera(
     assembly.sync_from_scene(lab_scene)
     sensor_ids = np.asarray(image_plate_ids, np.int32).reshape(-1)
     sensor_center = np.asarray(tri_arr, np.float64)[sensor_ids].reshape(-1, 3).mean(axis=0)
-    return RebuiltCameraArtifact.create(
+    camera_manifest = copy.deepcopy(
+        getattr(lab_scene, "resolved_camera_manifest", {}) or {}
+    )
+    artifact = RebuiltCameraArtifact.create(
         scene_config=lab_scene,
         lens_assembly=assembly,
         lens_surface_groups=lens_surface_groups,
@@ -1017,7 +1100,51 @@ def _make_rebuilt_lab_camera(
         wavelengths_nm=sidecar.wavelength_nm,
         sensor_center=sensor_center,
         diffraction_model="disabled_unless_wave_arena_is_explicitly_registered",
+        manifest=camera_manifest,
     )
+    solved = getattr(lab_scene, "optical_design", None)
+    if solved is not None and hasattr(solved, "groups"):
+        from camera_software.camera_manifest import (
+            CameraManifest,
+            resolve_camera_manifest,
+            with_resolved_optics,
+        )
+        base_manifest = (
+            CameraManifest(camera_manifest)
+            if camera_manifest else resolve_camera_manifest(
+                wavelengths_nm=sidecar.wavelength_nm
+            )
+        )
+        artifact.manifest = with_resolved_optics(
+            base_manifest,
+            groups=[{
+                "name": group.name,
+                "center_x_m": float(group.x_m),
+                "focal_length_mm": float(group.focal_length_m) * 1.0e3,
+                "aperture_radius_mm": float(group.aperture_radius_m) * 1.0e3,
+                "thickness_mm": float(group.thickness_m) * 1.0e3,
+                "radius_front_mm": float(group.radius_front_m) * 1.0e3,
+                "radius_back_mm": float(group.radius_back_m) * 1.0e3,
+                "ior": float(group.ior),
+                "glass": str(getattr(lens, "glass", "N-BK7")),
+            } for group, lens in zip(solved.groups, artifact.scene_lenses)],
+            # The paraxial design target and the exact thick-surface assembly
+            # are both retained; this field describes the transport artifact.
+            effective_focal_length_mm=float(optics.f_eff) * 1.0e3,
+            aperture_x_m=float(solved.aperture_x_m),
+            entrance_pupil=(
+                float(solved.entrance_pupil_x_m),
+                float(solved.entrance_pupil_radius_m),
+            ),
+            exit_pupil=(
+                float(solved.exit_pupil_x_m),
+                float(solved.exit_pupil_radius_m),
+            ),
+            sensor_x_m=float(lab_scene.image_plate.x),
+            sensor_error_mm=float(solved.sensor_error_m) * 1.0e3,
+            build_id=artifact.provenance.build_id,
+        ).mapping()
+    return artifact
 
 
 def _build_thick_lens_lab_tracer_scene() -> TracerScene:
@@ -1034,16 +1161,49 @@ def _build_thick_lens_lab_tracer_scene() -> TracerScene:
     import thick_lens_focus_lab as tll
 
     ordered_sensor_focus_m = None
+    ordered_camera_manifest = None
     if _ORDERED_SCENE_JOB is not None:
-        from scene_orders import camera_focus_distance
+        from scene_orders import camera_focus_distance, order_runtime_settings
         ordered_sensor_focus_m = camera_focus_distance(_ORDERED_SCENE_JOB)
+        ordered_camera_manifest = order_runtime_settings(
+            _ORDERED_SCENE_JOB
+        )["camera_manifest"]
 
-    lab_scene = (
-        tll.SceneConfig()
-        if ordered_sensor_focus_m is None
-        else _ordered_lab_scene_for_sensor_focus(tll, ordered_sensor_focus_m)
+    authored_flash_spectrum = None
+    if ordered_camera_manifest is not None:
+        authored_flash_spectrum = dict(
+            ordered_camera_manifest.get("flash", {})
+        ).get("resolved_spectral_model")
+    sidecar = _active_frequency_sidecar(
+        tll, DEFAULT_FREQ_HZ, authored_flash_spectrum
     )
-    sidecar = _active_frequency_sidecar(tll, DEFAULT_FREQ_HZ)
+    ordered_camera_object = None
+    if ordered_camera_manifest is not None:
+        from camera_software.camera_manifest import resolve_camera_manifest
+        ordered_camera_object = resolve_camera_manifest(
+            _ORDERED_SCENE_JOB.get("camera", {}),
+            _ORDERED_SCENE_JOB.get("image", {}),
+            _ORDERED_SCENE_JOB.get("flash", {}),
+            wavelengths_nm=sidecar.wavelength_nm,
+        )
+        ordered_camera_manifest = ordered_camera_object.mapping()
+    if ordered_sensor_focus_m is None:
+        lab_scene = tll.SceneConfig()
+        if ordered_camera_manifest is not None:
+            _apply_camera_manifest_to_lab_scene(
+                tll, lab_scene, ordered_camera_manifest
+            )
+    else:
+        lab_scene = _ordered_lab_scene_for_sensor_focus(
+            tll, ordered_sensor_focus_m, ordered_camera_manifest
+        )
+
+    camera_manifest_hash = "default"
+    if ordered_camera_object is not None:
+        from camera_software.camera_preparation import CameraPreparationKey
+        camera_manifest_hash = CameraPreparationKey.from_manifest(
+            ordered_camera_object
+        ).cache_key.replace("sha256:", "")[:16]
 
     cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".spectral_cache")
     focus_cache_tag = (
@@ -1051,12 +1211,21 @@ def _build_thick_lens_lab_tracer_scene() -> TracerScene:
         if ordered_sensor_focus_m is None
         else f"focus_{int(round(ordered_sensor_focus_m * 1.0e6))}um"
     )
+    transport_cache_tag = hashlib.sha256(
+        np.ascontiguousarray(
+            _ORDERED_MATERIAL_LUT_GRID
+            if _ORDERED_MATERIAL_LUT_GRID is not None else DEFAULT_FREQ_HZ,
+            np.float64,
+        ).tobytes()
+    ).hexdigest()[:12]
     cache_path = os.path.join(
-        cache_dir, f"thick_lens_exposure_scene_v6_{focus_cache_tag}.npz"
+        cache_dir,
+        f"thick_lens_exposure_scene_v7_{camera_manifest_hash}_"
+        f"{focus_cache_tag}_spectral_{transport_cache_tag}.npz",
     )
     cache_stamp = np.concatenate([
         np.asarray([
-            6.0,
+            7.0,
             float(os.path.getmtime(tll.__file__)),
             float(DEFAULT_FREQ_HZ.size),
             -1.0 if ordered_sensor_focus_m is None else float(ordered_sensor_focus_m),
@@ -1121,7 +1290,12 @@ def _build_thick_lens_lab_tracer_scene() -> TracerScene:
     normals = np.ascontiguousarray(normals, dtype=np.float64)
     mat_idx = np.ascontiguousarray(mat_idx, dtype=np.int32)
     tri_arr = np.ascontiguousarray(tri_arr, dtype=np.float64)
-    mat_buf = np.ascontiguousarray(db.build_mat_buf(), dtype=np.float32)
+    mat_buf = np.ascontiguousarray(
+        db.build_mat_buf(freq_hz=(
+            _ORDERED_MATERIAL_LUT_GRID
+            if _ORDERED_MATERIAL_LUT_GRID is not None else DEFAULT_FREQ_HZ
+        )), dtype=np.float32
+    )
     mat_n_mats = int(mat_buf.shape[0] // MAX_SPECTRAL_BANDS)
 
     source_ids = np.asarray(source_ids, dtype=np.int32).reshape(-1)
@@ -1425,7 +1599,10 @@ def _build_tracer_scene(t: float, scene_mode: str = "orbiters",
         mat_idx_arr = np.concatenate([mat_idx_arr, rig_mat_idx_arr]).astype(np.int32, copy=False)
         camera_tri_groups = rig_groups
 
-    mat_buf = db.build_mat_buf()                                # (N_mat*32, 12) f32
+    mat_buf = db.build_mat_buf(freq_hz=(
+        _ORDERED_MATERIAL_LUT_GRID
+        if _ORDERED_MATERIAL_LUT_GRID is not None else DEFAULT_FREQ_HZ
+    ))
     mat_n_mats = int(mat_buf.shape[0] // MAX_SPECTRAL_BANDS)
 
     # ── Emissive sources: any triangle whose material has nonzero PBR
@@ -1612,8 +1789,8 @@ class CameraOpticalRig:
         return cls(
             cam_pos=cam_pos, fwd=fwd, right=right, up=up,
             sensor_center=sensor_center,
-            sensor_w_m=0.036,
-            sensor_h_m=0.024,
+            sensor_w_m=DEFAULT_FILM_FORMAT.frame_width_mm * 1.0e-3,
+            sensor_h_m=DEFAULT_FILM_FORMAT.frame_height_mm * 1.0e-3,
             aperture_center=aperture_center,
             aperture_radius_m=aperture_r,
             lens_center=lens_center,
@@ -1846,6 +2023,27 @@ class CppExposureBackend(ExposureBackend):
             speed_m_s  = float(C_LIGHT),
             atmo_abs   = self.atmo_abs,
         )
+        if _ORDERED_TRANSPORT_LUT is not None:
+            self.tracer.configure_spectral_luts(**_ORDERED_TRANSPORT_LUT)
+            print(
+                "[config] native per-ray spectral LUT resolver loaded "
+                f"lanes={self.freq_hz.size} profiles="
+                f"{_ORDERED_TRANSPORT_LUT['profile_offsets'].size - 1}",
+                flush=True,
+            )
+        if _ORDERED_TRANSPORT_RGB_WEIGHTS is not None:
+            weights = np.ascontiguousarray(
+                _ORDERED_TRANSPORT_RGB_WEIGHTS, np.float32
+            )
+            if weights.shape != (self.freq_hz.size, 3):
+                raise ValueError(
+                    "ordered transport RGB weights must match active frequencies"
+                )
+            self.tracer.set_uv_blit_weights(weights, mode=0)
+            print(
+                "[config] exact transport sensor weights loaded "
+                f"lanes={weights.shape[0]}"
+            )
 
         # GPU-resident camera exposures use the recursive sensor hierarchy.
         # Configuration must precede the tracer's lazy pipeline creation.
@@ -1873,6 +2071,11 @@ class CppExposureBackend(ExposureBackend):
                 # Actual camera primaries emitted per selected sensor node in
                 # every native mip submission.
                 samples_per_epoch=sensor_samples_per_node,
+                subdivision_axis=int(
+                    dict(getattr(
+                        _NEXT_SITE_SCAN_COMMAND, "metadata", {}
+                    )).get("sensor_grid", {}).get("subdivision_axis", 3)
+                ),
             )
             print(
                 "[config] GPU sensor rays "
@@ -1991,6 +2194,58 @@ class CppExposureBackend(ExposureBackend):
         self._optical_assembly: Optional[OpticalAssembly] = None
         self._optical_telemetry: Optional[dict] = None
 
+    def _native_emitter_launch_args(self) -> tuple[int, float, float, float, float]:
+        """Resolve the scene-order emitter launch profile for the native ABI."""
+
+        profile = dict(
+            getattr(getattr(self, "scene", None), "emitter_launch_profile", {})
+            or {}
+        )
+        if not profile:
+            optical_camera = getattr(getattr(self, "scene", None), "optical_camera", None)
+            flash = dict(getattr(optical_camera, "manifest", {}).get("flash", {})) if optical_camera is not None else {}
+            profile = dict(flash.get("launch_profile", {}))
+        mode = str(profile.get("mode", "lambertian")).strip().lower()
+        if mode != "collimated":
+            return (0, -1.0, 0.0, 0.0, 0.0)
+        direction = np.asarray(profile.get("direction", [-1.0, 0.0, 0.0]), np.float64).reshape(-1)
+        if direction.size != 3 or not np.all(np.isfinite(direction)):
+            raise ValueError("collimated emitter direction must contain three finite values")
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1.0e-15:
+            raise ValueError("collimated emitter direction must be nonzero")
+        direction /= norm
+        divergence_deg = max(0.0, float(profile.get("divergence_deg", 0.0)))
+        return (
+            1, float(direction[0]), float(direction[1]), float(direction[2]),
+            float(math.radians(divergence_deg)),
+        )
+
+    def _bdpt_overflow_snapshot(self) -> dict[str, int]:
+        if not hasattr(self.tracer, "get_bdpt_overflow"):
+            return {}
+        return {
+            str(key): int(value)
+            for key, value in dict(self.tracer.get_bdpt_overflow()).items()
+        }
+
+    def _assert_no_bdpt_overflow(
+        self, before: dict[str, int], *, page_label: str,
+    ) -> None:
+        if not before:
+            return
+        after = self._bdpt_overflow_snapshot()
+        delta = {
+            key: int(after.get(key, 0)) - int(before.get(key, 0))
+            for key in set(before) | set(after)
+            if int(after.get(key, 0)) > int(before.get(key, 0))
+        }
+        if delta:
+            raise RuntimeError(
+                f"BDPT {page_label} rejected because native records overflowed: "
+                f"{delta}. The incomplete grey fallback was not published."
+            )
+
     def run_recursive_sensor_epoch(
         self, *, top_k: int, seed: int, emitter_tri_ids: np.ndarray,
         refinement_steps: int = 8, targeted_fraction: float = 0.75,
@@ -2007,7 +2262,12 @@ class CppExposureBackend(ExposureBackend):
             # At 32 primaries/node the mature camera side is ~1.1M vertices.
             # Eight million pairs preserves several stratified light samples
             # per camera vertex instead of starving that estimator dimension.
-            self.tracer.set_t5_pair_budget(8_000_000)
+            self.tracer.set_t5_pair_budget(max(
+                1,
+                int(os.environ.get(
+                    "SPECTRAL_SENSOR_T5_PAIR_BUDGET", "8000000"
+                )),
+            ))
         # Unlike the legacy flash launcher, an adaptive camera epoch may be
         # the first transport operation. Create the configured GPU pipeline
         # explicitly instead of depending on an unrelated submission side effect.
@@ -2027,25 +2287,30 @@ class CppExposureBackend(ExposureBackend):
             raise RuntimeError("recursive sensor exposure requires an emitter")
         requested_top_k = max(1, int(top_k))
         samples_per_node = max(1, int(self._sensor_samples_per_node))
-        # With max_children=1, 200k camera primaries plus the retained flash
-        # family stay below the 6.875M vertex/PDF arena on the 12 GiB profile.
-        # Split selected-node work rather than lowering samples-per-node.
-        nodes_per_page = max(1, 200_000 // samples_per_node)
-        page_count = int(math.ceil(requested_top_k / nodes_per_page))
-        if page_count > 1 or int(refinement_steps) > 1:
-            print(
-                "  [sensor-refine] BDPT record paging "
-                f"steps={max(1, int(refinement_steps))} "
-                f"node-pages/step={page_count} nodes/page<={nodes_per_page} "
-                f"samples/node={samples_per_node}",
-                flush=True,
+        if int(refinement_steps) != 1:
+            raise ValueError(
+                "recursive sensor refinement_steps must be 1; compile larger "
+                "logical work as additional max_sensor_epochs so every mip "
+                "selection receives its own complete batching cycle"
             )
-
+        # Fixed transport emits one persistent spectral record per active lane.
+        # Page against that cumulative arena, not only the transient primary
+        # dispatch and vertex/PDF arenas. Continuous LUT transport resolves one
+        # immutable frequency per ray and therefore has record width one.
+        record_lane_width = (
+            1 if _ORDERED_TRANSPORT_LUT is not None
+            else max(1, int(np.asarray(
+                getattr(self, "freq_hz", (1.0,))
+            ).size))
+        )
+        overflow_before = self._bdpt_overflow_snapshot()
         self.tracer.begin_sensor_batching()
         try:
             submitted_flash = int(self.tracer.submit_emissive_triangles(
                 tri_ids,
-                32_000,
+                max(1, int(os.environ.get(
+                    "SPECTRAL_SENSOR_FLASH_RAYS", "32000"
+                ))),
                 1.0,
                 1.0,
                 max(1, int(self.max_bounces)),
@@ -2056,6 +2321,7 @@ class CppExposureBackend(ExposureBackend):
                 True,
                 _SHADER_DIR,
                 0.0, 0.0, 0.0, 0.0,
+                *self._native_emitter_launch_args(),
             ))
             if submitted_flash <= 0:
                 raise RuntimeError(
@@ -2063,38 +2329,35 @@ class CppExposureBackend(ExposureBackend):
                 )
             self.tracer.signal_flash_dispatched()
             cycle = 0
-            for step in range(max(1, int(refinement_steps))):
-                nodes_remaining = requested_top_k
-                page = 0
-                while nodes_remaining > 0:
-                    page_top_k = min(nodes_per_page, nodes_remaining)
-                    if cycle > 0:
-                        # Logical flash-side marker: native batching retains
-                        # page zero's packed light rows, so no rays are relaunched.
-                        self.tracer.signal_flash_dispatched()
-                    ok = bool(self.tracer.submit_sensor_mip_epoch(
-                        top_k=page_top_k,
-                        seed=_bounded_native_seed(
-                            int(seed) * 65_537 + step * 257 + page
-                        ),
-                        max_bounces=max(1, int(self.max_bounces)),
-                        min_amplitude=0.0,
-                        exposure_weight=1.0,
-                        targeted_fraction=float(targeted_fraction),
-                    ))
-                    if not ok:
-                        raise RuntimeError("GPU recursive sensor epoch failed")
-                    self.tracer.signal_sensor_dispatched()
-                    if hasattr(self.tracer, "in_flight_count"):
-                        deadline = time.perf_counter() + 30.0
-                        while time.perf_counter() < deadline:
-                            if int(self.tracer.in_flight_count()) == 0:
-                                break
-                            time.sleep(0.002)
-                    self.tracer.join_t5()
-                    nodes_remaining -= page_top_k
-                    page += 1
-                    cycle += 1
+            for step in range(1):
+                if cycle > 0:
+                    # One complete selection per cycle. Native batching retains
+                    # page zero's packed light rows across refinement steps.
+                    self.tracer.signal_flash_dispatched()
+                ok = bool(self.tracer.submit_sensor_mip_epoch(
+                    top_k=requested_top_k,
+                    seed=_bounded_native_seed(int(seed) * 65_537 + step * 257),
+                    max_bounces=max(1, int(self.max_bounces)),
+                    min_amplitude=0.0,
+                    exposure_weight=1.0,
+                    targeted_fraction=float(targeted_fraction),
+                ))
+                if not ok:
+                    raise RuntimeError("GPU recursive sensor epoch failed")
+                self.tracer.signal_sensor_dispatched()
+                if hasattr(self.tracer, "in_flight_count"):
+                    deadline = time.perf_counter() + 30.0
+                    while time.perf_counter() < deadline:
+                        if int(self.tracer.in_flight_count()) == 0:
+                            break
+                        time.sleep(0.002)
+                self.tracer.join_t5()
+                self._assert_no_bdpt_overflow(
+                    overflow_before,
+                    page_label=f"recursive sensor step {step}",
+                )
+                overflow_before = self._bdpt_overflow_snapshot()
+                cycle += 1
         finally:
             self.tracer.end_sensor_batching()
 
@@ -2107,6 +2370,150 @@ class CppExposureBackend(ExposureBackend):
         self._native_sensor_priority_map = None
         self.sensor_uv_hits.fill(0.0)
         self.sensor_uv_thin_lens_hits.fill(0.0)
+
+    def run_gpu_first_scene_depth(
+        self,
+        *,
+        scene_tri_ids: np.ndarray,
+        seed: int,
+        rays_per_page: int = 16_384,
+    ) -> np.ndarray:
+        """Trace one real camera ray per native sensor site and return metres.
+
+        The camera rays and every optical/scene intersection run through the
+        native GPU pipeline.  CPU readback performs only the final product
+        reduction: for each sensor site, retain the nearest STRIKE belonging
+        to the authored scene-object group.  Lens and camera proxy events are
+        therefore traversed but never mistaken for scene depth.
+        """
+
+        required = (
+            "ensure_pipeline", "submit_sensor_sweep", "drain_records",
+            "in_flight_count", "pipeline_stats",
+        )
+        missing = [name for name in required if not hasattr(self.tracer, name)]
+        if missing:
+            raise RuntimeError(
+                "GPU first-scene depth requires RayTracer methods: "
+                + ", ".join(missing)
+            )
+        if self._sensor_camera_desc is None:
+            raise RuntimeError("GPU first-scene depth requires a registered camera")
+
+        object_ids = np.unique(np.asarray(scene_tri_ids, np.int32).reshape(-1))
+        if object_ids.size == 0:
+            raise RuntimeError("GPU first-scene depth requires authored scene triangles")
+        native_res = int(max(self.cam.width, self.cam.height))
+        schedule_total = native_res * native_res
+        depth_flat = np.full((schedule_total,), np.inf, np.float32)
+
+        # Depth is a diagnostic readback product, so explicitly enable records
+        # before the lazily-created all-GPU pipeline is instantiated.
+        if hasattr(self.tracer, "set_gpu_skip_record_readback"):
+            self.tracer.set_gpu_skip_record_readback(False)
+        self.tracer.ensure_pipeline(
+            max_children=1,
+            # Depth is a geometric diagnostic, not an aperture-integration
+            # estimate.  Native seed zero aims every primary at the pupil
+            # centre; a non-zero seed selects a different Fibonacci pupil
+            # point for each page and turns lens vignetting into random holes.
+            seed=0,
+            min_amplitude=0.0,
+            use_gpu_compute=True,
+            gpu_all_stages=True,
+            shader_dir=_SHADER_DIR,
+        )
+
+        def reduce_ready() -> int:
+            reduced = 0
+            while True:
+                records = self.tracer.drain_records(max_n=50_000)
+                kind = np.asarray(records.get("kind", ()), np.uint8).reshape(-1)
+                if kind.size == 0:
+                    break
+                src = np.asarray(records["src_id"], np.int64).reshape(-1)
+                tri = np.asarray(records["hit_tri"], np.int32).reshape(-1)
+                path = np.asarray(records["path_len"], np.float32).reshape(-1)
+                keep = (
+                    (kind == 0)
+                    & (src >= 0)
+                    & (src < schedule_total)
+                    & np.isfinite(path)
+                    & (path >= 0.0)
+                    & np.isin(tri, object_ids, assume_unique=False)
+                )
+                if np.any(keep):
+                    np.minimum.at(depth_flat, src[keep], path[keep])
+                    reduced += int(np.count_nonzero(keep))
+            return reduced
+
+        submitted = 0
+        page = max(1, min(int(rays_per_page), schedule_total))
+        while submitted < schedule_total:
+            count = int(self.tracer.submit_sensor_sweep(
+                # The reducer wants the first authored-scene strike.  Lens
+                # surfaces are traversed inside the camera launch; allowing
+                # scene scattering beyond the first strike only creates
+                # records that the minimum-depth reduction will discard.
+                max_bounces=1,
+                min_amplitude=0.0,
+                max_rays=min(page, schedule_total - submitted),
+                pix_offset=submitted,
+                max_children=1,
+                aperture_samples=1,
+                seed=0,
+                exposure_weight=1.0,
+            ))
+            if count <= 0:
+                raise RuntimeError(
+                    f"GPU depth sensor sweep stopped at {submitted}/{schedule_total} rays"
+                )
+            submitted += count
+            deadline = time.perf_counter() + 30.0
+            while True:
+                reduce_ready()
+                if int(self.tracer.in_flight_count()) == 0:
+                    reduce_ready()
+                    if int(self.tracer.pipeline_stats().get("output_queue_depth", 0)) == 0:
+                        break
+                if time.perf_counter() >= deadline:
+                    raise TimeoutError(
+                        f"GPU depth page did not drain after 30 s ({submitted}/{schedule_total})"
+                    )
+                time.sleep(0.001)
+
+        depth_native = depth_flat.reshape(native_res, native_res)
+        output_width, output_height = (
+            _ORDERED_TILE_OUTPUT
+            if _ORDERED_TILE_OUTPUT is not None
+            else (int(self.cam.width), int(self.cam.height))
+        )
+        depth_display = _native_sensor_tile_to_display(
+            depth_native[..., None], output_width, output_height
+        )[..., 0].astype(np.float32, copy=False)
+        valid = np.isfinite(depth_display)
+        preview = np.zeros_like(depth_display, np.float32)
+        if np.any(valid):
+            near = float(np.min(depth_display[valid]))
+            far = float(np.max(depth_display[valid]))
+            if far > near:
+                # Conventional depth preview: near is bright, far is dark.
+                preview[valid] = 1.0 - (depth_display[valid] - near) / (far - near)
+            else:
+                preview[valid] = 1.0
+        raw_rgb = np.repeat(depth_display[..., None], 3, axis=2)
+        preview_rgb = np.repeat(preview[..., None], 3, axis=2)
+        self._native_sensor_linear_image = np.ascontiguousarray(raw_rgb, np.float32)
+        self._native_sensor_image = np.ascontiguousarray(preview_rgb, np.float32)
+        self.n_rays_accumulated += int(submitted)
+        print(
+            "  [depth-gpu] first authored-scene strike "
+            f"sites={int(np.count_nonzero(valid))}/{valid.size} rays={submitted:,} "
+            f"range={float(np.min(depth_display[valid])) if np.any(valid) else float('nan'):.6g}.."
+            f"{float(np.max(depth_display[valid])) if np.any(valid) else float('nan'):.6g} m",
+            flush=True,
+        )
+        return self._native_sensor_image
 
     def cleanup_overflow_temp_file(self) -> None:
         if not self._bdpt_last_overflow_path:
@@ -2537,10 +2944,48 @@ class CppExposureBackend(ExposureBackend):
         # subpaths survive to become connectable vertices.  The session-level
         # self.min_amplitude (1e-3) is for the streaming integrators, not this
         # lab-parity path.
+        interaction_target = (0.0, 0.0, 0.0, 0.0)
+        native_flash_weight = float(max(0.0, exposure_weight))
+        optical_camera = getattr(getattr(self, "scene", None), "optical_camera", None)
+        if optical_camera is not None:
+            flash_manifest = dict(
+                getattr(optical_camera, "manifest", {}).get("flash", {})
+            )
+            modifier = dict(flash_manifest.get("modifier", {}))
+            burst = dict(flash_manifest.get("burst", {}))
+            native_flash_weight *= max(
+                0.0, float(burst.get("exposure_weight", 1.0))
+            ) * max(0.0, float(burst.get("energy_scale", 1.0))) * max(
+                0.0, min(1.0, float(burst.get("duty_cycle", 1.0)))
+            )
+            mode_name = str(modifier.get("mode", "none")).lower()
+            mode_value = {"none": 0, "snoot": 1, "grid": 2, "scrim": 3}.get(
+                mode_name, 0
+            )
+            if mode_value == 2:
+                param0 = float(modifier.get("grid_cell_mm", 5.0))
+                param1 = float(modifier.get("grid_depth_mm", 25.0))
+            elif mode_value == 3:
+                param0 = float(modifier.get("scrim_transmittance", 0.5))
+                param1 = 0.0
+            else:
+                param0 = param1 = 0.0
+            if hasattr(self.tracer, "set_flash_modifier"):
+                self.tracer.set_flash_modifier(mode_value, param0, param1)
+            if mode_value != 0:
+                lab_config = getattr(optical_camera, "scene_config", None)
+                subject = getattr(lab_config, "object_plane", None)
+                if subject is not None:
+                    interaction_target = (
+                        float(getattr(subject, "x", 0.0)), 0.0, 0.0,
+                        float(max(1.0e-6, getattr(subject, "radius", 0.05))),
+                    )
+
+        overflow_before = self._bdpt_overflow_snapshot()
         submitted_flash = int(self.tracer.submit_emissive_triangles(
             tri_ids,
             int(emitter_rays_per_domain),
-            float(max(0.0, exposure_weight)),
+            native_flash_weight,
             1.0,
             int(self.max_bounces),
             0.0,
@@ -2549,10 +2994,8 @@ class CppExposureBackend(ExposureBackend):
             bool(self._gpu_resident),
             bool(self._gpu_resident),
             _SHADER_DIR,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
+            *interaction_target,
+            *self._native_emitter_launch_args(),
         ))
         self.tracer.signal_flash_dispatched()
         if submitted_flash <= 0:
@@ -2590,6 +3033,11 @@ class CppExposureBackend(ExposureBackend):
                             break
                         time.sleep(0.002)
                 self.tracer.join_t5()
+                self._assert_no_bdpt_overflow(
+                    overflow_before,
+                    page_label=f"native sensor sweep page {sensor_page}",
+                )
+                overflow_before = self._bdpt_overflow_snapshot()
                 sensor_page += 1
             if submitted_sensor < slice_total:
                 raise RuntimeError(
@@ -4194,11 +4642,11 @@ class ExposureSession:
         if radiance <= 0.0:
             # Avoid divide-by-zero: bias to dim moonlight (~1e-4 W·sr⁻¹·m⁻²).
             radiance = 1.0e-4
-        # Budget against the active render raster (not physical film megapixels)
-        # so low-ray previews do not mutate camera geometry/FOV.
-        n_pix = max(1, int(self.width) * int(self.height))
-        # Respect explicit low total-ray requests (sub-1 ray/pixel previews).
-        rps = max(0.0, float(self.total_rays) / float(n_pix))
+        # The budget allocator multiplies density by the physical sensor pixel
+        # count. Divide by that same count so --total-rays is an actual dispatch
+        # budget, including deliberately tiny calibration exposures.
+        physical_pixels = max(1, int(self.optics.n_pixels()))
+        rps = max(0.0, float(self.total_rays) / float(physical_pixels))
         n_batches = max(1,
                         (self.total_rays + self.rays_per_batch - 1) //
                         self.rays_per_batch)
@@ -4825,6 +5273,7 @@ class ExposureSession:
                 # Mirror the fallback used by the final-save path instead of
                 # forcing the per-batch snapshot to black.
                 _native_img = None
+                _linear_evidence = None
                 _snap_cpp = back
                 if (isinstance(back, GlslExposureBackend)
                         and isinstance(getattr(back, "_mirror", None), CppExposureBackend)
@@ -4832,8 +5281,18 @@ class ExposureSession:
                     _snap_cpp = back._mirror
                 if (isinstance(_snap_cpp, CppExposureBackend)
                         and bool(getattr(_snap_cpp, "_gpu_resident", False))):
+                    _linear_evidence = _native_sensor_accumulation_output(_snap_cpp)
+                    if _linear_evidence is not None:
+                        _native_img = self._tone_map(
+                            _linear_evidence, frame_cfg.integral_split
+                        )
+                        rgb_linear = _linear_evidence
                     _snap_tracer = getattr(_snap_cpp, "tracer", None)
-                    if _snap_tracer is not None and hasattr(_snap_tracer, "get_sensor_image"):
+                    if (
+                        _native_img is None
+                        and _snap_tracer is not None
+                        and hasattr(_snap_tracer, "get_sensor_image")
+                    ):
                         _cached = getattr(_snap_cpp, "_native_sensor_image", None)
                         _cand = (np.asarray(_cached) if _cached is not None
                                  else _native_sensor_to_display(
@@ -4843,7 +5302,8 @@ class ExposureSession:
                                 np.float32, copy=False)
                 if _native_img is not None:
                     img = _native_img
-                    rgb_linear = _native_img.copy()
+                    if _linear_evidence is None:
+                        rgb_linear = _native_img.copy()
                 else:
                     self._warn_missing_rgb_source_once(
                         source="sensor",
@@ -5276,6 +5736,32 @@ class ExposureSession:
 
         scene_mode = self._scene_mode_for_frame()
         prebuilt_scene: Optional[TracerScene] = None
+        if self.integrator == "depth":
+            frame_cfg = FrameConfig(
+                field_capture=FieldCaptureConfig(
+                    enabled=False, grid_kind="regular",
+                    nx=1, ny=1, nz=1,
+                    capture_strikes=False, max_strikes=0,
+                ),
+                camera_visibility=CameraVisibilityConfig(
+                    camera_vis_mode=_CAM_VIS_AS_IS,
+                    transparent_mode=_CAM_TRANSP_BLOCK,
+                    depth_cull_enabled=False, depth_cull_m=0.0,
+                ),
+                surface_spline=SurfaceSplineConfig(enabled=False),
+                parametric_sdf=ParametricSdfConfig(enabled=False),
+                integral_split=IntegralSplitConfig(
+                    field_integrate_frac=0.0,
+                    field_bookkeep_frac=1.0,
+                    surface_integrate_frac=0.0,
+                    surface_bookkeep_frac=1.0,
+                    hdr_white_percentile=float(
+                        self.integral_split.hdr_white_percentile
+                    ),
+                ),
+                description="native GPU first-authored-scene depth · one primary/site",
+                detail_level=0,
+            )
         if scene_mode == CAMERA_SOLVE_PREVIEW_SCENE:
             frame_cfg = FrameConfig(
                 field_capture=FieldCaptureConfig(
@@ -5412,8 +5898,38 @@ class ExposureSession:
                       f"R {rgb_frac[0]*100.0:5.1f}%  "
                       f"G {rgb_frac[1]*100.0:5.1f}%  "
                       f"B {rgb_frac[2]*100.0:5.1f}%")
-        print(f"  budget (total)       : N_rays={plan.total_rays:_}  "
-              f"n_batches={plan.n_batches}  rays/batch={plan.rays_per_batch:_}")
+        sensor_budget_backend = backs.get("cpp")
+        if bool(getattr(sensor_budget_backend, "_sensor_mipmap_enabled", False)):
+            budget_epochs = max(
+                1, int(os.environ.get("SPECTRAL_SENSOR_MAX_EPOCHS", "1"))
+            )
+            budget_top_k = min(1024, max(
+                64,
+                int(os.environ.get(
+                    "SPECTRAL_SENSOR_TOP_K", str(max(self.width, self.height))
+                )),
+            ))
+            budget_samples = max(
+                1, int(getattr(sensor_budget_backend, "_sensor_samples_per_node", 1))
+            )
+            scheduled_camera = (
+                budget_epochs * budget_top_k * budget_samples
+            )
+            supporting_flash = budget_epochs * max(
+                1, int(os.environ.get("SPECTRAL_SENSOR_FLASH_RAYS", "32000"))
+            )
+            print(
+                f"  budget (impactful)   : camera_target={plan.total_rays:_}  "
+                f"camera_scheduled={scheduled_camera:_}  "
+                f"epochs={budget_epochs}"
+            )
+            print(
+                f"  support (not counted): flash_paths={supporting_flash:_}  "
+                f"T5_pairs/epoch<={int(os.environ.get('SPECTRAL_SENSOR_T5_PAIR_BUDGET', '8000000')):_}"
+            )
+        else:
+            print(f"  budget (total)       : N_rays={plan.total_rays:_}  "
+                  f"n_batches={plan.n_batches}  rays/batch={plan.rays_per_batch:_}")
         print(f"  per-pixel target     : H={plan.target_H_J/n_pix:.3e} J  "
               f"photons={photons_per_pix:.3e} @ lambda={plan.ref_wavelength_nm:.0f} nm")
         print(f"  shutter t            : {self.film.exposure_time_s:.4g} s @ "
@@ -5500,7 +6016,7 @@ class ExposureSession:
         _bdpt_native_work_units: list[tuple[int, int]] = []
         _bdpt_native_work_plan: dict[str, int] = {}
         _bdpt_native_schedule: list[tuple[int, int, int]] = []
-        if self.integrator in ("forward", "backward", "bdpt") and "cpp" in backs:
+        if self.integrator in ("forward", "backward", "bdpt", "depth") and "cpp" in backs:
             cpp_back = backs["cpp"]  # type: ignore[assignment]
             tracer = getattr(cpp_back, "tracer", None)
             if tracer is not None and hasattr(tracer, "register_tri_group"):
@@ -5655,7 +6171,7 @@ class ExposureSession:
                 # ── Sensor group (PIXEL_CONE / AREA) ─────────────────────
                 # backward/bdpt: PIXEL_CONE (shoots backward rays from sensor)
                 # forward:       AREA (passive receiver — pixel-maps forward hits)
-                _register_sensor = self.integrator in ("forward", "backward", "bdpt")
+                _register_sensor = self.integrator in ("forward", "backward", "bdpt", "depth")
                 if _register_sensor:
                     cam_groups = scene.camera_tri_groups
                     if not isinstance(cam_groups, dict):
@@ -5685,6 +6201,10 @@ class ExposureSession:
                     n_ap_requested, cone_half_deg, cone_solid_angle_sr = self._adaptive_aperture_sample_count(
                         cam, int(frame_cfg.detail_level)
                     )
+                    if self.integrator == "depth":
+                        # One primary per native site: depth is a spatial scan,
+                        # not an aperture-integration estimator.
+                        n_ap_requested = 1
                     n_emit_pre = len(emissive_group_centers)
                     tri_groups_est = int(getattr(tracer, "n_tri_groups", lambda: 0)()) + 2
                     if conv_drive_batches:
@@ -5698,6 +6218,8 @@ class ExposureSession:
                         tri_group_count_estimate=tri_groups_est,
                         expected_batches=int(expected_sensor_batches),
                     )
+                    if self.integrator == "depth":
+                        n_ap_samples, stream_div = 1, 1
                     if n_ap_samples != int(n_ap_requested):
                         print(f"  [bdpt] aperture samples scaled: requested={int(n_ap_requested)} -> using={int(n_ap_samples)}")
                     self._camera_last_n_aperture_samples = int(n_ap_samples)
@@ -5706,7 +6228,7 @@ class ExposureSession:
                     self._camera_last_cone_solid_angle_sr = float(cone_solid_angle_sr)
 
                     aperture_stop_group_id = -1
-                    if aperture_tris.size > 0 and self.integrator in ("backward", "bdpt"):
+                    if aperture_tris.size > 0 and self.integrator in ("backward", "bdpt", "depth"):
                         # Aperture stop only needs kernel registration for backward/BDPT;
                         # in forward mode the blocker geometry in the BVH already absorbs
                         # off-axis rays via the material response.
@@ -5720,7 +6242,7 @@ class ExposureSession:
                     # the kernel pixel-maps forward ray hits without shooting
                     # backward PIXEL_CONE rays.
                     _sensor_sample_policy = (tri_sample_pixel
-                                             if self.integrator in ("backward", "bdpt")
+                                             if self.integrator in ("backward", "bdpt", "depth")
                                              else tri_sample_area)
                     # Wire solved camera into the sensor descriptor so the
                     # thin-lens geometric mode and focus distance reach the kernel.
@@ -5785,7 +6307,7 @@ class ExposureSession:
                             "lens_center": _lens_c,
                             "lens_fwd": _lens_fwd,
                         })
-                    elif solved is not None and self.integrator in ("backward", "bdpt"):
+                    elif solved is not None and self.integrator in ("backward", "bdpt", "depth"):
                         # Failed solver packages can produce extreme thin-lens descriptors
                         # that starve PIXEL_CONE sensor paths. Keep backward sampling in
                         # aperture-cone mode until a valid solve is available.
@@ -5846,7 +6368,7 @@ class ExposureSession:
                         cpp_back._sensor_camera_desc = dict(self._sensor_camera_desc)
                         if (
                             bool(getattr(cpp_back, "_gpu_resident", False))
-                            and self.integrator in ("backward", "bdpt")
+                            and self.integrator in ("backward", "bdpt", "depth")
                             and hasattr(tracer, "configure_sensor_image")
                         ):
                             target_mode = 0
@@ -5958,7 +6480,7 @@ class ExposureSession:
                         )
                     print(f"  {self.integrator.upper()}: sensor group registered with id {self._sensor_group_id}")
                     print(
-                        f"  {self.integrator.upper()}: thin-lens aperture sampling="
+                        f"  {self.integrator.upper()}: aperture-domain proposal samples="
                         f"{n_ap_samples} stream_div={stream_div} stop_group={aperture_stop_group_id}"
                     )
 
@@ -5984,7 +6506,7 @@ class ExposureSession:
                     n_emit_pre = len(emissive_group_centers)
                     _rays_per_emit = max(64, self.total_rays // max(1, tracer.n_tri_groups()))
                     _bdpt_target_total = max(n_emit_pre, int(_rays_per_emit) * max(1, n_emit_pre))
-                    _bdpt_stream_active = self.integrator in ("backward", "bdpt")
+                    _bdpt_stream_active = self.integrator in ("backward", "bdpt", "depth")
                     _stream_divisor = max(1, int(stream_div))
                     _stream_seen = np.zeros((_stream_divisor,), dtype=bool)
                     _stream_cover_complete = (_stream_divisor <= 1)
@@ -6007,7 +6529,7 @@ class ExposureSession:
                                 0, int(os.environ.get("SPECTRAL_SENSOR_MAX_EPOCHS", "64"))
                             )
                             _sensor_mip_continuous = str(
-                                os.environ.get("SPECTRAL_SENSOR_CONTINUOUS", "0")
+                                os.environ.get("SPECTRAL_SENSOR_PERSISTENT_EPOCHS", "0")
                             ).strip().lower() in ("1", "true", "yes", "on")
                             _sensor_mip_top_k = min(
                                 1024,
@@ -6028,7 +6550,7 @@ class ExposureSession:
                             )
                             _sensor_mip_targeted_fraction = float(np.clip(
                                 float(os.environ.get(
-                                    "SPECTRAL_SENSOR_TARGETED_FRACTION", "0.75"
+                                    "SPECTRAL_SENSOR_TARGETED_FRACTION", "0.0"
                                 )), 0.0, 1.0,
                             ))
                             from camera_software.scan_control import CoverageBalanceController
@@ -6103,7 +6625,7 @@ class ExposureSession:
                     n_emit_pre = len(emissive_group_centers)
                     _rays_per_emit = max(64, self.total_rays // max(1, tracer.n_tri_groups()))
                     _bdpt_target_total = max(n_emit_pre, int(_rays_per_emit) * max(1, n_emit_pre))
-                    _bdpt_stream_active = self.integrator in ("backward", "bdpt")
+                    _bdpt_stream_active = self.integrator in ("backward", "bdpt", "depth")
                     _stream_divisor = 1
                     _stream_seen = np.zeros((1,), dtype=bool)
                     _stream_cover_complete = True
@@ -6142,6 +6664,31 @@ class ExposureSession:
             if _bdpt_stream_active:
                 _cpp = backs.get("cpp")
                 if _cpp is not None:
+                    if self.integrator == "depth":
+                        if not isinstance(_cpp, CppExposureBackend):
+                            raise RuntimeError("depth mode requires the native C++ GPU backend")
+                        scene_groups = scene.camera_tri_groups or {}
+                        _cpp.run_gpu_first_scene_depth(
+                            scene_tri_ids=np.asarray(
+                                scene_groups.get("object", np.zeros((0,), np.int32)),
+                                np.int32,
+                            ),
+                            seed=int(seed),
+                            rays_per_page=int(max(1, rays_per_batch_total)),
+                        )
+                        batches_executed = 1
+                        _stream_cover_complete = True
+                        _stream_covered_n = 1
+                        if batch_preview_cb is not None:
+                            _depth_snaps = self.stream_integration_snapshots(
+                                backs=backs, plan=plan, frame_cfg=frame_cfg,
+                                batch_index=1,
+                            )
+                            batch_preview_cb(
+                                backs, _depth_snaps, 1, 1,
+                                float(time.perf_counter() - t0),
+                            )
+                        break
                     if _bdpt_native_lab_active:
                         if not isinstance(_cpp, CppExposureBackend):
                             raise RuntimeError("native thick-lens BDPT requires the C++ exposure backend")
@@ -6543,6 +7090,11 @@ class ExposureSession:
 
         frame_config_summary = {
             "description":   frame_cfg.description,
+            "integrator":    self.integrator,
+            "render_product": (
+                "sensor_optical_path_depth_m"
+                if self.integrator == "depth" else "spectral_radiance"
+            ),
             "detail_level":  int(frame_cfg.detail_level),
             "scene_mode":    scene_mode,
             "field":         (f"{fc_s.grid_kind} {fc_s.nx}^3"
@@ -6614,6 +7166,24 @@ class ExposureSession:
                 None if scene.optical_camera is None
                 else scene.optical_camera.provenance.as_dict()
             ),
+            "camera_manifest": (
+                None if scene.optical_camera is None
+                else copy.deepcopy(scene.optical_camera.manifest)
+            ),
+            "effective_focal_mm": (
+                0.0 if scene.optical_camera is None else float(
+                    dict(scene.optical_camera.manifest.get("resolved", {})).get(
+                        "effective_focal_length_mm", 0.0
+                    )
+                )
+            ),
+            "camera_back_type": (
+                "flat" if scene.optical_camera is None else str(
+                    dict(scene.optical_camera.manifest.get("sensor", {})).get(
+                        "back_type", "flat"
+                    )
+                )
+            ),
         }
 
         # ── Per-backend calibration + dump ───────────────────────────────
@@ -6653,9 +7223,13 @@ class ExposureSession:
                     and tracer_obj is not None
                     and hasattr(tracer_obj, "get_sensor_image")
                 ):
+                    native_linear = _native_sensor_accumulation_output(back)
                     cached_native_img = getattr(back, "_native_sensor_image", None)
                     native_img = np.asarray(cached_native_img if cached_native_img is not None else tracer_obj.get_sensor_image())
-                    if native_img.ndim == 3 and native_img.shape[2] >= 3 and np.any(native_img[..., :3]):
+                    if native_linear is not None:
+                        rgb_linear = native_linear
+                        img = self._tone_map(rgb_linear, frame_cfg.integral_split)
+                    elif native_img.ndim == 3 and native_img.shape[2] >= 3 and np.any(native_img[..., :3]):
                         img = np.clip(native_img[..., :3], 0.0, 1.0).astype(np.float32, copy=False)
                         rgb_linear = _native_sensor_linear_output(back, img)
                     else:
@@ -6832,22 +7406,44 @@ class ExposureSession:
             if _native_sensor_mode:
                 _rgb_ev = np.asarray(rgb_linear, dtype=np.float64)
                 _energy_ev = np.sum(np.maximum(_rgb_ev, 0.0), axis=2)
-                _native_evidence = {
-                    "units": "normalized_native_sensor_rgb",
-                    "radiometrically_calibrated": False,
-                    "shape": [int(v) for v in _rgb_ev.shape],
-                    "finite": bool(np.all(np.isfinite(_rgb_ev))),
-                    "lit_pixels": int(np.count_nonzero(_energy_ev > 1.0e-8)),
-                    "total_pixels": int(_energy_ev.size),
-                    "mean": float(np.mean(_rgb_ev)) if _rgb_ev.size else 0.0,
-                    "peak": float(np.max(_rgb_ev)) if _rgb_ev.size else 0.0,
-                    "channel_sums": [float(v) for v in np.sum(_rgb_ev, axis=(0, 1))],
-                }
+                if self.integrator == "depth":
+                    _depth = _rgb_ev[..., 0]
+                    _valid_depth = np.isfinite(_depth)
+                    _native_evidence = {
+                        "units": "metres_from_sensor_along_optical_path",
+                        "render_product": "first_authored_scene_strike_depth",
+                        "gpu_traced": True,
+                        "cpu_operation": "per-site nearest-hit reduction only",
+                        "scene_bounces": 1,
+                        "camera_optics_traversed": True,
+                        "shape": [int(v) for v in _depth.shape],
+                        "valid_pixels": int(np.count_nonzero(_valid_depth)),
+                        "total_pixels": int(_depth.size),
+                        "minimum_m": (
+                            float(np.min(_depth[_valid_depth])) if np.any(_valid_depth) else None
+                        ),
+                        "maximum_m": (
+                            float(np.max(_depth[_valid_depth])) if np.any(_valid_depth) else None
+                        ),
+                    }
+                    _measurement_status = "native_gpu_first_scene_depth"
+                else:
+                    _native_evidence = {
+                        "units": "normalized_native_sensor_rgb",
+                        "radiometrically_calibrated": False,
+                        "shape": [int(v) for v in _rgb_ev.shape],
+                        "finite": bool(np.all(np.isfinite(_rgb_ev))),
+                        "lit_pixels": int(np.count_nonzero(_energy_ev > 1.0e-8)),
+                        "total_pixels": int(_energy_ev.size),
+                        "mean": float(np.mean(_rgb_ev)) if _rgb_ev.size else 0.0,
+                        "peak": float(np.max(_rgb_ev)) if _rgb_ev.size else 0.0,
+                        "channel_sums": [float(v) for v in np.sum(_rgb_ev, axis=(0, 1))],
+                    }
+                    _measurement_status = "native_sensor_nonradiometric"
                 if tracer_obj is not None and hasattr(tracer_obj, "get_bdpt_latch_state"):
                     _native_evidence["bdpt_latch"] = dict(tracer_obj.get_bdpt_latch_state())
-                _measurement_status = "native_sensor_nonradiometric"
                 frame_config_summary["optical_event_telemetry_status"] = (
-                    "not populated by GPU-resident native BDPT; use native_sensor_evidence"
+                    "not populated by GPU-resident native transport; use native_sensor_evidence"
                 )
 
             r = ExposureFrameResult(
@@ -6969,12 +7565,22 @@ class ExposureSession:
                     json.dump(r_dict, fh, indent=2)
             results.append(r)
             if _native_sensor_mode:
-                print(
-                    f"  [{name:>4}] N_rays={r.n_rays_emitted:_}  "
-                    f"native_sensor={_native_evidence['lit_pixels']}/{_native_evidence['total_pixels']} lit  "
-                    f"mean={_native_evidence['mean']:.3e} peak={_native_evidence['peak']:.3e}  "
-                    "H_meas=n/a (native sensor RGB is not radiometrically calibrated)"
-                )
+                if self.integrator == "depth":
+                    print(
+                        f"  [{name:>4}] N_rays={r.n_rays_emitted:_}  "
+                        f"depth={_native_evidence['valid_pixels']}/"
+                        f"{_native_evidence['total_pixels']} valid  "
+                        f"range={_native_evidence['minimum_m']}.."
+                        f"{_native_evidence['maximum_m']} m  "
+                        "H_meas=n/a (first-scene depth product)"
+                    )
+                else:
+                    print(
+                        f"  [{name:>4}] N_rays={r.n_rays_emitted:_}  "
+                        f"native_sensor={_native_evidence['lit_pixels']}/{_native_evidence['total_pixels']} lit  "
+                        f"mean={_native_evidence['mean']:.3e} peak={_native_evidence['peak']:.3e}  "
+                        "H_meas=n/a (native sensor RGB is not radiometrically calibrated)"
+                    )
             else:
                 print(f"  [{name:>4}] N_rays={r.n_rays_emitted:_}  "
                     f"H_meas={measured:.3e} J  H_targ={plan.target_H_J:.3e} J  "
@@ -7775,7 +8381,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--backward-max-bounces", type=int, default=None,
                    help=("Optional override for backward/BDPT bounce cap. "
                          "If omitted, backward/BDPT use --max-bounces."))
-    p.add_argument("--integrator",     choices=("splat", "forward", "backward", "bdpt"),
+    p.add_argument("--integrator",     choices=("splat", "forward", "backward", "bdpt", "depth"),
                     default="bdpt",
                     help="splat = legacy direct image projection (image accum). "
                         "forward = light tracing from emissive sources. "
@@ -7981,17 +8587,94 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: Optional[list[str]] = None) -> int:
     global _ORDERED_THICK_LENS_SCENE, _ORDERED_SCENE_JOB, _ORDERED_TILE_OUTPUT
+    global DEFAULT_FREQ_HZ
+    global _ORDERED_TRANSPORT_RGB_WEIGHTS
+    global _ORDERED_TRANSPORT_LUT
+    global _ORDERED_MATERIAL_LUT_GRID
     global _NEXT_SITE_SCAN_COMMAND
     _NEXT_SITE_SCAN_COMMAND = None
     _verify_native_bdpt_contract()
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
+    if args.integrator == "depth":
+        # Depth is a native sensor product.  Make its execution contract
+        # explicit and deterministic rather than accepting a CPU/scaffold path.
+        args.backend = "cpp"
+        args.gpu_resident = True
+        args.rgb_source = "sensor"
+        args.no_convergence = True
+        args.no_convergence_drive_batches = True
+        args.max_bounces = 1
+
     order_job = None
     order_report = None
+    ordered_sensor_film_slots = None
     cli_native_sweeps = args.bdpt_native_sweeps
     if args.scene_order:
-        from scene_orders import compile_job, load_order, order_runtime_settings, resolved_jobs
+        from scene_orders import (
+            compile_job, load_order, order_runtime_settings,
+            order_transport_frequencies, order_transport_rgb_weights,
+            order_transport_lut_config,
+            resolved_jobs,
+        )
         order_package = load_order(str(args.scene_order))
+        authored_runtime = dict(order_package.get("runtime", {}))
+        # Scene-order execution budgets are part of the exposure contract.  A
+        # calibration order must not silently inherit the production CLI's
+        # million-ray / 64-epoch defaults.
+        if "total_rays" in authored_runtime:
+            args.total_rays = max(1, int(authored_runtime["total_rays"]))
+        if "rays_per_batch" in authored_runtime:
+            args.rays_per_batch = max(1, int(authored_runtime["rays_per_batch"]))
+        if "max_bounces" in authored_runtime:
+            args.max_bounces = max(1, int(authored_runtime["max_bounces"]))
+        runtime_environment = {
+            "max_sensor_epochs": "SPECTRAL_SENSOR_MAX_EPOCHS",
+            "sensor_top_k": "SPECTRAL_SENSOR_TOP_K",
+            "sensor_samples_per_node": "SPECTRAL_SENSOR_SAMPLES_PER_NODE",
+            "sensor_steps_per_layer": "SPECTRAL_SENSOR_STEPS_PER_LAYER",
+            "sensor_flash_rays": "SPECTRAL_SENSOR_FLASH_RAYS",
+            "sensor_t5_pair_budget": "SPECTRAL_SENSOR_T5_PAIR_BUDGET",
+        }
+        for runtime_key, environment_key in runtime_environment.items():
+            if runtime_key in authored_runtime:
+                os.environ[environment_key] = str(
+                    max(1, int(authored_runtime[runtime_key]))
+                )
+        if not bool(authored_runtime.get("convergence_enabled", True)):
+            args.no_convergence = True
+            args.no_convergence_drive_batches = True
+        if "integrator" in authored_runtime:
+            args.integrator = str(authored_runtime["integrator"])
+            if args.integrator == "depth":
+                args.backend = "cpp"
+                args.gpu_resident = True
+                args.rgb_source = "sensor"
+                args.no_convergence = True
+                args.no_convergence_drive_batches = True
+                args.max_bounces = 1
+        authored_frequencies = order_transport_frequencies(order_package)
+        if authored_frequencies is not None:
+            DEFAULT_FREQ_HZ = authored_frequencies
+            _ORDERED_TRANSPORT_RGB_WEIGHTS = order_transport_rgb_weights(
+                order_package
+            )
+            _ORDERED_TRANSPORT_LUT = order_transport_lut_config(order_package)
+            if _ORDERED_TRANSPORT_LUT is not None:
+                knots = _ORDERED_TRANSPORT_LUT["frequency_knots_hz"]
+                _ORDERED_MATERIAL_LUT_GRID = np.ascontiguousarray(
+                    np.linspace(float(np.min(knots)), float(np.max(knots)), 32),
+                    np.float64,
+                )
+            else:
+                _ORDERED_MATERIAL_LUT_GRID = None
+            print(
+                "[scene-order] transport payload "
+                f"bands={DEFAULT_FREQ_HZ.size} "
+                f"lane_references_hz={DEFAULT_FREQ_HZ.tolist()} "
+                f"continuous_lut={_ORDERED_TRANSPORT_LUT is not None}",
+                flush=True,
+            )
         order_jobs = resolved_jobs(order_package, args.scene_job)
         if len(order_jobs) != 1:
             ids = ", ".join(str(job["id"]) for job in order_jobs)
@@ -7999,6 +8682,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                 f"--scene-order contains multiple jobs ({ids}); select one with --scene-job"
             )
         order_job = order_jobs[0]
+        ordered_exposure = dict(order_job.get("exposure", {}))
+        if "sensor_id" in ordered_exposure or "film_id" in ordered_exposure:
+            sensor_id = int(ordered_exposure.get("sensor_id", 0))
+            film_id = int(ordered_exposure.get("film_id", 0))
+            if sensor_id not in (0, 1) or film_id not in (0, 1):
+                raise ValueError("scene-order sensor_id and film_id must be 0 or 1")
+            ordered_sensor_film_slots = [
+                (sensor_id, film_id), (-1, -1), (-1, -1), (-1, -1),
+            ]
         _ORDERED_SCENE_JOB = order_job
         runtime = order_runtime_settings(order_job)
         _ORDERED_TILE_OUTPUT = (runtime["width"], runtime["height"])
@@ -8019,7 +8711,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         # only its subject group with the order compiler's result.
         _ORDERED_THICK_LENS_SCENE = None
         base_scene = _build_thick_lens_lab_tracer_scene()
-        _ORDERED_THICK_LENS_SCENE, order_report = compile_job(base_scene, order_job)
+        _ORDERED_THICK_LENS_SCENE, order_report = compile_job(
+            base_scene,
+            order_job,
+            # A continuous transport has one stochastic lane reference but a
+            # full material-response grid.  Compiling authored scene lights
+            # against the lone lane frequency can miss every narrow emission
+            # lobe and turn valid emitter geometry into a zero-power source.
+            freq_hz=(
+                _ORDERED_MATERIAL_LUT_GRID
+                if _ORDERED_MATERIAL_LUT_GRID is not None
+                else DEFAULT_FREQ_HZ
+            ),
+        )
         next_scan_path = str(
             args.next_scan_control
             or os.environ.get("SPECTRAL_NEXT_SCAN_CONTROL", "")
@@ -8264,6 +8968,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         bdpt_native_packages = int(args.bdpt_native_packages),
         bdpt_native_sweeps = int(args.bdpt_native_sweeps),
         save_files       = args.save_files,
+        sensor_film_slots = ordered_sensor_film_slots,
     )
 
     # Default to disabling convergence for simpler output focusing
@@ -8374,44 +9079,63 @@ def main(argv: Optional[list[str]] = None) -> int:
                         raise RuntimeError("progress event source is not GPU-resident")
                     if tracer is None or not hasattr(tracer, "get_sensor_image_linear"):
                         return
-                    raw = np.asarray(tracer.get_sensor_image_linear(), dtype=np.float32)
                     output_width, output_height = (
                         _ORDERED_TILE_OUTPUT if _ORDERED_TILE_OUTPUT is not None
                         else (int(args.width), int(args.height))
                     )
-                    linear = _native_sensor_tile_to_display(raw, output_width, output_height)
                     epoch_count_display = None
-                    if (hasattr(tracer, "get_sensor_epoch_count")
-                            and not bool(getattr(cpp_back, "_sensor_mipmap_enabled", False))):
-                        epoch_count = np.asarray(tracer.get_sensor_epoch_count())
-                        epoch_count_display = _native_sensor_tile_to_display(
-                            epoch_count[..., None], output_width, output_height
-                        )[..., 0]
-                        linear = _normalise_native_sensor_epochs(linear, epoch_count_display)
                     priority_display = None
-                    if hasattr(tracer, "get_sensor_learned_priority_map"):
-                        priority = np.asarray(
-                            tracer.get_sensor_learned_priority_map(), dtype=np.float32
-                        )
-                        priority_display = _native_sensor_tile_to_display(
-                            priority[..., None], output_width, output_height
-                        )[..., 0]
                     sensor_sum_display = None
-                    if hasattr(tracer, "get_sensor_image_sum_linear"):
-                        sensor_sum = np.asarray(
-                            tracer.get_sensor_image_sum_linear(), dtype=np.float32
-                        )
-                        sensor_sum_display = _native_sensor_tile_to_display(
-                            sensor_sum, output_width, output_height
-                        )[..., :3]
                     exposure_weight_display = None
-                    if hasattr(tracer, "get_sensor_exposure_weight"):
-                        exposure_weight = np.asarray(
-                            tracer.get_sensor_exposure_weight(), dtype=np.float32
+                    if args.integrator == "depth":
+                        # Depth is reduced from strike records on the CPU and
+                        # therefore never enters the radiance SSBO.  Publishing
+                        # that SSBO announced an all-zero layer while the PNG
+                        # correctly used this cached depth product.
+                        cached_depth = np.asarray(
+                            getattr(cpp_back, "_native_sensor_linear_image", None),
+                            dtype=np.float32,
                         )
-                        exposure_weight_display = _native_sensor_tile_to_display(
-                            exposure_weight[..., None], output_width, output_height
-                        )[..., 0]
+                        if cached_depth.ndim != 3 or cached_depth.shape[2] < 3:
+                            return
+                        valid_depth = np.all(np.isfinite(cached_depth[..., :3]), axis=2)
+                        linear = np.where(
+                            valid_depth[..., None], cached_depth[..., :3], 0.0
+                        ).astype(np.float32, copy=False)
+                        epoch_count_display = valid_depth.astype(np.uint32)
+                        sensor_sum_display = linear.copy()
+                        exposure_weight_display = valid_depth.astype(np.float32)
+                    else:
+                        raw = np.asarray(tracer.get_sensor_image_linear(), dtype=np.float32)
+                        linear = _native_sensor_tile_to_display(raw, output_width, output_height)
+                        if (hasattr(tracer, "get_sensor_epoch_count")
+                                and not bool(getattr(cpp_back, "_sensor_mipmap_enabled", False))):
+                            epoch_count = np.asarray(tracer.get_sensor_epoch_count())
+                            epoch_count_display = _native_sensor_tile_to_display(
+                                epoch_count[..., None], output_width, output_height
+                            )[..., 0]
+                            linear = _normalise_native_sensor_epochs(linear, epoch_count_display)
+                        if hasattr(tracer, "get_sensor_learned_priority_map"):
+                            priority = np.asarray(
+                                tracer.get_sensor_learned_priority_map(), dtype=np.float32
+                            )
+                            priority_display = _native_sensor_tile_to_display(
+                                priority[..., None], output_width, output_height
+                            )[..., 0]
+                        if hasattr(tracer, "get_sensor_image_sum_linear"):
+                            sensor_sum = np.asarray(
+                                tracer.get_sensor_image_sum_linear(), dtype=np.float32
+                            )
+                            sensor_sum_display = _native_sensor_tile_to_display(
+                                sensor_sum, output_width, output_height
+                            )[..., :3]
+                        if hasattr(tracer, "get_sensor_exposure_weight"):
+                            exposure_weight = np.asarray(
+                                tracer.get_sensor_exposure_weight(), dtype=np.float32
+                            )
+                            exposure_weight_display = _native_sensor_tile_to_display(
+                                exposure_weight[..., None], output_width, output_height
+                            )[..., 0]
                     _progress_sequence[0] += 1
                     event = ExposureProgressEvent(
                         exposure_id=_progress_exposure_id,

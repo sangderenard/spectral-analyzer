@@ -59,6 +59,16 @@ struct RayIntent {
     float            sensor_origin_y   = 0.0f;
     float            sensor_origin_z   = 0.0f;
 
+    /* Continuous spectral state.  spectral_lut_index is the lane's lookup
+     * signal.  A root ray resolves frequency_hz/pdf exactly once at launch;
+     * child intents copy these fields unchanged for the complete path.  A
+     * negative LUT index denotes ordinary fixed-band transport. */
+    double           spectral_frequency_hz = 0.0;
+    float            spectral_pdf          = 1.0f;
+    int16_t          spectral_lut_index    = -1;
+    uint8_t          spectral_lane_id      = 0u;
+    uint8_t          spectral_resolved     = 0u;
+
     /* ── BDPT sidecar identity ────────────────────────────────────────────
      * Assigned at launch; propagated unchanged into every child intent so
      * that T1/T2/T3 side-data records can be correlated back to a subpath.
@@ -726,10 +736,10 @@ struct WaveArena {
 };
 
 /* ── T5 GPU connection pass types ────────────────────────────────────────── */
-static constexpr int T5_LGV_STRIDE    = 56;  /* light vertex, floats (must match shader) */
+static constexpr int T5_LGV_STRIDE    = 57;  /* light vertex, floats (must match shader) */
 static constexpr int T5_CGV_STRIDE    = 72;  /* camera vertex, floats (must match shader) */
-static constexpr int T5_TILE_C        =  1;  /* WG X dim: camera verts per tile          */
-static constexpr int T5_TILE_L        =  1;  /* WG Y dim: light verts per tile            */
+static constexpr int T5_TILE_C        = 16;  /* WG X dim: camera verts per tile          */
+static constexpr int T5_TILE_L        = 16;  /* WG Y dim: light verts per tile            */
 static constexpr int T5_MAX_GPU_BANDS = 32;  /* per-band betas packed into GPU vert buffers */
 static constexpr int LGV_BAND_BASE    = 16;  /* first per-band beta field in LGV (field index) */
 static constexpr int CGV_BAND_BASE    = 22;  /* first per-band beta field in CGV (field index) */
@@ -981,12 +991,14 @@ struct RayPipelineConfig {
      * Settable at runtime via ray_pipeline_set_skip_record_readback(). */
     bool        gpu_skip_record_readback = false;
 
-    /* Sparse recursive 3x3 sensor mipmap. Disabled until explicitly
+    /* Sparse recursive sensor mipmap. Axis parity dispatches one of two
+     * hard-unrolled kernels: even=2×2, odd=3×3. Disabled until explicitly
      * configured; legacy fixed-sweep rendering remains unchanged. */
     bool        sensor_mipmap_enabled = false;
     uint32_t    sensor_mipmap_max_nodes = 0;
     uint32_t    sensor_mipmap_max_depth = 0;
     uint32_t    sensor_mipmap_samples_per_epoch = 0;
+    uint32_t    sensor_mipmap_subdivision_axis = 3;
     bool        sensor_priority_network_enabled = false;
     std::array<float, SENSOR_PRIORITY_NETWORK_PARAMS>
                 sensor_priority_network_params{};
@@ -1259,6 +1271,11 @@ int ray_pipeline_submit_emissive_triangles(
     double            interaction_target_y,
     double            interaction_target_z,
     double            interaction_target_r,
+    int               launch_mode,
+    double            launch_dir_x,
+    double            launch_dir_y,
+    double            launch_dir_z,
+    double            launch_divergence_rad,
     uint32_t          seed);
 
 /* Non-blocking drain: pop up to max_n records from the output queue.

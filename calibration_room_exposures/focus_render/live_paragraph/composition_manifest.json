@@ -1,0 +1,38 @@
+{
+  "coordinate_space": "full_sensor_pixels",
+  "origin": "top-left",
+  "full_frame": {
+    "width": 320,
+    "height": 320
+  },
+  "region": {
+    "x": 128,
+    "y": 128,
+    "width": 64,
+    "height": 64
+  },
+  "camera": {
+    "position_m": [
+      3.0,
+      -2.0,
+      1.0
+    ],
+    "target_m": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "up": [
+      -0.2223747949983304,
+      0.14824986333222026,
+      0.9636241116594317
+    ],
+    "focus_target_m": [
+      -0.006688971514774433,
+      0.0044593143431828075,
+      -0.0022296571715914038
+    ],
+    "focus_distance_m": 3.7500000000000004
+  },
+  "render_basis": "camera_local_canonical_x"
+}

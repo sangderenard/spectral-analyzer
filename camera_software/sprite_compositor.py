@@ -25,6 +25,8 @@ from .render_assets import (
     DEFAULT_INK_CONDITION,
     MIN_INK_GLYPH_EXPOSURE_COVERAGE,
     MIN_INK_GLYPH_RADIANCE_COVERAGE,
+    LIVE_INK_GLYPH_EXPOSURE_COVERAGE,
+    LIVE_INK_GLYPH_RADIANCE_COVERAGE,
     INK_ATLAS_CONVERGENCE_EXPOSURE_COVERAGE,
     INK_ATLAS_CONVERGENCE_RELATIVE_RMSE,
     INK_ATLAS_CONVERGENCE_P95_DELTA,
@@ -171,6 +173,7 @@ class SpriteExposureQuality:
     p95_relative_delta: float | None
     stable_hold: int
     finite: bool
+    live_usable: bool
     composable: bool
     converged: bool
 
@@ -185,6 +188,7 @@ class SpriteExposureQuality:
             "p95_relative_delta": self.p95_relative_delta,
             "stable_hold": self.stable_hold,
             "finite": self.finite,
+            "live_usable": self.live_usable,
             "composable": self.composable,
             "converged": self.converged,
         }
@@ -218,6 +222,12 @@ def measure_sprite_exposure_quality(
         np.all(np.isfinite(image))
         and np.all(np.isfinite(weight))
         and np.all(weight >= 0.0)
+    )
+    live_usable = bool(
+        finite
+        and mean_weight > 0.0
+        and glyph_coverage >= LIVE_INK_GLYPH_EXPOSURE_COVERAGE
+        and glyph_radiance_coverage >= LIVE_INK_GLYPH_RADIANCE_COVERAGE
     )
     composable = bool(
         finite
@@ -267,6 +277,7 @@ def measure_sprite_exposure_quality(
         p95_relative_delta=p95_relative_delta,
         stable_hold=stable_hold,
         finite=finite,
+        live_usable=live_usable,
         composable=composable,
         converged=converged,
     )
@@ -394,16 +405,35 @@ class CachedTokenStringComposer:
         self.horizontal_spacing_px = int(horizontal_spacing_px)
         self.vertical_spacing_px = int(vertical_spacing_px)
 
-    def _monofont_layout_metrics(self, height: int) -> tuple[int, int, int]:
+    def _monofont_layout_metrics(
+        self, height: int, font_scale: float = 1.0
+    ) -> tuple[int, int, int]:
         """Return glyph height, character advance, and line advance in pixels."""
 
-        glyph_line_height = max(8, int(round(min(48.0, height * 0.42))))
+        base_height = max(8, int(round(min(48.0, height * 0.42))))
+        glyph_line_height = max(
+            1,
+            min(int(height), int(round(base_height * max(0.1, float(font_scale))))),
+        )
         worst_case_width = max(3, int(round(glyph_line_height * 0.72)))
+        # Tracking controls are authored at the 48 px atlas design size. A
+        # literal -10 px adjustment at an 8 px UI label used to collapse both
+        # advances to one pixel and clip an otherwise valid rendered glyph to
+        # a single row. Scale the authored tracking with the resolved size.
+        spacing_scale = glyph_line_height / 48.0
+        horizontal_spacing = int(round(
+            self.horizontal_spacing_px * spacing_scale
+        ))
+        vertical_spacing = int(round(
+            self.vertical_spacing_px * spacing_scale
+        ))
         character_advance = max(
-            1, worst_case_width + self.horizontal_spacing_px
+            max(2, glyph_line_height // 3),
+            worst_case_width + horizontal_spacing,
         )
         line_advance = max(
-            1, glyph_line_height + self.vertical_spacing_px
+            max(2, int(round(glyph_line_height * 0.72))),
+            glyph_line_height + vertical_spacing,
         )
         return glyph_line_height, character_advance, line_advance
 
@@ -531,6 +561,7 @@ class CachedTokenStringComposer:
         *,
         background_rgb: tuple[float, float, float] = (0.002, 0.002, 0.002),
         character_tiles_only: bool = False,
+        font_scale: float = 1.0,
     ) -> CachedStringComposition:
         if width <= 0 or height <= 0:
             raise ValueError("composition dimensions must be positive")
@@ -543,7 +574,7 @@ class CachedTokenStringComposer:
         )
         used: list[str] = []
         line_height, cell_advance, line_advance = (
-            self._monofont_layout_metrics(height)
+            self._monofont_layout_metrics(height, font_scale)
         )
         x = max(2, line_height // 6)
         y = max(1, line_height // 5)
@@ -614,13 +645,29 @@ class CachedTokenStringComposer:
                 source_y:source_y + visible_height,
                 source_x:source_x + visible_width,
             ]
-            destination = canvas[
-                y:y + visible_height, draw_x:draw_x + visible_width
-            ]
-            canvas[y:y + visible_height, draw_x:draw_x + visible_width] = (
-                premul + (1.0 - alpha[..., None]) * destination + additive
-            )
-            used.append(token)
+            # Clip source and destination as one rectangle. A very narrow
+            # fitted UI can place the centered sprite wholly beyond an edge;
+            # slicing only the canvas then produces a zero-width destination
+            # against an unclipped alpha layer.
+            dst_x0 = max(0, draw_x)
+            dst_y0 = max(0, y)
+            dst_x1 = min(width, draw_x + visible_width)
+            dst_y1 = min(height, y + visible_height)
+            if dst_x1 > dst_x0 and dst_y1 > dst_y0:
+                src_x0 = dst_x0 - draw_x
+                src_y0 = dst_y0 - y
+                src_x1 = src_x0 + (dst_x1 - dst_x0)
+                src_y1 = src_y0 + (dst_y1 - dst_y0)
+                clipped_premul = premul[src_y0:src_y1, src_x0:src_x1]
+                clipped_alpha = alpha[src_y0:src_y1, src_x0:src_x1]
+                clipped_additive = additive[src_y0:src_y1, src_x0:src_x1]
+                destination = canvas[dst_y0:dst_y1, dst_x0:dst_x1]
+                canvas[dst_y0:dst_y1, dst_x0:dst_x1] = (
+                    clipped_premul
+                    + (1.0 - clipped_alpha[..., None]) * destination
+                    + clipped_additive
+                )
+                used.append(token)
             x += cell_span
         return CachedStringComposition(
             linear_rgb=np.ascontiguousarray(canvas, np.float32),

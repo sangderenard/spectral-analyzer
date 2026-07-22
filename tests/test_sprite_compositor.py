@@ -98,6 +98,64 @@ def test_sprite_quality_uses_coverage_and_image_stability_not_a_ray_count():
     assert converged.relative_rmse == 0.0
 
 
+def test_first_sparse_finite_evidence_is_live_usable_before_it_is_clear():
+    capture = AtlasCaptureSpec(
+        width=64, height=64, content_width=42, content_height=42
+    )
+    alpha = token_alpha_mask(ink_token_asset("A"), capture)
+    image = np.zeros((64, 64, 3), np.float32)
+    weight = np.zeros((64, 64), np.float32)
+    first_glyph_pixel = tuple(np.argwhere(alpha > 0.05)[0])
+    image[first_glyph_pixel] = (0.1, 0.02, 0.01)
+    weight[first_glyph_pixel] = 1.0
+
+    quality = measure_sprite_exposure_quality(
+        image, weight, alpha, refinement_pass=1
+    )
+
+    assert quality.live_usable
+    assert not quality.composable
+    assert not quality.converged
+    assert quality.as_metadata()["live_usable"] is True
+
+
+def test_negative_design_tracking_does_not_collapse_small_ui_text_to_one_pixel(
+    tmp_path,
+):
+    composer = CachedTokenStringComposer(
+        RenderAssetCatalog(),
+        horizontal_spacing_px=-10,
+        vertical_spacing_px=-10,
+    )
+
+    line_height, character_advance, line_advance = (
+        composer._monofont_layout_metrics(14)
+    )
+
+    assert line_height == 8
+    assert character_advance >= 4
+    assert line_advance >= 6
+
+    asset, _sprite, path, _image = _synthetic_sprite("A", tmp_path)
+    catalog = RenderAssetCatalog()
+    catalog.record(RenderedAssetRecord(
+        asset.asset_key,
+        DEFAULT_INK_CONDITION.condition_key,
+        DisplayProductKind.IMAGE,
+        metadata={"sprite_path": path},
+    ))
+    rendered = CachedTokenStringComposer(
+        catalog,
+        horizontal_spacing_px=-10,
+        vertical_spacing_px=-10,
+    ).compose("A", 80, 14, character_tiles_only=True).linear_rgb
+    changed_rows = np.flatnonzero(np.any(
+        np.abs(rendered - np.asarray((0.002, 0.002, 0.002))) > 1.0e-6,
+        axis=(1, 2),
+    ))
+    assert len(changed_rows) >= 4
+
+
 def test_cached_string_composer_prefers_available_glyphs_and_reports_pressure(
     tmp_path,
 ):
@@ -135,6 +193,26 @@ def test_cached_string_composer_accepts_empty_and_whitespace_editor_states():
         assert composition.linear_rgb.shape == (32, 80, 3)
 
 
+def test_cached_string_composer_clips_sprite_when_fitted_panel_is_too_narrow(
+    tmp_path,
+):
+    catalog = RenderAssetCatalog()
+    asset, _sprite, path, _image = _synthetic_sprite("A", tmp_path)
+    catalog.record(RenderedAssetRecord(
+        asset.asset_key,
+        DEFAULT_INK_CONDITION.condition_key,
+        DisplayProductKind.IMAGE,
+        metadata={"sprite_path": path},
+    ))
+
+    composition = CachedTokenStringComposer(catalog).compose(
+        "A", 1, 80, character_tiles_only=True
+    )
+
+    assert composition.linear_rgb.shape == (80, 1, 3)
+    assert np.all(np.isfinite(composition.linear_rgb))
+
+
 def test_monofont_spacing_defaults_to_negative_ten_and_allows_cropping(tmp_path):
     default = CachedTokenStringComposer(RenderAssetCatalog())
     expanded = CachedTokenStringComposer(
@@ -154,10 +232,15 @@ def test_monofont_spacing_defaults_to_negative_ten_and_allows_cropping(tmp_path)
 
     assert default.horizontal_spacing_px == -10
     assert default.vertical_spacing_px == -10
-    assert expanded_x == default_x + 13
-    assert expanded_y == default_y + 14
-    assert cropped_x == 1
-    assert cropped_y == 1
+    scale = glyph_height / 48.0
+    assert expanded_x == default_x + (
+        round(3 * scale) - round(-10 * scale)
+    )
+    assert expanded_y == default_y + (
+        round(4 * scale) - round(-10 * scale)
+    )
+    assert cropped_x >= glyph_height // 3
+    assert cropped_y >= round(glyph_height * 0.72)
     assert glyph_height > cropped_y
 
     catalog = RenderAssetCatalog()

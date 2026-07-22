@@ -39,8 +39,8 @@
 layout(local_size_x = 64) in;
 
 #define MAX_BANDS       32
-#define INTENT_STRIDE   (20 + 2 * MAX_BANDS)   /* child region stride = 84 floats */
-#define TERMINAL_STRIDE (26 + 2 * MAX_BANDS)   /* terminal record stride = 90 floats */
+#define INTENT_STRIDE   (22 + 2 * MAX_BANDS)
+#define TERMINAL_STRIDE (28 + 2 * MAX_BANDS)
 #define CAMERA_PATH_SCATTERED_BIT 16u
 
 layout(std430, binding = 0) readonly buffer ChildIntBuf {
@@ -85,9 +85,43 @@ uniform float splat_scale;      /* direct visible-emitter scale; normally 1.0   
 uniform uint  sensor_mip_enabled;
 uniform uint  sensor_mip_sample_capacity;
 
-float mat_emission(int mat, int b) {
+float mat_emission(int mat, int b, float frequency_hz) {
     if (mat < 0 || mat >= n_mats || b < 0 || b >= MAX_BANDS) return 1.0f;
+    if (frequency_hz > 0.0) {
+        int last = 0;
+        while (last + 1 < MAX_BANDS
+               && mat_bands[(mat * MAX_BANDS + last + 1) * 12] > 0.0) last++;
+        if (last > 0) {
+            bool inc = mat_bands[(mat * MAX_BANDS + last) * 12]
+                    >= mat_bands[(mat * MAX_BANDS) * 12];
+            int lo = 0;
+            while (lo + 1 < last) {
+                float nf = mat_bands[(mat * MAX_BANDS + lo + 1) * 12];
+                if ((inc && nf >= frequency_hz) || (!inc && nf <= frequency_hz)) break;
+                lo++;
+            }
+            int hi = min(last, lo + 1);
+            int ao = (mat * MAX_BANDS + lo) * 12, bo = (mat * MAX_BANDS + hi) * 12;
+            float den = mat_bands[bo] - mat_bands[ao];
+            float t = abs(den) > 1e-20 ? clamp((frequency_hz - mat_bands[ao]) / den, 0.0, 1.0) : 0.0;
+            return max(0.0, mix(mat_bands[ao + 5], mat_bands[bo + 5], t));
+        }
+    }
     return max(0.0f, mat_bands[(mat * MAX_BANDS + b) * 12 + 5]);
+}
+
+vec3 frequency_rgb(float frequency_hz) {
+    float wl = 299792458.0 / max(frequency_hz, 1.0) * 1.0e9;
+    vec3 c = vec3(0.0);
+    if (wl >= 380.0 && wl < 440.0) c = vec3(-(wl-440.0)/60.0, 0.0, 1.0);
+    else if (wl < 490.0) c = vec3(0.0, (wl-440.0)/50.0, 1.0);
+    else if (wl < 510.0) c = vec3(0.0, 1.0, -(wl-510.0)/20.0);
+    else if (wl < 580.0) c = vec3((wl-510.0)/70.0, 1.0, 0.0);
+    else if (wl < 645.0) c = vec3(1.0, -(wl-645.0)/65.0, 0.0);
+    else if (wl <= 700.0) c = vec3(1.0, 0.0, 0.0);
+    float edge = wl < 420.0 ? 0.3 + 0.7*(wl-380.0)/40.0
+               : (wl > 645.0 ? 0.3 + 0.7*(700.0-wl)/55.0 : 1.0);
+    return max(c * clamp(edge, 0.0, 1.0), vec3(0.0));
 }
 
 /* Float atomic-add via CAS spin-loop — no GL_EXT_shader_atomic_float needed.
@@ -192,15 +226,20 @@ void main() {
     /* Spectral → display RGB (matches band_to_display_rgb + SENSOR_SPLAT_SCALE) */
     float cr = 0.0f, cg = 0.0f, cb = 0.0f;
     const int nb = min(n_bands, MAX_BANDS);
+    const float spectral_frequency_hz = child_int_buf[base + 26];
+    const float spectral_pdf = max(child_int_buf[base + 27], 1.0e-30);
+    const vec3 exact_rgb = spectral_frequency_hz > 0.0
+        ? frequency_rgb(spectral_frequency_hz) / spectral_pdf : vec3(0.0);
     for (int b = 0; b < nb; ++b) {
-        const float re  = child_int_buf[base + 26 + b];
-        const float im  = child_int_buf[base + 26 + MAX_BANDS + b];
-        const float amp = sqrt(re * re + im * im) * mat_emission(mat_id, b);
+        const float re  = child_int_buf[base + 28 + b];
+        const float im  = child_int_buf[base + 28 + MAX_BANDS + b];
+        const float amp = sqrt(re * re + im * im) * mat_emission(mat_id, b, spectral_frequency_hz);
         if (adaptive_sample)
             atomic_add_sample_spectrum(tag_lo * uint(n_bands) + uint(b), amp * splat_scale);
-        cr += amp * rgb_w[b].x;
-        cg += amp * rgb_w[b].y;
-        cb += amp * rgb_w[b].z;
+        vec3 weight = spectral_frequency_hz > 0.0 ? exact_rgb : rgb_w[b];
+        cr += amp * weight.x;
+        cg += amp * weight.y;
+        cb += amp * weight.z;
     }
     cr *= splat_scale;
     cg *= splat_scale;

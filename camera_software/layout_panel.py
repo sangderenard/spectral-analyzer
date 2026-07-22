@@ -175,6 +175,47 @@ class LayoutPanelPrimitive:
         }
 
 
+@dataclass(frozen=True)
+class PanelCompositionPatchTrace:
+    """One semantic patch placement shared by raster and scene assembly."""
+
+    role: PanelPatchRole
+    target_rect_px: tuple[int, int, int, int]
+    crop_vectors: PanelCropVectors
+    fill: PanelPatchFill
+    object_key: str = ""
+    subtype_key: str = ""
+    condition_key: str = ""
+
+    def mapping(self) -> dict[str, Any]:
+        return {
+            "role": self.role.value,
+            "target_rect_px": list(self.target_rect_px),
+            "crop_vectors": self.crop_vectors.mapping(),
+            "fill": self.fill.value,
+            "object_key": self.object_key,
+            "subtype_key": self.subtype_key,
+            "condition_key": self.condition_key,
+            "uv_transform": "repeat_square_tiles_clip_partial_terminal_tile",
+        }
+
+
+@dataclass(frozen=True)
+class PanelCompositionTrace:
+    primitive_id: str
+    output_size_px: tuple[int, int]
+    effective_border_px: tuple[int, int, int, int]
+    patches: tuple[PanelCompositionPatchTrace, ...]
+
+    def mapping(self) -> dict[str, Any]:
+        return {
+            "primitive_id": self.primitive_id,
+            "output_size_px": list(self.output_size_px),
+            "effective_border_px": list(self.effective_border_px),
+            "patches": [patch.mapping() for patch in self.patches],
+        }
+
+
 def _representative_square_crop(role: PanelPatchRole) -> PanelCropVectors:
     cells = {
         PanelPatchRole.TOP_LEFT: (0, 0),
@@ -288,6 +329,54 @@ def _effective_borders(
     return left, top, right, bottom
 
 
+def layout_panel_composition_trace(
+    primitive: LayoutPanelPrimitive,
+    width: int,
+    height: int,
+) -> PanelCompositionTrace:
+    """Resolve exact nine-slice geometry without erasing its semantics."""
+
+    width, height = int(width), int(height)
+    if width <= 0 or height <= 0:
+        raise ValueError("composed panel size must be positive")
+    border = _effective_borders(width, height, primitive.border_px)
+    left, top, right, bottom = border
+    x = (0, left, width - right, width)
+    y = (0, top, height - bottom, height)
+    cells = {
+        PanelPatchRole.TOP_LEFT: (0, 0),
+        PanelPatchRole.TOP: (1, 0),
+        PanelPatchRole.TOP_RIGHT: (2, 0),
+        PanelPatchRole.LEFT: (0, 1),
+        PanelPatchRole.CENTER: (1, 1),
+        PanelPatchRole.RIGHT: (2, 1),
+        PanelPatchRole.BOTTOM_LEFT: (0, 2),
+        PanelPatchRole.BOTTOM: (1, 2),
+        PanelPatchRole.BOTTOM_RIGHT: (2, 2),
+    }
+    patches = []
+    for role, (column, row) in cells.items():
+        patch = primitive.patch_map.get(role)
+        if patch is None:
+            continue
+        patches.append(PanelCompositionPatchTrace(
+            role=role,
+            target_rect_px=(
+                x[column], y[row],
+                max(0, x[column + 1] - x[column]),
+                max(0, y[row + 1] - y[row]),
+            ),
+            crop_vectors=patch.crop_vectors,
+            fill=patch.fill,
+            object_key=patch.object_key,
+            subtype_key=patch.subtype_key,
+            condition_key=patch.condition_key,
+        ))
+    return PanelCompositionTrace(
+        primitive.primitive_id, (width, height), border, tuple(patches)
+    )
+
+
 def compose_layout_panel_rgba(
     primitive: LayoutPanelPrimitive,
     width: int,
@@ -299,24 +388,15 @@ def compose_layout_panel_rgba(
 
     from PIL import Image
 
-    width, height = int(width), int(height)
-    if width <= 0 or height <= 0:
-        raise ValueError("composed panel size must be positive")
-    left, top, right, bottom = _effective_borders(
-        width, height, primitive.border_px
-    )
-    x = (0, left, width - right, width)
-    y = (0, top, height - bottom, height)
+    trace = layout_panel_composition_trace(primitive, width, height)
+    width, height = trace.output_size_px
     targets = {
-        PanelPatchRole.TOP_LEFT: (x[0], y[0], x[1], y[1]),
-        PanelPatchRole.TOP: (x[1], y[0], x[2], y[1]),
-        PanelPatchRole.TOP_RIGHT: (x[2], y[0], x[3], y[1]),
-        PanelPatchRole.LEFT: (x[0], y[1], x[1], y[2]),
-        PanelPatchRole.CENTER: (x[1], y[1], x[2], y[2]),
-        PanelPatchRole.RIGHT: (x[2], y[1], x[3], y[2]),
-        PanelPatchRole.BOTTOM_LEFT: (x[0], y[2], x[1], y[3]),
-        PanelPatchRole.BOTTOM: (x[1], y[2], x[2], y[3]),
-        PanelPatchRole.BOTTOM_RIGHT: (x[2], y[2], x[3], y[3]),
+        item.role: (
+            item.target_rect_px[0], item.target_rect_px[1],
+            item.target_rect_px[0] + item.target_rect_px[2],
+            item.target_rect_px[1] + item.target_rect_px[3],
+        )
+        for item in trace.patches
     }
     canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
@@ -339,7 +419,9 @@ def compose_layout_panel_rgba(
         PanelPatchRole.TOP_LEFT, PanelPatchRole.TOP_RIGHT,
         PanelPatchRole.BOTTOM_RIGHT, PanelPatchRole.BOTTOM_LEFT,
     ):
-        target = targets[role]
+        target = targets.get(role)
+        if target is None:
+            continue
         target_width = target[2] - target[0]
         target_height = target[3] - target[1]
         if target_width <= 0 or target_height <= 0:
@@ -389,5 +471,6 @@ __all__ = [
     "PanelPatchRole", "PanelPatchFill", "PanelCropVectors",
     "PanelPatchObjectRequest", "PanelPatchAsset",
     "LayoutPanelPrimitive", "layout_panel_primitive_from_mapping",
-    "compose_layout_panel_rgba",
+    "PanelCompositionPatchTrace", "PanelCompositionTrace",
+    "layout_panel_composition_trace", "compose_layout_panel_rgba",
 ]

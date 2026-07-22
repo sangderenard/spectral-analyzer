@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import math
 from typing import Any, Mapping
 
 from controls import Panel, choice_knob, readonly_knob, stepper_knob, toggle_knob
@@ -90,15 +91,74 @@ def layout_control_panel(
             body_key, "panel", current.label or current.name, current_rect,
             parent, order,
         ))
-        header_rect = (x, y, w, min(20, h))
+        payload = current.payload if isinstance(current.payload, dict) else {}
+        raw_grid = payload.get("grid", {}) or {}
+        grid = dict(raw_grid) if isinstance(raw_grid, Mapping) else {}
+        grid_mode = str(grid.get("mode", "")).lower() == "grid"
+        title_width = (
+            max(0, min(w - 1, int(grid.get("title_width", 0))))
+            if grid_mode else 0
+        )
+        title_overlay = grid_mode and bool(grid.get("title_overlay", False))
+        header_rect = (
+            (x, y, title_width, h)
+            if grid_mode and title_width > 0
+            else (x, y, w, min(20, h))
+        )
         elements.append(ControlLayoutElement(
             f"header:{current.name}", "header", current.label or current.name,
             header_rect, body_key, 0,
         ))
+        if grid_mode:
+            knobs = list(current.knobs or [])
+            columns = max(1, int(grid.get("columns", len(knobs) or 1)))
+            rows = max(1, int(math.ceil(len(knobs) / columns)))
+            pad = max(0, int(grid.get("padding", 3)))
+            pad_x = max(0, int(grid.get("padding_x", pad)))
+            pad_y = max(0, int(grid.get("padding_y", pad)))
+            column_gap = max(0, int(grid.get("column_gap", 4)))
+            row_gap = max(0, int(grid.get("row_gap", 3)))
+            grid_x = x if title_overlay else x + title_width
+            grid_w = max(1, w if title_overlay else w - title_width)
+            inner_w = max(1, grid_w - 2 * pad_x - column_gap * (columns - 1))
+            inner_h = max(1, h - 2 * pad_y - row_gap * (rows - 1))
+            x_edges = [grid_x + pad_x + (inner_w * index) // columns
+                       + column_gap * index for index in range(columns + 1)]
+            y_edges = [y + pad_y + (inner_h * index) // rows
+                       + row_gap * index for index in range(rows + 1)]
+            for knob_i, knob in enumerate(knobs):
+                column = knob_i % columns
+                row = knob_i // columns
+                knob_x = x_edges[column]
+                knob_y = y_edges[row]
+                knob_w = max(1, x_edges[column + 1] - column_gap - knob_x)
+                knob_h = max(1, y_edges[row + 1] - row_gap - knob_y)
+                if column == columns - 1:
+                    knob_w = max(1, x + w - pad_x - knob_x)
+                if row == rows - 1:
+                    knob_h = max(1, y + h - pad_y - knob_y)
+                name = str(getattr(knob, "name", knob_i))
+                current_value = _knob_value(knob, values)
+                knob_rect = (knob_x, knob_y, knob_w, knob_h)
+                knob_routes[name] = {
+                    "rect": knob_rect,
+                    "widget": str(getattr(knob, "control_widget", "") or ""),
+                    "choices": list(getattr(knob, "choices", []) or []),
+                    "default": getattr(knob, "default", None),
+                    "low": float(getattr(knob, "low", 0.0)),
+                    "high": float(getattr(knob, "high", 1.0)),
+                    "step": float(getattr(knob, "step", 0.0)),
+                    "dtype": str(getattr(knob, "dtype", "float")),
+                }
+                elements.append(ControlLayoutElement(
+                    f"knob:{name}", "knob",
+                    str(getattr(knob, "label", name)), knob_rect,
+                    body_key, 10 + knob_i, name, current_value,
+                ))
+            return
         cursor_y = y + 22
         panel_bottom = y + h
         pad = 2
-        payload = current.payload if isinstance(current.payload, dict) else {}
         actions = payload.get("actions", []) or []
 
         def add_actions(start_y: int) -> int:
@@ -458,10 +518,26 @@ class ProgramUILayout:
 def program_ui_manifest() -> Panel:
     """Authoritative manifest for the ray-photography application frame."""
 
+    from .equipment_manifest import default_equipment_manifest
+    from .toolbar_manifests import (
+        camera_toolbar_panel,
+        exposure_toolbar_panel,
+        film_toolbar_panel,
+        integrator_toolbar_panel,
+        lens_toolbar_panel,
+        light_toolbar_panel,
+    )
+
     return Panel(
         name="program-backdrop",
         label="RAY PHOTOGRAPHY BAKERY",
         panels=[
+            camera_toolbar_panel(),
+            lens_toolbar_panel(),
+            light_toolbar_panel(),
+            film_toolbar_panel(),
+            integrator_toolbar_panel(),
+            exposure_toolbar_panel(),
             Panel(
                 "camera-panel", "CAMERA",
                 payload={
@@ -493,9 +569,13 @@ def program_ui_manifest() -> Panel:
                 },
             ),
             Panel(
-                "editor-text", "COMPOSITION",
+                "editor-text", "PRESENT WORK",
                 payload={
-                    "role": "editor",
+                    "role": "present_work_host",
+                    "widget": "PresentWorkPanel",
+                    "content_modules": [
+                        "text-material", "calibration", "toolbar", "detail",
+                    ],
                     "geometry": {"kind": "plane"},
                 },
             ),
@@ -509,6 +589,16 @@ def program_ui_manifest() -> Panel:
         ],
         payload={
             "type": "program_ui",
+            # Equipment is manifest-authored. Resolvers treat every nested
+            # group as partial, falling back field-by-field to current defaults.
+            "equipment": default_equipment_manifest(),
+            # This is the authored viewport geometry, not a render-product
+            # resolution.  Work tiles and calibration images may be any size
+            # without reflowing the program UI.
+            "layout_reference_size_px": [960, 600],
+            # Stable authored viewport geometry. This is deliberately
+            # independent of the live render tile dimensions.
+            "layout_work_viewport_size_px": [256, 256],
             "geometry": {
                 "kind": "plane",
                 "thickness_m": 0.001,
@@ -533,9 +623,19 @@ def program_ui_manifest() -> Panel:
                 "edge_rgba": [66, 73, 89, 255],
                 "center_rgba": [37, 42, 52, 255],
             },
-            "browser_width_ratio": 0.80,
-            "browser_width_min": 160,
-            "browser_width_max": 640,
+            # The hierarchy is a first-class inspector, not a narrow sidebar.
+            # Its host scales from the authored work width just like the camera
+            # inspector and may grow beyond the old 640 px ceiling.
+            "browser_width_ratio": 1.25,
+            "browser_width_min": 240,
+            "browser_width_max": 1200,
+            # The camera manifest and validation/work hierarchy need more
+            # horizontal room than the central image preview. Ratios are
+            # relative to the authored work-width baseline.
+            "camera_panel_width_ratio": 1.20,
+            # Keep the visualization at its authored width.  Side-list growth
+            # expands the containing window instead of consuming image space.
+            "work_panel_width_ratio": 1.00,
             "render_pipeline": {
                 "font": {
                     "mode": "monofont",
@@ -567,7 +667,7 @@ def program_ui_manifest() -> Panel:
                 },
                 {
                     "key": "queue-pause-auto",
-                    "label": "PAUSE AUTO",
+                    "label": "TOGGLE WORK",
                     "align": "start",
                     "width_units": 7.5,
                 },
@@ -597,15 +697,36 @@ def program_frame_metrics(
         browser_min,
         min(browser_max, int(round(preview_width * ratio))),
     )
-    frame_width = 2 * preview_width + browser_width
+    camera_width = max(1, int(round(
+        preview_width * float(payload.get("camera_panel_width_ratio", 1.0))
+    )))
+    work_panel_width = max(1, int(round(
+        preview_width * float(payload.get("work_panel_width_ratio", 1.0))
+    )))
+    frame_width = camera_width + work_panel_width + browser_width
     scale = min(1.0, max(0.4, float(frame_width) / 480.0))
-    control_h = max(12, int(round(24.0 * scale)))
-    label_h = max(10, int(round(20.0 * scale)))
-    label_clearance_h = max(1, label_h // 2)
+    tool_rows = tuple(
+        panel for panel in manifest.panels
+        if str((panel.payload or {}).get("role", "")) == "control_grid"
+    )
+    tool_gap = 1
+    tool_row_h = max(1, min(
+        int(dict((panel.payload or {}).get("grid", {})).get("row_height", 13))
+        for panel in tool_rows
+    )) if tool_rows else 0
+    tool_h = (
+        len(tool_rows) * tool_row_h
+        + max(0, len(tool_rows) - 1) * tool_gap
+    )
+    # The action row, six physical tool rows, and viewport labels each own
+    # actual vertical space; none overlap the photographed work panels.
+    control_h = max(13, int(round(26.0 * scale)))
+    label_h = max(13, int(round(26.0 * scale)))
+    label_clearance_h = max(3, int(round(5.0 * scale)))
     editor_h = max(24, int(round(preview_height * 0.35)))
-    status_h = max(12, int(round(18.0 * scale)))
+    status_h = max(13, int(round(26.0 * scale)))
     frame_height = (
-        control_h + label_h + label_clearance_h
+        control_h + tool_h + label_h + label_clearance_h
         + preview_height + editor_h + status_h
     )
     return {
@@ -614,7 +735,12 @@ def program_frame_metrics(
         "preview_width": preview_width,
         "preview_height": preview_height,
         "browser_width": browser_width,
+        "camera_width": camera_width,
+        "work_panel_width": work_panel_width,
         "control_h": control_h,
+        "tool_h": tool_h,
+        "tool_row_h": tool_row_h,
+        "tool_gap": tool_gap,
         "label_h": label_h,
         "label_clearance_h": label_clearance_h,
         "editor_h": editor_h,
@@ -649,27 +775,48 @@ def layout_program_ui(
     if work_height is None:
         work_height = max(1, height // 2)
     metrics = program_frame_metrics(work_width, work_height, manifest)
-    preview_width = min(int(work_width), max(1, width // 2))
-    browser_width = max(1, width - 2 * preview_width)
+    payload = manifest.payload if isinstance(manifest.payload, dict) else {}
+    baseline_width = min(int(work_width), max(1, width // 2))
+    camera_width = max(1, int(round(
+        baseline_width * float(payload.get("camera_panel_width_ratio", 1.0))
+    )))
+    work_panel_width = max(1, int(round(
+        baseline_width * float(payload.get("work_panel_width_ratio", 1.0))
+    )))
+    if camera_width + work_panel_width >= width:
+        available = max(2, width - 1)
+        scale_width = available / float(camera_width + work_panel_width)
+        camera_width = max(1, int(round(camera_width * scale_width)))
+        work_panel_width = max(1, available - camera_width)
+    browser_width = max(1, width - camera_width - work_panel_width)
     control_h = min(metrics["control_h"], max(1, height - 1))
-    label_h = min(metrics["label_h"], max(1, height - control_h - 1))
+    # Preserve at least one pixel each for labels, viewport, editor, and status
+    # when a deliberately tiny test/window asks six real rows to fit.
+    tool_h = min(metrics["tool_h"], max(0, height - control_h - 4))
+    label_h = min(
+        metrics["label_h"], max(1, height - control_h - tool_h - 3)
+    )
+    label_clearance_h = min(
+        metrics["label_clearance_h"],
+        max(0, height - control_h - tool_h - label_h - 3),
+    )
     panel_h = min(
         int(work_height),
-        max(1, height - control_h - label_h
-            - metrics["label_clearance_h"] - 1),
+        max(1, height - control_h - tool_h - label_h
+            - label_clearance_h - 2),
     )
     remaining_h = max(
-        1,
-        height - control_h - label_h
-        - metrics["label_clearance_h"] - panel_h,
+        2,
+        height - control_h - tool_h - label_h
+        - label_clearance_h - panel_h,
     )
-    status_h = min(metrics["status_h"], max(1, remaining_h))
-    editor_h = max(1, remaining_h - status_h)
-    label_y = y0 + control_h
-    panel_y = label_y + label_h + metrics["label_clearance_h"]
+    status_h = min(metrics["status_h"], max(1, remaining_h - 1))
+    editor_h = remaining_h - status_h
+    label_y = y0 + control_h + tool_h
+    panel_y = label_y + label_h + label_clearance_h
     editor_y = panel_y + panel_h
     status_y = editor_y + editor_h
-    main_width = 2 * preview_width
+    main_width = camera_width + work_panel_width
 
     panels = {str(panel.name): panel for panel in manifest.panels}
     required = {
@@ -681,24 +828,53 @@ def layout_program_ui(
         raise ValueError(f"program UI manifest is missing panels: {missing}")
     regions: dict[str, Rect] = {
         manifest.name: (x0, y0, width, height),
-        "camera-panel": (x0, panel_y, preview_width, panel_h),
-        "work-panel": (x0 + preview_width, panel_y, preview_width, panel_h),
+        "camera-panel": (x0, panel_y, camera_width, panel_h),
+        "work-panel": (x0 + camera_width, panel_y, work_panel_width, panel_h),
         "asset-browser": (
             x0 + main_width, panel_y, browser_width,
             max(1, height - (panel_y - y0)),
         ),
-        "camera-label": (x0, label_y, preview_width, label_h),
-        "work-label": (x0 + preview_width, label_y, preview_width, label_h),
+        "camera-label": (x0, label_y, camera_width, label_h),
+        "work-label": (x0 + camera_width, label_y, work_panel_width, label_h),
         "asset-browser-label": (
             x0 + main_width, label_y, browser_width, label_h,
         ),
         "editor-text": (x0, editor_y, main_width, editor_h),
         "status-text": (x0, status_y, main_width, status_h),
     }
-    payload = manifest.payload if isinstance(manifest.payload, dict) else {}
+    tool_rows = tuple(
+        name for name, panel in panels.items()
+        if str((panel.payload or {}).get("role", "")) == "control_grid"
+    )
+    if tool_rows:
+        # The manifest-owned action/window row is first. Every toolbar is a
+        # real row below it, before the separate viewport-label row.
+        tool_top = y0 + control_h
+        available = max(1, label_y - tool_top)
+        tool_gap = metrics["tool_gap"]
+        total_gap = tool_gap * max(0, len(tool_rows) - 1)
+        requested_height = min(
+            max(1, int(dict((panels[key].payload or {}).get("grid", {})).get(
+                "row_height", 13
+            )))
+            for key in tool_rows
+        )
+        row_height = max(1, min(
+            requested_height,
+            (available - total_gap) // len(tool_rows),
+        ))
+        used = row_height * len(tool_rows) + total_gap
+        tool_y = tool_top
+        for row_index, row_key in enumerate(tool_rows):
+            regions[row_key] = (
+                x0,
+                tool_y + row_index * (row_height + tool_gap),
+                width,
+                row_height,
+            )
     margin = min(2, max(0, (width - 1) // 24))
     gap = max(0, min(3, width // 20))
-    size = max(1, min(14, max(1, control_h - 2 * margin)))
+    size = max(1, min(48, max(1, control_h - 2 * margin)))
     right = x0 + width - margin
     raw_actions = list(payload.get("actions", ()) or ())
     actions = {
@@ -721,11 +897,16 @@ def layout_program_ui(
         )
         end_cursor -= action_width + gap
     start_cursor = x0 + margin
-    for action in (
+    start_actions = [
         item for item in actions.values() if item.align == "start"
-    ):
+    ]
+    for index, action in enumerate(start_actions):
         requested_width = max(size, int(round(size * action.width_units)))
-        available_width = max(size, end_cursor - gap - start_cursor)
+        remaining = max(1, len(start_actions) - index)
+        remaining_gap = gap * remaining
+        available_width = max(
+            1, (end_cursor - start_cursor - remaining_gap) // remaining
+        )
         action_width = min(requested_width, available_width)
         regions[action.key] = (
             start_cursor, y0 + margin, action_width, size,
@@ -741,6 +922,7 @@ def layout_program_ui(
         name: str((panel.payload or {}).get("role", "panel"))
         for name, panel in panels.items()
     }
+    roles.update({key: "control_grid" for key in tool_rows})
     contexts = {
         name: OpenGLContextRequest()
         for name, panel in panels.items()

@@ -43,6 +43,21 @@ def test_delta_optical_vertices_are_not_arbitrary_t5_endpoints() -> None:
     )
 
 
+def test_t5_uses_matching_cooperative_tiles() -> None:
+    shader = (ROOT / "csrc/shaders/t5_full_connect.comp.glsl").read_text(
+        encoding="utf-8"
+    )
+    native = (ROOT / "csrc/include/ray_pipeline.h").read_text(encoding="utf-8")
+
+    assert "#define TILE_C  16" in shader
+    assert "#define TILE_L  16" in shader
+    assert "T5_TILE_C        = 16" in native
+    assert "T5_TILE_L        = 16" in native
+    assert shader.index("if (t5_profile_mode != 0) return;") < shader.index(
+        "barrier();\n    memoryBarrierShared();", shader.index("if (t5_profile_mode != 0) return;")
+    )
+
+
 def test_scattered_sensor_paths_do_not_use_direct_emitter_splat() -> None:
     material_shader = (ROOT / "csrc/shaders/ray_material.comp.glsl").read_text(
         encoding="utf-8"

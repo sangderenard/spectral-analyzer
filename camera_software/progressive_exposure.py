@@ -107,6 +107,9 @@ class ExposureProgressEvent:
     global_uv_bounds: tuple[float, float, float, float] | None = None
     completed_work: int = 0
     total_work: int = 0
+    progress_fraction: float = 0.0
+    elapsed_s: float = 0.0
+    eta_s: float | None = None
     linear_accumulation_path: str = ""
     sample_count_path: str = ""
     preview_path: str = ""
@@ -128,6 +131,12 @@ class ExposureProgressEvent:
                 raise ValueError(f"{name} must be non-negative")
         if self.total_work and self.completed_work > self.total_work:
             raise ValueError("completed_work cannot exceed total_work")
+        if not 0.0 <= float(self.progress_fraction) <= 1.0:
+            raise ValueError("progress_fraction must be in [0, 1]")
+        if float(self.elapsed_s) < 0.0:
+            raise ValueError("elapsed_s must be non-negative")
+        if self.eta_s is not None and float(self.eta_s) < 0.0:
+            raise ValueError("eta_s must be non-negative when present")
         for name in ("sensor_node_id", "parent_sensor_node_id"):
             value = getattr(self, name)
             if value is not None and int(value) < 0:

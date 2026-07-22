@@ -242,8 +242,9 @@ MOUNT_CUSTOM     = "custom"
 class BackGeometrySpec:
     """Physical geometry of a camera back or film gate.
 
-    All dimensions in millimetres.  ``radius_m`` is the inscribed-circle half-
-    diagonal used by the optical design to define the image circle requirement.
+    All dimensions are in millimetres.  ``radius_m`` is half the required
+    image-circle diameter; the complete rectangular recording gate must fit
+    inside that circle.
 
     Attributes
     ----------
@@ -258,7 +259,7 @@ class BackGeometrySpec:
 
     Read-only properties
     --------------------
-    radius_m        — half-diagonal in metres (image_circle_mm / 2 / 1000).
+    radius_m        — image-circle radius in metres (diameter / 2 / 1000).
     """
 
     mount_standard  : str   = MOUNT_120_6x6

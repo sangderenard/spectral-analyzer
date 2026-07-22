@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 import scene_orders as orders
 
@@ -139,6 +140,26 @@ def test_empty_token_is_rejected():
         raise AssertionError("blank token must be rejected")
 
 
+def test_sensor_top_k_is_a_valid_positive_runtime_budget():
+    payload = orders.load_order(ORDER)
+    payload.pop("_source_path", None)
+    payload["runtime"] = {"sensor_top_k": 200}
+    orders.validate_order(payload)
+    payload["runtime"]["sensor_top_k"] = 0
+    with pytest.raises(ValueError, match="runtime.sensor_top_k must be positive"):
+        orders.validate_order(payload)
+
+
+def test_epoch_bundle_count_is_a_valid_positive_runtime_budget():
+    payload = orders.load_order(ORDER)
+    payload.pop("_source_path", None)
+    payload["runtime"] = {"epoch_bundle_count": 16}
+    orders.validate_order(payload)
+    payload["runtime"]["epoch_bundle_count"] = 0
+    with pytest.raises(ValueError, match="runtime.epoch_bundle_count must be positive"):
+        orders.validate_order(payload)
+
+
 def test_spatial_camera_maps_world_subject_into_stationary_optical_rig():
     import exposure_render_demo as exposure
 
@@ -214,17 +235,23 @@ def test_native_square_accumulator_returns_exact_rectangular_tile_shape_and_dtyp
     assert exposure._native_sensor_schedule_shape(width=12, height=7) == (12, 12)
 
 
-def test_native_sensor_readback_is_a_storage_transpose_without_double_flip():
+def test_native_sensor_readback_maps_physical_up_right_to_display_down_right():
     import exposure_render_demo as exposure
 
+    # Native axes are [right, up]. Give every physical site an asymmetric id.
     native = np.zeros((3, 3, 3), np.float32)
-    native[0, 1] = (1.0, 0.0, 0.0)
-    native[2, 1] = (0.0, 0.0, 1.0)
+    for right in range(3):
+        for up in range(3):
+            native[right, up] = (10 * right + up, right, up)
+    cpp_getter = native[::-1]
 
-    display = exposure._native_sensor_to_display(native)
+    display = exposure._native_sensor_to_display(cpp_getter)
+    expected = native.transpose(1, 0, 2)[::-1]
 
-    assert np.array_equal(display[1, 0], (1.0, 0.0, 0.0))
-    assert np.array_equal(display[1, 2], (0.0, 0.0, 1.0))
+    assert np.array_equal(display, expected)
+    # Top-left is physical left/up; bottom-right is physical right/down.
+    assert np.array_equal(display[0, 0], native[0, 2])
+    assert np.array_equal(display[2, 2], native[2, 0])
 
 
 def test_resumed_exposure_seeds_stay_inside_native_signed_int_contract():

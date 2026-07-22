@@ -1,0 +1,487 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "image": {
+      "width": 320,
+      "height": 320,
+      "region": {
+        "x": 128,
+        "y": 128,
+        "width": 64,
+        "height": 64
+      }
+    },
+    "camera": {
+      "focal_mm": 35.0,
+      "aperture_mm": 25.0,
+      "position_m": [
+        3.0,
+        -2.0,
+        1.0
+      ],
+      "target_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "focus_target_m": [
+        0.6075093110216447,
+        -0.11656210531064382,
+        0.15812708797586317
+      ],
+      "up": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "focus_distance_m": 3.1591296269700613
+    },
+    "exposure": {
+      "time_s": 0.016666666666666666,
+      "iso": 100.0,
+      "sensor_sweeps": 1,
+      "t5_pair_budget": 20000000
+    },
+    "flash": {
+      "intensity_scale": 1.0,
+      "enabled": false
+    },
+    "font": {
+      "family": "DejaVu Sans",
+      "weight": "bold",
+      "style": "normal"
+    },
+    "planes": [
+      {
+        "id": "receiver-wall",
+        "center_m": [
+          -0.7282943246783207,
+          0.48552954978554697,
+          -0.24276477489277348
+        ],
+        "normal": [
+          0.8017837257372732,
+          -0.5345224838248488,
+          0.2672612419124244
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          2.5,
+          1.7
+        ],
+        "thickness_m": 0.035,
+        "material": "receiver_white"
+      },
+      {
+        "id": "prism",
+        "shape": "triangular_prism",
+        "center_m": [
+          0.6075093110216447,
+          -0.11656210531064382,
+          0.15812708797586317
+        ],
+        "normal": [
+          0.9216526520714994,
+          -0.2903802607604024,
+          0.25736295982579255
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          0.42,
+          0.62
+        ],
+        "thickness_m": 0.34,
+        "material": "prism_bk7"
+      },
+      {
+        "id": "collimated-source",
+        "center_m": [
+          1.1928114308098539,
+          -0.5067635185027834,
+          0.353227794571933
+        ],
+        "normal": [
+          -0.8017837257372732,
+          0.5345224838248488,
+          -0.2672612419124244
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          0.055,
+          0.055
+        ],
+        "thickness_m": 0.004,
+        "material": "beam_emitter",
+        "emitter": true
+      },
+      {
+        "id": "room-floor",
+        "center_m": [
+          0.2335375302705862,
+          -0.15569168684705764,
+          -0.8561282955694588
+        ],
+        "normal": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "up": [
+          -0.8017837257372732,
+          0.5345224838248488,
+          -0.2672612419124244
+        ],
+        "size_m": [
+          2.7,
+          4.6
+        ],
+        "thickness_m": 0.035,
+        "material": "quiet_background"
+      },
+      {
+        "id": "room-ceiling",
+        "center_m": [
+          -0.16673710072640846,
+          0.11115806715093884,
+          0.8783951054175182
+        ],
+        "normal": [
+          0.22237479499833038,
+          -0.14824986333222026,
+          -0.9636241116594316
+        ],
+        "up": [
+          -0.8017837257372732,
+          0.5345224838248488,
+          -0.2672612419124244
+        ],
+        "size_m": [
+          2.7,
+          4.6
+        ],
+        "thickness_m": 0.035,
+        "material": "quiet_background"
+      },
+      {
+        "id": "room-left",
+        "center_m": [
+          -0.6599750305094476,
+          -1.0623296777703641,
+          0.011133404924029717
+        ],
+        "normal": [
+          0.5547001962252291,
+          0.8320502943378438,
+          -1.3877787807814457e-17
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          4.6,
+          1.8
+        ],
+        "thickness_m": 0.035,
+        "material": "quiet_background"
+      },
+      {
+        "id": "room-right",
+        "center_m": [
+          0.7267754600536254,
+          1.0177960580742453,
+          0.011133404924029682
+        ],
+        "normal": [
+          -0.5547001962252291,
+          -0.8320502943378438,
+          1.3877787807814457e-17
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          4.6,
+          1.8
+        ],
+        "thickness_m": 0.035,
+        "material": "quiet_background"
+      }
+    ],
+    "materials": {
+      "quiet_background": {
+        "albedo_rgb": [
+          0.018,
+          0.021,
+          0.022
+        ],
+        "reflectivity": 0.065,
+        "diffusion": 0.98,
+        "absorption": 0.92,
+        "roughness": 0.98,
+        "metallic": 0.0
+      },
+      "text_surface": {
+        "albedo_rgb": [
+          0.82,
+          0.76,
+          0.62
+        ],
+        "reflectivity": 0.58,
+        "diffusion": 0.72,
+        "absorption": 0.25,
+        "roughness": 0.3,
+        "metallic": 0.0,
+        "ior": 1.5
+      },
+      "prism_bk7": {
+        "albedo_rgb": [
+          0.98,
+          0.99,
+          1.0
+        ],
+        "reflectivity": 0.04,
+        "diffusion": 0.0,
+        "transmission": 0.955,
+        "roughness": 0.0,
+        "bands": [
+          {
+            "center_hz": 616688525581595.2,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5223762882959146,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 510231362896634.9,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5168000331008606,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 456810940577275.44,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.514322345876275,
+            "ior_imag": 0.0
+          }
+        ]
+      },
+      "receiver_white": {
+        "albedo_rgb": [
+          0.94,
+          0.94,
+          0.94
+        ],
+        "reflectivity": 0.94,
+        "diffusion": 0.98,
+        "absorption": 0.02,
+        "roughness": 0.92
+      },
+      "beam_emitter": {
+        "albedo_rgb": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "reflectivity": 0.0,
+        "diffusion": 0.0,
+        "emission": 18.0,
+        "bands": [
+          {
+            "center_hz": 616688525581595.2,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 510231362896634.9,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 456810940577275.44,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          }
+        ]
+      }
+    },
+    "geometry": {
+      "embed_plane": "receiver-wall",
+      "height_m": 0.055,
+      "line_height_m": 0.055,
+      "line_spacing": 1.22,
+      "text_box_m": [
+        0.31,
+        0.18
+      ],
+      "horizontal_align": "center",
+      "vertical_align": "center",
+      "extrusion_depth_ratio": 0.08,
+      "embed_fraction": 0.25,
+      "offset_m": [
+        0.0,
+        0.0
+      ],
+      "profile": "straight",
+      "outline_subdivisions": 4,
+      "cap_grid": 64,
+      "material": "text_surface"
+    },
+    "objects": [
+      {
+        "id": "receiver-label",
+        "token": "PRISM RECEIVER",
+        "embed_plane": "receiver-wall",
+        "geometry": {
+          "text_box_m": [
+            1.0,
+            0.16
+          ],
+          "line_height_m": 0.07,
+          "height_m": 0.07,
+          "material": "text_surface",
+          "offset_m": [
+            0.0,
+            -0.68
+          ]
+        }
+      }
+    ],
+    "emitter": {
+      "mode": "collimated",
+      "direction_space": "canonical_camera",
+      "direction": [
+        -1.0,
+        0.0,
+        0.0
+      ],
+      "divergence_deg": 0.0
+    }
+  },
+  "jobs": [
+    {
+      "id": "live_paragraph",
+      "token": ""
+    }
+  ],
+  "runtime": {
+    "work_kind": "calibration",
+    "max_sensor_epochs": 1,
+    "ordinary_work": false,
+    "convergence_enabled": false,
+    "total_rays": 4096,
+    "rays_per_batch": 4096,
+    "sensor_samples_per_node": 2,
+    "sensor_steps_per_layer": 1,
+    "sensor_flash_rays": 4096,
+    "sensor_t5_pair_budget": 262144,
+    "transport_option": "fixed:3"
+  },
+  "transport": {
+    "domain": "fixed_spectral",
+    "frequencies_hz": [
+      616688525581595.2,
+      510231362896634.9,
+      456810940577275.44
+    ],
+    "wavelengths_nm": [
+      486.1327,
+      587.5618000000001,
+      656.2725
+    ],
+    "lane_table": {
+      "abi_version": 1,
+      "domain": "fixed_spectral",
+      "cohort_id": "prism-fixed-3",
+      "lanes": [
+        {
+          "lane_id": 0,
+          "identity": "wavelength:486.133nm",
+          "frequency_hz": 616688525581595.2,
+          "sampling_pdf": 1.0,
+          "proposal_profile_key": "",
+          "sample_u": null,
+          "sensor_weight_xyz": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        },
+        {
+          "lane_id": 1,
+          "identity": "wavelength:587.562nm",
+          "frequency_hz": 510231362896634.9,
+          "sampling_pdf": 1.0,
+          "proposal_profile_key": "",
+          "sample_u": null,
+          "sensor_weight_xyz": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        },
+        {
+          "lane_id": 2,
+          "identity": "wavelength:656.273nm",
+          "frequency_hz": 456810940577275.44,
+          "sampling_pdf": 1.0,
+          "proposal_profile_key": "",
+          "sample_u": null,
+          "sensor_weight_xyz": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      ]
+    },
+    "calibration_mode": "prism-room"
+  }
+}

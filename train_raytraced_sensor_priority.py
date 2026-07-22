@@ -171,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         ]
         environment = os.environ.copy()
         environment["SPECTRAL_SENSOR_MAX_EPOCHS"] = str(epochs)
-        environment["SPECTRAL_SENSOR_CONTINUOUS"] = "0"
+        environment["SPECTRAL_SENSOR_PERSISTENT_EPOCHS"] = "0"
         environment["SPECTRAL_SENSOR_STEPS_PER_LAYER"] = str(args.steps_per_layer)
         environment["SPECTRAL_SENSOR_TARGETED_FRACTION"] = str(args.targeted_fraction)
         environment["SPECTRAL_PROGRESS_RETAIN_LAYERS"] = "0"

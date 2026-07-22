@@ -1,0 +1,1231 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "image": {
+      "width": 1024,
+      "height": 1024,
+      "region": {
+        "x": 0,
+        "y": 0,
+        "width": 1024,
+        "height": 1024
+      }
+    },
+    "camera": {
+      "focal_mm": 82.5,
+      "aperture_mm": 20.625,
+      "manifest": {
+        "schema_version": 1,
+        "asset_key": "camera/6x6/four-group/default",
+        "lens": {
+          "family": "four_group_zoom_surrogate",
+          "profile": "55-110/4",
+          "focal_length_range_mm": [
+            55.0,
+            110.0
+          ],
+          "zoom": 0.5,
+          "focal_length_mm": 82.5,
+          "f_number": 4.0,
+          "aperture_diameter_mm": 20.625,
+          "group_count": 4,
+          "group_thickness_mm": 18.0,
+          "minimum_air_gap_mm": 8.0,
+          "default_ior": 1.55,
+          "glass": "N-BK7",
+          "surface_model": "spherical_conic_k0",
+          "representation": "exact_parametric_conic",
+          "design_fidelity": "first_order_surrogate_exact_surface_transport"
+        },
+        "focus": {
+          "distance_m": 1.0,
+          "mechanism": "rear_group_G4_translation"
+        },
+        "sensor": {
+          "film_format_key": "120_6x6",
+          "film_format_label": "120 6x6 (nominal 56 mm square gate)",
+          "mount_standard": "120_6x6",
+          "back_type": "flat",
+          "physical_width_mm": 56.0,
+          "physical_height_mm": 56.0,
+          "physical_aspect_ratio": 1.0,
+          "default_work_raster_px": [
+            256,
+            256
+          ],
+          "default_final_raster_px": [
+            1024,
+            1024
+          ],
+          "crop_origin": "top-left"
+        },
+        "film_stage": {
+          "depth_delta_mm": 0.0,
+          "tilt_right_deg": 0.0,
+          "tilt_up_deg": 0.0,
+          "shift_x_mm": 0.0,
+          "shift_y_mm": 0.0
+        },
+        "body": {
+          "outer_material": "camera_body_charcoal",
+          "outer_reflectance": 0.16,
+          "outer_roughness": 0.28,
+          "outer_metallic": 0.35,
+          "interior_material": "calib_aperture_black",
+          "reflection_visibility": "physical_outer_surfaces"
+        },
+        "spectral": {
+          "authoring_domain": "continuous_functions_sampled_for_transport",
+          "transport_mode": "one_discrete_wavelength_per_path",
+          "transport_abi_version": 1,
+          "lane_semantics": "fixed_spectral",
+          "active_wavelengths_nm": [
+            700.0,
+            657.1428571428571,
+            614.2857142857143,
+            571.4285714285714,
+            528.5714285714286,
+            485.7142857142857,
+            442.8571428571429,
+            400.0
+          ],
+          "active_band_count": 8,
+          "material_band_capacity": 32,
+          "lens_dispersion_model": "sampled_sellmeier"
+        },
+        "flash": {
+          "asset_key": "lighting/thick-lens/default-photographic-rig",
+          "intensity_scale": 1.0,
+          "emitters": [
+            {
+              "key": "side_room_source",
+              "kind": "stage_light_tube",
+              "emission_scale": 12.0,
+              "declared_cct_k": 5500.0,
+              "declared_cri": 95.0
+            },
+            {
+              "key": "camera_ring_light",
+              "kind": "camera_mounted_ring",
+              "emission_scale": 200.0,
+              "declared_cct_k": 5600.0,
+              "declared_cri": 98.0
+            }
+          ],
+          "resolved_spectral_model": {
+            "kind": "sampled_gaussian",
+            "center_nm": 555.0,
+            "sigma_nm": 85.0
+          },
+          "modifier": {
+            "mode": "none"
+          },
+          "burst": {
+            "backend_mode": "native_flash_sensor_package",
+            "duration_s": 0.01,
+            "stages": 1,
+            "profile": "steady",
+            "duty_cycle": 1.0,
+            "energy_scale": 1.0,
+            "exposure_weight": 1.0
+          }
+        }
+      },
+      "position_m": [
+        3.0,
+        -2.0,
+        1.0
+      ],
+      "target_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "focus_target_m": [
+        0.6075093110216447,
+        -0.11656210531064382,
+        0.15812708797586317
+      ],
+      "up": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "focus_distance_m": 3.1591296269700613
+    },
+    "exposure": {
+      "time_s": 0.016666666666666666,
+      "iso": 100.0,
+      "sensor_sweeps": 1,
+      "t5_pair_budget": 20000000,
+      "sensor_id": 0,
+      "film_id": 0
+    },
+    "flash": {
+      "intensity_scale": 1.0,
+      "enabled": false
+    },
+    "font": {
+      "family": "DejaVu Sans",
+      "weight": "bold",
+      "style": "normal"
+    },
+    "planes": [
+      {
+        "id": "receiver-wall",
+        "center_m": [
+          -0.7282943246783207,
+          0.48552954978554697,
+          -0.24276477489277348
+        ],
+        "normal": [
+          0.8017837257372732,
+          -0.5345224838248488,
+          0.2672612419124244
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          2.5,
+          1.7
+        ],
+        "thickness_m": 0.035,
+        "material": "receiver_white"
+      },
+      {
+        "id": "prism",
+        "shape": "triangular_prism",
+        "center_m": [
+          0.6075093110216447,
+          -0.11656210531064382,
+          0.15812708797586317
+        ],
+        "normal": [
+          0.9216526520714994,
+          -0.2903802607604024,
+          0.25736295982579255
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          0.42,
+          0.62
+        ],
+        "thickness_m": 0.34,
+        "material": "prism_bk7"
+      },
+      {
+        "id": "collimated-source",
+        "center_m": [
+          1.1928114308098539,
+          -0.5067635185027834,
+          0.353227794571933
+        ],
+        "normal": [
+          -0.8017837257372732,
+          0.5345224838248488,
+          -0.2672612419124244
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          0.055,
+          0.055
+        ],
+        "thickness_m": 0.004,
+        "material": "beam_emitter",
+        "emitter": true
+      },
+      {
+        "id": "room-floor",
+        "center_m": [
+          0.2335375302705862,
+          -0.15569168684705764,
+          -0.8561282955694588
+        ],
+        "normal": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "up": [
+          -0.8017837257372732,
+          0.5345224838248488,
+          -0.2672612419124244
+        ],
+        "size_m": [
+          2.7,
+          4.6
+        ],
+        "thickness_m": 0.035,
+        "material": "quiet_background"
+      },
+      {
+        "id": "room-ceiling",
+        "center_m": [
+          -0.16673710072640846,
+          0.11115806715093884,
+          0.8783951054175182
+        ],
+        "normal": [
+          0.22237479499833038,
+          -0.14824986333222026,
+          -0.9636241116594316
+        ],
+        "up": [
+          -0.8017837257372732,
+          0.5345224838248488,
+          -0.2672612419124244
+        ],
+        "size_m": [
+          2.7,
+          4.6
+        ],
+        "thickness_m": 0.035,
+        "material": "quiet_background"
+      },
+      {
+        "id": "room-left",
+        "center_m": [
+          -0.6599750305094476,
+          -1.0623296777703641,
+          0.011133404924029717
+        ],
+        "normal": [
+          0.5547001962252291,
+          0.8320502943378438,
+          -1.3877787807814457E-17
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          4.6,
+          1.8
+        ],
+        "thickness_m": 0.035,
+        "material": "quiet_background"
+      },
+      {
+        "id": "room-right",
+        "center_m": [
+          0.7267754600536254,
+          1.0177960580742453,
+          0.011133404924029682
+        ],
+        "normal": [
+          -0.5547001962252291,
+          -0.8320502943378438,
+          1.3877787807814457E-17
+        ],
+        "up": [
+          -0.22237479499833038,
+          0.14824986333222026,
+          0.9636241116594316
+        ],
+        "size_m": [
+          4.6,
+          1.8
+        ],
+        "thickness_m": 0.035,
+        "material": "quiet_background"
+      }
+    ],
+    "materials": {
+      "quiet_background": {
+        "albedo_rgb": [
+          0.018,
+          0.021,
+          0.022
+        ],
+        "reflectivity": 0.065,
+        "diffusion": 0.98,
+        "absorption": 0.92,
+        "roughness": 0.98,
+        "metallic": 0.0
+      },
+      "text_surface": {
+        "albedo_rgb": [
+          0.82,
+          0.76,
+          0.62
+        ],
+        "reflectivity": 0.58,
+        "diffusion": 0.72,
+        "absorption": 0.25,
+        "roughness": 0.3,
+        "metallic": 0.0,
+        "ior": 1.5
+      },
+      "prism_bk7": {
+        "albedo_rgb": [
+          0.98,
+          0.99,
+          1.0
+        ],
+        "reflectivity": 0.04,
+        "diffusion": 0.0,
+        "transmission": 0.955,
+        "roughness": 0.0,
+        "bands": [
+          {
+            "center_hz": 428274940000000.0,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5130639958181895,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 438636430483870.94,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5135166047349504,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 448997920967741.94,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5139739834940114,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 459359411451612.9,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.514436663200994,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 469720901935483.9,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5149051261541868,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 480082392419354.8,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5153798124882236,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 490443882903225.8,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5158611258438666,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 500805373387096.75,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5163494382257465,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 511166863870967.75,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.51684509418033,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 521528354354838.7,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5173484144026932,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 531889844838709.7,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5178596988616306,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 542251335322580.6,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.518379229517217,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 552612825806451.6,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5189072726924449,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 562974316290322.5,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.519444081150354,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 573335806774193.5,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5199898959197247,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 583697297258064.5,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5205449479055417,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 594058787741935.5,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5211094593147774,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 604420278225806.5,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5216836449233455,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 614781768709677.4,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5222677132061897,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 625143259193548.4,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5228618673492207,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 635504749677419.4,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5234663061590927,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 645866240161290.2,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5240812248845432,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 656227730645161.2,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5247068159610966,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 666589221129032.2,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5253432696893126,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 676950711612903.2,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5259907748554034,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 687312202096774.1,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5266495193018785,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 697673692580645.1,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5273196904548914,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 708035183064516.1,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.528001475814124,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 718396673548387.0,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.528695063410345,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 728758164032258.0,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5294006422351367,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 739119654516129.0,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5301184026468058,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 749481145000000.0,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.04,
+            "transmittance": 0.955,
+            "diffuse_frac": 0.0,
+            "emission": 0.0,
+            "reemission": 0.0,
+            "ior_real": 1.5308485367560054,
+            "ior_imag": 0.0
+          }
+        ]
+      },
+      "receiver_white": {
+        "albedo_rgb": [
+          0.94,
+          0.94,
+          0.94
+        ],
+        "reflectivity": 0.94,
+        "diffusion": 0.98,
+        "absorption": 0.02,
+        "roughness": 0.92
+      },
+      "beam_emitter": {
+        "albedo_rgb": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "reflectivity": 0.0,
+        "diffusion": 0.0,
+        "emission": 18.0,
+        "bands": [
+          {
+            "center_hz": 428274940000000.0,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 438636430483870.94,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 448997920967741.94,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 459359411451612.9,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 469720901935483.9,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 480082392419354.8,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 490443882903225.8,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 500805373387096.75,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 511166863870967.75,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 521528354354838.7,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 531889844838709.7,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 542251335322580.6,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 552612825806451.6,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 562974316290322.5,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 573335806774193.5,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 583697297258064.5,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 594058787741935.5,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 604420278225806.5,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 614781768709677.4,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 625143259193548.4,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 635504749677419.4,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 645866240161290.2,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 656227730645161.2,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 666589221129032.2,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 676950711612903.2,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 687312202096774.1,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 697673692580645.1,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 708035183064516.1,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 718396673548387.0,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 728758164032258.0,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 739119654516129.0,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          },
+          {
+            "center_hz": 749481145000000.0,
+            "bandwidth_hz": 10000000000.0,
+            "reflectance": 0.0,
+            "transmittance": 0.0,
+            "diffuse_frac": 0.0,
+            "emission": 18.0,
+            "reemission": 0.0,
+            "ior_real": 1.0,
+            "ior_imag": 0.0
+          }
+        ]
+      }
+    },
+    "geometry": {
+      "embed_plane": "receiver-wall",
+      "height_m": 0.055,
+      "line_height_m": 0.055,
+      "line_spacing": 1.22,
+      "text_box_m": [
+        0.31,
+        0.18
+      ],
+      "horizontal_align": "center",
+      "vertical_align": "center",
+      "extrusion_depth_ratio": 0.08,
+      "embed_fraction": 0.25,
+      "offset_m": [
+        0.0,
+        0.0
+      ],
+      "profile": "straight",
+      "outline_subdivisions": 4,
+      "cap_grid": 64,
+      "material": "text_surface"
+    },
+    "objects": [
+      {
+        "id": "receiver-label",
+        "token": "PRISM RECEIVER",
+        "embed_plane": "receiver-wall",
+        "geometry": {
+          "text_box_m": [
+            1.0,
+            0.16
+          ],
+          "line_height_m": 0.07,
+          "height_m": 0.07,
+          "material": "text_surface",
+          "offset_m": [
+            0.0,
+            -0.68
+          ]
+        }
+      }
+    ],
+    "emitter": {
+      "mode": "collimated",
+      "direction_space": "canonical_camera",
+      "direction": [
+        -1.0,
+        0.0,
+        0.0
+      ],
+      "divergence_deg": 0.0
+    }
+  },
+  "jobs": [
+    {
+      "id": "live_paragraph",
+      "token": ""
+    }
+  ],
+  "runtime": {
+    "work_kind": "calibration",
+    "max_sensor_epochs": 4,
+    "ordinary_work": false,
+    "convergence_enabled": false,
+    "total_rays": 4194304,
+    "rays_per_batch": 1048576,
+    "sensor_top_k": 1024,
+    "sensor_samples_per_node": 1024,
+    "sensor_steps_per_layer": 1,
+    "sensor_flash_rays": 262144,
+    "sensor_t5_pair_budget": 268435456,
+    "sensor_work_tile_width": 1024,
+    "sensor_work_tile_height": 1024,
+    "epoch_bundle_count": 32,
+    "sensor_flash_page_count": 2,
+    "sensor_flash_total_rays": 524288,
+    "max_bounces": 32,
+    "transport_option": "continuous:1",
+    "sensor_allocation_mode": "even-sensor"
+  },
+  "transport": {
+    "domain": "continuous_spectral_lut",
+    "lane_table": {
+      "abi_version": 2,
+      "domain": "continuous_spectral_lut",
+      "cohort_id": "prism-room-continuous-1-42",
+      "lanes": [
+        {
+          "lane_id": 0,
+          "identity": "spectral-lut:sha256:b7aac0278c30605054f48a1d01251826e5aa46b3e892336fa44b32c8de263994:lane:0",
+          "frequency_hz": null,
+          "lut_index": 0,
+          "sensor_weight_xyz": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "wavelength_bin_nm": null,
+          "quadrature_weight": 1.0
+        }
+      ],
+      "lookup_tables": [
+        {
+          "key": "sha256:b7aac0278c30605054f48a1d01251826e5aa46b3e892336fa44b32c8de263994",
+          "frequency_knots_hz": [
+            428274940000000.0,
+            545077196363636.3,
+            749481145000000.0
+          ],
+          "density": [
+            0.3,
+            1.0,
+            0.3
+          ]
+        }
+      ]
+    },
+    "calibration_mode": "prism-room"
+  }
+}

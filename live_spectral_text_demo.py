@@ -6,13 +6,14 @@ import copy
 import json
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Callable
 
 import numpy as np
@@ -28,6 +29,9 @@ from camera_software import (
     DisplayPrimitiveKind,
     DisplayProductKind,
     FixedSceneCamera,
+    default_camera_manifest,
+    resolve_camera_manifest,
+    manifest_hash,
     WorldPlacement,
     DisplayPrimitive,
     DisplayProductRequest,
@@ -50,6 +54,9 @@ from camera_software import (
     extract_raytraced_sprite,
     token_alpha_mask,
     measure_sprite_exposure_quality,
+    CONVERGENCE_METRIC_VERSION,
+    convergence_metric,
+    convergence_velocity_per_pass,
     CachedTokenStringComposer,
     RenderObjectLibrary,
     canonical_subtype_directory,
@@ -62,6 +69,13 @@ from camera_software import (
     LayoutRenderPipeline,
     PanelGeometryKind,
     compose_layout_panel_rgba,
+    layout_panel_composition_trace,
+    build_layout_object_work_manifest,
+    LayoutWorkProgressCache,
+    write_layout_usd_package,
+    HierarchicalObjectResolver,
+    build_window_element_scene_manifest,
+    WindowElementHarvestCache,
     program_ui_manifest,
     layout_render_pipeline,
     program_frame_metrics as manifest_program_frame_metrics,
@@ -69,6 +83,7 @@ from camera_software import (
     OpenGLContextHost,
     process_linear_sensor_image,
     save_linear_sensor_image,
+    DEFAULT_FILM_FORMAT,
 )
 
 
@@ -76,16 +91,23 @@ DEFAULT_TEXT = "Actual light takes the long way home through glass."
 JOB_ID = "live_paragraph"
 DEFAULT_DISPLAY_WIDTH = 960
 DEFAULT_DISPLAY_HEIGHT = 600
+DEFAULT_WORK_WIDTH = DEFAULT_FILM_FORMAT.default_work_width_px
+DEFAULT_WORK_HEIGHT = DEFAULT_FILM_FORMAT.default_work_height_px
 DEFAULT_SENSOR_SWEEPS = 4
 DEFAULT_TARGETED_FRACTION = 0.75
 DEFAULT_LIVE_FOREGROUND_EPOCHS = 64
 DEFAULT_ATLAS_EPOCHS_PER_EXPOSURE = 1
-DEFAULT_ATLAS_SENSOR_TOP_K = 1024
-DEFAULT_ATLAS_STEPS_PER_EPOCH = 64
-DEFAULT_ATLAS_SAMPLES_PER_NODE = 1024
+# A background lease is deliberately small: after one packet the catalog is
+# committed and the global planner gets to choose the least-resolved job again.
+# This keeps N scenes visibly developing instead of hiding tens of millions of
+# rays behind one row that appears stuck.
+DEFAULT_ATLAS_SENSOR_TOP_K = 64
+DEFAULT_ATLAS_STEPS_PER_EPOCH = 1
+DEFAULT_ATLAS_SAMPLES_PER_NODE = 64
 SENSOR_CROP_SCALE = 5
 DEFAULT_EXTRUSION_DEPTH_RATIO = 0.08
 PROGRAM_SCENE_ID = "spectral-program-scene"
+NATIVE_SEED_BITS = 31
 PROGRAM_STATIC_GEOMETRY_REVISION = 7
 _DEFAULT_PROGRAM_MANIFEST = program_ui_manifest()
 _DEFAULT_LAYOUT_RENDER_PIPELINE = layout_render_pipeline(
@@ -102,6 +124,55 @@ FIXED_IMAGE_FONT = FontAssetSpec(
     style=_DEFAULT_LAYOUT_RENDER_PIPELINE.font_style,
 )
 FIXED_UI_TOKEN_STRINGS = _DEFAULT_LAYOUT_RENDER_PIPELINE.static_tokens
+
+
+def iching_coin_seed(
+    sequence: int,
+    bundle_index: int,
+    *,
+    toss_round: int = 0,
+) -> int:
+    """Fill a native seed word using three virtual I Ching coins per bit.
+
+    In the traditional three-coin method a line total of 7 or 9 is yang and a
+    total of 6 or 8 is yin.  Equivalently, an odd number of heads sets the bit.
+    The coin stream is deterministic so a revision can be reproduced exactly.
+    """
+
+    coin_stream = random.Random(
+        f"spectral-i-ching:{int(sequence)}:{int(bundle_index)}:{int(toss_round)}"
+    )
+    seed = 0
+    for bit_index in range(NATIVE_SEED_BITS):
+        heads = sum(coin_stream.getrandbits(1) for _ in range(3))
+        if heads in (1, 3):
+            seed |= 1 << bit_index
+    return seed
+
+
+def atlas_update_cadence(
+    *,
+    epochs_per_exposure: int = DEFAULT_ATLAS_EPOCHS_PER_EXPOSURE,
+    steps_per_epoch: int = DEFAULT_ATLAS_STEPS_PER_EPOCH,
+    sensor_top_k: int = DEFAULT_ATLAS_SENSOR_TOP_K,
+    samples_per_node: int = DEFAULT_ATLAS_SAMPLES_PER_NODE,
+) -> dict[str, int]:
+    """Describe preview and retained-quality checkpoint granularity."""
+
+    convergence_passes = max(
+        1, int(epochs_per_exposure) * int(steps_per_epoch)
+    )
+    rays_per_pass = max(1, int(sensor_top_k)) * max(
+        1, int(samples_per_node)
+    )
+    return {
+        "preview_update_passes": 1,
+        "convergence_update_passes": convergence_passes,
+        "primary_rays_per_pass": rays_per_pass,
+        "primary_rays_per_convergence_update": (
+            rays_per_pass * convergence_passes
+        ),
+    }
 
 
 def _manifest_render_font(manifest: Any = None) -> FontAssetSpec:
@@ -140,13 +211,16 @@ def render_contract_summary(
     height = int(display_height)
     full_width = int(scene_width if scene_width is not None else width)
     full_height = int(scene_height if scene_height is not None else height)
-    native_resolution = max(full_width, full_height)
+    composition_width, composition_height = DEFAULT_FILM_FORMAT.sensor_raster(
+        DEFAULT_FILM_FORMAT.default_final_edge_px
+    )
     return (
         f"ui_scene={full_width}x{full_height} "
         f"scan_region<={width}x{height} "
-        f"native_sensor={native_resolution}x{native_resolution} "
-        f"composition_frame={full_width * SENSOR_CROP_SCALE}x"
-        f"{full_height * SENSOR_CROP_SCALE} "
+        f"film={DEFAULT_FILM_FORMAT.key} "
+        f"gate={DEFAULT_FILM_FORMAT.frame_width_mm:g}x"
+        f"{DEFAULT_FILM_FORMAT.frame_height_mm:g}mm "
+        f"composition_frame={composition_width}x{composition_height} "
         f"authored_sensor_sweeps={int(sensor_sweeps)} "
         f"foreground_epochs<={DEFAULT_LIVE_FOREGROUND_EPOCHS}; "
         "production=alphabet->tokens->token-string->total-scene"
@@ -170,8 +244,17 @@ def build_paragraph_order(
         raise ValueError("display dimensions must be positive")
     if int(sensor_sweeps) <= 0:
         raise ValueError("sensor_sweeps must be positive")
-    full_width = output_width * SENSOR_CROP_SCALE
-    full_height = output_height * SENSOR_CROP_SCALE
+    full_width, full_height = DEFAULT_FILM_FORMAT.sensor_raster(
+        DEFAULT_FILM_FORMAT.default_final_edge_px
+    )
+    # The content is one central work-scale crop within the five-times larger
+    # square gate, matching program_display_region().
+    region = {
+        "x": (full_width - output_width) // 2,
+        "y": (full_height - output_height) // 2,
+        "width": output_width,
+        "height": output_height,
+    }
     plane_normal = [0.8017837257, -0.5345224838, 0.2672612419]
     order = {
         "schema_version": 1,
@@ -179,16 +262,12 @@ def build_paragraph_order(
             "image": {
                 "width": full_width,
                 "height": full_height,
-                "region": {
-                    "x": 2 * output_width,
-                    "y": 2 * output_height,
-                    "width": output_width,
-                    "height": output_height,
-                },
+                "region": region,
             },
             "camera": {
-                "focal_mm": 35.0,
-                "aperture_mm": 25.0,
+                "focal_mm": 82.5,
+                "aperture_mm": 20.625,
+                "manifest": default_camera_manifest(),
                 "position_m": [3.0, -2.0, 1.0],
                 "target_m": [0.0, 0.0, 0.0],
                 # Filled from the formatter-resolved glyph depth below. This
@@ -273,12 +352,646 @@ def build_paragraph_order(
     return order
 
 
+def build_calibration_render_order(
+    mode_key: str,
+    *,
+    display_width: int = DEFAULT_DISPLAY_WIDTH,
+    display_height: int = DEFAULT_DISPLAY_HEIGHT,
+    sensor_sweeps: int = 1,
+    cohort_seed: int = 0,
+    lane_table: Any | None = None,
+    startup_validation_key: str = "",
+    focus_distance_m: float | None = None,
+    transport_option: str | None = None,
+    render_budget: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Build an image-producing physical scene for a calibration selection.
+
+    These orders use the production thick-lens exposure path. Fixed modes use
+    authored frequencies. Continuous lanes contain LUT lookup signals; the
+    native launcher resolves one immutable frequency/PDF per ray.
+    """
+
+    key = str(mode_key)
+    if key == "off":
+        raise ValueError("the Off calibration mode has no render scene")
+    labels = {
+        "color-science": "450 nm        550 nm        650 nm",
+        "glass": "BK7 SPECTRAL TRANSMISSION\nFOCUS PLANE BEHIND GLASS",
+        "single-lane-ui": "SINGLE 587.5618 nm LINE\nUI IMAGE FORMATION",
+        "transport-sanity": "ACTIVE SENSOR SITE\nSPECTRAL TRANSPORT SANITY",
+        "prism-room": "PRISM RECEIVER",
+        "mirror-box": "MIRROR-BOX CAPACITY TORTURE",
+    }
+    if key == "focus-hall":
+        labels[key] = "FOCUS HALL"
+    if key == "depth":
+        labels[key] = "FIRST SCENE SURFACE DEPTH"
+    if key not in labels:
+        raise KeyError(key)
+    c = 299_792_458.0
+    wavelengths_by_mode = {
+        "color-science": (450.0, 550.0, 650.0),
+        "glass": (486.1327, 587.5618, 656.2725),
+        "focus-hall": (587.5618,),
+        "depth": (587.5618,),
+        "single-lane-ui": (587.5618,),
+        "transport-sanity": (587.5618,),
+        "prism-room": (486.1327, 587.5618, 656.2725),
+        "mirror-box": (587.5618,),
+    }
+    active_wavelengths_nm = wavelengths_by_mode[key]
+    if lane_table is None and transport_option:
+        from camera_software.transport_contract import (
+            continuous_lut_lane_table,
+        )
+
+        option = str(transport_option).strip().lower()
+        if option.startswith("continuous:"):
+            lane_count = int(option.split(":", 1)[1])
+            lane_table = continuous_lut_lane_table(
+                f"{key}-continuous-{lane_count}-{int(cohort_seed)}",
+                (c / 700.0e-9, c / 550.0e-9, c / 400.0e-9),
+                (0.30, 1.0, 0.30),
+                lane_count,
+                seed=int(cohort_seed),
+            )
+        elif option.startswith("fixed:"):
+            lane_count = int(option.split(":", 1)[1])
+            from camera_software.transport_contract import fixed_visible_lane_table
+            lane_table = fixed_visible_lane_table(
+                f"{key}-fixed-{lane_count}", lane_count
+            )
+        else:
+            raise ValueError(f"unsupported prism transport option {transport_option!r}")
+    if lane_table is None:
+        from camera_software.calibration_modes import calibration_mode
+
+        scene_mode = calibration_mode(key)
+        if scene_mode.transport is not None:
+            lane_table = scene_mode.transport.lane_table
+    order = build_paragraph_order(
+        labels[key],
+        # Calibration composes the whole physical sensor.  display_width and
+        # display_height are work-packet dimensions, not a camera crop.
+        display_width=DEFAULT_FILM_FORMAT.sensor_raster(
+            DEFAULT_FILM_FORMAT.default_final_edge_px
+        )[0],
+        display_height=DEFAULT_FILM_FORMAT.sensor_raster(
+            DEFAULT_FILM_FORMAT.default_final_edge_px
+        )[1],
+        sensor_sweeps=sensor_sweeps,
+    )
+    order["runtime"] = {
+        "work_kind": "calibration",
+        "max_sensor_epochs": 1,
+        "ordinary_work": False,
+        "convergence_enabled": False,
+        # A calibration must finish quickly enough to be useful interactively,
+        # but it is still an actual BDPT exposure.  These are ray counts, not a
+        # procedural image shortcut or a mocked validation result.
+        "total_rays": 16_384,
+        "rays_per_batch": 4_096,
+        "sensor_top_k": max(int(display_width), int(display_height)),
+        "sensor_samples_per_node": 2,
+        "sensor_steps_per_layer": 1,
+        "sensor_flash_rays": 4_096,
+        "sensor_t5_pair_budget": 262_144,
+        "sensor_work_tile_width": int(display_width),
+        "sensor_work_tile_height": int(display_height),
+    }
+    if key == "depth":
+        order["runtime"].update({
+            "integrator": "depth",
+            "render_product": "sensor_optical_path_depth_m",
+            "total_rays": int(max(display_width, display_height) ** 2),
+            "rays_per_batch": 16_384,
+        })
+    if render_budget:
+        allowed_budget_fields = {
+            "total_rays", "rays_per_batch", "max_sensor_epochs",
+            "epoch_bundle_count",
+            "sensor_top_k", "sensor_samples_per_node", "sensor_steps_per_layer",
+            "sensor_flash_rays", "sensor_flash_page_count",
+            "sensor_flash_total_rays", "sensor_t5_pair_budget", "max_bounces",
+        }
+        unknown_budget_fields = sorted(set(render_budget) - allowed_budget_fields)
+        if unknown_budget_fields:
+            raise ValueError(
+                f"unsupported calibration render-budget fields {unknown_budget_fields}"
+            )
+        order["runtime"].update({
+            field: int(value) for field, value in render_budget.items()
+        })
+    if startup_validation_key:
+        order["runtime"]["startup_validation_key"] = str(startup_validation_key)
+        order["runtime"]["max_sensor_epochs"] = 1
+        # Startup images are evidence of execution, not quality renders.
+        order["runtime"]["total_rays"] = 256
+        order["runtime"]["rays_per_batch"] = 256
+        order["runtime"]["sensor_samples_per_node"] = 1
+        order["runtime"]["sensor_steps_per_layer"] = 1
+        order["runtime"]["sensor_flash_rays"] = 256
+        order["runtime"]["sensor_t5_pair_budget"] = 32_768
+    if lane_table is None:
+        raise ValueError(f"calibration scene {key!r} has no spectral lane table")
+    from camera_software.transport_contract import TransportDomain
+
+    if lane_table.domain is TransportDomain.CONTINUOUS_SPECTRAL_LUT:
+        lut = lane_table.lookup_tables[0]
+        frequencies = np.linspace(
+            lut.frequency_knots_hz[0], lut.frequency_knots_hz[-1],
+            len(lane_table.lanes) + 2, dtype=np.float64,
+        )[1:-1].tolist()
+        order["transport"] = {
+            "domain": lane_table.domain.value,
+            "lane_table": lane_table.mapping(),
+            "calibration_mode": key,
+        }
+    elif lane_table.domain is TransportDomain.FIXED_SPECTRAL:
+        frequencies = [float(lane.frequency_hz) for lane in lane_table.lanes]
+        order["transport"] = {
+            "domain": lane_table.domain.value,
+            "frequencies_hz": frequencies,
+            "wavelengths_nm": [c / value * 1.0e9 for value in frequencies],
+            "lane_table": lane_table.mapping(),
+            "calibration_mode": key,
+        }
+    else:
+        raise ValueError("camera exposure calibration requires spectral lanes")
+    defaults = order["defaults"]
+    if key == "color-science":
+        def line_material(active_index: int, rgb: list[float]) -> dict[str, Any]:
+            return {
+                "albedo_rgb": rgb,
+                "reflectivity": 0.90,
+                "diffusion": 0.75,
+                "roughness": 0.4,
+                "bands": [
+                    {
+                        "center_hz": c / (wavelength_nm * 1.0e-9),
+                        "bandwidth_hz": 1.0e10,
+                        "reflectance": 0.90 if index == active_index else 0.002,
+                        "transmittance": 0.0,
+                        "diffuse_frac": 0.75,
+                        "emission": 0.0,
+                        "reemission": 0.0,
+                        "ior_real": 1.5,
+                        "ior_imag": 0.0,
+                    }
+                    for index, wavelength_nm in enumerate((450.0, 550.0, 650.0))
+                ],
+            }
+        defaults["materials"].update({
+            "line_blue": line_material(0, [0.03, 0.12, 1.0]),
+            "line_green": line_material(1, [0.02, 1.0, 0.08]),
+            "line_red": line_material(2, [1.0, 0.03, 0.01]),
+        })
+        defaults["objects"] = [
+            {
+                "id": "line-450", "token": "450 nm",
+                "embed_plane": "background",
+                "geometry": {"offset_m": [-0.40, 0.0], "material": "line_blue"},
+            },
+            {
+                "id": "line-550", "token": "550 nm",
+                "embed_plane": "background",
+                "geometry": {"offset_m": [0.0, 0.0], "material": "line_green"},
+            },
+            {
+                "id": "line-650", "token": "650 nm",
+                "embed_plane": "background",
+                "geometry": {"offset_m": [0.40, 0.0], "material": "line_red"},
+            },
+        ]
+        order["jobs"][0]["token"] = ""
+    elif key == "glass":
+        from camera_designer.optical_material import MATERIAL_CATALOG
+
+        glass = MATERIAL_CATALOG["BK7"]
+        wavelengths_nm = (486.1327, 587.5618, 656.2725)
+        defaults["materials"]["bk7_calibration"] = {
+            "albedo_rgb": [0.97, 0.98, 1.0],
+            "reflectivity": 0.04,
+            "diffusion": 0.0,
+            "transmission": 0.94,
+            "roughness": 0.0,
+            "bands": [
+                {
+                    "center_hz": c / (float(wavelength_nm) * 1.0e-9),
+                    "bandwidth_hz": 4.0e13,
+                    "reflectance": 0.04,
+                    "transmittance": 0.94,
+                    "diffuse_frac": 0.0,
+                    "emission": 0.0,
+                    "reemission": 0.0,
+                    "ior_real": float(glass.n_at(float(wavelength_nm) * 1.0e-3)),
+                    "ior_imag": 0.0,
+                }
+                for wavelength_nm in wavelengths_nm
+            ],
+        }
+        camera_position = np.asarray(defaults["camera"]["position_m"], np.float64)
+        target = np.asarray(defaults["camera"]["target_m"], np.float64)
+        glass_center = target + 0.36 * (camera_position - target)
+        defaults["planes"].append({
+            "id": "bk7-interface",
+            "center_m": glass_center.tolist(),
+            "normal": defaults["planes"][0]["normal"],
+            "up": defaults["planes"][0]["up"],
+            "size_m": [1.7, 1.25],
+            "thickness_m": 0.028,
+            "material": "bk7_calibration",
+        })
+    elif key in {"focus-hall", "depth"}:
+        camera_position = np.asarray(defaults["camera"]["position_m"], np.float64)
+        target = np.asarray(defaults["camera"]["target_m"], np.float64)
+        forward = target - camera_position
+        forward /= np.linalg.norm(forward)
+        up = np.asarray(defaults["camera"]["up"], np.float64)
+        up -= forward * float(np.dot(up, forward))
+        up /= np.linalg.norm(up)
+        right = np.cross(forward, up)
+        distances = (2.7, 3.1, 3.45, 3.75, 4.1, 4.55, 5.1)
+        selected_focus_m = float(
+            3.75 if focus_distance_m is None else focus_distance_m
+        )
+        selected_focus_m = float(np.clip(selected_focus_m, 2.7, 5.1))
+        defaults["materials"].update({
+            "focus_card_light": {
+                "albedo_rgb": [0.82, 0.84, 0.88],
+                "reflectivity": 0.82, "diffusion": 0.92,
+                "absorption": 0.08, "roughness": 0.82,
+            },
+            "focus_card_dark": {
+                "albedo_rgb": [0.20, 0.23, 0.29],
+                "reflectivity": 0.32, "diffusion": 0.90,
+                "absorption": 0.62, "roughness": 0.88,
+            },
+            "focus_hall_shell": {
+                "albedo_rgb": [0.28, 0.30, 0.34],
+                "reflectivity": 0.38, "diffusion": 0.94,
+                "absorption": 0.55, "roughness": 0.90,
+            },
+        })
+        planes = []
+        objects = []
+        for index, distance in enumerate(distances):
+            side = (-1.0 if index % 2 else 1.0) * (0.34 + 0.035 * index)
+            center = camera_position + forward * distance + right * side
+            plane_id = f"focus-card-{index}"
+            planes.append({
+                "id": plane_id,
+                "center_m": center.tolist(),
+                "normal": (-forward).tolist(),
+                "up": up.tolist(),
+                "size_m": [0.46, 0.22],
+                "thickness_m": 0.012,
+                "material": (
+                    "focus_card_light" if index % 2 == 0 else "focus_card_dark"
+                ),
+            })
+            objects.append({
+                "id": f"distance-label-{index}",
+                "token": f"{distance:.2f} m",
+                "embed_plane": plane_id,
+                "geometry": {
+                    "text_box_m": [0.39, 0.14],
+                    "line_height_m": 0.060,
+                    "height_m": 0.060,
+                    "material": "text_surface",
+                },
+            })
+        # A real enclosed calibration hall gives the cards stable spatial and
+        # illumination context instead of leaving them floating in darkness.
+        room_center = camera_position + forward * 3.9
+        planes.extend([
+            {
+                "id": "hall-floor",
+                "center_m": (room_center - up * 0.82).tolist(),
+                "normal": up.tolist(), "up": forward.tolist(),
+                "size_m": [2.4, 5.8], "thickness_m": 0.03,
+                "material": "focus_hall_shell",
+            },
+            {
+                "id": "hall-ceiling",
+                "center_m": (room_center + up * 0.82).tolist(),
+                "normal": (-up).tolist(), "up": forward.tolist(),
+                "size_m": [2.4, 5.8], "thickness_m": 0.03,
+                "material": "focus_hall_shell",
+            },
+            {
+                "id": "hall-left",
+                "center_m": (room_center - right * 1.12).tolist(),
+                "normal": right.tolist(), "up": up.tolist(),
+                "size_m": [5.8, 1.64], "thickness_m": 0.03,
+                "material": "focus_hall_shell",
+            },
+            {
+                "id": "hall-right",
+                "center_m": (room_center + right * 1.12).tolist(),
+                "normal": (-right).tolist(), "up": up.tolist(),
+                "size_m": [5.8, 1.64], "thickness_m": 0.03,
+                "material": "focus_hall_shell",
+            },
+            {
+                "id": "hall-end",
+                "center_m": (camera_position + forward * 5.45).tolist(),
+                "normal": (-forward).tolist(), "up": up.tolist(),
+                "size_m": [2.24, 1.64], "thickness_m": 0.03,
+                "material": "focus_hall_shell",
+            },
+        ])
+        defaults["planes"] = planes
+        defaults["objects"] = objects
+        defaults["geometry"]["embed_plane"] = planes[0]["id"]
+        defaults["camera"]["focus_target_m"] = (
+            camera_position + forward * selected_focus_m
+        ).tolist()
+        defaults["camera"]["focus_distance_m"] = selected_focus_m
+        order["runtime"]["focus_distance_m"] = selected_focus_m
+        order["jobs"][0]["token"] = ""
+    elif key == "prism-room":
+        from camera_designer.optical_material import MATERIAL_CATALOG
+
+        camera_position = np.asarray(defaults["camera"]["position_m"], np.float64)
+        target = np.asarray(defaults["camera"]["target_m"], np.float64)
+        forward = target - camera_position
+        forward /= np.linalg.norm(forward)
+        up = np.asarray(defaults["camera"]["up"], np.float64)
+        up -= forward * float(np.dot(up, forward))
+        up /= np.linalg.norm(up)
+        right = np.cross(forward, up)
+        if lane_table.domain is TransportDomain.CONTINUOUS_SPECTRAL_LUT:
+            lut = lane_table.lookup_tables[0]
+            active_freq = np.linspace(
+                lut.frequency_knots_hz[0], lut.frequency_knots_hz[-1], 32,
+                dtype=np.float64,
+            )
+        else:
+            active_freq = np.asarray(
+                [float(lane.frequency_hz) for lane in lane_table.lanes], np.float64
+            )
+        active_nm = c / active_freq * 1.0e9
+        glass = MATERIAL_CATALOG["BK7"]
+        defaults["materials"].update({
+            "prism_bk7": {
+                "albedo_rgb": [0.98, 0.99, 1.0],
+                "reflectivity": 0.04, "diffusion": 0.0,
+                "transmission": 0.955, "roughness": 0.0,
+                "bands": [
+                    {
+                        "center_hz": float(freq), "bandwidth_hz": 1.0e10,
+                        "reflectance": 0.04, "transmittance": 0.955,
+                        "diffuse_frac": 0.0, "emission": 0.0,
+                        "reemission": 0.0,
+                        "ior_real": float(glass.n_at(float(nm) * 1.0e-3)),
+                        "ior_imag": 0.0,
+                    }
+                    for freq, nm in zip(active_freq, active_nm)
+                ],
+            },
+            "receiver_white": {
+                "albedo_rgb": [0.94, 0.94, 0.94],
+                "reflectivity": 0.94, "diffusion": 0.98,
+                "absorption": 0.02, "roughness": 0.92,
+            },
+            "beam_emitter": {
+                "albedo_rgb": [1.0, 1.0, 1.0],
+                "reflectivity": 0.0, "diffusion": 0.0,
+                "emission": 18.0,
+                "bands": [
+                    {
+                        "center_hz": float(freq), "bandwidth_hz": 1.0e10,
+                        "reflectance": 0.0, "transmittance": 0.0,
+                        "diffuse_frac": 0.0, "emission": 18.0,
+                        "reemission": 0.0, "ior_real": 1.0, "ior_imag": 0.0,
+                    }
+                    for freq in active_freq
+                ],
+            },
+        })
+        beam_offset = right * 0.24
+        prism_center = camera_position + forward * 3.15 + beam_offset
+        receiver_center = camera_position + forward * 4.65
+        prism_normal = -forward + right * 0.28
+        prism_normal /= np.linalg.norm(prism_normal)
+        room_center = camera_position + forward * 3.7
+        defaults["planes"] = [
+            {
+                "id": "receiver-wall", "center_m": receiver_center.tolist(),
+                "normal": (-forward).tolist(), "up": up.tolist(),
+                "size_m": [2.5, 1.7], "thickness_m": 0.035,
+                "material": "receiver_white",
+            },
+            {
+                "id": "prism", "shape": "triangular_prism",
+                "center_m": prism_center.tolist(),
+                "normal": prism_normal.tolist(), "up": up.tolist(),
+                "size_m": [0.42, 0.62], "thickness_m": 0.34,
+                "material": "prism_bk7",
+            },
+            {
+                "id": "collimated-source",
+                "center_m": (camera_position + forward * 2.42 + beam_offset).tolist(),
+                "normal": forward.tolist(), "up": up.tolist(),
+                "size_m": [0.055, 0.055], "thickness_m": 0.004,
+                "material": "beam_emitter", "emitter": True,
+            },
+            {
+                "id": "room-floor", "center_m": (room_center - up * 0.9).tolist(),
+                "normal": up.tolist(), "up": forward.tolist(),
+                "size_m": [2.7, 4.6], "thickness_m": 0.035,
+                "material": "quiet_background",
+            },
+            {
+                "id": "room-ceiling", "center_m": (room_center + up * 0.9).tolist(),
+                "normal": (-up).tolist(), "up": forward.tolist(),
+                "size_m": [2.7, 4.6], "thickness_m": 0.035,
+                "material": "quiet_background",
+            },
+            {
+                "id": "room-left", "center_m": (room_center - right * 1.25).tolist(),
+                "normal": right.tolist(), "up": up.tolist(),
+                "size_m": [4.6, 1.8], "thickness_m": 0.035,
+                "material": "quiet_background",
+            },
+            {
+                "id": "room-right", "center_m": (room_center + right * 1.25).tolist(),
+                "normal": (-right).tolist(), "up": up.tolist(),
+                "size_m": [4.6, 1.8], "thickness_m": 0.035,
+                "material": "quiet_background",
+            },
+        ]
+        defaults["objects"] = [{
+            "id": "receiver-label", "token": "PRISM RECEIVER",
+            "embed_plane": "receiver-wall",
+            "geometry": {
+                "text_box_m": [1.0, 0.16], "line_height_m": 0.07,
+                "height_m": 0.07, "material": "text_surface",
+                "offset_m": [0.0, -0.68],
+            },
+        }]
+        defaults["geometry"]["embed_plane"] = "receiver-wall"
+        defaults["camera"]["focus_target_m"] = prism_center.tolist()
+        defaults["camera"]["focus_distance_m"] = float(
+            np.linalg.norm(prism_center - camera_position)
+        )
+        defaults["flash"] = {
+            "intensity_scale": 1.0,
+            "enabled": False,
+        }
+        defaults["emitter"] = {
+            "mode": "collimated",
+            "direction_space": "canonical_camera",
+            "direction": [-1.0, 0.0, 0.0],
+            "divergence_deg": 0.0,
+        }
+        order["runtime"]["transport_option"] = str(
+            transport_option or "fixed:3"
+        )
+        order["jobs"][0]["token"] = ""
+    elif key == "mirror-box":
+        camera_position = np.asarray(defaults["camera"]["position_m"], np.float64)
+        target = np.asarray(defaults["camera"]["target_m"], np.float64)
+        forward = target - camera_position
+        forward /= np.linalg.norm(forward)
+        up = np.asarray(defaults["camera"]["up"], np.float64)
+        up -= forward * float(np.dot(up, forward))
+        up /= np.linalg.norm(up)
+        right = np.cross(forward, up)
+        active_freq = np.asarray(
+            [float(lane.frequency_hz) for lane in lane_table.lanes], np.float64
+        )
+
+        def spectral_bands(*, reflectance: float, emission: float) -> list[dict[str, float]]:
+            return [
+                {
+                    "center_hz": float(freq), "bandwidth_hz": 1.0e10,
+                    "reflectance": float(reflectance), "transmittance": 0.0,
+                    "diffuse_frac": 0.0, "emission": float(emission),
+                    "reemission": 0.0, "ior_real": 1.0, "ior_imag": 0.0,
+                }
+                for freq in active_freq
+            ]
+
+        defaults["materials"].update({
+            "torture_mirror": {
+                "albedo_rgb": [0.995, 0.995, 0.995],
+                "reflectivity": 0.995, "diffusion": 0.0,
+                "absorption": 0.005, "roughness": 0.0, "metallic": 1.0,
+                "bands": spectral_bands(reflectance=0.995, emission=0.0),
+            },
+            "torture_emitter": {
+                "albedo_rgb": [1.0, 1.0, 1.0],
+                "reflectivity": 0.0, "diffusion": 0.0,
+                "emission": 6.0,
+                "bands": spectral_bands(reflectance=0.0, emission=6.0),
+            },
+            "torture_witness": {
+                "albedo_rgb": [0.62, 0.62, 0.62],
+                "reflectivity": 0.62, "diffusion": 0.92,
+                "absorption": 0.38, "roughness": 0.8,
+            },
+        })
+        room_center = camera_position + forward * 2.0
+        half_width, half_height, half_depth = 1.35, 0.95, 2.6
+        defaults["planes"] = [
+            {
+                "id": "mirror-floor", "center_m": (room_center - up * half_height).tolist(),
+                "normal": up.tolist(), "up": forward.tolist(),
+                "size_m": [2.0 * half_width, 2.0 * half_depth], "thickness_m": 0.02,
+                "material": "torture_mirror",
+            },
+            {
+                "id": "mirror-ceiling", "center_m": (room_center + up * half_height).tolist(),
+                "normal": (-up).tolist(), "up": forward.tolist(),
+                "size_m": [2.0 * half_width, 2.0 * half_depth], "thickness_m": 0.02,
+                "material": "torture_mirror",
+            },
+            {
+                "id": "mirror-left", "center_m": (room_center - right * half_width).tolist(),
+                "normal": right.tolist(), "up": up.tolist(),
+                "size_m": [2.0 * half_depth, 2.0 * half_height], "thickness_m": 0.02,
+                "material": "torture_mirror",
+            },
+            {
+                "id": "mirror-right", "center_m": (room_center + right * half_width).tolist(),
+                "normal": (-right).tolist(), "up": up.tolist(),
+                "size_m": [2.0 * half_depth, 2.0 * half_height], "thickness_m": 0.02,
+                "material": "torture_mirror",
+            },
+            {
+                "id": "mirror-front", "center_m": (room_center + forward * half_depth).tolist(),
+                "normal": (-forward).tolist(), "up": up.tolist(),
+                "size_m": [2.0 * half_width, 2.0 * half_height], "thickness_m": 0.02,
+                "material": "torture_mirror",
+            },
+            {
+                "id": "mirror-back", "center_m": (room_center - forward * half_depth).tolist(),
+                "normal": forward.tolist(), "up": up.tolist(),
+                "size_m": [2.0 * half_width, 2.0 * half_height], "thickness_m": 0.02,
+                "material": "torture_mirror",
+            },
+            {
+                "id": "internal-light",
+                "center_m": (room_center + right * 0.48 + up * 0.22).tolist(),
+                "normal": right.tolist(), "up": up.tolist(),
+                "size_m": [0.18, 0.18], "thickness_m": 0.006,
+                "material": "torture_emitter", "emitter": True,
+            },
+            {
+                "id": "diffuse-witness",
+                "center_m": (room_center + forward * 1.15 - right * 0.42).tolist(),
+                "normal": (-forward + right * 0.18).tolist(), "up": up.tolist(),
+                "size_m": [0.52, 0.72], "thickness_m": 0.012,
+                "material": "torture_witness",
+            },
+        ]
+        defaults["objects"] = []
+        defaults["geometry"]["embed_plane"] = "diffuse-witness"
+        defaults["camera"]["focus_target_m"] = room_center.tolist()
+        defaults["camera"]["focus_distance_m"] = 2.0
+        defaults["flash"] = {"intensity_scale": 1.0, "enabled": False}
+        order["runtime"]["transport_option"] = "fixed:32"
+        order["runtime"]["capacity_test"] = "mirror-box-fixed32"
+        if render_budget is None:
+            order["runtime"].update({
+                "total_rays": 4_194_304,
+                "rays_per_batch": 65_536,
+                "epoch_bundle_count": 64,
+                "sensor_top_k": 256,
+                "sensor_samples_per_node": 1024,
+                "sensor_flash_rays": 16_384,
+                "sensor_flash_page_count": 64,
+                "sensor_flash_total_rays": 1_048_576,
+                "sensor_t5_pair_budget": 268_435_456,
+                "max_bounces": 64,
+            })
+    return order
+
+
+def apply_toolbar_render_mode(
+    order: dict[str, Any], transport_mode: str,
+) -> dict[str, Any]:
+    """Apply the toolbar's output product without changing scene transport."""
+
+    if str(transport_mode).strip().lower() == "depth":
+        order["runtime"].update({
+            "integrator": "depth",
+            "render_product": "sensor_optical_path_depth_m",
+            "convergence_enabled": False,
+        })
+    return order
+
+
 def build_program_display_scene(
     text: str,
     *,
     display_width: int = DEFAULT_DISPLAY_WIDTH,
     display_height: int = DEFAULT_DISPLAY_HEIGHT,
     revision: int = 1,
+    sensor_edge_px: int | None = None,
     extra_objects: tuple[DisplayObjectSpec, ...] = (),
 ) -> DisplaySceneSpec:
     """Author retained program objects in one fixed-camera perspective scene."""
@@ -302,7 +1015,9 @@ def build_program_display_scene(
         products=(
             DisplayProductRequest(
                 DisplayProductKind.IMAGE,
-                program_display_region(width, height),
+                program_display_region(
+                    width, height, sensor_edge_px=sensor_edge_px
+                ),
             ),
         ),
         revision=max(1, int(revision)),
@@ -312,14 +1027,24 @@ def build_program_display_scene(
         target_m=(0.0, 0.0, 0.0),
         focus_target_m=(0.0, 0.0, 0.0),
         up=(0.0, 0.0, 1.0),
-        focal_mm=35.0,
-        aperture_mm=25.0,
+        # These are the physical thick-lens default, not a legacy thin-lens
+        # display approximation.  Scene orders may override them through the
+        # nested camera manifest below.
+        focal_mm=82.5,
+        aperture_mm=20.625,
+    )
+    full_width, full_height = (
+        DEFAULT_FILM_FORMAT.sensor_raster(
+            DEFAULT_FILM_FORMAT.default_final_edge_px
+        )
+        if sensor_edge_px is None else
+        DEFAULT_FILM_FORMAT.sensor_raster(sensor_edge_px)
     )
     return DisplaySceneSpec(
         scene_id=PROGRAM_SCENE_ID,
         camera=camera,
-        sensor_width=width * SENSOR_CROP_SCALE,
-        sensor_height=height * SENSOR_CROP_SCALE,
+        sensor_width=full_width,
+        sensor_height=full_height,
         objects=(main, *tuple(extra_objects)),
         revision=max(1, int(revision)),
     )
@@ -362,12 +1087,28 @@ def management_display_object(
 
 
 def program_display_region(
-    display_width: int, display_height: int,
+    display_width: int, display_height: int, *, sensor_edge_px: int | None = None,
 ) -> SensorRegion:
-    """The photographed UI rectangle inside the larger physical sensor."""
+    """Center the photographed UI rectangle inside the square 6x6 gate."""
 
     width, height = int(display_width), int(display_height)
-    return SensorRegion(2 * width, 2 * height, width, height)
+    full_width, full_height = (
+        DEFAULT_FILM_FORMAT.sensor_raster(
+            DEFAULT_FILM_FORMAT.default_final_edge_px
+        )
+        if sensor_edge_px is None else
+        DEFAULT_FILM_FORMAT.sensor_raster(sensor_edge_px)
+    )
+    if width > full_width or height > full_height:
+        scale = min(full_width / width, full_height / height)
+        width = max(1, int(round(width * scale)))
+        height = max(1, int(round(height * scale)))
+    return SensorRegion(
+        (full_width - width) // 2,
+        (full_height - height) // 2,
+        width,
+        height,
+    )
 
 
 def resolved_program_ui_layout(
@@ -377,10 +1118,13 @@ def resolved_program_ui_layout(
     work_width: int | None = None,
     work_height: int | None = None,
     manifest: Any = None,
+    sensor_edge_px: int | None = None,
 ) -> ProgramUILayout:
     """Resolve the authoritative manifest inside the photographed crop."""
 
-    crop = program_display_region(display_width, display_height)
+    crop = program_display_region(
+        display_width, display_height, sensor_edge_px=sensor_edge_px
+    )
     return layout_program_ui(
         manifest or program_ui_manifest(),
         crop.width,
@@ -398,6 +1142,7 @@ def program_ui_sensor_regions(
     work_width: int | None = None,
     work_height: int | None = None,
     manifest: Any = None,
+    sensor_edge_px: int | None = None,
 ) -> dict[str, SensorRegion]:
     """Manifest-resolved sensor-space products photographed together."""
 
@@ -407,6 +1152,7 @@ def program_ui_sensor_regions(
         work_width=work_width,
         work_height=work_height,
         manifest=manifest,
+        sensor_edge_px=sensor_edge_px,
     )
     return {
         key: SensorRegion(*rect)
@@ -543,6 +1289,8 @@ def build_self_rendering_program_scene(
     revision: int = 1,
     control_layout: ControlLayoutDesign | None = None,
     program_manifest: Any = None,
+    window_element_manifest: Any = None,
+    sensor_edge_px: int | None = None,
 ) -> DisplaySceneSpec:
     """Build editor and window-control geometry for one physical photograph."""
 
@@ -553,12 +1301,61 @@ def build_self_rendering_program_scene(
         work_width=work_width,
         work_height=work_height,
         manifest=manifest,
+        sensor_edge_px=sensor_edge_px,
     )
     regions = {
         key: SensorRegion(*rect)
         for key, rect in program_layout.regions.items()
     }
     program_font = _manifest_render_font(manifest)
+
+    def surface_library_reference(owner_id: str) -> dict[str, Any]:
+        primitive = {
+            **program_layout.panel_primitives,
+            **program_layout.action_primitives,
+        }.get(owner_id)
+        if primitive is None or not primitive.object_requests:
+            return {}
+        owner_region = regions[owner_id]
+        trace = layout_panel_composition_trace(
+            primitive, owner_region.width, owner_region.height
+        )
+
+        def patch_instance(item: Any) -> dict[str, Any]:
+            local = next(
+                patch.target_rect_px for patch in trace.patches
+                if patch.role is item.role
+            )
+            crop = (
+                owner_region.x + local[0], owner_region.y + local[1],
+                max(1, local[2]), max(1, local[3]),
+            )
+            return {
+                **item.mapping(),
+                "sensor_crop_px": list(crop),
+                "sample_resolution_px": [crop[2], crop[3]],
+                "source_domain": "unit_square",
+                "uv_transform": (
+                    "repeat_square_tiles_clip_partial_terminal_tile"
+                ),
+                "terminal_tile_policy": "clip_at_panel_boundary",
+                "physical_sensor_pixel_aspect": 1.0,
+                "sample_pitch_scale": [1.0, 1.0],
+            }
+        request = primitive.object_requests[0]
+        return {
+            "surface_object_key": request.object_key,
+            "surface_subtype_key": request.subtype_key,
+            "surface_parameters": {
+                "target_width_px": regions[owner_id].width,
+                "target_height_px": regions[owner_id].height,
+                "border_px": list(primitive.border_px),
+                "patch_instances": [
+                    patch_instance(item)
+                    for item in primitive.object_requests
+                ],
+            },
+        }
 
     def panel_primitive_kind(panel_id: str) -> DisplayPrimitiveKind:
         geometry = program_layout.panel_geometry[panel_id]
@@ -576,12 +1373,15 @@ def build_self_rendering_program_scene(
             BevelProfile.CHAMFER,
         )
 
-    crop = program_display_region(display_width, display_height)
+    crop = program_display_region(
+        display_width, display_height, sensor_edge_px=sensor_edge_px
+    )
     base = build_program_display_scene(
         text,
         display_width=display_width,
         display_height=display_height,
         revision=revision,
+        sensor_edge_px=sensor_edge_px,
     )
     editor_region = regions["editor-text"]
     backdrop_region = regions[manifest.name]
@@ -602,6 +1402,7 @@ def build_self_rendering_program_scene(
             panel_bevel(manifest.name),
             (LayoutSeam.FLUSH,) * 4,
         ),
+        **surface_library_reference(manifest.name),
         revision=PROGRAM_STATIC_GEOMETRY_REVISION,
     )
     editor = replace(
@@ -630,6 +1431,7 @@ def build_self_rendering_program_scene(
             panel_bevel("editor-text"),
             (LayoutSeam.BEVEL,) * 4,
         ),
+        **surface_library_reference("editor-text"),
     )
     authored_text_objects = []
     for object_id, content in (
@@ -681,6 +1483,7 @@ def build_self_rendering_program_scene(
             vertical_align=(
                 "bottom" if object_id == "status-text" else "center"
             ),
+            **surface_library_reference(object_id),
             revision=(
                 max(1, int(revision))
                 if dynamic else PROGRAM_STATIC_GEOMETRY_REVISION
@@ -688,7 +1491,11 @@ def build_self_rendering_program_scene(
         ))
     controls = []
     panels = []
-    for object_id in ("camera-panel", "work-panel", "asset-browser"):
+    for object_id in (
+        "camera-panel", "work-panel", "asset-browser",
+        "camera-toolbar", "lens-toolbar", "light-toolbar", "film-toolbar",
+        "integrator-toolbar", "exposure-toolbar",
+    ):
         if object_id not in regions:
             continue
         sensor_region = regions[object_id]
@@ -708,6 +1515,7 @@ def build_self_rendering_program_scene(
                 panel_bevel(object_id),
                 (LayoutSeam.BEVEL,) * 4,
             ),
+            **surface_library_reference(object_id),
             revision=PROGRAM_STATIC_GEOMETRY_REVISION,
         ))
     for object_id, action in program_layout.actions.items():
@@ -746,6 +1554,7 @@ def build_self_rendering_program_scene(
                 BevelRegion(0.001, 0.0004, BevelProfile.CHAMFER),
                 (LayoutSeam.BEVEL,) * 4,
             ),
+            **surface_library_reference(object_id),
             # Controls retain their exposure when only editor content changes.
             revision=PROGRAM_STATIC_GEOMETRY_REVISION,
         ))
@@ -760,11 +1569,59 @@ def build_self_rendering_program_scene(
         )
         if control_layout is not None else ()
     )
+    window_element_objects = []
+    if window_element_manifest is not None:
+        for element in window_element_manifest.elements:
+            if element.kind not in {
+                "window.list_row", "window.list_body_text",
+                "window.progress_pie"
+            }:
+                continue
+            x, y, width, height = element.visible_rect_px
+            if width <= 0 or height <= 0:
+                continue
+            sensor_region = SensorRegion(x, y, width, height)
+            content = element.authored_text
+            safe_key = re.sub(
+                r"[^A-Za-z0-9_.-]+", "-", element.element_key
+            ).strip("-")
+            window_element_objects.append(DisplayObjectSpec(
+                object_id=f"window-element-{safe_key}",
+                primitive=DisplayPrimitive(
+                    DisplayPrimitiveKind.TEXT, content=content
+                ),
+                placement=_placement_for_sensor_region(
+                    sensor_region, crop, thickness_m=0.0006,
+                    front_offset_m=(
+                        0.0009 + min(5000, element.z_index) * 1.0e-8
+                    ),
+                ),
+                products=(DisplayProductRequest(
+                    DisplayProductKind.IMAGE, sensor_region
+                ),),
+                layout_rectangle=LayoutRectangle(
+                    sensor_region, BevelRegion(), (LayoutSeam.FLUSH,) * 4
+                ),
+                material="text_surface",
+                surface_material="quiet_background",
+                font_family=program_font.family,
+                font_weight=program_font.weight,
+                font_style=program_font.style,
+                horizontal_align="left",
+                vertical_align="top",
+                surface_object_key=element.style_object_key,
+                surface_subtype_key=element.style_subtype_key,
+                surface_parameters={
+                    "window_element": element.mapping(),
+                    "semantic_source": "retained_2d_layout_before_rasterization",
+                },
+                revision=max(1, int(revision)),
+            ))
     return replace(
         base,
         objects=(
             backdrop, editor, *panels, *authored_text_objects, *controls,
-            *layout_objects,
+            *layout_objects, *window_element_objects,
         ),
     )
 
@@ -832,6 +1689,10 @@ def build_ui_next_scan_control(
     scan_width: int | None = None,
     scan_height: int | None = None,
     delta_restore: dict[str, str] | None = None,
+    grid_mode: str = "n-tree",
+    subdivision_axis: int = 3,
+    locked_grid_columns: int = 1,
+    locked_grid_rows: int = 1,
 ) -> dict[str, Any]:
     """Convert retained product regions to local UV requests for one GPU scan."""
 
@@ -908,6 +1769,34 @@ def build_ui_next_scan_control(
                         "work_value": 1.0,
                         "object_id": spec.object_id,
                     })
+    mode = str(grid_mode).strip().lower()
+    if mode not in {"n-tree", "locked"}:
+        raise ValueError("grid_mode must be n-tree or locked")
+    axis = int(subdivision_axis)
+    if axis not in {2, 3}:
+        raise ValueError("subdivision_axis must be 2 or 3")
+    columns = int(locked_grid_columns)
+    rows = int(locked_grid_rows)
+    if not 1 <= columns <= 64 or not 1 <= rows <= 64:
+        raise ValueError("locked grid dimensions must be in [1, 64]")
+    if mode == "locked":
+        # Ratios, rather than rounded pixel rectangles, make every terminal
+        # edge meet exactly in normalized sensor space for arbitrary grids.
+        requests = [
+            {
+                "uv_bounds": [
+                    column / columns,
+                    row / rows,
+                    (column + 1) / columns,
+                    (row + 1) / rows,
+                ],
+                "target_level": 0,
+                "work_value": 1.0,
+                "object_id": f"locked-grid-{column}-{row}",
+            }
+            for row in range(rows)
+            for column in range(columns)
+        ]
     # NextSiteScan deliberately accepts only its transport-neutral fields.
     return {
         "sequence": max(0, int(sequence)),
@@ -927,6 +1816,14 @@ def build_ui_next_scan_control(
                 request["object_id"] for request in pixel_requests
             ],
             "delta_restore": dict(delta_restore or {}),
+            "sensor_grid": {
+                "mode": mode,
+                "subdivision_axis": axis,
+                "children_per_split": axis * axis,
+                "locked_columns": columns,
+                "locked_rows": rows,
+                "uv_contract": "global-normalized-gapless",
+            },
         },
     }
 
@@ -1054,12 +1951,30 @@ def build_display_scene_order(
         placement = spec.placement
         planes.append({
             "id": plane_id,
+            "scene_object_id": spec.object_id,
+            **(
+                {}
+                if not spec.products or spec.products[0].sensor_region is None
+                else {
+                    "sensor_region_px": asdict(
+                        spec.products[0].sensor_region
+                    )
+                }
+            ),
             "center_m": list(placement.center_m),
             "normal": list(placement.normal),
             "up": list(placement.up),
             "size_m": list(placement.size_m),
             "thickness_m": float(placement.thickness_m),
             "material": spec.surface_material,
+            **(
+                {}
+                if not spec.surface_object_key else {
+                    "library_object_key": spec.surface_object_key,
+                    "library_subtype_key": spec.surface_subtype_key,
+                    "library_parameters": dict(spec.surface_parameters),
+                }
+            ),
             **(
                 {}
                 if spec.layout_rectangle is None
@@ -1116,6 +2031,26 @@ def build_display_scene_order(
         objects.append(token_asset.scene_order_object(
             spec.object_id, plane_id, enabled=spec.enabled
         ))
+    product_regions = [
+        product.sensor_region
+        for spec in scene.objects
+        for product in spec.products
+        if product.sensor_region is not None
+    ]
+    if not product_regions:
+        raise ValueError("display scene requires at least one sensor product")
+    min_x = min(region.x for region in product_regions)
+    min_y = min(region.y for region in product_regions)
+    max_x = max(region.x + region.width for region in product_regions)
+    max_y = max(region.y + region.height for region in product_regions)
+    photographed_region = {
+        "x": min_x, "y": min_y,
+        "width": max_x - min_x, "height": max_y - min_y,
+    }
+    camera_manifest = default_camera_manifest()
+    camera_manifest["sensor"]["ui_content_region_px"] = dict(
+        photographed_region
+    )
     first_plane = planes[0]
     first_geometry = objects[0]["geometry"]
     return {
@@ -1124,11 +2059,12 @@ def build_display_scene_order(
             "image": {
                 "width": scene.sensor_width,
                 "height": scene.sensor_height,
+                # The saved exposure is the whole physical gate. The authored
+                # UI products occupy the centered photographed_region within it.
                 "region": {
-                    "x": 2 * (scene.sensor_width // SENSOR_CROP_SCALE),
-                    "y": 2 * (scene.sensor_height // SENSOR_CROP_SCALE),
-                    "width": scene.sensor_width // SENSOR_CROP_SCALE,
-                    "height": scene.sensor_height // SENSOR_CROP_SCALE,
+                    "x": 0, "y": 0,
+                    "width": scene.sensor_width,
+                    "height": scene.sensor_height,
                 },
             },
             "camera": {
@@ -1138,6 +2074,7 @@ def build_display_scene_order(
                 "target_m": list(scene.camera.target_m),
                 "focus_target_m": list(scene.camera.focus_target_m),
                 "up": list(scene.camera.up),
+                "manifest": camera_manifest,
             },
             "exposure": {
                 "time_s": 1.0 / 60.0,
@@ -1145,7 +2082,10 @@ def build_display_scene_order(
                 "sensor_sweeps": int(sensor_sweeps),
                 "t5_pair_budget": 20_000_000,
             },
-            "flash": {"intensity_scale": 1.0},
+            "flash": {
+                "intensity_scale": 1.0,
+                "manifest": default_camera_manifest()["flash"],
+            },
             "font": objects[0]["font"],
             "planes": planes,
             "materials": {
@@ -1180,7 +2120,7 @@ def build_display_scene_order(
 
 
 def _display_raster_to_native_square(array: np.ndarray) -> np.ndarray:
-    """Invert the C++ getter's y-flip plus the Python display transpose."""
+    """Invert top-left display orientation into native ``[right, up]``."""
 
     display = np.asarray(array)
     if display.ndim not in (2, 3):
@@ -1196,11 +2136,10 @@ def _display_raster_to_native_square(array: np.ndarray) -> np.ndarray:
         width - 1,
     )
     square = display[source_y[:, None], source_x[None, :]]
-    # C++ readback writes getter[out_y, z] = native[y, z], with
-    # out_y = resolution - 1 - y. Display then transposes getter[z, out_y].
-    # Therefore native[y, z] = display.T[resolution - 1 - y, z].
+    # Display rows run down while native Z/up runs up; display columns and
+    # native Y/right both increase rightward after undoing that row reversal.
     return np.ascontiguousarray(
-        np.flip(np.swapaxes(square, 0, 1), axis=0)
+        np.swapaxes(np.flip(square, axis=0), 0, 1)
     )
 
 
@@ -1251,6 +2190,152 @@ def _prepare_native_delta_restore(
     return native_sum_path, native_weight_path, native_dirty_path
 
 
+def _repeat_order_signature(order: dict[str, Any]) -> str:
+    """Stable physical-scene identity, excluding sampling-only settings."""
+
+    runtime_work_fields = {
+        "total_rays", "rays_per_batch", "max_sensor_epochs",
+        "epoch_bundle_count", "sensor_top_k",
+        "sensor_samples_per_node", "sensor_steps_per_layer",
+        "sensor_flash_rays", "sensor_flash_page_count",
+        "sensor_flash_total_rays", "sensor_t5_pair_budget", "max_bounces",
+        "convergence_enabled",
+        "sensor_work_tile_width", "sensor_work_tile_height",
+    }
+
+    def normalized(value: Any, *, parent_key: str = "") -> Any:
+        if isinstance(value, dict):
+            return {
+                str(key): normalized(item, parent_key=str(key))
+                for key, item in sorted(value.items())
+                if key not in {"_source_path", "cohort_seed", "cohort_id"}
+                and not (parent_key == "runtime" and key in runtime_work_fields)
+            }
+        if isinstance(value, (list, tuple)):
+            return [normalized(item, parent_key=parent_key) for item in value]
+        return value
+
+    return json.dumps(
+        normalized(order), sort_keys=True, separators=(",", ":"),
+    )
+
+
+def _find_repeat_accumulation(
+    root: str, order: dict[str, Any], *, before_sequence: int,
+) -> tuple[str, str] | None:
+    """Find the newest compatible retained sum/weight pair for an exact order."""
+
+    wanted = _repeat_order_signature(order)
+    candidates: list[tuple[int, str, str]] = []
+    if not os.path.isdir(root):
+        return None
+    for entry in os.scandir(root):
+        match = re.fullmatch(r"revision_([0-9]+)", entry.name)
+        if not match or not entry.is_dir():
+            continue
+        sequence = int(match.group(1))
+        if sequence >= int(before_sequence):
+            continue
+        order_path = os.path.join(entry.path, "scene_order.json")
+        sum_path = os.path.join(
+            entry.path, JOB_ID, "0000_cpp_sum_linear.npy"
+        )
+        weight_path = os.path.join(
+            entry.path, JOB_ID, "0000_cpp_exposure_weight.npy"
+        )
+        if not all(os.path.isfile(path) for path in (order_path, sum_path, weight_path)):
+            continue
+        if not _sensor_sum_has_current_orientation(sum_path):
+            continue
+        try:
+            with open(order_path, "r", encoding="utf-8") as handle:
+                prior_order = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if _repeat_order_signature(prior_order) == wanted:
+            candidates.append((sequence, sum_path, weight_path))
+    if not candidates:
+        return None
+    _sequence, sum_path, weight_path = max(candidates, key=lambda item: item[0])
+    return sum_path, weight_path
+
+
+def _sensor_work_tiles(
+    region: dict[str, Any], tile_width: int, tile_height: int,
+) -> list[dict[str, int]]:
+    """Partition a full sensor ROI into deterministic row-major FIFO work."""
+
+    x0 = int(region.get("x", 0))
+    y0 = int(region.get("y", 0))
+    width = int(region["width"])
+    height = int(region["height"])
+    step_x = int(tile_width)
+    step_y = int(tile_height)
+    if width <= 0 or height <= 0 or step_x <= 0 or step_y <= 0:
+        raise ValueError("sensor region and work-tile dimensions must be positive")
+    return [
+        {
+            "x": x,
+            "y": y,
+            "width": min(step_x, x0 + width - x),
+            "height": min(step_y, y0 + height - y),
+        }
+        for y in range(y0, y0 + height, step_y)
+        for x in range(x0, x0 + width, step_x)
+    ]
+
+
+def _compose_sensor_work_tile(
+    full_linear: np.ndarray,
+    full_sum: np.ndarray,
+    full_weight: np.ndarray,
+    tile_linear: np.ndarray,
+    tile_sum: np.ndarray,
+    tile_weight: np.ndarray,
+    tile: dict[str, Any],
+) -> None:
+    """Place one top-left-origin sensor tile into row-major whole-frame arrays."""
+
+    x0, y0 = int(tile["x"]), int(tile["y"])
+    x1 = x0 + int(tile["width"])
+    y1 = y0 + int(tile["height"])
+    expected_shape = (y1 - y0, x1 - x0)
+    if (
+        tile_linear.shape[:2] != expected_shape
+        or tile_sum.shape != expected_shape + (3,)
+        or tile_weight.shape != expected_shape
+    ):
+        raise ValueError(
+            "calibration tile artifacts do not match their sensor region"
+        )
+    if (
+        full_linear.ndim != 3 or full_linear.shape[2] < 3
+        or full_sum.shape != full_linear.shape[:2] + (3,)
+        or full_weight.shape != full_linear.shape[:2]
+        or x0 < 0 or y0 < 0
+        or x1 > full_linear.shape[1] or y1 > full_linear.shape[0]
+    ):
+        raise ValueError("calibration tile region is outside the whole sensor")
+    # Image coordinates are (x, y); NumPy raster indexing is [row=y, column=x].
+    full_linear[y0:y1, x0:x1, :3] = tile_linear[..., :3]
+    full_sum[y0:y1, x0:x1] = tile_sum
+    full_weight[y0:y1, x0:x1] = tile_weight
+
+
+def _latest_revision_sequence(root: str) -> int:
+    if not os.path.isdir(root):
+        return 0
+    return max(
+        (
+            int(match.group(1))
+            for entry in os.scandir(root)
+            if (match := re.fullmatch(r"revision_([0-9]+)", entry.name))
+            and entry.is_dir()
+        ),
+        default=0,
+    )
+
+
 def _blend_delta_exposure(
     current_linear: np.ndarray,
     current_weight: np.ndarray,
@@ -1287,6 +2372,122 @@ def _blend_delta_exposure(
     return np.ascontiguousarray(result)
 
 
+def _arrival_shimmer_rgb(
+    previous_linear: np.ndarray,
+    current_linear: np.ndarray,
+    *,
+    sample_count: np.ndarray | None = None,
+    priority_map: np.ndarray | None = None,
+) -> np.ndarray:
+    """Build a presentation-only sparkle field from a real integration delta.
+
+    Positive revisions preserve the arriving light's chroma and receive a
+    small warm lift. Negative revisions are shown as a cool settling glint.
+    Nothing returned by this function is fed back into sensor evidence.
+    """
+
+    previous = np.asarray(previous_linear, np.float32)
+    current = np.asarray(current_linear, np.float32)
+    if (
+        previous.shape != current.shape
+        or current.ndim != 3 or current.shape[2] < 3
+    ):
+        raise ValueError("arrival shimmer requires matching HxWxC linear images")
+    delta = current[..., :3] - previous[..., :3]
+    signed_luma = np.mean(delta, axis=2)
+    magnitude = np.abs(signed_luma)
+    finite = magnitude[np.isfinite(magnitude) & (magnitude > 0.0)]
+    if not finite.size:
+        return np.zeros((*current.shape[:2], 3), np.float32)
+    scale = max(float(np.percentile(finite, 97.0)), 1.0e-20)
+    sparkle = np.sqrt(np.clip(magnitude / scale, 0.0, 1.0))
+
+    weight = np.ones(current.shape[:2], np.float32)
+    if sample_count is not None:
+        counts = np.asarray(sample_count, np.float32)
+        if counts.shape == weight.shape:
+            uncertainty = 1.0 / np.sqrt(np.maximum(counts, 1.0))
+            peak = float(np.percentile(uncertainty, 95.0))
+            if peak > 0.0:
+                weight *= 0.30 + 0.70 * np.clip(uncertainty / peak, 0.0, 1.0)
+    if priority_map is not None:
+        priority = np.maximum(np.asarray(priority_map, np.float32), 0.0)
+        if priority.shape == weight.shape:
+            peak = float(np.percentile(priority[priority > 0.0], 95.0)) \
+                if np.any(priority > 0.0) else 0.0
+            if peak > 0.0:
+                weight *= 0.35 + 0.65 * np.clip(priority / peak, 0.0, 1.0)
+
+    arriving = np.maximum(delta, 0.0)
+    arriving_peak = np.max(arriving, axis=2, keepdims=True)
+    arriving_chroma = arriving / np.maximum(arriving_peak, 1.0e-20)
+    warm = np.asarray([1.0, 0.72, 0.24], np.float32)
+    cool = np.asarray([0.20, 0.48, 1.0], np.float32)
+    positive_rgb = 0.68 * arriving_chroma + 0.32 * warm
+    color = np.where((signed_luma >= 0.0)[..., None], positive_rgb, cool)
+    return np.ascontiguousarray(
+        np.clip(color * (sparkle * weight)[..., None], 0.0, 1.0),
+        np.float32,
+    )
+
+
+def _add_arrival_shimmer(
+    surface: Any,
+    shimmer_rgb: np.ndarray | None,
+    age_s: float,
+    pygame_module: Any,
+) -> Any:
+    """Add a decaying shimmer to a copied display surface."""
+
+    if surface is None or shimmer_rgb is None:
+        return surface
+    gain = math.exp(-max(0.0, float(age_s)) / 0.70)
+    if gain < 0.015:
+        return surface
+    pixels = np.ascontiguousarray(
+        np.clip(shimmer_rgb, 0.0, 1.0) * (112.0 * gain), dtype=np.uint8
+    )
+    overlay = pygame_module.surfarray.make_surface(pixels.swapaxes(0, 1))
+    if overlay.get_size() != surface.get_size():
+        overlay = pygame_module.transform.smoothscale(overlay, surface.get_size())
+    result = surface.copy()
+    result.blit(overlay, (0, 0), special_flags=pygame_module.BLEND_RGB_ADD)
+    return result
+
+
+def _mark_unexposed_preview(
+    display_rgb: np.ndarray,
+    exposure_weight: np.ndarray | None,
+    *,
+    checker_size: int = 16,
+) -> np.ndarray:
+    """Return an RGBA preview with translucent checkerboard pending sites."""
+
+    display = np.asarray(display_rgb)
+    if exposure_weight is None:
+        return display
+    weight = np.asarray(exposure_weight)
+    if display.ndim != 3 or display.shape[2] < 3 or weight.shape != display.shape[:2]:
+        return display
+    pending = weight <= 0.0
+    size = max(1, int(checker_size))
+    yy, xx = np.indices(weight.shape)
+    alternate = ((xx // size + yy // size) & 1).astype(bool)
+    low = np.asarray([0.035, 0.045, 0.055], dtype=display.dtype)
+    high = np.asarray([0.075, 0.090, 0.105], dtype=display.dtype)
+    pending_color = np.where(alternate[..., None], high, low)
+    result_rgb = np.array(display[..., :3], copy=True, order="C")
+    result_rgb[pending] = pending_color[pending]
+    alpha = np.ones(weight.shape, dtype=display.dtype)
+    pending_alpha = np.where(alternate, 0.58, 0.38).astype(
+        display.dtype, copy=False
+    )
+    alpha[pending] = pending_alpha[pending]
+    return np.ascontiguousarray(
+        np.concatenate((result_rgb, alpha[..., None]), axis=2)
+    )
+
+
 @dataclass(frozen=True)
 class RenderedTextRevision:
     sequence: int
@@ -1300,6 +2501,10 @@ class RenderedTextRevision:
     priority_overlay_path: str = ""
     interface_assembly_key: str = ""
     after_render_key: str = ""
+
+
+class RenderCancelled(RuntimeError):
+    """A user-requested foreground cancellation, not a render failure."""
 
 
 RenderFunction = Callable[
@@ -1559,7 +2764,7 @@ class InkAtlasSubprocessRenderer:
             os.path.join(script_dir, "exposure_render_demo.py"),
             "--scene-order", order_path,
             "--scene-job", job_id,
-            "--integrator", "bdpt",
+            "--integrator", str(package.get("runtime", {}).get("integrator", "bdpt")),
             "--backend", "cpp",
             "--frames", "1",
             "--gpu-resident",
@@ -1578,7 +2783,7 @@ class InkAtlasSubprocessRenderer:
         # One native submission is one visible and resumable epoch. The total
         # burst remains epochs_per_exposure * steps_per_epoch submissions.
         environment["SPECTRAL_SENSOR_MAX_EPOCHS"] = str(remaining_epochs)
-        environment["SPECTRAL_SENSOR_CONTINUOUS"] = "1"
+        environment["SPECTRAL_SENSOR_PERSISTENT_EPOCHS"] = "1"
         environment["SPECTRAL_SENSOR_TOP_K"] = str(self.sensor_top_k)
         environment["SPECTRAL_SENSOR_STEPS_PER_LAYER"] = "1"
         environment["SPECTRAL_SENSOR_SAMPLES_PER_NODE"] = str(
@@ -1850,6 +3055,33 @@ class InkAtlasSubprocessRenderer:
             previous_image=prior_linear,
             previous_stable_hold=int(prior_quality.get("stable_hold", 0)),
         )
+        quality_metadata = quality.as_metadata()
+        current_convergence = convergence_metric(
+            quality_metadata,
+            refinement_pass=quality.refinement_pass,
+        )
+        previous_pass = int(prior_metadata.get("refinement_pass", 0) or 0)
+        previous_convergence = convergence_metric(
+            prior_quality,
+            completion_basis=str(
+                prior_metadata.get("completion_basis", "")
+            ),
+            refinement_pass=previous_pass,
+        )
+        convergence_velocity = convergence_velocity_per_pass(
+            current_convergence,
+            quality.refinement_pass,
+            previous_convergence,
+            previous_pass,
+        )
+        quality_metadata.update({
+            "convergence_metric_version": CONVERGENCE_METRIC_VERSION,
+            "convergence_metric": current_convergence,
+            "convergence_velocity_per_pass": convergence_velocity,
+            "previous_convergence_metric": previous_convergence,
+            "previous_refinement_pass": previous_pass,
+            "quality_measured_at_s": time.time(),
+        })
         manifest = {
             "schema_version": 1,
             "target_key": request.target_key,
@@ -1870,7 +3102,7 @@ class InkAtlasSubprocessRenderer:
             "sum_linear_path": sum_path,
             "exposure_weight_path": weight_path,
             "preview_path": preview_path,
-            "quality": quality.as_metadata(),
+            "quality": quality_metadata,
         }
         with open(manifest_path, "w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2, sort_keys=True)
@@ -1909,7 +3141,7 @@ class InkAtlasSubprocessRenderer:
                     * self.samples_per_node
                 ),
                 "sensor_display_orientation": SENSOR_DISPLAY_ORIENTATION,
-                "atlas_quality": quality.as_metadata(),
+                "atlas_quality": quality_metadata,
                 "sum_linear_path": sum_path,
                 "exposure_weight_path": weight_path,
                 "sprite_path": sprite_path,
@@ -1965,6 +3197,8 @@ class SpectralTextRenderWorker:
         progress_observer: ProgressSink | None = None,
         background_source: BackgroundRequestSource | None = None,
         background_render_function: BackgroundRenderFunction | None = None,
+        background_paused: bool = False,
+        initial_sequence: int = 0,
     ):
         self._render_function = render_function
         self._progress_observer = progress_observer
@@ -1974,8 +3208,8 @@ class SpectralTextRenderWorker:
             )
         self._background_source = background_source
         self._background_render_function = background_render_function
-        self._background_paused = False
-        self._background_user_paused = False
+        self._background_paused = bool(background_paused)
+        self._background_user_paused = bool(background_paused)
         self._background_error = ""
         self._background_busy = False
         self._condition = threading.Condition()
@@ -1983,9 +3217,9 @@ class SpectralTextRenderWorker:
             int, str, dict[str, Any], dict[str, Any] | None
         ] | None = None
         self._latest: RenderedTextRevision | None = None
-        self._latest_sequence = 0
+        self._latest_sequence = max(0, int(initial_sequence))
         self._progress = ExposureProgressBroker()
-        self._submitted_sequence = 0
+        self._submitted_sequence = max(0, int(initial_sequence))
         self._busy = False
         self._error = ""
         self._stopping = False
@@ -2062,6 +3296,14 @@ class SpectralTextRenderWorker:
         with self._condition:
             return self._background_busy, self._background_error
 
+    def toggle_foreground_paused(self) -> bool | None:
+        toggle = getattr(self._render_function, "toggle_paused", None)
+        return toggle() if callable(toggle) else None
+
+    def cancel_foreground(self) -> bool:
+        cancel = getattr(self._render_function, "cancel_current", None)
+        return bool(cancel()) if callable(cancel) else False
+
     def snapshot(self) -> tuple[RenderedTextRevision | None, bool, str, int]:
         with self._condition:
             return self._latest, self._busy, self._error, self._submitted_sequence
@@ -2130,6 +3372,10 @@ class SpectralTextRenderWorker:
                 with self._condition:
                     self._latest = result
                     self._latest_sequence = sequence
+            except RenderCancelled:
+                with self._condition:
+                    if sequence == self._submitted_sequence:
+                        self._error = ""
             except Exception as exc:
                 with self._condition:
                     if not foreground:
@@ -2169,12 +3415,73 @@ def make_subprocess_renderer(
     script_dir = os.path.dirname(os.path.abspath(__file__))
     process_lock = threading.Lock()
     active_process: list[subprocess.Popen[str] | None] = [None]
+    active_suspended = [False]
+    cancel_requested = [False]
+    active_eta_tracker: list[Any | None] = [None]
 
-    def cancel_current() -> None:
+    def set_process_suspended(
+        process: subprocess.Popen[str], suspended: bool
+    ) -> None:
+        if os.name == "nt":
+            import ctypes
+            process_suspend_resume = 0x0800
+            process_query_limited_information = 0x1000
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            ntdll = ctypes.WinDLL("ntdll")
+            kernel32.OpenProcess.argtypes = [
+                ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32,
+            ]
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_int
+            handle = kernel32.OpenProcess(
+                process_suspend_resume | process_query_limited_information,
+                False,
+                int(process.pid),
+            )
+            if not handle:
+                raise OSError(ctypes.get_last_error(), "OpenProcess failed")
+            try:
+                operation = (
+                    ntdll.NtSuspendProcess
+                    if suspended else ntdll.NtResumeProcess
+                )
+                operation.argtypes = [ctypes.c_void_p]
+                operation.restype = ctypes.c_long
+                status = int(operation(handle))
+                if status != 0:
+                    raise OSError(status, "process suspend/resume failed")
+            finally:
+                kernel32.CloseHandle(handle)
+        else:
+            import signal
+            os.kill(process.pid, signal.SIGSTOP if suspended else signal.SIGCONT)
+
+    def toggle_paused() -> bool | None:
         with process_lock:
             process = active_process[0]
+            if process is None or process.poll() is not None:
+                return None
+            paused = not active_suspended[0]
+            set_process_suspended(process, paused)
+            active_suspended[0] = paused
+            if active_eta_tracker[0] is not None:
+                active_eta_tracker[0].set_paused(paused)
+            return paused
+
+    def cancel_current() -> bool:
+        with process_lock:
+            process = active_process[0]
+            paused = active_suspended[0]
         if process is not None and process.poll() is None:
+            cancel_requested[0] = True
+            if paused:
+                set_process_suspended(process, False)
+                with process_lock:
+                    active_suspended[0] = False
             process.terminate()
+            return True
+        return False
 
     def render(
         sequence: int,
@@ -2183,6 +3490,7 @@ def make_subprocess_renderer(
         next_scan_control: dict[str, Any] | None,
         progress_sink: ProgressSink,
     ) -> RenderedTextRevision:
+        started = time.perf_counter()
         revision_dir = os.path.join(root, f"revision_{sequence:04d}")
         os.makedirs(revision_dir, exist_ok=True)
         job_dir = os.path.join(revision_dir, JOB_ID)
@@ -2190,8 +3498,98 @@ def make_subprocess_renderer(
         order_path = os.path.join(revision_dir, "scene_order.json")
         with open(order_path, "w", encoding="utf-8") as handle:
             json.dump(order, handle, indent=2)
+        runtime = order.get("runtime", {})
+        full_region = order["defaults"]["image"]["region"]
+        calibration_tiles: list[dict[str, int]] = []
+        if (
+            str(runtime.get("work_kind", "")) == "calibration"
+            and "sensor_work_tile_width" in runtime
+            and "sensor_work_tile_height" in runtime
+        ):
+            calibration_tiles = _sensor_work_tiles(
+                full_region,
+                int(runtime["sensor_work_tile_width"]),
+                int(runtime["sensor_work_tile_height"]),
+            )
+        if str(runtime.get("work_kind", "")) == "wave_calibration":
+            region = order["defaults"]["image"]["region"]
+            wave_work_dir = os.path.abspath(str(runtime["wave_work_dir"]))
+            command = [
+                sys.executable,
+                os.path.join(script_dir, "wave_double_slit_calibration.py"),
+                "--work-dir", wave_work_dir,
+                "--width", str(int(region["width"])),
+                "--height", str(int(region["height"])),
+                "--steps", str(max(1, int(runtime.get("wave_steps", 100)))),
+            ]
+            log_path = os.path.join(revision_dir, "render.log")
+            process = subprocess.Popen(
+                command, cwd=script_dir, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                errors="replace", bufsize=1,
+            )
+            with process_lock:
+                active_process[0] = process
+                active_suspended[0] = False
+            forwarded = 0
+            latest_preview = ""
+            wave_result: dict[str, Any] = {}
+            with open(log_path, "w", encoding="utf-8", newline="\n") as log:
+                assert process.stdout is not None
+                for line in process.stdout:
+                    log.write(line); log.flush()
+                    print(line.rstrip("\r\n"), flush=True)
+                    if line.startswith("[wave-progress] "):
+                        payload = json.loads(line[len("[wave-progress] "):])
+                        forwarded += 1
+                        latest_preview = str(payload.get("preview_path", ""))
+                        completed = int(payload.get("completed", 0))
+                        total = max(1, int(payload.get("total", 1)))
+                        progress_sink(ExposureProgressEvent(
+                            exposure_id=f"revision-{sequence:04d}",
+                            sequence=forwarded,
+                            kind=ExposureProgressKind.LAYER_AVAILABLE,
+                            region=SensorRegion(
+                                x=int(region.get("x", 0)), y=int(region.get("y", 0)),
+                                width=int(region["width"]), height=int(region["height"]),
+                            ),
+                            pass_index=completed,
+                            completed_work=completed, total_work=total,
+                            progress_fraction=float(completed) / float(total),
+                            elapsed_s=time.perf_counter() - started,
+                            preview_path=latest_preview,
+                            message=(
+                                f"double slit {payload.get('backend', 'wave')} "
+                                f"step {completed}/{total}"
+                            ),
+                        ))
+                    elif line.startswith("[wave-result] "):
+                        wave_result = json.loads(line[len("[wave-result] "):])
+            return_code = process.wait()
+            with process_lock:
+                active_process[0] = None
+                active_suspended[0] = False
+            if cancel_requested[0]:
+                raise RenderCancelled("wave calibration cancelled")
+            if return_code != 0:
+                raise RuntimeError(
+                    f"double-slit wave calibration exited with code {return_code}; "
+                    f"see {log_path}"
+                )
+            image_path = str(wave_result.get(
+                "preview_path", os.path.join(wave_work_dir, "comparison.png")
+            ))
+            manifest_path = os.path.join(wave_work_dir, "wave_checkpoint.json")
+            linear_path = os.path.join(wave_work_dir, "cpu", "intensity.npy")
+            elapsed_s = time.perf_counter() - started
+            return RenderedTextRevision(
+                sequence=sequence, text=text, image_path=image_path,
+                linear_path=linear_path, manifest_path=manifest_path,
+                elapsed_s=elapsed_s, diagnostic_image_path=image_path,
+            )
         next_scan_path = ""
         native_delta_restore = None
+        repeat_evidence = None
         if next_scan_control is not None:
             next_scan_path = os.path.join(revision_dir, "next_scan_control.json")
             with open(next_scan_path, "w", encoding="utf-8") as handle:
@@ -2199,7 +3597,30 @@ def make_subprocess_renderer(
             native_delta_restore = _prepare_native_delta_restore(
                 revision_dir, next_scan_control
             )
-        region = order["defaults"]["image"]["region"]
+        else:
+            repeat_evidence = _find_repeat_accumulation(
+                root, order, before_sequence=sequence
+            )
+            if repeat_evidence is not None and not calibration_tiles:
+                prior_sum, prior_weight = repeat_evidence
+                native_delta_restore = _prepare_native_delta_restore(
+                    revision_dir,
+                    {
+                        "metadata": {
+                            "delta_restore": {
+                                "sensor_sum_path": prior_sum,
+                                "exposure_weight_path": prior_weight,
+                            }
+                        },
+                        "pixel_slice_requests": [],
+                    },
+                )
+                print(
+                    f"[live] revision {sequence}: accumulating exact repeated "
+                    f"order from sum={prior_sum} weight={prior_weight}",
+                    flush=True,
+                )
+        region = full_region
         reusable_model = str(priority_model_path).strip()
         flat_reference_path = ""
         attention_model_path = ""
@@ -2240,7 +3661,7 @@ def make_subprocess_renderer(
             os.path.join(script_dir, "exposure_render_demo.py"),
             "--scene-order", order_path,
             "--scene-job", JOB_ID,
-            "--integrator", "bdpt",
+            "--integrator", str(order.get("runtime", {}).get("integrator", "bdpt")),
             "--backend", "cpp",
             "--frames", "1",
             "--gpu-resident",
@@ -2253,6 +3674,14 @@ def make_subprocess_renderer(
             "--progress-exposure-id",
             f"revision-{sequence:04d}",
         ]
+        runtime = order.get("runtime", {})
+        if "total_rays" in runtime:
+            command.extend(["--total-rays", str(max(1, int(runtime["total_rays"])))])
+        if "rays_per_batch" in runtime:
+            command.extend([
+                "--rays-per-batch",
+                str(max(1, int(runtime["rays_per_batch"]))),
+            ])
         log_path = os.path.join(revision_dir, "render.log")
         print(f"[live] revision {sequence} process: {' '.join(command)}", flush=True)
         with open(log_path, "w", encoding="utf-8") as log:
@@ -2261,11 +3690,20 @@ def make_subprocess_renderer(
             # the clarity discriminator accepts the frame; afterward the same
             # render owner can manufacture one missing atlas asset.
             environment["SPECTRAL_SENSOR_MAX_EPOCHS"] = str(
-                DEFAULT_LIVE_FOREGROUND_EPOCHS
+                int(order.get("runtime", {}).get(
+                    "max_sensor_epochs", DEFAULT_LIVE_FOREGROUND_EPOCHS
+                ))
             )
-            environment["SPECTRAL_SENSOR_CONTINUOUS"] = "0"
+            environment["SPECTRAL_SENSOR_PERSISTENT_EPOCHS"] = "0"
+            from exposure_control_toolbar import ExposureControlSettings
+            allocation_mode = str(runtime.get(
+                "sensor_allocation_mode", "even-sensor"
+            ))
+            allocation_targeted_fraction = ExposureControlSettings(
+                allocation_mode=allocation_mode
+            ).targeted_fraction(targeted_fraction)
             environment["SPECTRAL_SENSOR_TARGETED_FRACTION"] = str(
-                float(targeted_fraction)
+                allocation_targeted_fraction
             )
             if next_scan_path:
                 environment["SPECTRAL_NEXT_SCAN_CONTROL"] = next_scan_path
@@ -2284,40 +3722,416 @@ def make_subprocess_renderer(
             else:
                 environment.pop("SPECTRAL_SENSOR_PRIORITY_MODEL", None)
             environment["SPECTRAL_PROGRESS_RETAIN_LAYERS"] = "3"
-            process = subprocess.Popen(
-                command,
-                cwd=script_dir,
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
+            if str(runtime.get("work_kind", "")) == "calibration":
+                environment["SPECTRAL_SENSOR_TOP_K"] = str(max(
+                    1, int(runtime.get(
+                        "sensor_top_k",
+                        max(int(region["width"]), int(region["height"])),
+                    ))
+                ))
+                environment["SPECTRAL_SENSOR_SAMPLES_PER_NODE"] = str(max(
+                    1, int(runtime.get("sensor_samples_per_node", 2))
+                ))
+                environment["SPECTRAL_SENSOR_STEPS_PER_LAYER"] = str(max(
+                    1, int(runtime.get("sensor_steps_per_layer", 1))
+                ))
+                environment["SPECTRAL_SENSOR_FLASH_RAYS"] = str(max(
+                    1, int(runtime.get("sensor_flash_rays", 1024))
+                ))
+                environment["SPECTRAL_SENSOR_T5_PAIR_BUDGET"] = str(max(
+                    1, int(runtime.get("sensor_t5_pair_budget", 262144))
+                ))
+            requested_bundle_count = max(
+                1, int(runtime.get("epoch_bundle_count", 1))
             )
-            with process_lock:
-                active_process[0] = process
-            assert process.stdout is not None
-            try:
-                for line in process.stdout:
-                    log.write(line)
-                    log.flush()
-                    event = ExposureProgressEvent.from_line(line.rstrip("\r\n"))
-                    if event is not None:
-                        progress_sink(event)
-                    print(f"[render {sequence:04d}] {line}", end="", flush=True)
-                return_code = process.wait()
-            finally:
+            bundle_count = (
+                max(requested_bundle_count, len(calibration_tiles))
+                if calibration_tiles else requested_bundle_count
+            )
+            from camera_software.render_eta import RenderEtaTracker
+            eta_runtime = dict(runtime)
+            eta_runtime["epoch_bundle_count"] = bundle_count
+            eta_tracker = RenderEtaTracker(eta_runtime, started_at=started)
+            active_eta_tracker[0] = eta_tracker
+            forwarded_sequence = 0
+            latest_artifact_event: list[ExposureProgressEvent | None] = [None]
+            used_bundle_seed_offsets: set[int] = set()
+            full_width = int(order["defaults"]["image"]["width"])
+            full_height = int(order["defaults"]["image"]["height"])
+            full_sum = np.zeros((full_height, full_width, 3), np.float32)
+            full_weight = np.zeros((full_height, full_width), np.float32)
+            full_linear = np.zeros((full_height, full_width, 3), np.float32)
+            if calibration_tiles and repeat_evidence is not None:
+                prior_sum = np.asarray(
+                    np.load(repeat_evidence[0], allow_pickle=False), np.float32
+                )
+                prior_weight = np.asarray(
+                    np.load(repeat_evidence[1], allow_pickle=False), np.float32
+                )
+                if (
+                    prior_sum.shape == full_sum.shape
+                    and prior_weight.shape == full_weight.shape
+                ):
+                    full_sum[...] = prior_sum
+                    full_weight[...] = prior_weight
+                    np.divide(
+                        full_sum,
+                        np.maximum(full_weight[..., None], 1.0e-20),
+                        out=full_linear,
+                        where=full_weight[..., None] > 0.0,
+                    )
+
+            def publish_eta(snapshot) -> None:
+                nonlocal forwarded_sequence
+                forwarded_sequence += 1
+                artifact = latest_artifact_event[0]
+                progress_sink(ExposureProgressEvent(
+                    exposure_id=f"revision-{sequence:04d}",
+                    sequence=forwarded_sequence,
+                    kind=ExposureProgressKind.STARTED,
+                    region=SensorRegion(
+                        x=int(region.get("x", 0)),
+                        y=int(region.get("y", 0)),
+                        width=int(region["width"]),
+                        height=int(region["height"]),
+                    ),
+                    pass_index=int(snapshot.page_index),
+                    completed_work=min(
+                        int(snapshot.completed_units), snapshot.total_units
+                    ),
+                    total_work=int(snapshot.total_units),
+                    progress_fraction=float(snapshot.fraction),
+                    elapsed_s=float(snapshot.elapsed_s),
+                    eta_s=(
+                        None if snapshot.eta_s is None
+                        else float(snapshot.eta_s)
+                    ),
+                    linear_accumulation_path=(
+                        "" if artifact is None
+                        else artifact.linear_accumulation_path
+                    ),
+                    sample_count_path=(
+                        "" if artifact is None else artifact.sample_count_path
+                    ),
+                    preview_path=(
+                        "" if artifact is None else artifact.preview_path
+                    ),
+                    priority_map_path=(
+                        "" if artifact is None else artifact.priority_map_path
+                    ),
+                    sensor_sum_path=(
+                        "" if artifact is None else artifact.sensor_sum_path
+                    ),
+                    exposure_weight_path=(
+                        "" if artifact is None else artifact.exposure_weight_path
+                    ),
+                    orthographic_reference_path=(
+                        "" if artifact is None
+                        else artifact.orthographic_reference_path
+                    ),
+                    global_uv_bounds=(
+                        None if artifact is None else artifact.global_uv_bounds
+                    ),
+                    message=snapshot.message(),
+                ))
+
+            for bundle_index in range(bundle_count):
+                cancel_requested[0] = False
+                toss_round = 0
+                bundle_seed_offset = iching_coin_seed(
+                    sequence, bundle_index, toss_round=toss_round
+                )
+                while bundle_seed_offset in used_bundle_seed_offsets:
+                    toss_round += 1
+                    bundle_seed_offset = iching_coin_seed(
+                        sequence, bundle_index, toss_round=toss_round
+                    )
+                used_bundle_seed_offsets.add(bundle_seed_offset)
+                environment["SPECTRAL_EXPOSURE_SEED_OFFSET"] = str(
+                    bundle_seed_offset
+                )
+                bundle_command = command
+                active_tile = None
+                tile_job_dir = job_dir
+                if calibration_tiles:
+                    tile_index = bundle_index % len(calibration_tiles)
+                    active_tile = calibration_tiles[tile_index]
+                    tile_root = os.path.join(
+                        revision_dir, "sensor_tiles", f"tile_{tile_index:04d}"
+                    )
+                    tile_job_dir = os.path.join(tile_root, JOB_ID)
+                    os.makedirs(tile_job_dir, exist_ok=True)
+                    tile_order = copy.deepcopy(order)
+                    tile_order["defaults"]["image"]["region"] = dict(active_tile)
+                    tile_order_path = os.path.join(tile_root, "scene_order.json")
+                    with open(tile_order_path, "w", encoding="utf-8") as handle:
+                        json.dump(tile_order, handle, indent=2)
+                    bundle_command = list(command)
+                    bundle_command[bundle_command.index("--scene-order") + 1] = (
+                        tile_order_path
+                    )
+                    bundle_command[bundle_command.index("--out-dir") + 1] = (
+                        tile_job_dir
+                    )
+                    tile_sum_path = os.path.join(
+                        tile_job_dir, "0000_cpp_sum_linear.npy"
+                    )
+                    tile_weight_path = os.path.join(
+                        tile_job_dir, "0000_cpp_exposure_weight.npy"
+                    )
+                    restore_sum_path = tile_sum_path
+                    restore_weight_path = tile_weight_path
+                    if not (
+                        os.path.isfile(restore_sum_path)
+                        and os.path.isfile(restore_weight_path)
+                    ) and repeat_evidence is not None:
+                        x0, y0 = int(active_tile["x"]), int(active_tile["y"])
+                        x1 = x0 + int(active_tile["width"])
+                        y1 = y0 + int(active_tile["height"])
+                        restore_dir = os.path.join(tile_root, "prior_display")
+                        os.makedirs(restore_dir, exist_ok=True)
+                        restore_sum_path = os.path.join(restore_dir, "sum.npy")
+                        restore_weight_path = os.path.join(restore_dir, "weight.npy")
+                        np.save(
+                            restore_sum_path, full_sum[y0:y1, x0:x1],
+                            allow_pickle=False,
+                        )
+                        np.save(
+                            restore_weight_path, full_weight[y0:y1, x0:x1],
+                            allow_pickle=False,
+                        )
+                    tile_restore = _prepare_native_delta_restore(
+                        os.path.join(tile_root, "native_restore"),
+                        {
+                            "metadata": {"delta_restore": {
+                                "sensor_sum_path": restore_sum_path,
+                                "exposure_weight_path": restore_weight_path,
+                            }},
+                            "pixel_slice_requests": [],
+                        },
+                    )
+                    if tile_restore is not None:
+                        environment["SPECTRAL_SENSOR_RESTORE_SUM"] = tile_restore[0]
+                        environment["SPECTRAL_SENSOR_RESTORE_WEIGHT"] = tile_restore[1]
+                        environment["SPECTRAL_SENSOR_DIRTY_SITES"] = tile_restore[2]
+                    else:
+                        environment.pop("SPECTRAL_SENSOR_RESTORE_SUM", None)
+                        environment.pop("SPECTRAL_SENSOR_RESTORE_WEIGHT", None)
+                        environment.pop("SPECTRAL_SENSOR_DIRTY_SITES", None)
+                publish_eta(eta_tracker.begin_bundle(bundle_index + 1))
+                print(
+                    f"[live] revision {sequence}: epoch bundle "
+                    f"{bundle_index + 1}/{bundle_count} "
+                    f"i-ching-seed=0b{bundle_seed_offset:031b} "
+                    f"offset={bundle_seed_offset} toss-round={toss_round}",
+                    flush=True,
+                )
+                process = subprocess.Popen(
+                    bundle_command,
+                    cwd=script_dir,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
                 with process_lock:
-                    if active_process[0] is process:
-                        active_process[0] = None
-            if return_code != 0:
-                raise subprocess.CalledProcessError(return_code, command)
+                    active_process[0] = process
+                    active_suspended[0] = False
+                assert process.stdout is not None
+                try:
+                    for line in process.stdout:
+                        log.write(line)
+                        log.flush()
+                        event = ExposureProgressEvent.from_line(
+                            line.rstrip("\r\n")
+                        )
+                        if event is not None:
+                            has_artifact = bool(
+                                event.linear_accumulation_path
+                                or event.preview_path
+                                or event.sensor_sum_path
+                            )
+                            if has_artifact and not calibration_tiles:
+                                latest_artifact_event[0] = event
+                            # A calibration child artifact is tile-local. The
+                            # parent publishes the correctly positioned whole
+                            # canvas immediately after composing it; presenting
+                            # this child first causes a full-size flash followed
+                            # by a mostly-unexposed (apparently black) canvas.
+                            if not (calibration_tiles and has_artifact):
+                                forwarded_sequence += 1
+                                progress_sink(replace(
+                                    event,
+                                    sequence=forwarded_sequence,
+                                    message=(
+                                        f"epoch bundle {bundle_index + 1}/"
+                                        f"{bundle_count}: {event.message}"
+                                    ),
+                                ))
+                        eta_snapshot, t5_pass_completed = eta_tracker.observe(line)
+                        if eta_snapshot is not None:
+                            publish_eta(eta_snapshot)
+                            if t5_pass_completed:
+                                overall_line = (
+                                    f"[overall {sequence:04d}] "
+                                    f"{eta_snapshot.message()}"
+                                )
+                                log.write(overall_line + "\n")
+                                log.flush()
+                                print(
+                                    overall_line,
+                                    flush=True,
+                                )
+                        # A native dependency may emit a byte sequence that the
+                        # UTF-8 subprocess decoder replaces with U+FFFD. Windows
+                        # cp1252 consoles cannot encode that character; logging
+                        # must never abort a real exposure.
+                        console_encoding = sys.stdout.encoding or "utf-8"
+                        console_line = line.encode(
+                            console_encoding, errors="replace"
+                        ).decode(console_encoding, errors="replace")
+                        print(
+                            f"[render {sequence:04d} bundle "
+                            f"{bundle_index + 1:03d}] {console_line}",
+                            end="",
+                            flush=True,
+                        )
+                    return_code = process.wait()
+                finally:
+                    with process_lock:
+                        if active_process[0] is process:
+                            active_process[0] = None
+                            active_suspended[0] = False
+                if return_code != 0:
+                    if cancel_requested[0]:
+                        print(
+                            f"[render-control] revision {sequence} cancelled",
+                            flush=True,
+                        )
+                        raise RenderCancelled(
+                            f"revision {sequence} cancelled by user"
+                        )
+                    raise subprocess.CalledProcessError(return_code, bundle_command)
+                if active_tile is not None:
+                    tile_linear = np.asarray(np.load(
+                        os.path.join(tile_job_dir, "0000_cpp_linear.npy"),
+                        allow_pickle=False,
+                    ), np.float32)
+                    tile_sum = np.asarray(np.load(
+                        os.path.join(tile_job_dir, "0000_cpp_sum_linear.npy"),
+                        allow_pickle=False,
+                    ), np.float32)
+                    tile_weight = np.asarray(np.load(
+                        os.path.join(tile_job_dir, "0000_cpp_exposure_weight.npy"),
+                        allow_pickle=False,
+                    ), np.float32)
+                    x0, y0 = int(active_tile["x"]), int(active_tile["y"])
+                    x1 = x0 + int(active_tile["width"])
+                    y1 = y0 + int(active_tile["height"])
+                    _compose_sensor_work_tile(
+                        full_linear, full_sum, full_weight,
+                        tile_linear, tile_sum, tile_weight, active_tile,
+                    )
+                    np.save(
+                        os.path.join(job_dir, "0000_cpp_linear.npy"),
+                        full_linear, allow_pickle=False,
+                    )
+                    np.save(
+                        os.path.join(job_dir, "0000_cpp_sum_linear.npy"),
+                        full_sum, allow_pickle=False,
+                    )
+                    np.save(
+                        os.path.join(job_dir, "0000_cpp_exposure_weight.npy"),
+                        full_weight, allow_pickle=False,
+                    )
+                    _mark_sensor_display_orientation(os.path.join(
+                        job_dir, "0000_cpp_sum_linear.npy"
+                    ))
+                    forwarded_sequence += 1
+                    composite_event = ExposureProgressEvent(
+                        exposure_id=f"revision-{sequence:04d}",
+                        sequence=forwarded_sequence,
+                        kind=ExposureProgressKind.PASS_AVAILABLE,
+                        region=SensorRegion(
+                            x=int(region.get("x", 0)),
+                            y=int(region.get("y", 0)),
+                            width=int(region["width"]),
+                            height=int(region["height"]),
+                        ),
+                        pass_index=bundle_index + 1,
+                        completed_work=bundle_index + 1,
+                        total_work=bundle_count,
+                        progress_fraction=(bundle_index + 1) / bundle_count,
+                        elapsed_s=time.perf_counter() - started,
+                        linear_accumulation_path=os.path.join(
+                            job_dir, "0000_cpp_linear.npy"
+                        ),
+                        sensor_sum_path=os.path.join(
+                            job_dir, "0000_cpp_sum_linear.npy"
+                        ),
+                        exposure_weight_path=os.path.join(
+                            job_dir, "0000_cpp_exposure_weight.npy"
+                        ),
+                        global_uv_bounds=(
+                            x0 / full_width,
+                            y0 / full_height,
+                            x1 / full_width,
+                            y1 / full_height,
+                        ),
+                        message=(
+                            f"sensor tile {tile_index + 1}/"
+                            f"{len(calibration_tiles)} composed into whole frame"
+                        ),
+                    )
+                    latest_artifact_event[0] = composite_event
+                    progress_sink(composite_event)
+                completed_bundle = eta_tracker.complete_bundle(bundle_index + 1)
+                publish_eta(completed_bundle)
+                overall_line = (
+                    f"[overall {sequence:04d}] {completed_bundle.message()}"
+                )
+                log.write(overall_line + "\n")
+                log.flush()
+                print(
+                    overall_line,
+                    flush=True,
+                )
+                if bundle_index + 1 < bundle_count and not calibration_tiles:
+                    bundle_sum = os.path.join(
+                        job_dir, "0000_cpp_sum_linear.npy"
+                    )
+                    bundle_weight = os.path.join(
+                        job_dir, "0000_cpp_exposure_weight.npy"
+                    )
+                    native_delta_restore = _prepare_native_delta_restore(
+                        revision_dir,
+                        {
+                            "metadata": {"delta_restore": {
+                                "sensor_sum_path": bundle_sum,
+                                "exposure_weight_path": bundle_weight,
+                            }},
+                            "pixel_slice_requests": [],
+                        },
+                    )
+                    environment["SPECTRAL_SENSOR_RESTORE_SUM"] = (
+                        native_delta_restore[0]
+                    )
+                    environment["SPECTRAL_SENSOR_RESTORE_WEIGHT"] = (
+                        native_delta_restore[1]
+                    )
+                    environment["SPECTRAL_SENSOR_DIRTY_SITES"] = (
+                        native_delta_restore[2]
+                    )
         linear_path = os.path.join(job_dir, "0000_cpp_linear.npy")
         diagnostic_image_path = os.path.join(job_dir, "0000_cpp.png")
         camera_image_path = os.path.join(job_dir, "0000_cpp_camera.png")
         linear_sensor = np.load(linear_path, allow_pickle=False)
         save_linear_sensor_image(linear_sensor, camera_image_path, camera_profile)
+        if calibration_tiles:
+            diagnostic_image_path = camera_image_path
         print(
             f"[live] camera output revision {sequence}: raw={linear_path} "
             f"display={camera_image_path} white_level={camera_profile.sensor_white_level:g} "
@@ -2326,18 +4140,30 @@ def make_subprocess_renderer(
             flush=True,
         )
         elapsed_s = time.perf_counter() - started
+        priority_array_path = os.path.join(job_dir, "0000_cpp_priority.npy")
+        priority_overlay_path = ""
+        if os.path.isfile(priority_array_path):
+            priority_values = np.load(priority_array_path, allow_pickle=False)
+            if priority_values.size and np.any(priority_values > 0.0):
+                priority_overlay_path = os.path.join(
+                    job_dir, "0000_cpp_priority.png"
+                )
         final = final_library.register_interface_after_render(
             PROGRAM_SCENE_ID,
             sequence,
             scene_path=order_path,
             image_path=camera_image_path,
             linear_path=linear_path,
-            manifest_path=os.path.join(job_dir, "composition_manifest.json"),
+            manifest_path=(
+                os.path.join(tile_job_dir, "composition_manifest.json")
+                if calibration_tiles
+                else os.path.join(job_dir, "composition_manifest.json")
+            ),
             text=text,
             display_name="Live spectral text interface",
             diagnostic_image_path=diagnostic_image_path,
             orthographic_path=flat_reference_path,
-            priority_overlay_path=os.path.join(job_dir, "0000_cpp_priority.png"),
+            priority_overlay_path=priority_overlay_path,
             render_log_path=log_path,
             metadata={
                 "tier": final_pipeline.tiers[-1].value,
@@ -2347,6 +4173,7 @@ def make_subprocess_renderer(
                 "final_policy": final_pipeline.final_policy,
                 "all_ui_elements_in_place": True,
                 "elapsed_s": elapsed_s,
+                "source_revision_dir": revision_dir,
                 "camera_profile": {
                     "sensor_white_level": camera_profile.sensor_white_level,
                     "exposure_compensation_ev": camera_profile.exposure_compensation_ev,
@@ -2369,6 +4196,7 @@ def make_subprocess_renderer(
         )
 
     setattr(render, "cancel_current", cancel_current)
+    setattr(render, "toggle_paused", toggle_paused)
     return render
 
 
@@ -2387,6 +4215,63 @@ def _texture_display_rect(
     width = max(1, int(round(float(source_width) * scale)))
     height = max(1, int(round(float(source_height) * scale)))
     return (window_width - width) // 2, (window_height - height) // 2, width, height
+
+
+def _presentation_rect(
+    logical_width: int,
+    logical_height: int,
+    physical_width: int,
+    physical_height: int,
+) -> tuple[int, int, int, int]:
+    """Fit the complete logical interface inside the physical window."""
+
+    scale = min(
+        float(physical_width) / max(1, int(logical_width)),
+        float(physical_height) / max(1, int(logical_height)),
+    )
+    width = max(1, int(round(int(logical_width) * scale)))
+    height = max(1, int(round(int(logical_height) * scale)))
+    return (
+        (int(physical_width) - width) // 2,
+        (int(physical_height) - height) // 2,
+        width,
+        height,
+    )
+
+
+def _presentation_subrect(
+    logical_rect: tuple[int, int, int, int],
+    presentation: tuple[int, int, int, int],
+    logical_width: int,
+    logical_height: int,
+) -> tuple[int, int, int, int]:
+    """Map one logical host rectangle into the fitted presentation."""
+
+    x, y, width, height = map(int, logical_rect)
+    px, py, pw, ph = map(int, presentation)
+    x0 = px + int(round(x * pw / max(1, int(logical_width))))
+    y0 = py + int(round(y * ph / max(1, int(logical_height))))
+    x1 = px + int(round((x + width) * pw / max(1, int(logical_width))))
+    y1 = py + int(round((y + height) * ph / max(1, int(logical_height))))
+    return x0, y0, max(1, x1 - x0), max(1, y1 - y0)
+
+
+def _presentation_point(
+    physical_point: tuple[int, int],
+    presentation: tuple[int, int, int, int],
+    logical_width: int,
+    logical_height: int,
+) -> tuple[int, int]:
+    """Map a pointer from the fitted window back to logical UI coordinates."""
+
+    x, y = map(int, physical_point)
+    px, py, pw, ph = map(int, presentation)
+    if not (px <= x < px + pw and py <= y < py + ph):
+        return -1, -1
+    return (
+        min(int(logical_width) - 1, int((x - px) * int(logical_width) / pw)),
+        min(int(logical_height) - 1, int((y - py) * int(logical_height) / ph)),
+    )
 
 
 def _texture_panel_rect(
@@ -2409,6 +4294,25 @@ def _texture_panel_rect(
         width,
         height,
     )
+
+
+def _work_panel_preview_texture(
+    exposure_texture: Any,
+    browser_texture: Any,
+    atlas_texture: Any,
+    priority_texture: Any,
+    *,
+    calibration_active: bool,
+) -> Any:
+    """Prefer each completed bundle's exposure while calibration is active."""
+
+    if calibration_active and exposure_texture is not None:
+        return exposure_texture
+    if browser_texture is not None:
+        return browser_texture
+    if atlas_texture is not None:
+        return atlas_texture
+    return priority_texture if priority_texture is not None else exposure_texture
 
 
 def _hud_layout(width: int) -> dict[str, int]:
@@ -2452,6 +4356,55 @@ def _initial_window_size(
         work_width, work_height, manifest or program_ui_manifest()
     )
     return metrics["frame_width"], metrics["frame_height"]
+
+
+def _layout_reference_size(manifest: Any = None) -> tuple[int, int]:
+    """Return manifest-authored UI geometry, independent of work products."""
+
+    effective_manifest = manifest or program_ui_manifest()
+    payload = (
+        effective_manifest.payload
+        if isinstance(effective_manifest.payload, dict)
+        else {}
+    )
+    raw = payload.get(
+        "layout_reference_size_px",
+        (DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_HEIGHT),
+    )
+    try:
+        width, height = int(raw[0]), int(raw[1])
+    except (TypeError, ValueError, IndexError) as exc:
+        raise ValueError(
+            "layout_reference_size_px must contain two positive integers"
+        ) from exc
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            "layout_reference_size_px must contain two positive integers"
+        )
+    return width, height
+
+
+def _layout_work_viewport_size(manifest: Any = None) -> tuple[int, int]:
+    """Return fixed authored work-panel geometry, not render tile size."""
+
+    effective_manifest = manifest or program_ui_manifest()
+    payload = (
+        effective_manifest.payload
+        if isinstance(effective_manifest.payload, dict)
+        else {}
+    )
+    raw = payload.get("layout_work_viewport_size_px", (256, 256))
+    try:
+        width, height = int(raw[0]), int(raw[1])
+    except (TypeError, ValueError, IndexError) as exc:
+        raise ValueError(
+            "layout_work_viewport_size_px must contain two positive integers"
+        ) from exc
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            "layout_work_viewport_size_px must contain two positive integers"
+        )
+    return width, height
 
 
 def _sensor_product_texture_rect(
@@ -2513,13 +4466,20 @@ def _active_work_texture(
     uv_bounds: tuple[float, float, float, float] | None,
     viewport_width: int,
     viewport_height: int,
+    work_piece_width: int,
+    work_piece_height: int,
+    final_edge_px: int,
     sequence: int,
 ) -> Any:
-    """Copy one exact-size 2-D region of the active sensor footprint."""
+    """Crop one work tile, then fit it to the current UI viewport."""
 
     if texture is None:
         return texture
     width, height = texture.get_size()
+    if width <= int(work_piece_width) and height <= int(work_piece_height):
+        return _fit_panel_preview_texture(
+            texture, viewport_width, viewport_height
+        )
     if uv_bounds is None:
         uv_bounds = (0.0, 0.0, 1.0, 1.0)
     u0, v0, u1, v1 = uv_bounds
@@ -2535,21 +4495,27 @@ def _active_work_texture(
         min(active.width, width - active.x),
         min(active.height, height - active.y),
     )
+    source_piece_width = max(1, int(round(
+        width * int(work_piece_width) / max(1, int(final_edge_px))
+    )))
+    source_piece_height = max(1, int(round(
+        height * int(work_piece_height) / max(1, int(final_edge_px))
+    )))
     regions = [
         SensorRegion(
             x,
             y,
-            min(viewport_width, active.x + active.width - x),
-            min(viewport_height, active.y + active.height - y),
+            min(source_piece_width, active.x + active.width - x),
+            min(source_piece_height, active.y + active.height - y),
         )
-        for y in range(active.y, active.y + active.height, viewport_height)
-        for x in range(active.x, active.x + active.width, viewport_width)
+        for y in range(active.y, active.y + active.height, source_piece_height)
+        for x in range(active.x, active.x + active.width, source_piece_width)
     ]
     # Morton order keeps presentation viewports spatially coherent while the
     # underlying work contract remains arbitrary 2-D regions and pixel slices.
     def morton(region: SensorRegion) -> int:
-        local_x = (region.x - active.x) // viewport_width
-        local_y = (region.y - active.y) // viewport_height
+        local_x = (region.x - active.x) // source_piece_width
+        local_y = (region.y - active.y) // source_piece_height
         result = 0
         for bit in range(max(local_x.bit_length(), local_y.bit_length(), 1)):
             result |= ((local_x >> bit) & 1) << (2 * bit)
@@ -2558,14 +4524,43 @@ def _active_work_texture(
 
     regions.sort(key=morton)
     selected = regions[max(0, int(sequence) - 1) % len(regions)]
-    work = texture.__class__((viewport_width, viewport_height))
-    work.fill((0, 0, 0))
-    work.blit(
-        texture,
-        (0, 0),
-        (selected.x, selected.y, selected.width, selected.height),
+    cropped = texture.subsurface(
+        (selected.x, selected.y, selected.width, selected.height)
+    ).copy()
+    return _fit_panel_preview_texture(
+        cropped, viewport_width, viewport_height
     )
-    return work
+
+
+def _fit_panel_preview_texture(
+    texture: Any,
+    viewport_width: int,
+    viewport_height: int,
+) -> Any:
+    """Scale and center a completed preview so it actually uses its panel."""
+
+    import pygame
+
+    if texture is None:
+        return None
+    viewport_width = max(1, int(viewport_width))
+    viewport_height = max(1, int(viewport_height))
+    source_width, source_height = texture.get_size()
+    x, y, width, height = _texture_panel_rect(
+        source_width,
+        source_height,
+        viewport_width,
+        viewport_height,
+    )
+    fitted = pygame.Surface((viewport_width, viewport_height))
+    fitted.fill((0, 0, 0))
+    scaled = (
+        texture
+        if (source_width, source_height) == (width, height)
+        else pygame.transform.smoothscale(texture, (width, height))
+    )
+    fitted.blit(scaled, (x, y))
+    return fitted
 
 
 def _load_work_preview_surface(
@@ -2659,8 +4654,8 @@ def _fixed_image_alphabet_is_ready(
 def run_window(
     output_root: str,
     initial_text: str,
-    display_width: int,
-    display_height: int,
+    work_width: int,
+    work_height: int,
     sensor_sweeps: int,
     camera_profile: ColorScienceProfile,
     targeted_fraction: float = DEFAULT_TARGETED_FRACTION,
@@ -2682,13 +4677,28 @@ def run_window(
     import pygame
 
     manifest = program_manifest_override or program_ui_manifest()
-    scene_width, scene_height = _initial_window_size(
-        display_width, display_height, manifest=manifest
+    from camera_software.equipment_manifest import resolve_equipment_settings
+    initial_ray_settings, initial_exposure_settings = (
+        resolve_equipment_settings(manifest)
     )
+    work_width, work_height = int(work_width), int(work_height)
+    if work_width <= 0 or work_height <= 0:
+        raise ValueError("work dimensions must be positive")
+    layout_width, layout_height = _layout_reference_size(manifest)
+    layout_work_width, layout_work_height = _layout_work_viewport_size(manifest)
+    scene_width, scene_height = layout_width, layout_height
+    # Function/CLI dimensions are explicit user input. Everything else, and
+    # the final raster in particular, begins at the manifest equipment layer.
+    initial_exposure_settings = replace(
+        initial_exposure_settings,
+        work_width_px=work_width,
+        work_height_px=work_height,
+    ).validated()
+    final_edge_px = int(initial_exposure_settings.final_edge_px)
     print(
         "[live] " + render_contract_summary(
-            display_width,
-            display_height,
+            work_width,
+            work_height,
             sensor_sweeps,
             scene_width=scene_width,
             scene_height=scene_height,
@@ -2705,6 +4715,21 @@ def run_window(
         f"{int(atlas_samples_per_node)} rays/node)",
         flush=True,
     )
+    update_cadence = atlas_update_cadence(
+        epochs_per_exposure=atlas_epochs_per_exposure,
+        steps_per_epoch=atlas_steps_per_epoch,
+        sensor_top_k=atlas_sensor_top_k,
+        samples_per_node=atlas_samples_per_node,
+    )
+    print(
+        "[live] atlas presentation cadence "
+        f"preview_every={update_cadence['preview_update_passes']} pass; "
+        f"convergence_every="
+        f"{update_cadence['convergence_update_passes']} passes "
+        f"({update_cadence['primary_rays_per_convergence_update']:,} "
+        "primary rays)",
+        flush=True,
+    )
     print(
         "[live] camera output "
         f"white_level={camera_profile.sensor_white_level:g} "
@@ -2715,17 +4740,62 @@ def run_window(
     )
     pygame.init()
     pygame.key.start_text_input()
-    window = pygame.display.set_mode((scene_width, scene_height))
+    # Keep the authored/sensor surface exact, but present it in a physical
+    # window that actually fits a desktop.  The inspectors are redrawn after
+    # fitting, at physical resolution, so their list text stays crisp.
+    desktop_sizes = pygame.display.get_desktop_sizes() or [(scene_width, scene_height)]
+    display_index = max(
+        range(len(desktop_sizes)),
+        key=lambda index: desktop_sizes[index][0] * desktop_sizes[index][1],
+    )
+    desktop_width, desktop_height = desktop_sizes[display_index]
+    available_width = max(640, int(desktop_width) - 64)
+    available_height = max(480, int(desktop_height) - 96)
+    initial_presentation = _presentation_rect(
+        scene_width, scene_height, available_width, available_height
+    )
+    display_window = pygame.display.set_mode(
+        (initial_presentation[2], initial_presentation[3]),
+        pygame.RESIZABLE,
+        display=display_index,
+    )
+    window = pygame.Surface((scene_width, scene_height)).convert()
     pygame.display.set_caption("Spectral text surface")
     clock = pygame.time.Clock()
+    from camera_loadout_browser import CameraLoadoutBrowser
     from render_work_browser import RenderWorkBrowser
 
     runtime_layout = resolved_program_ui_layout(
         scene_width,
         scene_height,
-        work_width=display_width,
-        work_height=display_height,
+        work_width=layout_work_width,
+        work_height=layout_work_height,
         manifest=manifest,
+        sensor_edge_px=final_edge_px,
+    )
+    layout_work_manifest = build_layout_object_work_manifest(
+        runtime_layout, os.path.abspath(output_root)
+    )
+    layout_work_directory = os.path.join(
+        os.path.abspath(output_root), "layout_object_work"
+    )
+    layout_work_manifest.save(os.path.join(
+        layout_work_directory, "work_manifest.json"
+    ))
+    layout_work_cache = LayoutWorkProgressCache(
+        layout_work_manifest.progress_cache_path
+    )
+    from camera_software.calibration_work import (
+        CalibrationWorkCatalog, calibration_work_key,
+    )
+    calibration_work_catalog = CalibrationWorkCatalog(os.path.join(
+        layout_work_directory, "calibration_assets"
+    ))
+    window_harvest_cache = WindowElementHarvestCache(os.path.join(
+        layout_work_directory, "window_element_harvests.json"
+    ))
+    panel_patch_loader = layout_work_cache.patch_loader(
+        layout_work_manifest
     )
     context_host = OpenGLContextHost(
         parent_gl_context, owned_factory=gl_context_factory
@@ -2734,7 +4804,29 @@ def run_window(
         key: context_host.acquire(request)
         for key, request in runtime_layout.context_requests.items()
     }
-    work_browser = RenderWorkBrowser("WORK / ASSETS")
+    camera_browser = CameraLoadoutBrowser("CAMERA LOADOUT")
+    work_browser = RenderWorkBrowser("SCENE / CALIBRATION")
+    from ray_trace_toolbar import RayTraceToolbar
+    ray_trace_toolbar = RayTraceToolbar(initial_ray_settings)
+    from exposure_control_toolbar import (
+        ExposureControlSettings, ExposureControlToolbar,
+    )
+    exposure_toolbar = ExposureControlToolbar(initial_exposure_settings)
+    from top_toolbar_rows import TopToolbarRows
+    top_toolbar_rows = TopToolbarRows(ray_trace_toolbar, exposure_toolbar)
+    from present_work_panel import PresentWorkPanel
+    present_work_panel = PresentWorkPanel(initial_text)
+    from render_progress_toolbar import RenderProgressToolbar
+    render_progress_toolbar = RenderProgressToolbar()
+    from work_preview_toolbar import WorkPreviewToolbar
+    work_preview_toolbar = WorkPreviewToolbar()
+    # Startup is intentionally inert. Validation descriptions remain visible,
+    # but neither CPU/GPU checks nor camera exposures run without RUN SELECTED.
+    work_browser.set_startup_validation(None, ())
+    print(
+        "[startup] idle; automatic work and automatic calibration are OFF",
+        flush=True,
+    )
 
     inventory = DisplaySceneInventory(os.path.join(
         os.path.abspath(output_root), "display_inventory.json"
@@ -2769,8 +4861,45 @@ def run_window(
         steps_per_epoch=atlas_steps_per_epoch,
         samples_per_node=atlas_samples_per_node,
     )
+    layout_library_objects = (
+        atlas_renderer.object_library.register_parametric_layout_manifest(
+            layout_work_manifest
+        )
+    )
+    print(
+        "[object-library] registered parametric layout scenes "
+        f"objects={len(layout_library_objects)} "
+        f"subtypes={sum(len(item.subtypes) for item in layout_library_objects)}",
+        flush=True,
+    )
+    object_resolver = HierarchicalObjectResolver(
+        runtime_layout,
+        atlas_renderer.object_library,
+        layout_work_manifest,
+        layout_work_cache,
+    )
+    window_element_manifest = build_window_element_scene_manifest(
+        runtime_layout
+    )
+    layout_usd_package = write_layout_usd_package(
+        layout_work_manifest,
+        layout_work_cache,
+        os.path.join(layout_work_directory, "usd"),
+        resolved_text_images=object_resolver.text_images(),
+        render_library=atlas_renderer.object_library,
+        assembly_readiness=object_resolver.assembly_readiness(),
+        window_element_manifest=window_element_manifest,
+    )
+    print(
+        f"[layout-usd] stage={layout_usd_package.stage_path} "
+        f"objects={len(layout_usd_package.object_layers)} "
+        f"text_images={len(layout_usd_package.text_image_layers)} "
+        f"animations={len(layout_usd_package.animation_layers)}",
+        flush=True,
+    )
     atlas_lock = threading.Lock()
     atlas_text = [str(initial_text)[:500]]
+    camera_fallback_order: list[dict[str, Any]] = [{}]
 
     def next_atlas_request() -> BakeRequest | None:
         with atlas_lock:
@@ -2789,7 +4918,26 @@ def run_window(
         progress_observer=retain_progress,
         background_source=next_atlas_request,
         background_render_function=atlas_renderer,
+        background_paused=True,
+        initial_sequence=_latest_revision_sequence(output_root),
     )
+    ordinary_work_enabled = [False]
+    calibration_orders: dict[int, dict[str, Any]] = {}
+    calibration_work_keys: dict[int, str] = {}
+    displaying_calibration = [False]
+
+    def checkpoint_interrupted_calibration() -> None:
+        latest_work, busy_work, _error_work, submitted_work = worker.snapshot()
+        if submitted_work not in calibration_work_keys:
+            return
+        if (
+            not busy_work and latest_work is not None
+            and latest_work.sequence == submitted_work
+        ):
+            return
+        work_key = calibration_work_keys.pop(submitted_work)
+        calibration_orders.pop(submitted_work, None)
+        calibration_work_catalog.checkpoint(work_key, submitted_work)
 
     def accept_selected_visual_pass() -> str:
         payload = work_browser.selected_payload
@@ -2839,20 +4987,117 @@ def run_window(
         worker.wake_background()
         return f"accepted cached work {accepted.target_key}"
 
-    text = str(initial_text)[:500]
-    cursor = len(text)
+    def activate_calibration_mode(mode_key: str) -> str:
+        from camera_software.calibration_modes import (
+            calibration_mode, run_calibration_validators,
+        )
+        from camera_software.ray_trace_settings import resolve_ray_trace_settings
+
+        mode_spec = calibration_mode(mode_key)
+        manifest = mode_spec.work_asset_manifest()
+        resolved_trace_settings = resolve_ray_trace_settings(
+            ray_trace_toolbar.settings, manifest
+        )
+        manifest["parameters"] = work_browser.calibration_parameters(mode_key)
+        manifest["user_ray_trace_settings"] = ray_trace_toolbar.settings.mapping()
+        manifest["resolved_ray_trace_settings"] = resolved_trace_settings.mapping()
+        manifest["exposure_control_settings"] = asdict(
+            exposure_toolbar.settings.validated()
+        )
+        manifest["render_product"] = {
+            "width": work_width,
+            "height": work_height,
+            "display_host": "work-panel",
+            "presentation_fit": "contain",
+        }
+        results = run_calibration_validators(mode_key)
+        status = ", ".join(
+            f"{result.validator_key}={'pass' if result.passed else 'FAIL'}"
+            for result in results
+        ) or "no injected validators"
+        if mode_key == "off":
+            return f"mode={mode_key} {status}; no exposure"
+        work_key = calibration_work_key(mode_key, manifest)
+        work_dir = os.path.join(calibration_work_catalog.root, work_key)
+        if mode_key == "double-slit":
+            wave_scene = dict(manifest.get("scene", {}))
+            propagation = dict(wave_scene.get("propagation", {}))
+            manifest["wave_solver"] = {
+                "cpu": "compiled RayTracer.wave_bpm_step",
+                "gpu": "csrc/shaders/ray_wave_bpm.comp.glsl",
+                "ray_transport_allowed": False,
+                "checkpoint_steps": 5,
+            }
+            # Recompute after adding the wave solver contract.
+            work_key = calibration_work_key(mode_key, manifest)
+            work_dir = os.path.join(calibration_work_catalog.root, work_key)
+            calibration_order = {
+                "schema_version": 1,
+                "defaults": {"image": {"region": {
+                    "x": 0, "y": 0, "width": work_width, "height": work_height,
+                }}},
+                "runtime": {
+                    "work_kind": "wave_calibration",
+                    "calibration_mode": mode_key,
+                    "wave_work_dir": work_dir,
+                    "wave_steps": int(propagation.get("steps", 100)),
+                },
+                "jobs": [{"id": "double_slit_wave", "token": ""}],
+            }
+        else:
+            calibration_order = build_calibration_render_order(
+                mode_key,
+                display_width=work_width,
+                display_height=work_height,
+                sensor_sweeps=1,
+                cohort_seed=worker.snapshot()[3] + 1,
+                transport_option=resolved_trace_settings.transport_option,
+                render_budget=resolved_trace_settings.render_budget(
+                    sensor_top_k=max(work_width, work_height)
+                ),
+                **work_browser.calibration_parameters(mode_key),
+            )
+            exposure_toolbar.settings.apply_to_order(calibration_order)
+            apply_toolbar_render_mode(
+                calibration_order, resolved_trace_settings.transport_mode
+            )
+        checkpoint_interrupted_calibration()
+        sequence = worker.submit(
+            f"CALIBRATION / {mode_key}", calibration_order, None
+        )
+        record = calibration_work_catalog.begin(
+            mode_key, mode_spec.label, manifest, sequence
+        )
+        calibration_orders[sequence] = calibration_order
+        calibration_work_keys[sequence] = record.work_key
+        return (
+            f"mode={mode_key} work={record.manifest_path} {status}; "
+            f"retained calibration revision={sequence} queued"
+        )
+
+    text = present_work_panel.text
     submitted_text = ""
     dirty_at = time.monotonic() - 2.0
+    assembly_dirty_at = dirty_at
+    observed_assembly_signature: tuple[Any, ...] | None = None
+    submitted_assembly_signature: tuple[Any, ...] | None = None
     loaded_sequence = 0
+    submitted_window_manifests: dict[int, Any] = {}
     loaded_progress: tuple[str, int] | None = None
     progress_event: ExposureProgressEvent | None = None
+    presented_progress_exposure = ""
+    presented_progress_linear: np.ndarray | None = None
+    arrival_shimmer: np.ndarray | None = None
+    arrival_shimmer_started_s = 0.0
     texture = None
     priority_texture = None
     atlas_work_texture = None
     atlas_work_revision = -1
     browser_preview_texture = None
     browser_preview_path = ""
-    photographed_region = program_display_region(scene_width, scene_height)
+    photographed_region = program_display_region(
+        scene_width, scene_height, sensor_edge_px=final_edge_px
+    )
     ui_sensor_regions = {
         key: SensorRegion(*rect)
         for key, rect in runtime_layout.regions.items()
@@ -2863,27 +5108,74 @@ def run_window(
         scene_width,
         scene_height,
     )
-    pre_render_panel_surfaces: list[tuple[tuple[int, int, int, int], Any]] = []
+    work_window_rect = _sensor_product_window_rect(
+        ui_sensor_regions["work-panel"],
+        photographed_region,
+        scene_width,
+        scene_height,
+    )
+    camera_browser_rect = _sensor_product_window_rect(
+        ui_sensor_regions["camera-panel"],
+        photographed_region,
+        scene_width,
+        scene_height,
+    )
+    toolbar_rects = {
+        key: _sensor_product_window_rect(
+            ui_sensor_regions[key], photographed_region,
+            scene_width, scene_height,
+        )
+        for key in top_toolbar_rows.ROW_KEYS
+    }
+    status_window_rect = _sensor_product_window_rect(
+        ui_sensor_regions["status-text"],
+        photographed_region,
+        scene_width,
+        scene_height,
+    )
+    present_work_window_rect = _sensor_product_window_rect(
+        ui_sensor_regions["editor-text"],
+        photographed_region,
+        scene_width,
+        scene_height,
+    )
     pre_render_primitives = {
         **runtime_layout.panel_primitives,
         **runtime_layout.action_primitives,
     }
-    for panel_id, primitive in pre_render_primitives.items():
-        if panel_id not in ui_sensor_regions:
-            continue
-        region = ui_sensor_regions[panel_id]
-        destination = _sensor_product_window_rect(
-            region, photographed_region, scene_width, scene_height
-        )
-        rgba = compose_layout_panel_rgba(
-            primitive,
-            destination[2],
-            destination[3],
-        )
-        panel_surface = pygame.image.frombuffer(
-            rgba.tobytes(), (destination[2], destination[3]), "RGBA"
-        ).convert_alpha()
-        pre_render_panel_surfaces.append((destination, panel_surface))
+
+    def compose_pre_render_panel_surfaces(
+    ) -> list[tuple[tuple[int, int, int, int], Any]]:
+        surfaces: list[tuple[tuple[int, int, int, int], Any]] = []
+        for panel_id, primitive in pre_render_primitives.items():
+            if panel_id not in ui_sensor_regions:
+                continue
+            region = ui_sensor_regions[panel_id]
+            destination = _sensor_product_window_rect(
+                region, photographed_region, scene_width, scene_height
+            )
+            rgba = compose_layout_panel_rgba(
+                primitive,
+                destination[2],
+                destination[3],
+                image_loader=panel_patch_loader,
+            )
+            panel_surface = pygame.image.frombuffer(
+                rgba.tobytes(), (destination[2], destination[3]), "RGBA"
+            ).convert_alpha()
+            surfaces.append((destination, panel_surface))
+        return surfaces
+
+    def artifact_revision(path: str) -> tuple[str, int, int]:
+        absolute = os.path.abspath(path) if path else ""
+        try:
+            stat = os.stat(absolute)
+            return absolute, int(stat.st_mtime_ns), int(stat.st_size)
+        except OSError:
+            return absolute, -1, -1
+
+    pre_render_panel_surfaces = compose_pre_render_panel_surfaces()
+    layout_constituent_signature = layout_work_cache.revision_signature()
     ray_control_hitboxes: dict[str, Any] = {}
     transition_restore: dict[str, str] = {}
     transition_dirty_slice: SensorPixelSlice | None = None
@@ -2894,24 +5186,234 @@ def run_window(
     cached_layout_text_surfaces: list[
         tuple[tuple[int, int, int, int], Any]
     ] = []
+    published_usd_signature: tuple[Any, ...] = ()
     running = True
 
     try:
         while running:
+            display_window = pygame.display.get_surface()
+            presentation = _presentation_rect(
+                scene_width, scene_height,
+                display_window.get_width(), display_window.get_height(),
+            )
+            camera_browser_display_rect = _presentation_subrect(
+                camera_browser_rect, presentation, scene_width, scene_height
+            )
+            browser_display_rect = _presentation_subrect(
+                browser_window_rect, presentation, scene_width, scene_height
+            )
+            work_display_rect = _presentation_subrect(
+                work_window_rect, presentation, scene_width, scene_height
+            )
+            presentation_scale = presentation[3] / max(1, scene_height)
+            work_tab_inset = max(1, int(round(3 * presentation_scale)))
+            work_tab_height = min(
+                max(14, int(round(
+                    WorkPreviewToolbar.HEIGHT * presentation_scale
+                ))),
+                max(1, work_display_rect[3] - 2 * work_tab_inset),
+            )
+            work_preview_tabs_rect = (
+                work_display_rect[0] + work_tab_inset,
+                work_display_rect[1] + work_tab_inset,
+                max(1, work_display_rect[2] - 2 * work_tab_inset),
+                work_tab_height,
+            )
+            status_display_rect = _presentation_subrect(
+                status_window_rect,
+                presentation,
+                scene_width,
+                scene_height,
+            )
+            present_work_display_rect = _presentation_subrect(
+                present_work_window_rect,
+                presentation,
+                scene_width,
+                scene_height,
+            )
+            toolbar_display_rects = {
+                key: _presentation_subrect(
+                    rect, presentation, scene_width, scene_height
+                )
+                for key, rect in toolbar_rects.items()
+            }
+            browser_content_rect = browser_display_rect
             for event in pygame.event.get():
                 if event.type != pygame.QUIT:
-                    browser_action = work_browser.handle_event(
-                        event, browser_window_rect
+                    toolbar_action = None
+                    exposure_toolbar_action = None
+                    advanced_route = present_work_panel.handle_panel_event(
+                        event, present_work_display_rect
                     )
-                    if browser_action is not None:
+                    if advanced_route is not None:
+                        advanced_action = top_toolbar_rows.handle_routed(
+                            *advanced_route
+                        )
+                        if advanced_action == "ray-settings-changed":
+                            toolbar_action = advanced_action
+                        elif advanced_action == "exposure-settings-changed":
+                            exposure_toolbar_action = advanced_action
+                    for row_key in top_toolbar_rows.ROW_KEYS:
+                        row_action = top_toolbar_rows.handle_event(
+                            row_key, event, toolbar_display_rects[row_key]
+                        )
+                        if row_action == "ray-settings-changed":
+                            toolbar_action = row_action
+                            present_work_panel.show_toolbar(
+                                row_key, top_toolbar_rows.panels[row_key].label
+                            )
+                        elif row_action == "exposure-settings-changed":
+                            exposure_toolbar_action = row_action
+                            present_work_panel.show_toolbar(
+                                row_key, top_toolbar_rows.panels[row_key].label
+                            )
+                    progress_toolbar_action = render_progress_toolbar.handle_event(
+                        event, status_display_rect
+                    )
+                    work_preview_action = work_preview_toolbar.handle_event(
+                        event, work_preview_tabs_rect
+                    )
+                    if progress_toolbar_action == "toggle-render-pause":
+                        paused = worker.toggle_foreground_paused()
+                        if paused is None:
+                            print("[render-control] no active render to pause", flush=True)
+                        else:
+                            render_progress_toolbar.set_paused(paused)
+                            print(
+                                "[render-control] "
+                                + ("PAUSED" if paused else "RESUMED"),
+                                flush=True,
+                            )
+                    elif progress_toolbar_action == "cancel-render":
+                        cancel_sequence = worker.snapshot()[3]
+                        cancelled = worker.cancel_foreground()
+                        if cancelled and cancel_sequence in calibration_work_keys:
+                            cancelled_key = calibration_work_keys.pop(cancel_sequence)
+                            calibration_orders.pop(cancel_sequence, None)
+                            calibration_work_catalog.checkpoint(
+                                cancelled_key, cancel_sequence
+                            )
+                        render_progress_toolbar.set_paused(False)
+                        print(
+                            "[render-control] "
+                            + ("CANCEL REQUESTED" if cancelled else "no active render"),
+                            flush=True,
+                        )
+                    camera_action = camera_browser.handle_event(
+                        event, camera_browser_display_rect
+                    )
+                    work_action = work_browser.handle_event(
+                        event, browser_content_rect
+                    )
+                    if work_action and work_action not in {"scroll"}:
+                        if work_action.startswith((
+                            "calibration:", "calibration-config:"
+                        )):
+                            mode_key = work_action.split(":", 1)[1]
+                            work_browser.select_calibration_mode(mode_key)
+                            present_work_panel.show_calibration(
+                                work_browser.selected_calibration_mode,
+                                work_browser.calibration_parameters(mode_key),
+                            )
+                        elif work_action not in {
+                            "delete-selected-version", "work-assets-root"
+                        }:
+                            present_work_panel.show_work(
+                                work_browser.selected_payload
+                            )
+                    if work_action == "delete-selected-version":
+                        selected = work_browser.selected_payload
+                        assembly = selected.get("assembly")
+                        latest_version = getattr(assembly, "latest", None)
+                        if assembly is None or latest_version is None:
+                            print(
+                                "[version-delete] select a retained interface "
+                                "version before deleting",
+                                flush=True,
+                            )
+                        else:
+                            deleted = atlas_renderer.object_library.delete_interface_after_render(
+                                assembly.assembly_key,
+                                render_key=latest_version.render_key,
+                            )
+                            print(
+                                f"[version-delete] deleted revision={deleted.revision} "
+                                f"render={deleted.render_key}",
+                                flush=True,
+                            )
+                    if work_action and work_action.startswith("calibration:"):
+                        print(
+                            "[calibration] " + activate_calibration_mode(
+                                work_action.split(":", 1)[1]
+                            ),
+                            flush=True,
+                        )
+                    if (
+                        toolbar_action is not None
+                        or exposure_toolbar_action is not None
+                        or progress_toolbar_action is not None
+                        or work_preview_action is not None
+                        or camera_action is not None
+                        or work_action is not None
+                    ):
+                        if toolbar_action is not None:
+                            dirty_at = time.monotonic()
+                            assembly_dirty_at = dirty_at
+                        if exposure_toolbar_action is not None:
+                            live_format = exposure_toolbar.settings.validated()
+                            previous_format = (
+                                work_width, work_height, final_edge_px
+                            )
+                            work_width = int(live_format.work_width_px)
+                            work_height = int(live_format.work_height_px)
+                            final_edge_px = int(live_format.final_edge_px)
+                            current_format = (
+                                work_width, work_height, final_edge_px
+                            )
+                            if current_format != previous_format:
+                                old_region = photographed_region
+                                photographed_region = program_display_region(
+                                    scene_width,
+                                    scene_height,
+                                    sensor_edge_px=final_edge_px,
+                                )
+                                dx = photographed_region.x - old_region.x
+                                dy = photographed_region.y - old_region.y
+                                ui_sensor_regions = {
+                                    key: SensorRegion(
+                                        region.x + dx, region.y + dy,
+                                        region.width, region.height,
+                                    )
+                                    for key, region in ui_sensor_regions.items()
+                                }
+                                if final_edge_px != previous_format[2]:
+                                    # A different sensor grid cannot consume an
+                                    # old accumulation without resampling it.
+                                    worker.cancel_foreground()
+                                    texture = None
+                                    loaded_progress = None
+                                    progress_event = None
+                                print(
+                                    "[format] "
+                                    f"film={DEFAULT_FILM_FORMAT.key} "
+                                    f"work={work_width}x{work_height} "
+                                    f"final={final_edge_px}x{final_edge_px} "
+                                    "pixel_aspect=1.0; new scene revision queued",
+                                    flush=True,
+                                )
+                            dirty_at = time.monotonic()
+                            assembly_dirty_at = dirty_at
                         continue
                 if event.type == pygame.QUIT:
                     running = False
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    logical_pointer = _presentation_point(
+                        event.pos, presentation, scene_width, scene_height
+                    )
                     action_key = next(
                         (
                             key for key, hitbox in ray_control_hitboxes.items()
-                            if hitbox.collidepoint(event.pos)
+                            if hitbox.collidepoint(logical_pointer)
                         ),
                         "",
                     )
@@ -2929,33 +5431,22 @@ def run_window(
                         )
                     elif action_key == "queue-pause-auto":
                         paused = worker.toggle_background_paused()
+                        ordinary_work_enabled[0] = not paused
                         print(
                             "[layout-action] automatic queue resolution "
                             + ("paused" if paused else "resumed"),
                             flush=True,
                         )
                 elif event.type == pygame.TEXTINPUT:
-                    text = (text[:cursor] + event.text + text[cursor:])[:500]
-                    cursor = min(len(text), cursor + len(event.text))
-                    dirty_at = time.monotonic()
+                    if present_work_panel.handle_text_event(event):
+                        text = present_work_panel.text
+                        dirty_at = time.monotonic()
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
-                    elif event.key == pygame.K_BACKSPACE and cursor > 0:
-                        text = text[:cursor - 1] + text[cursor:]
-                        cursor -= 1
+                    elif present_work_panel.handle_text_event(event):
+                        text = present_work_panel.text
                         dirty_at = time.monotonic()
-                    elif event.key == pygame.K_DELETE and cursor < len(text):
-                        text = text[:cursor] + text[cursor + 1:]
-                        dirty_at = time.monotonic()
-                    elif event.key == pygame.K_LEFT:
-                        cursor = max(0, cursor - 1)
-                    elif event.key == pygame.K_RIGHT:
-                        cursor = min(len(text), cursor + 1)
-                    elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                        text = text[:cursor] + "\n" + text[cursor:]
-                    cursor += 1
-                    dirty_at = time.monotonic()
 
             with atlas_lock:
                 atlas_text_changed = atlas_text[0] != text
@@ -2970,23 +5461,61 @@ def run_window(
             alphabet_ready = _fixed_image_alphabet_is_ready(
                 atlas_catalog, manifest
             )
+            assembly_readiness = object_resolver.assembly_readiness()
+            assembly_layout_signature = layout_work_cache.revision_signature()
+            assembly_catalog_signature = tuple(
+                (
+                    record.record_key,
+                    artifact_revision(str(record.metadata.get("sprite_path", ""))),
+                    artifact_revision(record.linear_path),
+                    artifact_revision(record.preview_path),
+                    int(record.metadata.get("refinement_pass", record.samples)),
+                )
+                for record in atlas_catalog.snapshot()
+            )
+            assembly_signature = (
+                text,
+                (work_width, work_height, final_edge_px),
+                json.dumps(
+                    ray_trace_toolbar.settings.mapping(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                assembly_layout_signature,
+                assembly_catalog_signature,
+                window_element_manifest.content_signature,
+                json.dumps(
+                    assembly_readiness.mapping(), sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+            if assembly_signature != observed_assembly_signature:
+                observed_assembly_signature = assembly_signature
+                assembly_dirty_at = time.monotonic()
+            background_busy, _background_error = worker.background_snapshot()
 
             if (
+                ordinary_work_enabled[0]
+                and
                 text.strip()
-                and text != submitted_text
+                and assembly_signature != submitted_assembly_signature
                 and production_ready
-                and time.monotonic() - dirty_at >= 1.0
+                and assembly_readiness.ready
+                and not background_busy
+                and time.monotonic() - max(dirty_at, assembly_dirty_at) >= 1.0
             ):
                 next_revision = worker.snapshot()[3] + 1
                 scene = build_self_rendering_program_scene(
                     text,
                     display_width=scene_width,
                     display_height=scene_height,
-                    work_width=display_width,
-                    work_height=display_height,
+                    work_width=layout_work_width,
+                    work_height=layout_work_height,
                     status_text="SPECTRAL EXPOSURE ACTIVE",
                     revision=next_revision,
                     program_manifest=manifest,
+                    window_element_manifest=window_element_manifest,
+                    sensor_edge_px=final_edge_px,
                 )
                 delta_restore: dict[str, str] = {}
                 for retained_scene in inventory.snapshot():
@@ -3036,16 +5565,37 @@ def run_window(
                 order = build_display_scene_order(
                     scene, sensor_sweeps=sensor_sweeps,
                 )
+                exposure_toolbar.settings.apply_to_order(order)
+                camera_fallback_order[0] = order
+                allocation_targeted_fraction = (
+                    exposure_toolbar.settings.targeted_fraction(
+                        targeted_fraction
+                    )
+                )
+                allocation_grid_mode = (
+                    "n-tree"
+                    if exposure_toolbar.settings.allocation_mode
+                    == "n-tree-preview"
+                    else ray_trace_toolbar.settings.grid_mode
+                )
                 next_scan = build_ui_next_scan_control(
                     scene,
                     photographed_region,
                     sequence=worker.snapshot()[3] + 1,
-                    targeted_fraction=targeted_fraction,
-                    scan_width=display_width,
-                    scan_height=display_height,
+                    targeted_fraction=allocation_targeted_fraction,
+                    scan_width=work_width,
+                    scan_height=work_height,
                     delta_restore=delta_restore,
+                    grid_mode=allocation_grid_mode,
+                    subdivision_axis=ray_trace_toolbar.settings.subdivision_axis,
+                    locked_grid_columns=(
+                        ray_trace_toolbar.settings.locked_grid_columns
+                    ),
+                    locked_grid_rows=ray_trace_toolbar.settings.locked_grid_rows,
                 )
+                checkpoint_interrupted_calibration()
                 sequence = worker.submit(text, order, next_scan)
+                submitted_window_manifests[sequence] = window_element_manifest
                 transition_restore = delta_restore
                 requests = next_scan.get("pixel_slice_requests", ())
                 transition_dirty_slice = (
@@ -3064,8 +5614,8 @@ def run_window(
                 print(
                     f"[live] submitted revision {sequence}: characters={len(text)} "
                     + render_contract_summary(
-                        display_width,
-                        display_height,
+                        work_width,
+                        work_height,
                         sensor_sweeps,
                         scene_width=scene_width,
                         scene_height=scene_height,
@@ -3073,10 +5623,23 @@ def run_window(
                     flush=True,
                 )
                 submitted_text = text
+                submitted_assembly_signature = assembly_signature
+                # Never present an older holistic exposure under newer
+                # constituent panels or glyphs while the replacement renders.
+                texture = None
                 loaded_progress = None
                 progress_event = None
 
             latest, _busy, _error, _submitted_sequence = worker.snapshot()
+            if (
+                _error and not _busy
+                and _submitted_sequence in calibration_work_keys
+            ):
+                failed_key = calibration_work_keys.pop(_submitted_sequence)
+                calibration_orders.pop(_submitted_sequence, None)
+                calibration_work_catalog.fail(
+                    failed_key, _submitted_sequence, _error
+                )
             (
                 current_work_revision,
                 current_work_path,
@@ -3146,6 +5709,25 @@ def run_window(
                     current_work_pass,
                     current_work_active,
                 ),
+                layout_work=(layout_work_manifest, layout_work_cache),
+                resolved_text_images=object_resolver.text_images(),
+                calibration_work=calibration_work_catalog.snapshot(),
+            )
+            camera_browser.sync(
+                work_browser.selected_payload,
+                fallback_order=camera_fallback_order[0],
+                camera_profile=camera_profile,
+                progress_metrics=work_browser.selected_metrics,
+            )
+            window_element_manifest = build_window_element_scene_manifest(
+                runtime_layout,
+                widgets={
+                    "camera-panel": camera_browser,
+                    "asset-browser": work_browser,
+                },
+                widget_display_origin_sensor_px=(
+                    photographed_region.x, photographed_region.y
+                ),
             )
             selected_preview_path = work_browser.selected_preview_path
             if selected_preview_path != browser_preview_path:
@@ -3159,6 +5741,7 @@ def run_window(
                         browser_preview_texture = None
                 browser_preview_path = selected_preview_path
             newest_progress, _progress_layers = worker.progress_snapshot()
+            render_progress_toolbar.update(newest_progress)
             if newest_progress is not None:
                 progress_key = (newest_progress.exposure_id, newest_progress.sequence)
                 if progress_key != loaded_progress:
@@ -3170,10 +5753,18 @@ def run_window(
                             newest_progress.linear_accumulation_path,
                             allow_pickle=False,
                         )
+                        progress_weight = None
+                        if (
+                            newest_progress.exposure_weight_path
+                            and os.path.isfile(newest_progress.exposure_weight_path)
+                        ):
+                            progress_weight = np.load(
+                                newest_progress.exposure_weight_path,
+                                allow_pickle=False,
+                            )
                         if (
                             transition_dirty_slice is not None
-                            and newest_progress.exposure_weight_path
-                            and os.path.isfile(newest_progress.exposure_weight_path)
+                            and progress_weight is not None
                             and os.path.isfile(
                                 transition_restore.get("sensor_sum_path", "")
                             )
@@ -3185,10 +5776,7 @@ def run_window(
                         ):
                             linear_progress = _blend_delta_exposure(
                                 linear_progress,
-                                np.load(
-                                    newest_progress.exposure_weight_path,
-                                    allow_pickle=False,
-                                ),
+                                progress_weight,
                                 np.load(
                                     transition_restore["sensor_sum_path"],
                                     allow_pickle=False,
@@ -3199,6 +5787,53 @@ def run_window(
                                 ),
                                 transition_dirty_slice,
                             )
+                        shimmer_counts = None
+                        if (
+                            newest_progress.sample_count_path
+                            and os.path.isfile(newest_progress.sample_count_path)
+                        ):
+                            shimmer_counts = np.load(
+                                newest_progress.sample_count_path,
+                                allow_pickle=False,
+                            )
+                        shimmer_priority = None
+                        if (
+                            newest_progress.priority_map_path
+                            and newest_progress.priority_map_path.lower().endswith(".npy")
+                            and os.path.isfile(newest_progress.priority_map_path)
+                        ):
+                            shimmer_priority = np.load(
+                                newest_progress.priority_map_path,
+                                allow_pickle=False,
+                            )
+                        now_s = time.monotonic()
+                        if (
+                            presented_progress_exposure == newest_progress.exposure_id
+                            and presented_progress_linear is not None
+                            and presented_progress_linear.shape == linear_progress.shape
+                        ):
+                            new_shimmer = _arrival_shimmer_rgb(
+                                presented_progress_linear,
+                                linear_progress,
+                                sample_count=shimmer_counts,
+                                priority_map=shimmer_priority,
+                            )
+                            if arrival_shimmer is not None:
+                                carried = math.exp(
+                                    -max(0.0, now_s - arrival_shimmer_started_s) / 0.70
+                                )
+                                new_shimmer = np.maximum(
+                                    new_shimmer, arrival_shimmer * (0.55 * carried)
+                                )
+                            arrival_shimmer = new_shimmer
+                            arrival_shimmer_started_s = now_s
+                        else:
+                            arrival_shimmer = None
+                            arrival_shimmer_started_s = now_s
+                        presented_progress_exposure = newest_progress.exposure_id
+                        presented_progress_linear = np.ascontiguousarray(
+                            linear_progress, np.float32
+                        ).copy()
                         # Presentation-only exposure for an in-progress Monte
                         # Carlo layer. Raw evidence remains linear and untouched.
                         preview_rgb = np.maximum(linear_progress[..., :3], 0.0)
@@ -3215,30 +5850,64 @@ def run_window(
                         display_progress = process_linear_sensor_image(
                             linear_progress, preview_profile,
                         )
+                        display_progress = _mark_unexposed_preview(
+                            display_progress, progress_weight
+                        )
                         pixels = np.ascontiguousarray(
                             np.clip(display_progress[..., :3], 0.0, 1.0) * 255.0,
                             dtype=np.uint8,
                         )
-                        texture = pygame.surfarray.make_surface(pixels.swapaxes(0, 1))
+                        if display_progress.shape[2] >= 4:
+                            texture = pygame.Surface(
+                                (pixels.shape[1], pixels.shape[0]),
+                                flags=pygame.SRCALPHA,
+                                depth=32,
+                            )
+                            rgb_view = pygame.surfarray.pixels3d(texture)
+                            rgb_view[...] = pixels.swapaxes(0, 1)
+                            del rgb_view
+                            alpha_view = pygame.surfarray.pixels_alpha(texture)
+                            alpha_view[...] = np.ascontiguousarray(
+                                np.clip(display_progress[..., 3], 0.0, 1.0)
+                                * 255.0,
+                                dtype=np.uint8,
+                            ).swapaxes(0, 1)
+                            del alpha_view
+                        else:
+                            texture = pygame.surfarray.make_surface(
+                                pixels.swapaxes(0, 1)
+                            )
+                    elif (
+                        newest_progress.preview_path
+                        and os.path.isfile(newest_progress.preview_path)
+                    ):
+                        # Wave calibration publishes already-developed band
+                        # strips while retaining its complex fields separately.
+                        texture = pygame.image.load(
+                            newest_progress.preview_path
+                        ).convert()
                     priority_path = newest_progress.priority_map_path
                     if priority_path and os.path.isfile(priority_path):
                         if priority_path.lower().endswith(".npy"):
                             values = np.maximum(
                                 np.load(priority_path, allow_pickle=False), 0.0
                             )
-                            peak = max(float(np.max(values)), 1.0e-12)
-                            value = np.clip(values / peak, 0.0, 1.0)
-                            heat = np.stack([
-                                value,
-                                np.sqrt(value) * 0.35,
-                                1.0 - value,
-                            ], axis=-1)
-                            priority_pixels = np.ascontiguousarray(
-                                heat * 255.0, dtype=np.uint8
-                            )
-                            priority_texture = pygame.surfarray.make_surface(
-                                priority_pixels.swapaxes(0, 1)
-                            )
+                            peak = float(np.max(values)) if values.size else 0.0
+                            if peak > 0.0:
+                                value = np.clip(values / peak, 0.0, 1.0)
+                                heat = np.stack([
+                                    value,
+                                    np.sqrt(value) * 0.35,
+                                    1.0 - value,
+                                ], axis=-1)
+                                priority_pixels = np.ascontiguousarray(
+                                    heat * 255.0, dtype=np.uint8
+                                )
+                                priority_texture = pygame.surfarray.make_surface(
+                                    priority_pixels.swapaxes(0, 1)
+                                )
+                            else:
+                                priority_texture = None
                         else:
                             priority_texture = pygame.image.load(priority_path).convert()
                     loaded_progress = progress_key
@@ -3250,7 +5919,101 @@ def run_window(
                     texture = pygame.image.load(latest.image_path).convert()
                 if latest.priority_overlay_path and os.path.isfile(latest.priority_overlay_path):
                     priority_texture = pygame.image.load(latest.priority_overlay_path).convert()
+                else:
+                    priority_texture = None
                 loaded_sequence = latest.sequence
+                completed_calibration = calibration_orders.pop(
+                    latest.sequence, None
+                )
+                completed_work_key = calibration_work_keys.pop(
+                    latest.sequence, ""
+                )
+                displaying_calibration[0] = completed_calibration is not None
+                if completed_calibration is not None:
+                    if str(completed_calibration.get("runtime", {}).get(
+                        "work_kind", ""
+                    )) == "wave_calibration":
+                        texture = pygame.image.load(latest.image_path).convert()
+                    if completed_work_key:
+                        calibration_work_catalog.complete(
+                            completed_work_key,
+                            latest.sequence,
+                            preview_path=latest.image_path,
+                            linear_path=latest.linear_path,
+                            result_manifest_path=latest.manifest_path,
+                            elapsed_s=latest.elapsed_s,
+                        )
+                    if str(completed_calibration.get("runtime", {}).get(
+                        "work_kind", ""
+                    )) != "wave_calibration":
+                        camera_fallback_order[0] = completed_calibration
+                    startup_key = str(
+                        completed_calibration.get("runtime", {}).get(
+                            "startup_validation_key", ""
+                        )
+                    )
+                    if startup_key:
+                        work_browser.set_startup_exposure(
+                            startup_key,
+                            "passed",
+                            preview_path=latest.image_path,
+                            detail=f"native camera exposure revision {latest.sequence}",
+                        )
+                    print(
+                        "[calibration] displaying raytraced calibration "
+                        f"revision={latest.sequence}",
+                        flush=True,
+                    )
+                else:
+                    order_defaults = dict(
+                        camera_fallback_order[0].get("defaults", {})
+                    )
+                    harvest_manifest = submitted_window_manifests.pop(
+                        latest.sequence, window_element_manifest
+                    )
+                    harvested_camera = resolve_camera_manifest(
+                        dict(order_defaults.get("camera", {})),
+                        dict(order_defaults.get("image", {})),
+                        dict(order_defaults.get("flash", {})),
+                    )
+                    harvest_condition = window_harvest_cache.condition_signature(
+                        camera_key=harvested_camera.hash,
+                        lighting_key=manifest_hash({
+                            "flash_geometry": harvested_camera.compatibility_key(
+                                "flash_geometry"
+                            ),
+                            "flash_spectrum": harvested_camera.compatibility_key(
+                                "flash_spectrum"
+                            ),
+                        }, namespace="window-lighting"),
+                        material_key=manifest_hash(
+                            [
+                                (item.style_object_key, item.style_subtype_key)
+                                for item in harvest_manifest.elements
+                            ], namespace="window-materials"
+                        ),
+                        reflection_boundary_key=manifest_hash({
+                            "scene": PROGRAM_SCENE_ID,
+                            "layout": harvest_manifest.content_signature,
+                        }, namespace="window-reflection-boundary"),
+                        color_transform_key=manifest_hash(asdict(camera_profile),
+                            namespace="window-color-transform"),
+                    )
+                    try:
+                        window_harvest_cache.harvest(
+                            harvest_manifest,
+                            condition_signature=harvest_condition,
+                            display_image_path=latest.image_path,
+                            linear_image_path=latest.linear_path,
+                            output_directory=os.path.join(
+                                layout_work_directory, "harvested_window_elements"
+                            ),
+                        )
+                    except (OSError, ValueError) as exc:
+                        print(
+                            f"[window-harvest] skipped incompatible exposure: {exc}",
+                            flush=True,
+                        )
                 print(
                     f"[live] completed revision {latest.sequence}: "
                     f"texture={texture.get_width()}x{texture.get_height()} "
@@ -3258,13 +6021,27 @@ def run_window(
                     flush=True,
                 )
 
+            current_layout_signature = layout_work_cache.revision_signature()
+            if current_layout_signature != layout_constituent_signature:
+                pre_render_panel_surfaces = compose_pre_render_panel_surfaces()
+                layout_constituent_signature = current_layout_signature
+
             # CLI dimensions permanently define the complete preview product.
             # Every panel, label, control, editor, and status pixel stays inside.
             width, height = scene_width, scene_height
             window.fill((15, 18, 19))
             for panel_destination, panel_surface in pre_render_panel_surfaces:
                 window.blit(panel_surface, panel_destination[:2])
-            if texture is not None and production_ready:
+            submitted_sequence = worker.snapshot()[3]
+            calibration_active = (
+                displaying_calibration[0]
+                or submitted_sequence in calibration_orders
+            )
+            if (
+                texture is not None
+                and not calibration_active
+                and production_ready
+            ):
                 window.blit(texture, (0, 0))
             editor_destination = _sensor_product_window_rect(
                 ui_sensor_regions["editor-text"],
@@ -3276,7 +6053,9 @@ def run_window(
             catalog_signature = tuple(
                 (
                     record.record_key,
-                    str(record.metadata.get("sprite_path", "")),
+                    artifact_revision(str(record.metadata.get("sprite_path", ""))),
+                    artifact_revision(record.linear_path),
+                    artifact_revision(record.preview_path),
                     int(record.metadata.get(
                         "refinement_pass", record.samples
                     )),
@@ -3285,6 +6064,22 @@ def run_window(
                 )
                 for record in catalog_state
             )
+            scene_constituent_signature = (
+                catalog_signature,
+                layout_constituent_signature,
+                window_element_manifest.content_signature,
+            )
+            if scene_constituent_signature != published_usd_signature:
+                layout_usd_package = write_layout_usd_package(
+                    layout_work_manifest,
+                    layout_work_cache,
+                    os.path.join(layout_work_directory, "usd"),
+                    resolved_text_images=object_resolver.text_images(),
+                    render_library=atlas_renderer.object_library,
+                    assembly_readiness=object_resolver.assembly_readiness(),
+                    window_element_manifest=window_element_manifest,
+                )
+                published_usd_signature = scene_constituent_signature
             layout_text_key = (
                 tuple(runtime_layout.authored_text.items()),
                 tuple(
@@ -3308,6 +6103,7 @@ def run_window(
                         destination[2],
                         destination[3],
                         character_tiles_only=not alphabet_ready,
+                        font_scale=3.0,
                     )
                     display_composition = process_linear_sensor_image(
                         composition.linear_rgb, camera_profile
@@ -3373,17 +6169,20 @@ def run_window(
                 and (latest is None or latest.text != text)
             ):
                 window.blit(cached_overlay_texture, editor_destination[:2])
-            selected_work_texture = (
-                browser_preview_texture
-                if browser_preview_texture is not None
-                else (
-                    atlas_work_texture
-                    if atlas_work_texture is not None
-                    else priority_texture
-                )
+            shimmered_texture = _add_arrival_shimmer(
+                texture,
+                arrival_shimmer,
+                time.monotonic() - arrival_shimmer_started_s,
+                pygame,
+            )
+            selected_work_texture = _work_panel_preview_texture(
+                shimmered_texture,
+                browser_preview_texture,
+                atlas_work_texture,
+                priority_texture,
+                calibration_active=calibration_active,
             )
             panel_products = (
-                ("camera-panel", texture),
                 ("work-panel", selected_work_texture),
             )
             first_panel_y = min(
@@ -3416,40 +6215,28 @@ def run_window(
                     width,
                     height,
                 )
-                panel_texture = _active_work_texture(
-                    panel_texture,
-                    (
-                        None
-                        if panel_id == "work-panel" and (
-                            browser_preview_texture is not None
-                            or atlas_work_texture is not None
-                        )
-                        else (
+                show_whole_work = work_preview_toolbar.mode == "whole-work"
+                panel_texture = (
+                    _fit_panel_preview_texture(
+                        panel_texture, destination[2], destination[3]
+                    )
+                    if show_whole_work else _active_work_texture(
+                        panel_texture,
+                        (
                             None if progress_event is None
                             else progress_event.global_uv_bounds
-                        )
-                    ),
-                    destination[2],
-                    destination[3],
-                    (
-                        current_work_revision
-                        if panel_id == "work-panel" and (
-                            browser_preview_texture is not None
-                            or atlas_work_texture is not None
-                        )
-                        else (
-                            1 if progress_event is None
-                            else progress_event.sequence
-                        )
-                    ),
+                        ),
+                        destination[2],
+                        destination[3],
+                        work_width,
+                        work_height,
+                        final_edge_px,
+                        1 if progress_event is None else progress_event.sequence,
+                    )
                 )
                 if panel_texture is None:
                     continue
                 window.blit(panel_texture, destination[:2])
-
-            # The manifest reserves this host; the repository's specialized
-            # ScrollableSubpanelList owns all list rendering and interaction.
-            work_browser.render(window, browser_window_rect)
 
             # Controls remain part of the camera-rendered scene. Only their
             # sensor-space rectangles are reused for pointer hit testing.
@@ -3462,6 +6249,29 @@ def run_window(
                     height,
                 )
                 ray_control_hitboxes[object_id] = pygame.Rect(*destination)
+            display_window.fill((9, 11, 14))
+            fitted = pygame.transform.smoothscale(
+                window, (presentation[2], presentation[3])
+            )
+            display_window.blit(fitted, presentation[:2])
+            # These interactive inspectors occupy the same manifest hosts but
+            # render at physical resolution after the photographed composition
+            # is fitted. Their nested lists therefore use every visible pixel.
+            present_work_panel.render(
+                display_window, present_work_display_rect, top_toolbar_rows
+            )
+            camera_browser.render(display_window, camera_browser_display_rect)
+            work_browser.render(display_window, browser_content_rect)
+            for row_key in top_toolbar_rows.ROW_KEYS:
+                top_toolbar_rows.render(
+                    row_key, display_window, toolbar_display_rects[row_key]
+                )
+            render_progress_toolbar.render(
+                display_window, status_display_rect
+            )
+            work_preview_toolbar.render(
+                display_window, work_preview_tabs_rect
+            )
             pygame.display.flip()
             clock.tick(60)
     finally:
@@ -3529,10 +6339,22 @@ def _args(argv: list[str]) -> argparse.Namespace:
         help="Clear this demo's camera storage and exit without opening a window.",
     )
     parser.add_argument("--text", default=DEFAULT_TEXT)
-    parser.add_argument("--display-width", type=int, default=DEFAULT_DISPLAY_WIDTH,
-                        help="Exact width of the complete camera-rendered program preview.")
-    parser.add_argument("--display-height", type=int, default=DEFAULT_DISPLAY_HEIGHT,
-                        help="Exact height of the complete camera-rendered program preview.")
+    parser.add_argument(
+        "--work-width", "--display-width", dest="work_width", type=int,
+        default=DEFAULT_WORK_WIDTH,
+        help=(
+            "Width of each render work tile/product (default: 200). The legacy "
+            "--display-width spelling is accepted and no longer changes UI layout."
+        ),
+    )
+    parser.add_argument(
+        "--work-height", "--display-height", dest="work_height", type=int,
+        default=DEFAULT_WORK_HEIGHT,
+        help=(
+            "Height of each render work tile/product (default: 200). The legacy "
+            "--display-height spelling is accepted and no longer changes UI layout."
+        ),
+    )
     parser.add_argument("--sensor-sweeps", type=int, default=DEFAULT_SENSOR_SWEEPS,
                         help="Scene-order compatibility value; live foreground work is clarity/cap bounded.")
     parser.add_argument(
@@ -3598,7 +6420,7 @@ def _args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--targeted-fraction", type=float,
                         default=DEFAULT_TARGETED_FRACTION,
-                        help="Fraction of recursive GPU work selected by learned/measured value; the remainder guarantees broad coverage (default: 0.75).")
+                        help="Focus/explore mode's learned/measured fraction; even-sensor mode overrides this to zero so every slot performs broad coverage (default focus/explore split: 0.75).")
     parser.add_argument("--priority-model", default="",
                         help="Reusable ray-trained .npz model; skips per-text synthetic training.")
     parser.add_argument("--camera-white-level", type=float, default=1.0,
@@ -3618,6 +6440,8 @@ def _args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _args(sys.argv[1:] if argv is None else argv)
+    if int(args.work_width) <= 0 or int(args.work_height) <= 0:
+        raise SystemExit("--work-width and --work-height must be positive")
     if not 0.0 <= float(args.targeted_fraction) <= 1.0:
         raise SystemExit("--targeted-fraction must be in [0, 1]")
     if int(args.atlas_epochs_per_exposure) <= 0:
@@ -3646,15 +6470,15 @@ def main(argv: list[str] | None = None) -> int:
         tone_curve_mode=args.camera_tone_curve,
     )
     if args.write_order:
-        scene_width, scene_height = _initial_window_size(
-            args.display_width, args.display_height
-        )
+        layout_width, layout_height = _layout_reference_size()
+        layout_work_width, layout_work_height = _layout_work_viewport_size()
+        scene_width, scene_height = layout_width, layout_height
         scene = build_self_rendering_program_scene(
             args.text,
             display_width=scene_width,
             display_height=scene_height,
-            work_width=args.display_width,
-            work_height=args.display_height,
+            work_width=layout_work_width,
+            work_height=layout_work_height,
         )
         with open(args.write_order, "w", encoding="utf-8") as handle:
             json.dump(build_display_scene_order(
@@ -3664,8 +6488,8 @@ def main(argv: list[str] | None = None) -> int:
     return run_window(
         args.out_dir,
         args.text,
-        args.display_width,
-        args.display_height,
+        args.work_width,
+        args.work_height,
         args.sensor_sweeps,
         camera_profile,
         args.targeted_fraction,

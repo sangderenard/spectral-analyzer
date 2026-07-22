@@ -6,7 +6,7 @@
  * and PDFs), but are never treated as finite-area merge receivers. */
 layout(local_size_x = 128) in;
 
-#define LGV_STRIDE 56u
+#define LGV_STRIDE 57u
 #define PDF_DELTA_SPECULAR (1u << 2)
 #define MAT_APERTURE_STOP 128u
 

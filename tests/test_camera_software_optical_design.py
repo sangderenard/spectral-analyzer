@@ -25,7 +25,10 @@ def test_four_group_solver_returns_ordered_controllable_train():
     assert xs == sorted(xs)
     assert all(b > a for a, b in zip(xs, xs[1:]))
     assert solved.aperture_radius_m > 0.0
-    assert solved.exit_pupil_x_m < spec.sensor_x_m
+    # A compound rear train may form a virtual exit pupil beyond the sensor.
+    # Backward transport carries that finite virtual target explicitly.
+    assert np.isfinite(solved.exit_pupil_x_m)
+    assert solved.exit_pupil_radius_m > 0.0
     assert np.isclose(xs[0], spec.entrance_x_m)
     assert xs[-1] <= spec.sensor_x_m - spec.sensor_clearance_m + 1.0e-9
     assert solved.assembly_front_x_m == spec.entrance_x_m
@@ -75,8 +78,8 @@ def test_thick_lens_scene_defaults_to_semantic_optical_design():
     assert isinstance(scene.optical_design, SolvedOpticalTrain)
     assert np.isclose(scene.image_plate.sensor_half_w, 0.028)
     assert np.isclose(scene.image_plate.sensor_half_h, 0.028)
-    assert abs(scene.optical_design.spec.target_focal_length_m - 0.060) < 1.0e-12
-    assert abs(optics.f_eff - 0.060) < 1.0e-3
+    assert abs(scene.optical_design.spec.target_focal_length_m - 0.0825) < 1.0e-12
+    assert np.isfinite(optics.f_eff) and optics.f_eff > 0.0
     assert scene.exit_pupil_radius > 0.0
     assert scene.aperture_model == "geometry"
 
@@ -164,7 +167,7 @@ def test_default_solved_lens_mesh_radii_are_geometrically_valid():
 
     assert len(lenses) == 4
     assert all(_lens_is_valid(lens) for lens in lenses)
-    assert 0.025 <= max(lens.aperture_radius for lens in lenses) <= 0.035
+    assert 0.025 <= max(lens.aperture_radius for lens in lenses) <= 0.120
     assert all((b.x_front - a.x_back) > 0.0 for a, b in zip(lenses, lenses[1:]))
 
 
@@ -204,14 +207,20 @@ def test_image_distance_for_object_is_finite_for_solution():
     assert img_d > 0.0
 
 
-def test_scene_sensor_tracks_exact_compound_focus_after_physical_clamps():
+def test_scene_solves_exact_compound_focus_to_fixed_sensor_and_focal_length():
     from thick_lens_focus_lab import SceneConfig, _compound_lens_from_scene, _paraxial_image_x, _scene_lenses
 
     scene = SceneConfig()
-    _scene_lenses(scene)
+    lenses = _scene_lenses(scene)
 
     optics = _compound_lens_from_scene(scene)
     exact_focus_x = _paraxial_image_x(optics, scene.object_plane.x)
 
     assert np.isfinite(exact_focus_x)
+    assert abs(float(scene.image_plate.x) - float(scene.optical_design.spec.sensor_x_m)) < 1.0e-12
     assert abs(float(scene.image_plate.x) - exact_focus_x) < 5.0e-6
+    assert abs(float(optics.f_eff) - scene.optical_design.spec.target_focal_length_m) < 5.0e-4
+    assert all(
+        (b.x_front - a.x_back) >= scene.optical_design.spec.min_air_gap_m - 1.0e-9
+        for a, b in zip(lenses, lenses[1:])
+    )

@@ -1758,7 +1758,7 @@ class MaterialDatabase:
         return self._tensors
 
     # ── Unified MatBuf SSBO helper ─────────────────────────────────────────
-    def build_mat_buf(self) -> np.ndarray:
+    def build_mat_buf(self, freq_hz: Optional[np.ndarray] = None) -> np.ndarray:
         """Return the contiguous float32 byte stream for the unified `MatBuf`
         SSBO consumed by both backends (GLSL `_GPU_RAY_FIELD_CS`/
         `_GPU_SENSOR_CS` at binding=10 and the C++ `_spectral_kernels`
@@ -1778,10 +1778,88 @@ class MaterialDatabase:
         between `build_complex_reflectances_spectral` (CPU) and the GLSL
         approximation that prompted this unification.
 
-        Bands beyond the per-material `n_bands` are zero-padded so a runtime
-        `b >= n_bands` early-out in shader/tracer is safe and observable.
+        When ``freq_hz`` is supplied, authored Gaussian lobes are resolved onto
+        that exact transport grid.  This is the form required by RayTracer:
+        transport band ``b`` must address the material response at
+        ``freq_hz[b]``.  Without ``freq_hz`` the historical/raw lobe table is
+        returned for authoring and compatibility consumers.
         """
-        spec = self.build_tensors()['spectral']            # (N, MAX_BANDS, 12) f32
+        tensors = self.build_tensors()
+        spec = tensors['spectral']                         # (N, MAX_BANDS, 12) f32
+        if freq_hz is not None:
+            grid = np.asarray(freq_hz, dtype=np.float64).reshape(-1)
+            if grid.size < 1 or grid.size > MAX_SPECTRAL_BANDS:
+                raise ValueError(
+                    f"freq_hz must contain 1..{MAX_SPECTRAL_BANDS} bands"
+                )
+            if not np.all(np.isfinite(grid)) or np.any(grid <= 0.0):
+                raise ValueError("freq_hz must contain finite positive frequencies")
+
+            resolved = np.zeros_like(spec)
+            pbr = tensors['pbr']
+            for i in range(spec.shape[0]):
+                n_lobes = int(tensors['n_bands'][i])
+                lobes = spec[i, :n_lobes].astype(np.float64, copy=False)
+                for b, frequency in enumerate(grid):
+                    row = resolved[i, b]
+                    row[0] = float(frequency)
+                    if grid.size == 1:
+                        row[1] = float(frequency)
+                    else:
+                        nearest = np.min(np.abs(np.delete(grid, b) - frequency))
+                        row[1] = float(max(nearest, 1.0e-6))
+
+                    if n_lobes:
+                        bandwidth = np.maximum(lobes[:, 1], 1.0e-6)
+                        weight = np.exp(-0.5 * ((frequency - lobes[:, 0]) / bandwidth) ** 2)
+                        reflectance = float(np.sum(lobes[:, 2] * weight))
+                        transmittance = float(np.sum(lobes[:, 3] * weight))
+                        row[2] = np.clip(reflectance, 0.0, 1.0)
+                        row[3] = np.clip(transmittance, 0.0, 1.0 - row[2])
+                        reflected_weight = lobes[:, 2] * weight
+                        reflected_sum = float(np.sum(reflected_weight))
+                        weight_sum = float(np.sum(weight))
+                        if reflected_sum > 1.0e-12:
+                            row[4] = np.clip(
+                                np.sum(lobes[:, 4] * reflected_weight) / reflected_sum,
+                                0.0, 1.0,
+                            )
+                        elif weight_sum > 1.0e-12:
+                            row[4] = np.clip(
+                                np.sum(lobes[:, 4] * weight) / weight_sum, 0.0, 1.0
+                            )
+                        row[5] = max(0.0, float(np.sum(lobes[:, 5] * weight)))
+                        row[6] = np.clip(
+                            float(np.sum(lobes[:, 6] * weight)), 0.0, 1.0
+                        )
+                        if weight_sum > 1.0e-12:
+                            row[7] = max(
+                                1.0e-6, float(np.sum(lobes[:, 7] * weight) / weight_sum)
+                            )
+                            row[8] = max(
+                                0.0, float(np.sum(lobes[:, 8] * weight) / weight_sum)
+                            )
+                        else:
+                            row[7] = max(1.0e-6, float(pbr[i, 6]))
+                    else:
+                        # Legacy/PBR-only material: make its scalar properties
+                        # explicit at every active transport band instead of
+                        # leaving an all-zero material row.
+                        albedo = pbr[i, 0:3].astype(np.float64, copy=False)
+                        row[2] = np.clip(
+                            0.2126 * albedo[0] + 0.7152 * albedo[1] + 0.0722 * albedo[2],
+                            0.0, 1.0,
+                        )
+                        row[3] = np.clip(pbr[i, 5], 0.0, 1.0 - row[2])
+                        row[4] = np.clip(pbr[i, 3], 0.0, 1.0)
+                        emission = pbr[i, 8:11].astype(np.float64, copy=False)
+                        row[5] = max(
+                            0.0,
+                            float(0.2126 * emission[0] + 0.7152 * emission[1] + 0.0722 * emission[2]),
+                        )
+                        row[7] = max(1.0e-6, float(pbr[i, 6]))
+                        row[8] = max(0.0, float(pbr[i, 4]) * 3.0)
+            spec = resolved
         # Project per-material surface controls into MatBuf pad slots so the
         # C++ tracer and GLSL T3 can sample the same lobes without adding an
         # SSBO binding. Slot [9] remains the Stokes shift convention; [10]/[11]
@@ -1789,8 +1867,8 @@ class MaterialDatabase:
         flat = np.ascontiguousarray(spec.copy().reshape(-1, 12), dtype=np.float32)
         N = spec.shape[0]
         if N > 0:
-            ray = self.build_tensors()['raymat_compat']    # (N, RAYMAT_FLOATS) f32
-            pbr = self.build_tensors()['pbr']              # (N, PBR_FLOATS) f32
+            ray = tensors['raymat_compat']                 # (N, RAYMAT_FLOATS) f32
+            pbr = tensors['pbr']                           # (N, PBR_FLOATS) f32
             # RayMatRecord.reactive_shift_hz is at the trailing slot (verified
             # by struct: see _fill_ray_from_mat11_dict in this module).
             # Pull last column safely.

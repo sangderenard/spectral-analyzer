@@ -3,7 +3,15 @@
 layout(local_size_x = 64) in;
 
 #define MAX_BANDS 32
-#define INTENT_STRIDE (20 + 2 * MAX_BANDS)
+#define INTENT_STRIDE (22 + 2 * MAX_BANDS)
+#define MAX_LUT_KNOTS 256
+#define MAX_LUT_PROFILES 32
+#define LUT_LANE_BASE 0
+#define LUT_PROFILE_OFFSET_BASE (LUT_LANE_BASE + MAX_BANDS)
+#define LUT_FREQUENCY_BASE (LUT_PROFILE_OFFSET_BASE + MAX_LUT_PROFILES + 1)
+#define LUT_DENSITY_BASE (LUT_FREQUENCY_BASE + MAX_LUT_KNOTS)
+#define LUT_CDF_BASE (LUT_DENSITY_BASE + MAX_LUT_KNOTS)
+#define LUT_INTEGRAL_BASE (LUT_CDF_BASE + MAX_LUT_KNOTS)
 
 struct SensorMipNode {
     vec4 uv_bounds;
@@ -40,6 +48,11 @@ layout(std430, binding = 4) buffer CounterBuf { uint counters[]; };
 layout(std430, binding = 5) writeonly buffer IntentBuf { float intents[]; };
 /* One exposure weight per sensor bin, float bit-cast for CAS atomics. */
 layout(std430, binding = 6) coherent buffer SensorWeightBuf { uint sensor_weight[]; };
+/* Keep the dynamically indexed LUT out of the default uniform block.  Some
+ * Windows GL drivers scalarize large uniform arrays and fail internally once
+ * this shader's helper functions are inlined.  A packed SSBO also gives every
+ * scalar an unambiguous four-byte stride under std430. */
+layout(std430, binding = 7) readonly buffer SpectralLutBuf { uint spectral_lut[]; };
 
 uniform vec3 sensor_center;
 uniform vec3 sensor_right;
@@ -57,6 +70,9 @@ uniform uint max_bounces;
 uniform float min_amplitude;
 uniform float exposure_weight;
 uniform uint epoch_seed;
+uniform uint continuous_lut_enabled;
+uniform uint spectral_lut_knot_count;
+uniform uint spectral_lut_profile_count;
 
 uint mix_bits(uint x) {
     x ^= x >> 16; x *= 0x7feb352du;
@@ -65,6 +81,48 @@ uint mix_bits(uint x) {
 }
 
 float unit_float(uint x) { return float(x >> 8) * (1.0 / 16777216.0); }
+
+void resolve_spectral_lut(uint lane, uint key, out float frequency_hz, out float pdf) {
+    frequency_hz = 0.0;
+    pdf = 1.0;
+    if (continuous_lut_enabled == 0u) return;
+    int profile = floatBitsToInt(uintBitsToFloat(
+        spectral_lut[LUT_LANE_BASE + min(lane, MAX_BANDS - 1u)]));
+    if (profile < 0 || profile >= int(spectral_lut_profile_count)) return;
+    int begin = floatBitsToInt(uintBitsToFloat(
+        spectral_lut[LUT_PROFILE_OFFSET_BASE + profile]));
+    int end = floatBitsToInt(uintBitsToFloat(
+        spectral_lut[LUT_PROFILE_OFFSET_BASE + profile + 1]));
+    if (begin < 0 || end - begin < 2 || end > int(spectral_lut_knot_count)) return;
+    float u = unit_float(mix_bits(key));
+    int interval = begin;
+    for (int i = begin; i + 1 < end; ++i) {
+        if (u <= uintBitsToFloat(spectral_lut[LUT_CDF_BASE + i + 1])) {
+            interval = i;
+            break;
+        }
+    }
+    float f0 = uintBitsToFloat(spectral_lut[LUT_FREQUENCY_BASE + interval]);
+    float f1 = uintBitsToFloat(spectral_lut[LUT_FREQUENCY_BASE + interval + 1]);
+    float d0 = uintBitsToFloat(spectral_lut[LUT_DENSITY_BASE + interval]);
+    float d1 = uintBitsToFloat(spectral_lut[LUT_DENSITY_BASE + interval + 1]);
+    float total = uintBitsToFloat(spectral_lut[LUT_INTEGRAL_BASE + profile]);
+    float width = f1 - f0;
+    float target_area = (u - uintBitsToFloat(
+        spectral_lut[LUT_CDF_BASE + interval])) * total;
+    float slope = (d1 - d0) / width;
+    float offset;
+    if (abs(slope) <= 1.0e-30) offset = target_area / max(d0, 1.0e-30);
+    else {
+        float disc = max(0.0, d0*d0 + 2.0*slope*target_area);
+        float r0 = (-d0 + sqrt(disc)) / slope;
+        float r1 = (-d0 - sqrt(disc)) / slope;
+        offset = (r0 >= 0.0 && r0 <= width) ? r0 : r1;
+    }
+    offset = clamp(offset, 0.0, width);
+    frequency_hz = f0 + offset;
+    pdf = (d0 + slope*offset) / total;
+}
 
 void atomic_add_weight(uint index, float value) {
     if (value <= 0.0 || isnan(value) || isinf(value)) return;
@@ -171,12 +229,21 @@ void main() {
     intents[base + 16u] = node.priority;
     intents[base + 17u] = y;
     intents[base + 18u] = z;
-    intents[base + 19u] = uintBitsToFloat(
-        0x80000000u | ((mix_bits(epoch_seed) + output_index + 1u) & 0x7FFFFFFFu));
-    for (uint band = 0u; band < MAX_BANDS; ++band) {
-        intents[base + 20u + band] = 0.0;
-        intents[base + 20u + MAX_BANDS + band] = 0.0;
-    }
     uint sampled_band = sample_lineage.sample_index % max(1u, n_bands);
-    intents[base + 20u + sampled_band] = exposure_weight * float(max(1u, n_bands));
+    uint spectral_sample_id = (output_index % 255u) + 1u;
+    float resolved_frequency_hz, resolved_pdf;
+    resolve_spectral_lut(sampled_band,
+        (sampled_band << 8u) | spectral_sample_id,
+        resolved_frequency_hz, resolved_pdf);
+    intents[base + 19u] = resolved_frequency_hz;
+    intents[base + 20u] = resolved_pdf;
+    intents[base + 21u] = uintBitsToFloat(
+        0x80000000u
+        | (((mix_bits(epoch_seed) + output_index + 1u) & 0x007FFFFFu) << 8u)
+        | spectral_sample_id);
+    for (uint band = 0u; band < MAX_BANDS; ++band) {
+        intents[base + 22u + band] = 0.0;
+        intents[base + 22u + MAX_BANDS + band] = 0.0;
+    }
+    intents[base + 22u + sampled_band] = exposure_weight * float(max(1u, n_bands));
 }

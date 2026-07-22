@@ -91,8 +91,16 @@ def test_program_manifest_owns_three_hosts_and_context_requests():
     browser = layout.region("asset-browser")
     assert work[0] == camera[0] + camera[2]
     assert browser[0] == work[0] + work[2]
-    assert browser[2] == metrics["browser_width"] == 160
-    assert browser[2] >= 2 * 80
+    assert camera[2] == 120
+    assert work[2] == 100
+    assert browser[2] == 240
+    assert camera[2] > 100
+    assert browser[2] == metrics["browser_width"] == 240
+    assert metrics["frame_width"] == 460
+    assert metrics["control_h"] >= 13
+    assert metrics["status_h"] >= 13
+    assert metrics["control_h"] <= 26
+    assert metrics["status_h"] <= 26
     assert layout.roles["asset-browser"] == "widget_host"
     pipeline = layout.render_pipeline
     assert pipeline.font_family == "DejaVu Sans Mono"
@@ -108,7 +116,62 @@ def test_program_manifest_owns_three_hosts_and_context_requests():
         panel for panel in manifest.panels if panel.name == "asset-browser"
     )
     assert browser_panel.payload["widget"] == "ScrollableSubpanelList"
+    tool_panels = {
+        panel.name: panel for panel in manifest.panels
+        if panel.payload.get("role") == "control_grid"
+    }
+    assert set(tool_panels) == {
+        "camera-toolbar", "lens-toolbar", "light-toolbar", "film-toolbar",
+        "integrator-toolbar", "exposure-toolbar",
+    }
+    assert len(tool_panels["integrator-toolbar"].knobs) == 8
+    assert len(tool_panels["exposure-toolbar"].knobs) == 8
+    assert all(
+        getattr(knob, "control_widget", "") == "stepper"
+        for panel in tool_panels.values() for knob in panel.knobs
+    )
 
+
+def test_canonical_knob_layout_supports_dense_header_grid():
+    panel = Panel(
+        "toolbar",
+        "TOOLS",
+        knobs=[
+            choice_knob(f"k{index}", f"K{index}", ("a", "b"))
+            for index in range(8)
+        ],
+        payload={"grid": {
+            "mode": "grid", "columns": 8, "title_width": 112,
+            "padding": 3, "column_gap": 4,
+        }},
+    )
+
+    design = layout_control_panel(panel, 1380, 52)
+    rects = [design.knob_routes[f"k{index}"]["rect"] for index in range(8)]
+
+    assert design.elements[1].kind == "header"
+    assert design.elements[1].rect == (0, 0, 112, 52)
+    assert all(rect[1] == 3 and rect[3] == 46 for rect in rects)
+    assert all(
+        left[0] + left[2] < right[0]
+        for left, right in zip(rects, rects[1:])
+    )
+    assert rects[-1][0] + rects[-1][2] == 1377
+
+
+def test_toolbar_title_can_overlay_cells_without_reserving_a_column():
+    panel = Panel(
+        "toolbar", "TOOLS",
+        knobs=[choice_knob("left", "LEFT", ("a", "b"))],
+        payload={"grid": {
+            "mode": "grid", "columns": 1, "title_width": 112,
+            "title_overlay": True, "padding_x": 1, "padding_y": 0,
+        }},
+    )
+
+    design = layout_control_panel(panel, 300, 52)
+    assert design.elements[1].rect == (0, 0, 112, 52)
+    assert design.knob_routes["left"]["rect"] == (1, 0, 298, 52)
 def test_program_actions_are_manifest_owned_resolved_and_serialized():
     from camera_software import layout_program_ui, program_ui_manifest
 
@@ -125,9 +188,9 @@ def test_program_actions_are_manifest_owned_resolved_and_serialized():
         "window-close",
     )
     assert layout.actions["work-visual-pass"].label == "VISUAL PASS"
-    assert layout.actions["queue-pause-auto"].label == "PAUSE AUTO"
+    assert layout.actions["queue-pause-auto"].label == "TOGGLE WORK"
     assert layout.authored_text["work-visual-pass"] == "VISUAL PASS"
-    assert layout.authored_text["queue-pause-auto"] == "PAUSE AUTO"
+    assert layout.authored_text["queue-pause-auto"] == "TOGGLE WORK"
     assert set(layout.action_primitives) == set(layout.actions)
     assert all(
         primitive.mapping()["kind"] == "nine_slice"
@@ -136,6 +199,8 @@ def test_program_actions_are_manifest_owned_resolved_and_serialized():
     first = layout.region("work-visual-pass")
     second = layout.region("queue-pause-auto")
     assert first[0] + first[2] <= second[0]
+    assert first[3] >= 8
+    assert second[3] >= 8
     contract = layout.mapping()
     assert contract["actions"]["work-visual-pass"]["align"] == "start"
     assert contract["authored_text"]["work-visual-pass"] == "VISUAL PASS"
@@ -155,4 +220,4 @@ def test_program_actions_are_manifest_owned_resolved_and_serialized():
         "camera-panel", "work-panel", "work-visual-pass"
     }
     assert "VISUAL PASS" in layout.render_pipeline.static_tokens
-    assert "PAUSE AUTO" in layout.render_pipeline.static_tokens
+    assert "TOGGLE WORK" in layout.render_pipeline.static_tokens

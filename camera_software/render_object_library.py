@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -24,7 +25,7 @@ from .render_assets import (
     stable_asset_key,
 )
 
-RENDER_OBJECT_LIBRARY_SCHEMA_VERSION = 3
+RENDER_OBJECT_LIBRARY_SCHEMA_VERSION = 4
 RENDER_OBJECT_BUNDLE_SCHEMA_VERSION = 3
 
 
@@ -250,6 +251,24 @@ class InterfaceAfterRender:
 
 
 @dataclass(frozen=True)
+class InterfacePanelHarvest:
+    """A panel crop retained from a completed holistic exposure."""
+
+    harvest_key: str
+    render_key: str
+    scene_object_id: str
+    object_key: str
+    subtype_key: str
+    content_signature: str
+    condition_signature: str
+    crop_rect_px: tuple[int, int, int, int]
+    image_path: str
+    linear_path: str
+    source_scene_path: str
+    created_at_s: float = field(default_factory=time.time)
+
+
+@dataclass(frozen=True)
 class InterfaceAssembly:
     """A growing revision history of final in-place interface renders."""
 
@@ -258,6 +277,7 @@ class InterfaceAssembly:
     display_name: str
     after_renders: tuple[InterfaceAfterRender, ...] = ()
     manifest_path: str = ""
+    panel_harvests: tuple[InterfacePanelHarvest, ...] = ()
     created_at_s: float = field(default_factory=time.time)
     updated_at_s: float = field(default_factory=time.time)
 
@@ -467,6 +487,214 @@ class RenderObjectLibrary:
         candidates = [s for s in bundle.subtypes if s.text == str(text) and (not kind or s.kind == kind)]
         return candidates[0] if candidates else None
 
+    def register_parametric_layout_manifest(
+        self, manifest: Any
+    ) -> tuple[RenderObjectBundle, ...]:
+        """Register manifest design objects as renderable library scene objects.
+
+        A nine-slice is one representative-square subtype. Its nine patches
+        are instance parameters (role, crop, fill, and target dimensions), not
+        nine unrelated image assets. Render artifacts can therefore accrue on
+        the subtype without changing the identity of any panel consumer.
+        """
+
+        registered: list[RenderObjectBundle] = []
+        now = time.time()
+        for design_object in tuple(getattr(manifest, "objects", ())):
+            object_key = str(design_object.object_key)
+            directory_key = stable_asset_key(
+                "parametric-layout-object", object_key
+            ).rsplit(":", 1)[-1]
+            canonical_directory = os.path.join(self.object_root, directory_key)
+            with self._lock:
+                current = self._bundles.get(object_key)
+            prior_subtypes = {
+                subtype.source_asset_key: subtype
+                for subtype in (() if current is None else current.subtypes)
+            }
+            subtypes: list[RenderObjectSubtype] = []
+            for work_subtype in design_object.subtypes:
+                source_key = str(work_subtype.subtype_key)
+                subtype_key = stable_asset_key(
+                    "render-subtype",
+                    (object_key, source_key, "parametric-layout"),
+                )
+                condition_key = str(work_subtype.condition_key)
+                condition_directory = (
+                    condition_key.rsplit(":", 1)[-1]
+                    if condition_key else "default"
+                )
+                scene_path = os.path.join(
+                    canonical_directory,
+                    "subtypes",
+                    "parametric_layout",
+                    subtype_key.rsplit(":", 1)[-1],
+                    "conditions",
+                    condition_directory,
+                    "scene_order.json",
+                )
+                parameters = dict(work_subtype.parameter_spec)
+                parameters["aspect_variants"] = [
+                    asdict(variant) for variant in work_subtype.aspect_variants
+                ]
+                capture = list(parameters.get(
+                    "capture_resolution_px", (128, 128)
+                ))
+                scene_payload = {
+                    "schema_version": 1,
+                    "scene_kind": "parametric_layout_object",
+                    "object_key": object_key,
+                    "subtype_key": source_key,
+                    "defaults": {
+                        "image": {
+                            "width": int(capture[0]),
+                            "height": int(capture[1]),
+                        },
+                        "camera": {
+                            "focal_mm": 50.0,
+                            "aperture_mm": 16.0,
+                            "focus_distance_cm": 35.0,
+                        },
+                        "exposure": {
+                            "time_s": 1.0 / 60.0,
+                            "iso": 100.0,
+                        },
+                        "parameters": parameters,
+                    },
+                    "jobs": [{
+                        "id": "representative-square",
+                        "object_key": object_key,
+                        "subtype_key": source_key,
+                        "geometry": {
+                            "kind": "parametric_nine_slice_square",
+                            "representative_grid": parameters.get(
+                                "representative_grid", [3, 3]
+                            ),
+                            "border_px": parameters.get(
+                                "border_px", [12, 12, 12, 12]
+                            ),
+                        },
+                        "parameters": parameters,
+                    }] + [{
+                        "id": variant.variant_key,
+                        "object_key": object_key,
+                        "subtype_key": source_key,
+                        "geometry": {
+                            "kind": "tiled_panel_aspect_variant",
+                            "source_capture": variant.source_capture,
+                            "aspect_ratio": list(variant.aspect_ratio),
+                            "work_resolution_px": list(
+                                variant.work_resolution_px
+                            ),
+                            "square_pane_rect": list(
+                                variant.square_pane_rect
+                            ),
+                            "sampling_policy": variant.sampling_policy,
+                            "physical_pixel_aspect": (
+                                variant.physical_pixel_aspect
+                            ),
+                        },
+                        "parameters": {
+                            "owner_ids": list(variant.owner_ids),
+                            "terminal_tile_policy": (
+                                "clip_at_panel_boundary"
+                            ),
+                        },
+                    } for variant in work_subtype.aspect_variants],
+                }
+                _atomic_json(scene_path, scene_payload)
+                prior = prior_subtypes.get(source_key)
+                scene = ArchivedObjectScene(
+                    subtype_key=subtype_key,
+                    condition_key=condition_key,
+                    scene_path=os.path.abspath(scene_path),
+                    scene_digest=_file_digest(scene_path),
+                    condition_spec={
+                        "condition_key": condition_key,
+                        "parameterized": True,
+                    },
+                    camera_spec=dict(scene_payload["defaults"]["camera"]),
+                    stage_spec={
+                        "family": parameters.get(
+                            "scene_family", "parametric-nine-slice-panel-v1"
+                        ),
+                        "pose_animations": [
+                            animation.animation_key
+                            for animation in work_subtype.pose_animations
+                        ],
+                    },
+                    material_specs={
+                        role: dict(spec)
+                        for role, spec in dict(
+                            parameters.get("patches", {})
+                        ).items()
+                    },
+                    geometry_spec=dict(
+                        scene_payload["jobs"][0]["geometry"]
+                    ),
+                    object_template=dict(scene_payload["jobs"][0]),
+                    inferred_fields=(),
+                )
+                subtypes.append(RenderObjectSubtype(
+                    subtype_key=subtype_key,
+                    kind="parametric_layout",
+                    text="",
+                    source_asset_key=source_key,
+                    display_name=str(work_subtype.display_name),
+                    scenes=(scene,),
+                    artifacts=(() if prior is None else prior.artifacts),
+                    tags=(
+                        "layout", "nine-slice", "parametric",
+                        str(work_subtype.source_capture),
+                    ),
+                    complete=(False if prior is None else prior.complete),
+                    created_at_s=(now if prior is None else prior.created_at_s),
+                    updated_at_s=now,
+                ))
+            subtype_sets = {
+                "parametric_layout": tuple(
+                    subtype.subtype_key for subtype in subtypes
+                ),
+                "glyph": (),
+                "token": (),
+            }
+            bundle = RenderObjectBundle(
+                object_key=object_key,
+                bundle_key=stable_asset_key(
+                    "render-object-bundle", object_key
+                ),
+                display_name=str(design_object.display_name),
+                object_kind=str(design_object.object_kind),
+                style_spec={
+                    "family": "parametric-layout",
+                    "manifest_key": str(manifest.manifest_key),
+                    "source_layout": str(manifest.source_layout),
+                    "parameterization": "representative-square-nine-slice",
+                    "aspect_library": [
+                        asdict(variant)
+                        for work_subtype in design_object.subtypes
+                        for variant in work_subtype.aspect_variants
+                    ],
+                },
+                subtypes=tuple(subtypes),
+                subtype_sets=subtype_sets,
+                tags=("layout", "parametric-scene-object"),
+                canonical_directory=canonical_directory,
+                manifest_path=os.path.join(
+                    canonical_directory, "object.json"
+                ),
+                created_at_s=(now if current is None else current.created_at_s),
+                updated_at_s=now,
+            )
+            with self._lock:
+                self._bundles[object_key] = bundle
+                self._save_bundle(bundle)
+            registered.append(bundle)
+        with self._lock:
+            if registered:
+                self._save()
+        return tuple(registered)
+
     def adopt_record(
         self,
         record: RenderedAssetRecord,
@@ -536,7 +764,7 @@ class RenderObjectLibrary:
                 object_key=object_key,
                 bundle_key=stable_asset_key("render-object-bundle", object_key),
                 display_name=str(display_name) or (current.display_name if current else "") or f"{asset.font.family} {asset.font.weight} {asset.material}",
-                object_kind="render_style",
+                object_kind=str(object_kind),
                 style_spec=render_style_spec(asset), subtypes=tuple(subtypes[k] for k in sorted(subtypes)),
                 subtype_sets=sets,
                 tags=tuple(sorted(set((*(() if current is None else current.tags), "text-style", *map(str, tags))))),
@@ -709,8 +937,38 @@ class RenderObjectLibrary:
     def _resolve_interface_components(
         self, scene_payload: Mapping[str, Any]
     ) -> tuple[InterfaceComponentReference, ...]:
-        objects = tuple(dict(scene_payload.get("defaults", {})).get("objects", ()))
+        defaults = dict(scene_payload.get("defaults", {}))
+        objects = tuple(defaults.get("objects", ()))
         references: list[InterfaceComponentReference] = []
+        for raw_plane in tuple(defaults.get("planes", ())):
+            plane = dict(raw_plane)
+            object_key = str(plane.get("library_object_key", ""))
+            work_subtype_key = str(plane.get("library_subtype_key", ""))
+            if not object_key or not work_subtype_key:
+                continue
+            bundle = self.find(object_key)
+            if bundle is None:
+                continue
+            subtype = next(
+                (
+                    item for item in bundle.subtypes
+                    if item.source_asset_key == work_subtype_key
+                    or item.subtype_key == work_subtype_key
+                ),
+                None,
+            )
+            if subtype is None:
+                continue
+            references.append(InterfaceComponentReference(
+                scene_object_id=str(plane.get(
+                    "scene_object_id", plane.get("id", "")
+                )),
+                object_key=bundle.object_key,
+                subtype_key=subtype.subtype_key,
+                subtype_kind=subtype.kind,
+                text="",
+                text_offset=0,
+            ))
         for raw_object in objects:
             scene_object = dict(raw_object)
             object_id = str(scene_object.get("id", ""))
@@ -842,6 +1100,9 @@ class RenderObjectLibrary:
             artifact_paths=artifacts,
             metadata=dict(metadata or {}),
         )
+        panel_harvests = self._harvest_interface_panels(
+            final, scene_payload, destination
+        )
         with self._lock:
             current = self._interfaces.get(assembly_key)
             renders = {
@@ -849,6 +1110,11 @@ class RenderObjectLibrary:
                 for item in (() if current is None else current.after_renders)
             }
             renders[render_key] = final
+            harvests = {
+                item.harvest_key: item
+                for item in (() if current is None else current.panel_harvests)
+            }
+            harvests.update({item.harvest_key: item for item in panel_harvests})
             now = time.time()
             directory = os.path.join(
                 self.interface_root, assembly_key.rsplit(":", 1)[-1]
@@ -861,6 +1127,9 @@ class RenderObjectLibrary:
                 ),
                 after_renders=tuple(renders[key] for key in sorted(renders)),
                 manifest_path=os.path.join(directory, "interface.json"),
+                panel_harvests=tuple(
+                    harvests[key] for key in sorted(harvests)
+                ),
                 created_at_s=current.created_at_s if current else now,
                 updated_at_s=now,
             )
@@ -868,6 +1137,192 @@ class RenderObjectLibrary:
             self._save_interface(assembly)
             self._save()
         return final
+
+    @staticmethod
+    def _panel_signatures(
+        scene_payload: Mapping[str, Any], plane: Mapping[str, Any]
+    ) -> tuple[str, str]:
+        defaults = dict(scene_payload.get("defaults", {}))
+        planes = tuple(defaults.get("planes", ()))
+        panel_rect = dict(plane.get("sensor_region_px", {}))
+
+        def overlaps(candidate: Mapping[str, Any]) -> bool:
+            rect = dict(candidate.get("sensor_region_px", {}))
+            if not rect or not panel_rect:
+                return candidate.get("id") == plane.get("id")
+            return not (
+                int(rect["x"]) + int(rect["width"]) <= int(panel_rect["x"])
+                or int(panel_rect["x"]) + int(panel_rect["width"]) <= int(rect["x"])
+                or int(rect["y"]) + int(rect["height"]) <= int(panel_rect["y"])
+                or int(panel_rect["y"]) + int(panel_rect["height"]) <= int(rect["y"])
+            )
+
+        overlapping = tuple(item for item in planes if overlaps(item))
+        overlapping_ids = {str(item.get("id", "")) for item in overlapping}
+        objects = tuple(
+            item for item in defaults.get("objects", ())
+            if str(dict(item.get("geometry", {})).get("embed_plane", ""))
+            in overlapping_ids
+        )
+        content_signature = stable_asset_key(
+            "panel-content",
+            {
+                "scene_object_id": plane.get("scene_object_id", ""),
+                "library_object_key": plane.get("library_object_key", ""),
+                "library_subtype_key": plane.get("library_subtype_key", ""),
+                "overlapping_planes": overlapping,
+                "embedded_objects": objects,
+            },
+        )
+        condition_signature = stable_asset_key(
+            "holistic-condition",
+            {
+                "camera": defaults.get("camera", {}),
+                "flash": defaults.get("flash", {}),
+                "exposure": defaults.get("exposure", {}),
+                "materials": defaults.get("materials", {}),
+                # Geometry outside the crop may still appear by reflection.
+                "reflection_boundary": planes,
+            },
+        )
+        return content_signature, condition_signature
+
+    def _harvest_interface_panels(
+        self,
+        final: InterfaceAfterRender,
+        scene_payload: Mapping[str, Any],
+        destination: str,
+    ) -> tuple[InterfacePanelHarvest, ...]:
+        """Cut reusable panel evidence from a holistic display + linear image."""
+
+        from PIL import Image
+        import numpy as np
+
+        defaults = dict(scene_payload.get("defaults", {}))
+        window_manifest = dict(
+            defaults.get("window_element_manifest", {}) or {}
+        )
+        # A host rectangle alone is not a holistic panel. Do not mint a cache
+        # artifact until the 2D authoring hierarchy and every visible child
+        # have actually been handed to the ray scene.
+        if not bool(window_manifest.get("complete", False)):
+            return ()
+        image_spec = dict(defaults.get("image", {}))
+        output_region = dict(image_spec.get("region", {}))
+        required = {"x", "y", "width", "height"}
+        if not required <= set(output_region):
+            return ()
+        candidate_planes = tuple(
+            plane for plane in defaults.get("planes", ())
+            if str(plane.get("library_object_key", ""))
+            and str(plane.get("library_subtype_key", ""))
+            and required <= set(dict(plane.get("sensor_region_px", {})))
+        )
+        if not candidate_planes:
+            return ()
+        with Image.open(final.image_path) as source_image:
+            display = source_image.convert("RGBA")
+            display_size = display.size
+            display_copy = display.copy()
+        linear = np.load(final.linear_path, allow_pickle=False)
+        if linear.ndim < 2:
+            return ()
+        harvest_root = os.path.join(destination, "panel_harvests")
+        os.makedirs(harvest_root, exist_ok=True)
+        harvested = []
+        for plane in candidate_planes:
+            object_key = str(plane.get("library_object_key", ""))
+            subtype_key = str(plane.get("library_subtype_key", ""))
+            sensor = dict(plane.get("sensor_region_px", {}))
+            if not object_key or not subtype_key or not required <= set(sensor):
+                continue
+            x0 = max(int(sensor["x"]), int(output_region["x"]))
+            y0 = max(int(sensor["y"]), int(output_region["y"]))
+            x1 = min(
+                int(sensor["x"]) + int(sensor["width"]),
+                int(output_region["x"]) + int(output_region["width"]),
+            )
+            y1 = min(
+                int(sensor["y"]) + int(sensor["height"]),
+                int(output_region["y"]) + int(output_region["height"]),
+            )
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            def raster_rect(width: int, height: int) -> tuple[int, int, int, int]:
+                rx = int(output_region["x"])
+                ry = int(output_region["y"])
+                rw = max(1, int(output_region["width"]))
+                rh = max(1, int(output_region["height"]))
+                left = max(0, min(width, round((x0 - rx) * width / rw)))
+                top = max(0, min(height, round((y0 - ry) * height / rh)))
+                right = max(left + 1, min(width, round((x1 - rx) * width / rw)))
+                bottom = max(top + 1, min(height, round((y1 - ry) * height / rh)))
+                return left, top, right, bottom
+
+            content_signature, condition_signature = self._panel_signatures(
+                scene_payload, plane
+            )
+            scene_object_id = str(plane.get("scene_object_id", ""))
+            harvest_key = stable_asset_key(
+                "interface-panel-harvest",
+                (
+                    object_key, subtype_key, scene_object_id,
+                    content_signature, condition_signature,
+                ),
+            )
+            stem = harvest_key.rsplit(":", 1)[-1]
+            image_path = os.path.join(harvest_root, stem + ".png")
+            linear_path = os.path.join(harvest_root, stem + ".npy")
+            image_rect = raster_rect(*display_size)
+            linear_rect = raster_rect(int(linear.shape[1]), int(linear.shape[0]))
+            display_copy.crop(image_rect).save(image_path)
+            np.save(
+                linear_path,
+                np.ascontiguousarray(linear[
+                    linear_rect[1]:linear_rect[3],
+                    linear_rect[0]:linear_rect[2],
+                ]),
+            )
+            harvested.append(InterfacePanelHarvest(
+                harvest_key=harvest_key,
+                render_key=final.render_key,
+                scene_object_id=scene_object_id,
+                object_key=object_key,
+                subtype_key=subtype_key,
+                content_signature=content_signature,
+                condition_signature=condition_signature,
+                crop_rect_px=(x0, y0, x1 - x0, y1 - y0),
+                image_path=os.path.abspath(image_path),
+                linear_path=os.path.abspath(linear_path),
+                source_scene_path=final.scene_path,
+            ))
+        return tuple(harvested)
+
+    def find_panel_harvest(
+        self,
+        object_key: str,
+        subtype_key: str,
+        *,
+        scene_object_id: str = "",
+        content_signature: str = "",
+        condition_signature: str = "",
+    ) -> InterfacePanelHarvest | None:
+        """Reactivate a prior crop when its authored and optical keys recur."""
+
+        candidates = (
+            item
+            for assembly in self.interface_snapshot()
+            for item in assembly.panel_harvests
+            if item.object_key == str(object_key)
+            and item.subtype_key == str(subtype_key)
+            and (not scene_object_id or item.scene_object_id == scene_object_id)
+            and (not content_signature or item.content_signature == content_signature)
+            and (not condition_signature or item.condition_signature == condition_signature)
+            and os.path.isfile(item.image_path)
+            and os.path.isfile(item.linear_path)
+        )
+        return max(candidates, key=lambda item: item.created_at_s, default=None)
 
     def select_interface_after_render(
         self, interface_id_or_key: str, *, render_key: str = ""
@@ -887,6 +1342,67 @@ class RenderObjectLibrary:
         if latest is None:
             raise LookupError("interface assembly has no final after-render")
         return latest
+
+    def delete_interface_after_render(
+        self, interface_id_or_key: str, *, render_key: str = ""
+    ) -> InterfaceAfterRender:
+        """Explicitly delete one retained interface version and its artifacts."""
+
+        assembly = self.find_interface(interface_id_or_key)
+        if assembly is None:
+            raise KeyError(interface_id_or_key)
+        target = (
+            next(
+                (item for item in assembly.after_renders if item.render_key == render_key),
+                None,
+            )
+            if render_key else assembly.latest
+        )
+        if target is None:
+            raise KeyError(render_key or interface_id_or_key)
+        with self._lock:
+            kept_renders = tuple(
+                item for item in assembly.after_renders
+                if item.render_key != target.render_key
+            )
+            kept_harvests = tuple(
+                item for item in assembly.panel_harvests
+                if item.render_key != target.render_key
+            )
+            if kept_renders:
+                updated = replace(
+                    assembly,
+                    after_renders=kept_renders,
+                    panel_harvests=kept_harvests,
+                    updated_at_s=time.time(),
+                )
+                self._interfaces[assembly.assembly_key] = updated
+                self._save_interface(updated)
+            else:
+                self._interfaces.pop(assembly.assembly_key, None)
+            self._save()
+
+        artifact_dir = os.path.abspath(os.path.dirname(target.scene_path))
+        interface_root = os.path.abspath(self.interface_root)
+        if (
+            os.path.isdir(artifact_dir)
+            and os.path.commonpath((interface_root, artifact_dir)) == interface_root
+            and artifact_dir != interface_root
+        ):
+            shutil.rmtree(artifact_dir)
+        source_revision = os.path.abspath(
+            str(dict(target.metadata).get("source_revision_dir", ""))
+        ) if dict(target.metadata).get("source_revision_dir") else ""
+        library_root = os.path.dirname(self.path) if self.path else os.getcwd()
+        if (
+            source_revision
+            and re.fullmatch(r"revision_[0-9]+", os.path.basename(source_revision))
+            and os.path.isdir(source_revision)
+            and os.path.commonpath((os.path.abspath(library_root), source_revision))
+                == os.path.abspath(library_root)
+        ):
+            shutil.rmtree(source_revision)
+        return target
 
     def _save_interface(self, assembly: InterfaceAssembly) -> None:
         _atomic_json(assembly.manifest_path, {
@@ -912,7 +1428,7 @@ class RenderObjectLibrary:
         if version == 1:
             self._bundles = {}
             return
-        if version not in {2, RENDER_OBJECT_LIBRARY_SCHEMA_VERSION}:
+        if version not in {2, 3, RENDER_OBJECT_LIBRARY_SCHEMA_VERSION}:
             raise ValueError("unsupported render object library schema")
         bundles: dict[str, RenderObjectBundle] = {}
         for raw_bundle in payload.get("objects", ()):
@@ -950,6 +1466,10 @@ class RenderObjectLibrary:
                 )
                 renders.append(InterfaceAfterRender(**rendered))
             item["after_renders"] = tuple(renders)
+            item["panel_harvests"] = tuple(
+                InterfacePanelHarvest(**harvest)
+                for harvest in item.get("panel_harvests", ())
+            )
             assembly = InterfaceAssembly(**item)
             interfaces[assembly.assembly_key] = assembly
         self._interfaces = interfaces
@@ -960,7 +1480,8 @@ __all__ = [
     "ObjectViewMode", "ArchivedObjectScene", "ObjectProductArtifact",
     "RenderObjectSubtype", "RenderObjectBundle", "ObjectViewSelection",
     "SceneSubtypeComposition", "InterfaceComponentReference",
-    "InterfaceAfterRender", "InterfaceAssembly", "RenderObjectLibrary",
+    "InterfaceAfterRender", "InterfacePanelHarvest", "InterfaceAssembly",
+    "RenderObjectLibrary",
     "render_style_spec",
     "render_style_key", "render_subtype_kind", "render_subtype_key",
     "canonical_subtype_directory",

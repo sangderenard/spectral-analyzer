@@ -7,7 +7,7 @@
  * divided exactly once here. */
 layout(local_size_x = 64) in;
 
-#define LGV_STRIDE 56u
+#define LGV_STRIDE 57u
 #define CGV_STRIDE 72u
 #define LGV_BETA 16u
 #define CGV_BETA 22u

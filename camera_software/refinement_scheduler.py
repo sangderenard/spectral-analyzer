@@ -36,8 +36,14 @@ class RefinementWork:
 class RecursiveSensorWorkScheduler:
     """Order a sparse frontier while keeping sampling separate from splitting."""
 
-    def __init__(self, n_bands: int, *, maximum_depth: int) -> None:
-        self.mipmap = SparseSensorMipmap(n_bands, maximum_depth=maximum_depth)
+    def __init__(
+        self, n_bands: int, *, maximum_depth: int, subdivision_axis: int = 3
+    ) -> None:
+        self.mipmap = SparseSensorMipmap(
+            n_bands,
+            maximum_depth=maximum_depth,
+            subdivision_axis=subdivision_axis,
+        )
         root = self.mipmap.nodes[self.mipmap.root_id]
         self._pending: dict[int, RefinementWork] = {
             root.node_id: RefinementWork(root.node_id, root.bounds, root.level, 0)

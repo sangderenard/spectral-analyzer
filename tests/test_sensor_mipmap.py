@@ -24,6 +24,43 @@ def test_children_exactly_partition_parent_area_without_overlap():
     assert len({(item.u0, item.v0, item.u1, item.v1) for item in bounds}) == 9
 
 
+def test_even_and_odd_n_tree_paths_make_four_and_nine_children():
+    even = SparseSensorMipmap(1, maximum_depth=1, subdivision_axis=2)
+    even_children = even.complete_work(even.root_id, subdivide=True)
+    assert len(even_children) == 4
+    assert np.isclose(
+        sum(even.nodes[node_id].bounds.area for node_id in even_children), 1.0
+    )
+
+    odd = SparseSensorMipmap(1, maximum_depth=1, subdivision_axis=3)
+    odd_children = odd.complete_work(odd.root_id, subdivide=True)
+    assert len(odd_children) == 9
+    assert np.isclose(
+        sum(odd.nodes[node_id].bounds.area for node_id in odd_children), 1.0
+    )
+
+
+def test_even_tree_rolls_up_after_all_four_children_have_evidence():
+    tree = SparseSensorMipmap(1, maximum_depth=1, subdivision_axis=2)
+    children = tree.complete_work(tree.root_id, subdivide=True)
+    for value, node_id in enumerate(children, start=1):
+        node = tree.nodes[node_id]
+        tree.add_sample(node_id, center(node.bounds), np.asarray([float(value)]))
+    assert np.allclose(tree.nodes[tree.root_id].rolled.mean, [2.5])
+
+
+def test_preview_inherits_coarse_estimate_then_overrides_evidenced_child():
+    tree = SparseSensorMipmap(1, maximum_depth=1, subdivision_axis=2)
+    tree.add_sample(tree.root_id, (0.5, 0.5), np.asarray([2.0]))
+    children = tree.complete_work(tree.root_id, subdivide=True)
+    first = tree.nodes[children[0]]
+    tree.add_sample(first.node_id, center(first.bounds), np.asarray([9.0]))
+
+    preview = tree.reconstruct_preview(2, 2)[..., 0]
+    assert preview[0, 0] == 9.0
+    assert np.all(preview[[0, 1, 1], [1, 0, 1]] == 2.0)
+
+
 def test_direct_coarse_evidence_is_retained_when_children_roll_up():
     tree = SparseSensorMipmap(2, maximum_depth=1)
     tree.add_sample(tree.root_id, (0.5, 0.5), np.asarray([90.0, 45.0]))

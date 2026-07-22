@@ -3291,6 +3291,10 @@ void main() {
 # collapse, complex storage end-to-end.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Legacy scalar-frequency field-tracer reference. This is deliberately not a
+# selectable native continuous-spectral mode: spectral MatBuf evaluation and
+# complex BDPT/sensor parity below remain unfinished. New transport work uses
+# camera_software.transport_contract and the native BDPT pipeline.
 _GPU_RAY_FIELD_CS = """
 #version 430 core
 layout(local_size_x = 128) in;
@@ -5938,7 +5942,7 @@ def _stochastic_spectral_packets(sources: list,
                                  *,
                                  packets_per_source: int = 32,
                                  seed: int = 1337) -> list:
-    """Expand sources into individually mono-spectral ray packets.
+    """Expand sources into legacy single-frequency ray packets.
 
     Source tuple layout (indices 4-7 are optional):
       [0] pos          (3,) float32

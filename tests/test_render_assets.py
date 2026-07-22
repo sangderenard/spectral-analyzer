@@ -276,6 +276,21 @@ def test_ink_atlas_accepts_trickled_tokens_and_only_queues_missing_work():
     )
 
 
+def test_atlas_plan_exposes_the_same_normalized_need_used_for_dispatch():
+    catalog = RenderAssetCatalog()
+    plan = plan_ink_atlas_bake(("ABC",), catalog)
+
+    assert plan.next_request is not None
+    assert plan.next_request.priority_need == max(
+        request.priority_need for request in plan.requests
+    )
+    assert sum(plan.normalized_priorities.values()) == pytest.approx(1.0)
+    assert plan.normalized_priorities[plan.next_request.request_key] == pytest.approx(
+        plan.next_request.priority_need
+        / sum(request.priority_need for request in plan.requests)
+    )
+
+
 def test_token_sequence_work_is_blocked_until_every_glyph_converges():
     catalog = RenderAssetCatalog()
     initial = plan_ink_atlas_bake(("AXE",), catalog)
@@ -505,11 +520,11 @@ def test_atlas_executor_restores_and_overwrites_until_image_converges(
     assert "--progress-dir" in first_command
     assert "--progress-exposure-id" in first_command
     assert first_environment["SPECTRAL_PROGRESS_RETAIN_LAYERS"] == "2"
-    assert first_environment["SPECTRAL_SENSOR_MAX_EPOCHS"] == "64"
-    assert first_environment["SPECTRAL_SENSOR_CONTINUOUS"] == "1"
-    assert first_environment["SPECTRAL_SENSOR_TOP_K"] == "1024"
+    assert first_environment["SPECTRAL_SENSOR_MAX_EPOCHS"] == "1"
+    assert first_environment["SPECTRAL_SENSOR_PERSISTENT_EPOCHS"] == "1"
+    assert first_environment["SPECTRAL_SENSOR_TOP_K"] == "64"
     assert first_environment["SPECTRAL_SENSOR_STEPS_PER_LAYER"] == "1"
-    assert first_environment["SPECTRAL_SENSOR_SAMPLES_PER_NODE"] == "1024"
+    assert first_environment["SPECTRAL_SENSOR_SAMPLES_PER_NODE"] == "64"
     assert "SPECTRAL_SENSOR_RESTORE_SUM" not in first_environment
     for _command, environment in launched[1:]:
         assert environment["SPECTRAL_SENSOR_RESTORE_SUM"].endswith(
@@ -524,18 +539,23 @@ def test_atlas_executor_restores_and_overwrites_until_image_converges(
     }) == 4
     assert record.metadata["bounded_background_render"] is True
     assert record.metadata["refinement_state"] == "converged"
+    assert "convergence_metric" in record.metadata["atlas_quality"]
+    assert (
+        "convergence_velocity_per_pass"
+        in record.metadata["atlas_quality"]
+    )
     assert record.metadata["atlas_quality"]["converged"] is True
-    assert record.samples == 256
+    assert record.samples == 4
     assert [item.linear_path for item in records] == [record.linear_path] * 4
     assert record.metadata["sprite_path"].endswith("raytraced_sprite.npz")
     assert record.metadata["capture"]["content_region"] == [24, 24, 80, 80]
     work_revision, work_path, work_token, work_pass, active = (
         renderer.work_snapshot()
     )
-    assert work_revision >= 264
+    assert work_revision >= 12
     assert work_path == record.preview_path
     assert work_token == "A"
-    assert work_pass == 256
+    assert work_pass == 4
     assert not active
     (
         object_revision,
@@ -548,7 +568,7 @@ def test_atlas_executor_restores_and_overwrites_until_image_converges(
     style_key = render_style_key(request.token_asset)
     assert work_object_key == style_key
     assert object_token == "A"
-    assert object_pass == 256
+    assert object_pass == 4
     assert not object_active
     bundle = renderer.object_library.find(style_key)
     assert bundle is not None
@@ -628,7 +648,9 @@ def test_atlas_executor_resumes_from_each_published_epoch(tmp_path, monkeypatch)
             pass
 
     monkeypatch.setattr(demo.subprocess, "Popen", Process)
-    renderer = demo.InkAtlasSubprocessRenderer(str(tmp_path), catalog)
+    renderer = demo.InkAtlasSubprocessRenderer(
+        str(tmp_path), catalog, steps_per_epoch=64
+    )
 
     with pytest.raises(demo.subprocess.CalledProcessError):
         renderer(request)
@@ -692,6 +714,34 @@ def test_atlas_plan_refines_the_least_developed_glyph_first():
     assert next_request is not None
     assert next_request.token_asset.token == "B"
     assert next_request.refinement_pass == 2
+
+
+def test_one_completed_packet_replans_to_an_unresolved_peer():
+    catalog = RenderAssetCatalog()
+    initial = plan_ink_atlas_bake(("AB",), catalog)
+    first = initial.next_request
+    assert first is not None
+    assert first.token_asset.token == "A"
+    catalog.complete(
+        first,
+        samples=1,
+        metadata={
+            "bounded_background_render": True,
+            "sensor_display_orientation": SENSOR_DISPLAY_ORIENTATION,
+            "refinement_state": "developing",
+            "refinement_pass": 1,
+            "atlas_quality": {
+                "composable": False,
+                "converged": False,
+            },
+        },
+    )
+
+    replanned = plan_ink_atlas_bake(("AB",), catalog).next_request
+
+    assert replanned is not None
+    assert replanned.token_asset.token == "B"
+    assert replanned.refinement_pass == 0
 
 
 def test_atlas_plan_can_resume_a_converged_asset_to_a_requested_pass():

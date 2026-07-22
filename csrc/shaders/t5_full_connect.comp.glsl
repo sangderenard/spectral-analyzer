@@ -101,13 +101,13 @@
  * ────────────────────────────────────────────────────────────────────────── */
 
 /* ── Tile dimensions (must match T5_TILE_C / T5_TILE_L in ray_pipeline.h) ── */
-#define TILE_C  1
-#define TILE_L  1
+#define TILE_C  16
+#define TILE_L  16
 
 layout(local_size_x = TILE_C, local_size_y = TILE_L, local_size_z = 1) in;
 
 /* ── Stride and field offsets (mirror ray_pipeline.h) ─────────────────── */
-#define T5_LGV_STRIDE    56
+#define T5_LGV_STRIDE    57
 #define T5_CGV_STRIDE    72
 
 #define LGV_MAT_ID        10
@@ -135,8 +135,8 @@ layout(local_size_x = TILE_C, local_size_y = TILE_L, local_size_z = 1) in;
  *   Layout: consecutive stride-sized slots, [vert * stride + field].       *
  * s_lum_*: per-invocation contributions, reduced before atomic write.      *
  *   Layout: tid = lid_l * TILE_C + lid_c.                                  */
-shared float s_cam  [TILE_C * T5_CGV_STRIDE];   /* 8×72 = 576 floats (2.25 KB) */
-shared float s_light[TILE_L * T5_LGV_STRIDE];   /* 8×56 = 448 floats (1.75 KB) */
+shared float s_cam  [TILE_C * T5_CGV_STRIDE];   /* 16×72 = 1152 floats (4.5 KB) */
+shared float s_light[TILE_L * T5_LGV_STRIDE];   /* 16×57 = 912 floats (3.56 KB) */
 shared float s_lum_r[TILE_C * TILE_L];
 shared float s_lum_g[TILE_C * TILE_L];
 shared float s_lum_b[TILE_C * TILE_L];
@@ -611,6 +611,20 @@ float glass_transmittance_band(int band, int n_cross,
     return T;
 }
 
+vec3 frequency_rgb(float frequency_hz) {
+    float wl = 299792458.0 / max(frequency_hz, 1.0) * 1.0e9;
+    vec3 c = vec3(0.0);
+    if (wl >= 380.0 && wl < 440.0) c = vec3(-(wl-440.0)/60.0, 0.0, 1.0);
+    else if (wl < 490.0) c = vec3(0.0, (wl-440.0)/50.0, 1.0);
+    else if (wl < 510.0) c = vec3(0.0, 1.0, -(wl-510.0)/20.0);
+    else if (wl < 580.0) c = vec3((wl-510.0)/70.0, 1.0, 0.0);
+    else if (wl < 645.0) c = vec3(1.0, -(wl-645.0)/65.0, 0.0);
+    else if (wl <= 700.0) c = vec3(1.0, 0.0, 0.0);
+    float edge = wl < 420.0 ? 0.3 + 0.7*(wl-380.0)/40.0
+               : (wl > 645.0 ? 0.3 + 0.7*(700.0-wl)/55.0 : 1.0);
+    return max(c * clamp(edge, 0.0, 1.0), vec3(0.0));
+}
+
 void connection_spectral_rgb(uint sc, uint sl,
                              vec3 c_norm, vec3 c_dir_in, uint c_pdf_flags,
                              int c_mat, vec3 c_to_l,
@@ -630,6 +644,9 @@ void connection_spectral_rgb(uint sc, uint sl,
     bool any_camera_response = false;
     bool any_light_response = false;
     bool any_glass_pass = false;
+    const uint spectral_sample_id = floatBitsToUint(s_cam[sc + 62u]);
+    const float exact_frequency_hz = s_cam[sc + 63u];
+    const float exact_spectral_pdf = max(s_cam[sc + 64u], 1.0e-30f);
     for (int _b = 0; _b < nb; ++_b) {
         const float cb = s_cam[sc + uint(CGV_BAND_BASE + _b)];
         const float lb = s_light[sl + uint(LGV_BAND_BASE + _b)];
@@ -655,9 +672,17 @@ void connection_spectral_rgb(uint sc, uint sl,
         if (lf > 0.0f) any_light_response = true;
         const float v = cb * lb * cf * lf * glassT;
         if (v <= 0.0f || isnan(v) || isinf(v)) continue;
-        r += v * spectral_weights[_b * 3 + 0];
-        g += v * spectral_weights[_b * 3 + 1];
-        b += v * spectral_weights[_b * 3 + 2];
+        if (spectral_sample_id != 0u && exact_frequency_hz > 0.0f) {
+            const vec3 exact = frequency_rgb(exact_frequency_hz)
+                             / exact_spectral_pdf;
+            r += v * exact.r;
+            g += v * exact.g;
+            b += v * exact.b;
+        } else {
+            r += v * spectral_weights[_b * 3 + 0];
+            g += v * spectral_weights[_b * 3 + 1];
+            b += v * spectral_weights[_b * 3 + 2];
+        }
     }
     if (t5_debug_enabled != 0 && any_overlap) atomicAdd(debug_counts[9], 1u);
     if (t5_debug_enabled != 0 && any_glass_pass) atomicAdd(debug_counts[10], 1u);
@@ -770,7 +795,7 @@ void main() {
      * Each of the 64 threads strides through the tile arrays.               *
      * Out-of-bounds verts are zeroed so downstream logic reads clean data.  */
 
-    /* Camera tile: TILE_C × T5_CGV_STRIDE = 448 floats → 7 loads/thread   */
+    /* Camera tile: 16 × 72 = 1152 floats → at most 5 loads/thread. */
     for (uint i = tid; i < uint(TILE_C) * uint(T5_CGV_STRIDE); i += total) {
         const uint v = i / uint(T5_CGV_STRIDE);
         const uint f = i % uint(T5_CGV_STRIDE);
@@ -780,7 +805,7 @@ void main() {
             : 0.0f;
     }
 
-    /* Light tile: TILE_L × T5_LGV_STRIDE = 320 floats → 5 loads/thread    */
+    /* Light tile: 16 × 57 = 912 floats → at most 4 loads/thread. */
     for (uint i = tid; i < uint(TILE_L) * uint(T5_LGV_STRIDE); i += total) {
         const uint v      = i / uint(T5_LGV_STRIDE);
         const uint f      = i % uint(T5_LGV_STRIDE);
@@ -851,6 +876,11 @@ void main() {
 
         const bool c_ok = vertex_connectable(c_vinfo, c_flags, c_pdf_flags, c_optical_blk);
         const bool l_ok = vertex_connectable(l_vinfo, l_flags, l_pdf_flags, l_optical_blk);
+        const uint c_spectral_sample = floatBitsToUint(s_cam[sc + 62u]);
+        const uint l_spectral_sample = floatBitsToUint(s_light[sl + 56u]);
+        const bool spectral_pair_ok =
+            (c_spectral_sample == 0u && l_spectral_sample == 0u)
+            || (c_spectral_sample != 0u && c_spectral_sample == l_spectral_sample);
         if (t5_debug_enabled != 0 && (c_vinfo >> 31) != 0u) {
             const uint region_bin = c_pos.x < 1.0f ? 0u : (c_pos.x > 3.0f ? 2u : 1u);
             atomicAdd(debug_counts[87u + region_bin], 1u);
@@ -867,7 +897,8 @@ void main() {
         if (t5_debug_enabled != 0 && l_ok &&
             (l_pdf_flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u)
             atomicAdd(debug_counts[67], 1u);
-        if (c_ok && l_ok && c_beta_sum >= 1e-15f && l_beta_sum >= 1e-15f)
+        if (c_ok && l_ok && spectral_pair_ok
+            && c_beta_sum >= 1e-15f && l_beta_sum >= 1e-15f)
         {
             if (t5_debug_enabled != 0) atomicAdd(debug_counts[3], 1u);
             if (t5_debug_enabled != 0 && li_v == 0u) atomicAdd(debug_counts[13], 1u);
@@ -1025,9 +1056,12 @@ void main() {
         }
     }
 
+    /* Profile exits above are pair-dependent.  Keep the matching fall-through
+     * exit before the reduction barrier so partially populated edge tiles do
+     * not leave inactive lanes waiting at a barrier after active lanes return. */
+    if (t5_profile_mode != 0) return;
     barrier();
     memoryBarrierShared();
-    if (t5_profile_mode != 0) return;
 
     /* ── Per-cam-vert reduction along the light-tile dimension ─────────── *
      * Thread (lid_c, 0) sums TILE_L contributions for its cam vert and     *

@@ -383,7 +383,7 @@ class RayTracerWorker(threading.Thread):
         freq_hz = mesh["freq_hz"]
         
         # ─── C++ API: Create RayTracer ──────────────────────────────────
-        mat_buf = db.build_mat_buf().astype(np.float32, copy=False)
+        mat_buf = db.build_mat_buf(freq_hz=freq_hz).astype(np.float32, copy=False)
         mat_n_mats = int(mat_buf.shape[0] // MAX_SPECTRAL_BANDS)
         
         self.tracer = _sk.RayTracer(

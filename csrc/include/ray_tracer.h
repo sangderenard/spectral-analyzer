@@ -249,6 +249,23 @@ SK_API RayTracerState* ray_tracer_create(
     const double*   atmo_abs
 );
 
+/** Configure continuous-frequency LUT indirection.
+ *
+ * lane_lut_index has n_bands entries and is the lookup signal carried by each
+ * payload lane. profile_offsets has n_profiles+1 entries into the shared knot
+ * and density arrays.  Frequencies are sampled once per root ray and retained
+ * through all descendants.  Passing n_profiles=0 disables continuous mode.
+ */
+SK_API int ray_tracer_set_spectral_luts(
+    RayTracerState* st,
+    const int* lane_lut_index,
+    int n_lanes,
+    const int* profile_offsets,
+    int n_profiles,
+    const double* frequency_knots_hz,
+    const double* density,
+    int n_knots);
+
 /** Free tracer state.  Safe to call with NULL. */
 SK_API void ray_tracer_destroy(RayTracerState* st);
 

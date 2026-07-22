@@ -15,7 +15,7 @@ layout(std430, binding = 3)          buffer T5CamBuf    { float t5_cam[];     };
 #define BDPT_SPECTRAL_STRIDE 8
 #define BDPT_PDF_STRIDE      12
 #define BDPT_OPTICAL_STRIDE  28
-#define T5_LGV_STRIDE        56
+#define T5_LGV_STRIDE        57
 #define T5_CGV_STRIDE        72
 #define LGV_BAND_BASE        16
 #define CGV_BAND_BASE        22
@@ -68,17 +68,24 @@ void scatter_spectral(uint r) {
     float re = bdpt_verts[rb + 2];
     float im = bdpt_verts[rb + 3];
     float beta = sqrt(max(0.0, re * re + im * im));
+    float spectral_frequency_hz = bdpt_verts[rb + 4];
+    float spectral_pdf = max(bdpt_verts[rb + 5], 1.0e-30);
+    uint spectral_sample_id = floatBitsToUint(bdpt_verts[rb + 7]);
 
     int p = find_sorted_pos(0u, sid, vi);
     if (p >= 0 && p < n_lv) {
         int ob = p * T5_LGV_STRIDE;
         t5_light[ob + LGV_BAND_BASE + int(band)] = beta;
+        t5_light[ob + 56] = uintBitsToFloat(spectral_sample_id);
         return;
     }
     p = find_sorted_pos(1u, sid, vi);
     if (p >= n_lv) {
         int ob = (p - n_lv) * T5_CGV_STRIDE;
         t5_cam[ob + CGV_BAND_BASE + int(band)] = beta;
+        t5_cam[ob + 62] = uintBitsToFloat(spectral_sample_id);
+        t5_cam[ob + 63] = spectral_frequency_hz;
+        t5_cam[ob + 64] = spectral_pdf;
     }
 }
 

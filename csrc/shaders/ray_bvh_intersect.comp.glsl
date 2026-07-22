@@ -87,8 +87,8 @@ layout(local_size_x = 64) in;
 
 /* ── Binding constants ──────────────────────────────────────────────────── */
 #define MAX_GPU_BANDS     32
-#define INTENT_STRIDE     (20 + 2*MAX_GPU_BANDS)      /* 84 with MAX_GPU_BANDS=32 */
-#define HIT_STRIDE        (27 + 2*MAX_GPU_BANDS)      /* 91 with MAX_GPU_BANDS=32; bdpt_sid at [90] */
+#define INTENT_STRIDE     (22 + 2*MAX_GPU_BANDS)
+#define HIT_STRIDE        (29 + 2*MAX_GPU_BANDS)
 #define BVH_NODE_STRIDE   10
 #define TRI_FULL_STRIDE   16
 #define MAT_BAND_STRIDE   12
@@ -205,6 +205,29 @@ float mat_n_imag_gpu(int mat, int b) {
     return mat_bands[off];
 }
 
+float mat_field_at_frequency(int mat, int lane, float frequency_hz, int field) {
+    if (mat < 0 || mat >= n_mats || frequency_hz <= 0.0)
+        return mat_bands[(max(mat, 0) * MAT_FULL_BANDS + lane) * MAT_BAND_STRIDE + field];
+    int last = 0;
+    while (last + 1 < MAT_FULL_BANDS
+           && mat_bands[(mat * MAT_FULL_BANDS + last + 1) * MAT_BAND_STRIDE] > 0.0) last++;
+    if (last == 0) return mat_bands[(mat * MAT_FULL_BANDS) * MAT_BAND_STRIDE + field];
+    bool increasing = mat_bands[(mat * MAT_FULL_BANDS + last) * MAT_BAND_STRIDE]
+                    >= mat_bands[(mat * MAT_FULL_BANDS) * MAT_BAND_STRIDE];
+    int lo = 0;
+    while (lo + 1 < last) {
+        float next_f = mat_bands[(mat * MAT_FULL_BANDS + lo + 1) * MAT_BAND_STRIDE];
+        if ((increasing && next_f >= frequency_hz) || (!increasing && next_f <= frequency_hz)) break;
+        lo++;
+    }
+    int hi = min(last, lo + 1);
+    int a = (mat * MAT_FULL_BANDS + lo) * MAT_BAND_STRIDE;
+    int b = (mat * MAT_FULL_BANDS + hi) * MAT_BAND_STRIDE;
+    float denom = mat_bands[b] - mat_bands[a];
+    float t = abs(denom) > 1e-20 ? clamp((frequency_hz - mat_bands[a]) / denom, 0.0, 1.0) : 0.0;
+    return mix(mat_bands[a + field], mat_bands[b + field], t);
+}
+
 /* ── Main ───────────────────────────────────────────────────────────────── */
 
 void main() {
@@ -230,13 +253,15 @@ void main() {
     uint  color_flag = intent_u(ib, 15);
     float sensor_oy  = intent_f(ib, 17);
     float sensor_oz  = intent_f(ib, 18);
-    uint  bdpt_sid   = intent_u(ib, 19);  /* bdpt_subpath_id packed in the _pad slot */
+    float spectral_frequency_hz = intent_f(ib, 19);
+    float spectral_pdf = intent_f(ib, 20);
+    uint  bdpt_sid   = intent_u(ib, 21);
 
     float amp_re[MAX_GPU_BANDS];
     float amp_im[MAX_GPU_BANDS];
     for (int b = 0; b < MAX_GPU_BANDS; ++b) {
-        amp_re[b] = (b < n_bands) ? intent_f(ib, 20 + b)              : 0.0;
-        amp_im[b] = (b < n_bands) ? intent_f(ib, 20 + MAX_GPU_BANDS + b) : 0.0;
+        amp_re[b] = (b < n_bands) ? intent_f(ib, 22 + b)              : 0.0;
+        amp_im[b] = (b < n_bands) ? intent_f(ib, 22 + MAX_GPU_BANDS + b) : 0.0;
     }
 
     /* Normalise direction defensively */
@@ -309,9 +334,11 @@ void main() {
 
     int nb = min(n_bands, MAX_GPU_BANDS);
     for (int b = 0; b < nb; ++b) {
-        float n_re = (medium_mat >= 0) ? mat_n_real_gpu(medium_mat, b) : 1.0;
-        float n_im = (medium_mat >= 0) ? mat_n_imag_gpu(medium_mat, b) : 0.0;
-        float k_real_b = scene_bands[b];
+        float n_re = (medium_mat >= 0) ? mat_field_at_frequency(medium_mat, b, spectral_frequency_hz, 7) : 1.0;
+        float n_im = (medium_mat >= 0) ? mat_field_at_frequency(medium_mat, b, spectral_frequency_hz, 8) : 0.0;
+        float k_real_b = spectral_frequency_hz > 0.0
+            ? 6.283185307179586 * spectral_frequency_hz / 299792458.0
+            : scene_bands[b];
         float atmo_b   = scene_bands[n_bands + b];
         float k_med    = k_real_b * n_re;
         float alpha    = atmo_b + k_real_b * n_im;
@@ -370,13 +397,14 @@ void main() {
     hit_wf(ob, 23, sensor_oy);
     hit_wf(ob, 24, sensor_oz);
     hit_wi(ob, 25, medium_mat);
+    hit_wf(ob, 26, spectral_frequency_hz);
+    hit_wf(ob, 27, spectral_pdf);
 
     for (int b = 0; b < MAX_GPU_BANDS; ++b) {
-        hit_wf(ob, 26 + b,              amp_re[b]);
-        hit_wf(ob, 26 + MAX_GPU_BANDS + b, amp_im[b]);
+        hit_wf(ob, 28 + b,              amp_re[b]);
+        hit_wf(ob, 28 + MAX_GPU_BANDS + b, amp_im[b]);
     }
-    /* bdpt_subpath_id embedded at hit[26+2*MAX_GPU_BANDS] (last slot) so T3 needs no extra binding. */
-    hit_wu(ob, 26 + 2*MAX_GPU_BANDS, bdpt_sid);
+    hit_wu(ob, 28 + 2*MAX_GPU_BANDS, bdpt_sid);
 
     /* ── Wave intent counter (C++ dispatcher routes these to Q_wave) ─────── */
     if (wave_arena_id >= 0)

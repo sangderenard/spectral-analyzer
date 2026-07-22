@@ -1,0 +1,131 @@
+{
+  "interfaces": [
+    {
+      "after_renders": [
+        {
+          "artifact_paths": {
+            "diagnostic_image": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\calibration_native_smoke\\render_interfaces\\f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9\\after_renders\\13aad6fae08acc165ec16f84659c91ae83e6d90aa78203fe2460caa8be675de1\\live_paragraph\\0000_cpp.png",
+            "priority_overlay": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\calibration_native_smoke\\render_interfaces\\f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9\\after_renders\\13aad6fae08acc165ec16f84659c91ae83e6d90aa78203fe2460caa8be675de1\\live_paragraph\\0000_cpp_priority.png",
+            "render_log": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\calibration_native_smoke\\render_interfaces\\f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9\\after_renders\\13aad6fae08acc165ec16f84659c91ae83e6d90aa78203fe2460caa8be675de1\\render.log"
+          },
+          "assembly_key": "interface-assembly:f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9",
+          "completed_at_s": 1784610588.5575137,
+          "component_references": [],
+          "image_path": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\calibration_native_smoke\\render_interfaces\\f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9\\after_renders\\13aad6fae08acc165ec16f84659c91ae83e6d90aa78203fe2460caa8be675de1\\live_paragraph\\0000_cpp_camera.png",
+          "interface_id": "spectral-program-scene",
+          "linear_path": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\calibration_native_smoke\\render_interfaces\\f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9\\after_renders\\13aad6fae08acc165ec16f84659c91ae83e6d90aa78203fe2460caa8be675de1\\live_paragraph\\0000_cpp_linear.npy",
+          "manifest_path": "",
+          "metadata": {
+            "all_ui_elements_in_place": true,
+            "camera_profile": {
+              "exposure_compensation_ev": 0.0,
+              "sensor_white_level": 1.0,
+              "tone_curve_mode": "reinhard"
+            },
+            "elapsed_s": 12.95296490000328,
+            "final_policy": "shared_camera_interface_after_render",
+            "layout_contract": {},
+            "layout_render_pipeline": {
+              "final_policy": "shared_camera_interface_after_render",
+              "font": {
+                "family": "DejaVu Sans Mono",
+                "mode": "monofont",
+                "style": "normal",
+                "weight": "bold"
+              },
+              "glyph_alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+              "static_tokens": [
+                "SPECTRAL EXPOSURE ACTIVE",
+                "CAMERA",
+                "WORK",
+                "ASSETS / JOBS",
+                "VISUAL PASS",
+                "TOGGLE WORK"
+              ],
+              "tiers": [
+                "monofont_glyphs",
+                "whole_token_single_shots",
+                "interface_after_render"
+              ],
+              "whole_token_policy": "single_shot_shrink_to_fit"
+            },
+            "tier": "interface_after_render",
+            "whole_token_policy": "single_shot_shrink_to_fit"
+          },
+          "render_key": "interface-after-render:13aad6fae08acc165ec16f84659c91ae83e6d90aa78203fe2460caa8be675de1",
+          "revision": 3,
+          "scene_digest": "e455a941dd092d78fdd6dbd360b6542bc9fb69f923431c8df9951ca276bdc4fa",
+          "scene_object_ids": [],
+          "scene_path": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\calibration_native_smoke\\render_interfaces\\f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9\\after_renders\\13aad6fae08acc165ec16f84659c91ae83e6d90aa78203fe2460caa8be675de1\\scene_order.json",
+          "text": "STARTUP / ACTIVE SITE / 1 LANE"
+        },
+        {
+          "artifact_paths": {
+            "diagnostic_image": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\calibration_native_smoke\\render_interfaces\\f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9\\after_renders\\8862e2dbdf4af5a8d4f2292baa7b1dc36fe9a3cae2461214a24903c3c3ae143c\\live_paragraph\\0000_cpp.png",
+            "priority_overlay": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\calibration_native_smoke\\render_interfaces\\f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9\\after_renders\\8862e2dbdf4af5a8d4f2292baa7b1dc36fe9a3cae2461214a24903c3c3ae143c\\live_paragraph\\0000_cpp_priority.png",
+            "render_log": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\calibration_native_smoke\\render_interfaces\\f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9\\after_renders\\8862e2dbdf4af5a8d4f2292baa7b1dc36fe9a3cae2461214a24903c3c3ae143c\\render.log"
+          },
+          "assembly_key": "interface-assembly:f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9",
+          "completed_at_s": 1784610471.3832457,
+          "component_references": [],
+          "image_path": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\calibration_native_smoke\\render_interfaces\\f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9\\after_renders\\8862e2dbdf4af5a8d4f2292baa7b1dc36fe9a3cae2461214a24903c3c3ae143c\\live_paragraph\\0000_cpp_camera.png",
+          "interface_id": "spectral-program-scene",
+          "linear_path": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\calibration_native_smoke\\render_interfaces\\f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9\\after_renders\\8862e2dbdf4af5a8d4f2292baa7b1dc36fe9a3cae2461214a24903c3c3ae143c\\live_paragraph\\0000_cpp_linear.npy",
+          "manifest_path": "",
+          "metadata": {
+            "all_ui_elements_in_place": true,
+            "camera_profile": {
+              "exposure_compensation_ev": 0.0,
+              "sensor_white_level": 1.0,
+              "tone_curve_mode": "reinhard"
+            },
+            "elapsed_s": 77.84286679999786,
+            "final_policy": "shared_camera_interface_after_render",
+            "layout_contract": {},
+            "layout_render_pipeline": {
+              "final_policy": "shared_camera_interface_after_render",
+              "font": {
+                "family": "DejaVu Sans Mono",
+                "mode": "monofont",
+                "style": "normal",
+                "weight": "bold"
+              },
+              "glyph_alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+              "static_tokens": [
+                "SPECTRAL EXPOSURE ACTIVE",
+                "CAMERA",
+                "WORK",
+                "ASSETS / JOBS",
+                "VISUAL PASS",
+                "TOGGLE WORK"
+              ],
+              "tiers": [
+                "monofont_glyphs",
+                "whole_token_single_shots",
+                "interface_after_render"
+              ],
+              "whole_token_policy": "single_shot_shrink_to_fit"
+            },
+            "tier": "interface_after_render",
+            "whole_token_policy": "single_shot_shrink_to_fit"
+          },
+          "render_key": "interface-after-render:8862e2dbdf4af5a8d4f2292baa7b1dc36fe9a3cae2461214a24903c3c3ae143c",
+          "revision": 2,
+          "scene_digest": "5cef8e8688737bad29bdef11918f444a5b9cf51e9fd6dbb11d7d35ea94689b70",
+          "scene_object_ids": [],
+          "scene_path": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\calibration_native_smoke\\render_interfaces\\f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9\\after_renders\\8862e2dbdf4af5a8d4f2292baa7b1dc36fe9a3cae2461214a24903c3c3ae143c\\scene_order.json",
+          "text": "STARTUP / ACTIVE SITE / 1 LANE"
+        }
+      ],
+      "assembly_key": "interface-assembly:f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9",
+      "created_at_s": 1784610471.3832457,
+      "display_name": "Live spectral text interface",
+      "interface_id": "spectral-program-scene",
+      "manifest_path": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\calibration_native_smoke\\render_interfaces\\f1d596007d096671f9e89fa3eda568b0a0013247d6d633b6be9f59ac0b2bb9d9\\interface.json",
+      "panel_harvests": [],
+      "updated_at_s": 1784610588.5575137
+    }
+  ],
+  "objects": [],
+  "schema_version": 4
+}

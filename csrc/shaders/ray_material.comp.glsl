@@ -98,9 +98,9 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 /* ── Compile-time constants ─────────────────────────────────────────────── */
 #define MAX_BANDS           32
-#define REFINED_HIT_STRIDE  (27 + 2 * MAX_BANDS)   /* 59: [58]=bdpt_sid at end */
-#define INTENT_STRIDE       (20 + 2 * MAX_BANDS)   /* 52 */
-#define TERMINAL_STRIDE     (26 + 2 * MAX_BANDS)   /* 58: terminals don't carry bdpt_sid */
+#define REFINED_HIT_STRIDE  (29 + 2 * MAX_BANDS)
+#define INTENT_STRIDE       (22 + 2 * MAX_BANDS)
+#define TERMINAL_STRIDE     (28 + 2 * MAX_BANDS)
 #define TRI_FULL_STRIDE     16
 #define MAT_BAND_STRIDE     12
 #define MAT_FULL_BANDS      32
@@ -224,6 +224,9 @@ float fresnel_R(float cos_i, float cos_t, float n1, float n2) {
 }
 
 /* ── Material accessors ──────────────────────────────────────────────────── */
+float path_spectral_frequency_hz = 0.0;
+float path_spectral_pdf = 1.0;
+
 int mat_band_off(int mat, int b) {
     int mm = clamp(mat, 0, max(n_mats - 1, 0));
     int bb = clamp(b, 0, MAT_FULL_BANDS - 1);
@@ -232,6 +235,28 @@ int mat_band_off(int mat, int b) {
 
 float mat_band_field(int mat, int b, int field, float fallback) {
     if (mat < 0 || mat >= n_mats) return fallback;
+    if (path_spectral_frequency_hz > 0.0) {
+        int last = 0;
+        while (last + 1 < MAT_FULL_BANDS
+               && mat_bands[mat_band_off(mat, last + 1)] > 0.0) last++;
+        if (last > 0) {
+            bool increasing = mat_bands[mat_band_off(mat, last)] >= mat_bands[mat_band_off(mat, 0)];
+            int lo = 0;
+            while (lo + 1 < last) {
+                float next_f = mat_bands[mat_band_off(mat, lo + 1)];
+                if ((increasing && next_f >= path_spectral_frequency_hz)
+                    || (!increasing && next_f <= path_spectral_frequency_hz)) break;
+                lo++;
+            }
+            int hi = min(last, lo + 1);
+            int ao = mat_band_off(mat, lo), bo = mat_band_off(mat, hi);
+            float denom = mat_bands[bo] - mat_bands[ao];
+            float t = abs(denom) > 1e-20
+                ? clamp((path_spectral_frequency_hz - mat_bands[ao]) / denom, 0.0, 1.0)
+                : 0.0;
+            return mix(mat_bands[ao + field], mat_bands[bo + field], t);
+        }
+    }
     return mat_bands[mat_band_off(mat, b) + field];
 }
 
@@ -375,10 +400,12 @@ uint  hit_taghi      (uint b) { return floatBitsToUint(HIT(b,22)); }
 float hit_soy        (uint b) { return HIT(b,23); }
 float hit_soz        (uint b) { return HIT(b,24); }
 int   hit_medium     (uint b) { return floatBitsToInt(HIT(b,25)); }
-float hit_amp_re(uint b, int band) { return HIT(b, 26 + band); }
-float hit_amp_im(uint b, int band) { return HIT(b, 26 + MAX_BANDS + band); }
+float hit_spectral_frequency(uint b) { return HIT(b, 26); }
+float hit_spectral_pdf(uint b) { return HIT(b, 27); }
+float hit_amp_re(uint b, int band) { return HIT(b, 28 + band); }
+float hit_amp_im(uint b, int band) { return HIT(b, 28 + MAX_BANDS + band); }
 float hit_pathatseg(uint b) { return HIT(b, 13); }
-uint  hit_bdpt_sid (uint b) { return floatBitsToUint(HIT(b, 26 + 2 * MAX_BANDS)); }
+uint  hit_bdpt_sid (uint b) { return floatBitsToUint(HIT(b, 28 + 2 * MAX_BANDS)); }
 
 /* ── BDPT emit helpers ───────────────────────────────────────────────────── */
 #define BDPT_VERTEX_STRIDE   28
@@ -450,10 +477,11 @@ void emit_bdpt_spectral(uint sid, uint vi_band, float re, float im, float band_p
     bdpt_out[sb + 1] = uintBitsToFloat(vi_band);
     bdpt_out[sb + 2] = re;
     bdpt_out[sb + 3] = im;
-    bdpt_out[sb + 4] = 0.0;
+    bdpt_out[sb + 4] = path_spectral_frequency_hz;
     bdpt_out[sb + 5] = band_pdf;
     bdpt_out[sb + 6] = 1.0;
-    bdpt_out[sb + 7] = 0.0;
+    bdpt_out[sb + 7] = uintBitsToFloat(
+        path_spectral_frequency_hz > 0.0 ? (sid & 0xffu) : 0u);
 }
 
 void emit_bdpt_pdf(uint sid, uint vi, uint domain, float pdf_fwd, float pdf_rev,
@@ -532,10 +560,12 @@ void write_intent(uint slot,
     out_buf[ibase + 16] = priority;
     out_buf[ibase + 17] = soy;
     out_buf[ibase + 18] = soz;
-    out_buf[ibase + 19] = uintBitsToFloat(bdpt_sid);
+    out_buf[ibase + 19] = path_spectral_frequency_hz;
+    out_buf[ibase + 20] = path_spectral_pdf;
+    out_buf[ibase + 21] = uintBitsToFloat(bdpt_sid);
     for (int b = 0; b < MAX_BANDS; b++) {
-        out_buf[ibase + 20 +           b] = amp_re[b];
-        out_buf[ibase + 20 + MAX_BANDS + b] = amp_im[b];
+        out_buf[ibase + 22 +           b] = amp_re[b];
+        out_buf[ibase + 22 + MAX_BANDS + b] = amp_im[b];
     }
 }
 
@@ -548,6 +578,8 @@ void main() {
     if (int(gid) >= n_hits) return;
 
     uint hbase = gid * uint(REFINED_HIT_STRIDE);
+    path_spectral_frequency_hz = hit_spectral_frequency(hbase);
+    path_spectral_pdf = max(hit_spectral_pdf(hbase), 1.0e-30);
     uint rng   = rng_init(gid);
 
     vec3  pos       = hit_pos(hbase);
@@ -587,7 +619,9 @@ void main() {
      * (plain store, no ordering) and resolve last-writer-wins, so we do not. */
     uint bdpt_sid      = hit_bdpt_sid(hbase);
     uint bdpt_vi       = uint(bounce) & 0xFFFFu;
-    float bdpt_band_pdf = (nb > 0) ? 1.0 / float(nb) : 1.0;
+    float bdpt_band_pdf = path_spectral_frequency_hz > 0.0
+        ? path_spectral_pdf / float(max(nb, 1))
+        : ((nb > 0) ? 1.0 / float(nb) : 1.0);
     int g_bdpt_slot = -1;  /* vertex slot returned by emit_bdpt_vertex, used by fill_bdpt_vertex_pdf */
     if (bdpt_sid != 0u && bdpt_max_verts > 0) {
         uint vi         = bdpt_vi;

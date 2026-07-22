@@ -34,6 +34,9 @@ class CompiledOrderReport:
     removed_subject_emitters: int = 0
     camera_position_m: tuple[float, float, float] | None = None
     camera_target_m: tuple[float, float, float] | None = None
+    camera_manifest_hash: str = ""
+    optical_compatibility_key: str = ""
+    flash_spectrum_compatibility_key: str = ""
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -59,6 +62,63 @@ def validate_order(payload: dict[str, Any]) -> None:
         raise ValueError("scene order root must be an object")
     if int(payload.get("schema_version", -1)) != SCHEMA_VERSION:
         raise ValueError(f"scene order schema_version must be {SCHEMA_VERSION}")
+    runtime = payload.get("runtime", {})
+    if not isinstance(runtime, dict):
+        raise ValueError("scene order runtime must be an object")
+    runtime_allowed = {
+        "work_kind", "max_sensor_epochs", "epoch_bundle_count", "ordinary_work",
+        "convergence_enabled", "total_rays", "rays_per_batch",
+        "integrator", "render_product", "startup_validation_key",
+        "sensor_top_k", "sensor_samples_per_node", "sensor_steps_per_layer",
+        "sensor_flash_rays", "sensor_flash_page_count",
+        "sensor_flash_total_rays", "sensor_t5_pair_budget", "focus_distance_m",
+        "transport_option", "max_bounces", "sensor_work_tile_width",
+        "sensor_work_tile_height", "sensor_allocation_mode", "capacity_test",
+    }
+    runtime_extra = sorted(set(runtime) - runtime_allowed)
+    if runtime_extra:
+        raise ValueError(f"scene order runtime has unsupported fields {runtime_extra}")
+    for key in (
+        "total_rays", "rays_per_batch", "sensor_top_k", "sensor_samples_per_node",
+        "sensor_steps_per_layer", "sensor_flash_rays",
+        "sensor_flash_page_count", "sensor_flash_total_rays",
+        "sensor_t5_pair_budget", "max_bounces", "epoch_bundle_count",
+        "sensor_work_tile_width", "sensor_work_tile_height",
+    ):
+        if key in runtime and int(runtime[key]) <= 0:
+            raise ValueError(f"runtime.{key} must be positive")
+    if "max_sensor_epochs" in runtime and int(runtime["max_sensor_epochs"]) < 0:
+        raise ValueError("runtime.max_sensor_epochs must be non-negative")
+    transport = payload.get("transport")
+    if transport is not None:
+        if not isinstance(transport, dict):
+            raise ValueError("scene order transport must be an object")
+        domain = str(transport.get("domain", ""))
+        if domain == "fixed_spectral":
+            frequencies = np.asarray(
+                transport.get("frequencies_hz", ()), np.float64
+            ).reshape(-1)
+        elif domain == "continuous_spectral_lut":
+            from camera_software.transport_contract import TransportLaneTable
+
+            table = TransportLaneTable.from_mapping(
+                dict(transport.get("lane_table", {}))
+            )
+            if table.domain.value != domain:
+                raise ValueError("continuous transport lane-table domain mismatch")
+            frequencies = np.asarray([], np.float64)
+        else:
+            raise ValueError(
+                "scene order transport domain must be fixed_spectral or "
+                "continuous_spectral_lut"
+            )
+        if domain != "continuous_spectral_lut":
+            if not 1 <= frequencies.size <= 32:
+                raise ValueError("transport frequencies_hz requires 1..32 values")
+            if not np.all(np.isfinite(frequencies)) or np.any(frequencies <= 0.0):
+                raise ValueError("transport frequencies_hz must be finite and positive")
+            if np.unique(frequencies).size != frequencies.size:
+                raise ValueError("transport frequencies_hz must be unique")
     jobs = payload.get("jobs")
     if not isinstance(jobs, list) or not jobs:
         raise ValueError("scene order requires a non-empty jobs array")
@@ -91,6 +151,80 @@ def resolved_jobs(payload: dict[str, Any], job_id: str | None = None) -> list[di
     return jobs
 
 
+def order_transport_frequencies(payload: dict[str, Any]) -> np.ndarray | None:
+    """Return fixed frequencies or continuous payload-lane reference values.
+
+    Continuous references only size the compiled lane payload.  They are not
+    ray frequencies; the native launch resolver assigns those through the LUT.
+    """
+
+    validate_order(payload)
+    transport = payload.get("transport")
+    if transport is None:
+        return None
+    if str(transport["domain"]) == "fixed_spectral":
+        values = transport["frequencies_hz"]
+    else:
+        table = transport["lane_table"]
+        lut = table["lookup_tables"][0]
+        f0, f1 = float(lut["frequency_knots_hz"][0]), float(lut["frequency_knots_hz"][-1])
+        count = len(table["lanes"])
+        values = np.linspace(f0, f1, count + 2, dtype=np.float64)[1:-1]
+    return np.ascontiguousarray(np.asarray(values, np.float64).reshape(-1))
+
+
+def order_transport_lut_config(payload: dict[str, Any]) -> dict[str, np.ndarray] | None:
+    """Flatten the continuous lane→LUT contract for the native ABI."""
+    validate_order(payload)
+    transport = payload.get("transport")
+    if not transport or str(transport["domain"]) != "continuous_spectral_lut":
+        return None
+    table = transport["lane_table"]
+    offsets = [0]
+    frequencies: list[float] = []
+    density: list[float] = []
+    for lut in table["lookup_tables"]:
+        frequencies.extend(float(v) for v in lut["frequency_knots_hz"])
+        density.extend(float(v) for v in lut["density"])
+        offsets.append(len(frequencies))
+    return {
+        "lane_lut_index": np.ascontiguousarray(
+            [int(lane["lut_index"]) for lane in table["lanes"]], np.int32),
+        "profile_offsets": np.ascontiguousarray(offsets, np.int32),
+        "frequency_knots_hz": np.ascontiguousarray(frequencies, np.float64),
+        "density": np.ascontiguousarray(density, np.float64),
+    }
+
+
+def order_transport_rgb_weights(payload: dict[str, Any]) -> np.ndarray | None:
+    """Resolve display/sensor weights for fixed or continuous transport lanes."""
+
+    frequencies = order_transport_frequencies(payload)
+    if frequencies is None:
+        return None
+    transport = dict(payload["transport"])
+    if str(transport["domain"]) == "continuous_spectral_lut":
+        # Exact sensor response and 1/pdf correction happen after per-ray LUT
+        # resolution in the native transport, not once per scene lane.
+        return None
+    table = dict(transport.get("lane_table", {}))
+    lanes = list(table.get("lanes", ()))
+    if len(lanes) == frequencies.size and all(
+        lane.get("sensor_weight_xyz") is not None for lane in lanes
+    ):
+        weights = np.asarray(
+            [lane["sensor_weight_xyz"] for lane in lanes], np.float64
+        )
+        if weights.shape != (frequencies.size, 3) or not np.all(np.isfinite(weights)):
+            raise ValueError("transport lane sensor weights must be finite RGB triplets")
+        if np.any(weights < 0.0):
+            raise ValueError("transport lane sensor weights must be non-negative")
+    else:
+        wavelengths_nm = 299_792_458.0 / frequencies * 1.0e9
+        weights = _display_rgb_weights(wavelengths_nm)
+    return np.ascontiguousarray(weights, np.float32)
+
+
 def _vec(value: Any, name: str, n: int = 3) -> np.ndarray:
     arr = np.asarray(value, dtype=np.float64).reshape(-1)
     if arr.size != n or not np.all(np.isfinite(arr)):
@@ -109,7 +243,8 @@ def _positive(value: Any, name: str, allow_zero: bool = False) -> float:
 def _validate_resolved_job(job: dict[str, Any]) -> None:
     supported = {
         "id", "token", "image", "camera", "exposure", "flash", "font",
-        "planes", "materials", "geometry", "objects", "single_shot_fit"
+        "planes", "materials", "geometry", "objects", "single_shot_fit",
+        "emitter",
     }
     unknown = sorted(set(job) - supported)
     if unknown:
@@ -121,10 +256,14 @@ def _validate_resolved_job(job: dict[str, Any]) -> None:
     contracts = {
         "image": {"width", "height", "region"},
         "camera": {
-            "focal_mm", "aperture_mm", "position_m", "target_m", "focus_target_m", "up"
+            "focal_mm", "aperture_mm", "position_m", "target_m", "focus_target_m", "up",
+            "focus_distance_m", "manifest",
         },
-        "exposure": {"time_s", "iso", "sensor_sweeps", "t5_pair_budget"},
-        "flash": {"intensity_scale"},
+        "exposure": {
+            "time_s", "iso", "sensor_sweeps", "t5_pair_budget",
+            "sensor_id", "film_id",
+        },
+        "flash": {"intensity_scale", "manifest", "enabled"},
         "font": {"family", "weight", "style", "file"},
     }
     for section, allowed in contracts.items():
@@ -136,6 +275,26 @@ def _validate_resolved_job(job: dict[str, Any]) -> None:
             raise ValueError(
                 f"job {job['id']!r}: unsupported {section} fields {extra}; "
                 "refusing to silently ignore requested behavior"
+            )
+    emitter = job.get("emitter", {})
+    if not isinstance(emitter, dict):
+        raise ValueError(f"job {job['id']!r}: emitter must be an object")
+    emitter_extra = sorted(set(emitter) - {
+        "mode", "direction_space", "direction", "divergence_deg",
+    })
+    if emitter_extra:
+        raise ValueError(f"job {job['id']!r}: unsupported emitter fields {emitter_extra}")
+    if emitter:
+        mode = str(emitter.get("mode", "lambertian"))
+        if mode not in {"lambertian", "collimated"}:
+            raise ValueError(f"unsupported emitter mode {mode!r}")
+        if mode == "collimated":
+            direction = _vec(emitter.get("direction", [-1, 0, 0]), "emitter.direction")
+            if float(np.linalg.norm(direction)) <= 1.0e-12:
+                raise ValueError("emitter.direction must be nonzero")
+            _positive(
+                emitter.get("divergence_deg", 0.0),
+                "emitter.divergence_deg", allow_zero=True,
             )
     image = job.get("image", {})
     full_width = int(image.get("width", 64))
@@ -179,6 +338,8 @@ def _validate_resolved_job(job: dict[str, Any]) -> None:
     _positive(job.get("exposure", {}).get("iso", 100.0), "exposure.iso")
     _positive(job.get("exposure", {}).get("sensor_sweeps", 1), "exposure.sensor_sweeps")
     _positive(job.get("flash", {}).get("intensity_scale", 1.0), "flash.intensity_scale")
+    from camera_software.camera_manifest import resolve_camera_manifest
+    resolve_camera_manifest(camera, image, job.get("flash", {}))
     geometry = job.get("geometry", {})
     planes = job.get("planes", [])
     if not isinstance(geometry, dict):
@@ -195,10 +356,20 @@ def _validate_resolved_job(job: dict[str, Any]) -> None:
         plane_ids.add(pid)
         plane_extra = sorted(set(plane) - {
             "id", "center_m", "normal", "up", "size_m", "thickness_m", "material",
+            "shape", "emitter",
             "bevel_width_m", "bevel_depth_m", "bevel_profile", "bevel_seams",
+            "scene_object_id", "library_object_key", "library_subtype_key",
+            "library_parameters", "sensor_region_px",
         })
         if plane_extra:
             raise ValueError(f"plane {pid}: unsupported fields {plane_extra}")
+        shape = str(plane.get("shape", "box"))
+        if shape not in {"box", "triangular_prism"}:
+            raise ValueError(f"plane {pid}: unsupported shape {shape!r}")
+        if not isinstance(plane.get("library_parameters", {}), dict):
+            raise ValueError(
+                f"plane {pid}: library_parameters must be an object"
+            )
         _vec(plane.get("center_m", [0, 0, 0]), f"plane {pid}.center_m")
         _vec(plane.get("normal", [1, 0, 0]), f"plane {pid}.normal")
         _vec(plane.get("up", [0, 0, 1]), f"plane {pid}.up")
@@ -320,7 +491,12 @@ def order_runtime_settings(job: dict[str, Any]) -> dict[str, Any]:
     """Return consumed camera/exposure/output settings for a resolved job."""
     image = job.get("image", {})
     camera = job.get("camera", {})
+    flash = job.get("flash", {})
     exposure = job.get("exposure", {})
+    from camera_software.camera_manifest import resolve_camera_manifest
+    resolved_camera = resolve_camera_manifest(camera, image, flash)
+    resolved_mapping = resolved_camera.mapping()
+    resolved_lens = dict(resolved_mapping["lens"])
     full_width = int(image.get("width", 64))
     full_height = int(image.get("height", 64))
     region = image.get("region", {})
@@ -337,8 +513,10 @@ def order_runtime_settings(job: dict[str, Any]) -> dict[str, Any]:
             "x": region_x, "y": region_y,
             "width": region_width, "height": region_height,
         },
-        "focal_mm": float(camera.get("focal_mm", 35.0)),
-        "aperture_mm": float(camera.get("aperture_mm", 25.0)),
+        "focal_mm": float(resolved_lens["focal_length_mm"]),
+        "aperture_mm": float(resolved_lens["aperture_diameter_mm"]),
+        "camera_manifest": resolved_mapping,
+        "camera_manifest_hash": resolved_camera.hash,
         "iso": float(exposure.get("iso", 100.0)),
         "exposure_time_s": float(exposure.get("time_s", 1.0 / 60.0)),
         "sensor_sweeps": int(exposure.get("sensor_sweeps", 1)),
@@ -404,11 +582,28 @@ def sensor_tile(job: dict[str, Any], sensor_w_m: float, sensor_h_m: float) -> di
 def composition_metadata(job: dict[str, Any]) -> dict[str, Any]:
     runtime = order_runtime_settings(job)
     pose = camera_pose(job)
+    sensor = dict(runtime["camera_manifest"].get("sensor", {}))
+    physical_width_mm = float(sensor.get("physical_width_mm", 0.0))
+    physical_height_mm = float(sensor.get("physical_height_mm", 0.0))
+    physical_tile = sensor_tile(
+        job, physical_width_mm * 1.0e-3, physical_height_mm * 1.0e-3
+    )
     return {
         "coordinate_space": "full_sensor_pixels",
         "origin": "top-left",
         "full_frame": {"width": runtime["full_width"], "height": runtime["full_height"]},
         "region": dict(runtime["region"]),
+        "film_format": {
+            "key": str(sensor.get("film_format_key", "custom")),
+            "mount_standard": str(sensor.get("mount_standard", "custom")),
+            "physical_width_mm": physical_width_mm,
+            "physical_height_mm": physical_height_mm,
+            "physical_aspect_ratio": float(sensor.get(
+                "physical_aspect_ratio",
+                physical_width_mm / max(physical_height_mm, 1.0e-12),
+            )),
+        },
+        "physical_sensor_tile": physical_tile,
         "camera": None if pose is None else {
             "position_m": pose["position"].tolist(),
             "target_m": pose["target"].tolist(),
@@ -456,6 +651,29 @@ def _box_plane_triangles(plane: dict[str, Any]) -> np.ndarray:
     center, normal, right, up = _plane_basis(plane)
     width, height = _vec(plane.get("size_m", [0.5, 0.5]), "plane.size_m", 2)
     thickness = float(plane.get("thickness_m", 0.01))
+    if str(plane.get("shape", "box")) == "triangular_prism":
+        # Isosceles triangular optical cross-section in the normal/right plane,
+        # extruded along `up`. `normal` points from the base toward the apex.
+        apex = center + normal * (0.5 * thickness)
+        base_center = center - normal * (0.5 * thickness)
+        cross_section = (
+            apex,
+            base_center + right * (0.5 * width),
+            base_center - right * (0.5 * width),
+        )
+        lower = [point - up * (0.5 * height) for point in cross_section]
+        upper = [point + up * (0.5 * height) for point in cross_section]
+        faces = [
+            (lower[0], lower[2], lower[1]),
+            (upper[0], upper[1], upper[2]),
+        ]
+        for index in range(3):
+            nxt = (index + 1) % 3
+            faces.extend((
+                (lower[index], lower[nxt], upper[nxt]),
+                (lower[index], upper[nxt], upper[index]),
+            ))
+        return np.ascontiguousarray(faces, np.float64)
     bevel_width = float(plane.get("bevel_width_m", 0.0))
     bevel_depth = float(plane.get("bevel_depth_m", 0.0))
     profile = str(plane.get("bevel_profile", "square"))
@@ -937,6 +1155,12 @@ def _material_payload(authored: dict[str, Any], kind: str) -> dict[str, Any]:
             "opacity": 1.0, "emission_rgb": [0.0, 0.0, 0.0],
         }
     payload = _deep_merge(defaults, authored)
+    # Calibration and laboratory objects may author the same explicit spectral
+    # records consumed by MaterialDatabase. Preserve those records instead of
+    # replacing them with the RGB compatibility reconstruction below.
+    if "bands" in authored:
+        payload["bands"] = copy.deepcopy(authored["bands"])
+        return payload
     # Native BDPT consumes explicit SpectralBandRecord rows.  PBR/albedo fields
     # alone only populate compatibility records and otherwise yield a black
     # spectral surface.  Bake the authored linear RGB into the renderer's eight
@@ -983,7 +1207,11 @@ def _material_payload(authored: dict[str, Any], kind: str) -> dict[str, Any]:
     return payload
 
 
-def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrderReport]:
+def compile_job(
+    base_scene: Any,
+    job: dict[str, Any],
+    freq_hz: np.ndarray | None = None,
+) -> tuple[Any, CompiledOrderReport]:
     """Compile one resolved job by replacing ``base_scene`` subject triangles."""
     _validate_resolved_job(job)
     from material_db import MaterialDatabase, MAX_SPECTRAL_BANDS
@@ -1024,6 +1252,7 @@ def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrde
     normal_parts = [np.asarray(base_scene.normals, np.float64)[keep_ids]]
     mat_parts = [np.asarray(base_scene.mat_idx, np.int32)[keep_ids]]
     object_ids: list[np.ndarray] = []
+    authored_emitter_ids: list[np.ndarray] = []
 
     authored_materials = job.get("materials", {})
     if not isinstance(authored_materials, dict):
@@ -1051,6 +1280,10 @@ def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrde
         idx = material_index(str(plane.get("material", "matte_black")), "plane")
         mat_parts.append(np.full(tri.shape[0], idx, np.int32))
         object_ids.append(np.arange(start, start + tri.shape[0], dtype=np.int32))
+        if bool(plane.get("emitter", False)):
+            authored_emitter_ids.append(
+                np.arange(start, start + tri.shape[0], dtype=np.int32)
+            )
         plane_triangles += int(tri.shape[0])
 
     authored_objects = job.get("objects", ())
@@ -1108,7 +1341,7 @@ def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrde
         )
         glyph_triangle_total = int(glyph_tri.shape[0])
 
-    custom_buf = np.ascontiguousarray(db.build_mat_buf(), np.float32)
+    custom_buf = np.ascontiguousarray(db.build_mat_buf(freq_hz=freq_hz), np.float32)
     if custom_buf.shape[0] % MAX_SPECTRAL_BANDS != 0:
         raise RuntimeError("authored material buffer has invalid spectral stride")
     mat_buf = np.ascontiguousarray(np.vstack([base_scene.mat_buf, custom_buf]), np.float32)
@@ -1116,28 +1349,54 @@ def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrde
     flash_scale = float(job.get("flash", {}).get("intensity_scale", 1.0))
     if not math.isfinite(flash_scale) or flash_scale <= 0.0:
         raise ValueError("flash.intensity_scale must be positive")
-    # Scale the actual spectral emission slots used by source triangles as well
-    # as the host-side power bookkeeping.  Camera/lens geometry is untouched.
-    if flash_scale != 1.0:
-        source_old = np.asarray(base_scene.src_tri_idx, np.int64)
-        source_old = source_old[(source_old >= 0) & (source_old < n_base)]
-        # Scale only the RETAINED photographic emitters; removed subject-space
-        # demo emitters must not have their (shared) materials touched.
-        source_old = source_old[keep_mask[source_old]]
-        source_mats = np.unique(np.asarray(base_scene.mat_idx, np.int32)[source_old])
-        for mid in source_mats:
-            lo = int(mid) * MAX_SPECTRAL_BANDS
-            mat_buf[lo:lo + MAX_SPECTRAL_BANDS, 5] *= flash_scale
-
     tri_all = np.ascontiguousarray(np.concatenate(tri_parts, axis=0), np.float64)
     # Preserve the already-authored normals of retained camera/flash geometry;
     # the lab mesh intentionally contains a few zero-area bookkeeping faces.
     # Only newly compiled geometry is held to the non-degenerate contract.
     normals = np.ascontiguousarray(np.concatenate(normal_parts, axis=0), np.float64)
     mat_idx = np.ascontiguousarray(np.concatenate(mat_parts), np.int32)
+    flash_enabled = bool(dict(job.get("flash", {})).get("enabled", True))
     src_old = np.asarray(base_scene.src_tri_idx, np.int64).reshape(-1)
+    if not flash_enabled:
+        src_old = np.zeros((0,), np.int64)
     src_valid = (src_old >= 0) & (src_old < n_base) & (remap[np.clip(src_old, 0, max(0, n_base-1))] >= 0)
     src_new = remap[src_old[src_valid]].astype(np.int32, copy=False)
+    authored_src = (
+        np.ascontiguousarray(np.concatenate(authored_emitter_ids), np.int32)
+        if authored_emitter_ids
+        else np.zeros((0,), np.int32)
+    )
+    all_src = np.ascontiguousarray(
+        np.concatenate((src_new, authored_src)), np.int32
+    )
+
+    # LIGHT EV is a scene-light control, so apply it to both the retained
+    # photographic flash and authored emitters such as the prism-room beam.
+    # Scaling each material once keeps its spectral distribution intact.
+    if flash_scale != 1.0 and all_src.size:
+        source_mats = np.unique(mat_idx[all_src])
+        for mid in source_mats:
+            lo = int(mid) * MAX_SPECTRAL_BANDS
+            mat_buf[lo:lo + MAX_SPECTRAL_BANDS, 5] *= flash_scale
+
+    authored_area = np.zeros((authored_src.size,), np.float64)
+    authored_power = np.zeros((authored_src.size,), np.float64)
+    authored_rgb = np.zeros((authored_src.size, 3), np.float64)
+    if authored_src.size:
+        authored_tri = tri_all[authored_src]
+        authored_area = 0.5 * np.linalg.norm(
+            np.cross(
+                authored_tri[:, 1] - authored_tri[:, 0],
+                authored_tri[:, 2] - authored_tri[:, 0],
+            ), axis=1,
+        )
+        active_bands = max(
+            1, min(MAX_SPECTRAL_BANDS, int(np.asarray(freq_hz).size) if freq_hz is not None else 8)
+        )
+        rows = mat_buf.reshape(-1, MAX_SPECTRAL_BANDS, mat_buf.shape[1])
+        emission = rows[mat_idx[authored_src], :active_bands, 5]
+        authored_power = np.sum(np.maximum(emission, 0.0), axis=1) * authored_area
+        authored_rgb[:] = authored_power[:, None] / 3.0
 
     new_groups: dict[str, np.ndarray] = {}
     for name, ids in groups.items():
@@ -1156,13 +1415,24 @@ def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrde
         mat_idx=mat_idx,
         mat_buf=mat_buf,
         mat_n_mats=int(base_scene.mat_n_mats + custom_buf.shape[0] // MAX_SPECTRAL_BANDS),
-        src_pos=np.ascontiguousarray(tri_all[src_new].mean(axis=1), np.float64),
-        src_dir=np.ascontiguousarray(normals[src_new], np.float64),
-        src_directivity=np.ascontiguousarray(np.asarray(base_scene.src_directivity)[src_valid], np.float64),
-        src_area_m2=np.ascontiguousarray(np.asarray(base_scene.src_area_m2)[src_valid], np.float64),
-        src_emit_W=np.ascontiguousarray(np.asarray(base_scene.src_emit_W)[src_valid] * flash_scale, np.float64),
-        src_emit_rgb_W=np.ascontiguousarray(np.asarray(base_scene.src_emit_rgb_W)[src_valid] * flash_scale, np.float64),
-        src_tri_idx=np.ascontiguousarray(src_new, np.int32),
+        src_pos=np.ascontiguousarray(tri_all[all_src].mean(axis=1), np.float64),
+        src_dir=np.ascontiguousarray(normals[all_src], np.float64),
+        src_directivity=np.ascontiguousarray(np.concatenate((
+            np.asarray(base_scene.src_directivity)[src_valid],
+            np.ones(authored_src.size, np.float64),
+        )), np.float64),
+        src_area_m2=np.ascontiguousarray(np.concatenate((
+            np.asarray(base_scene.src_area_m2)[src_valid], authored_area,
+        )), np.float64),
+        src_emit_W=np.ascontiguousarray(np.concatenate((
+            np.asarray(base_scene.src_emit_W)[src_valid] * flash_scale,
+            authored_power,
+        )), np.float64),
+        src_emit_rgb_W=np.ascontiguousarray(np.concatenate((
+            np.asarray(base_scene.src_emit_rgb_W)[src_valid] * flash_scale,
+            authored_rgb,
+        ), axis=0), np.float64),
+        src_tri_idx=all_src,
         bounds_min=np.ascontiguousarray(pts.min(axis=0), np.float32),
         bounds_max=np.ascontiguousarray(pts.max(axis=0), np.float32),
         camera_tri_groups=new_groups,
@@ -1172,6 +1442,7 @@ def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrde
             if getattr(base_scene, "optical_camera", None) is None
             else base_scene.optical_camera.remap_triangles(remap)
         ),
+        emitter_launch_profile=copy.deepcopy(dict(job.get("emitter", {}))),
     )
     report_token = (
         str(job.get("token", ""))
@@ -1181,6 +1452,10 @@ def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrde
             for item in authored_objects if bool(item.get("enabled", True))
         )
     )
+    from camera_software.camera_manifest import resolve_camera_manifest
+    _resolved_camera = resolve_camera_manifest(
+        job.get("camera", {}), job.get("image", {}), job.get("flash", {})
+    )
     report = CompiledOrderReport(
         job_id=str(job["id"]), token=report_token,
         plane_triangles=plane_triangles, glyph_triangles=glyph_triangle_total,
@@ -1189,5 +1464,8 @@ def compile_job(base_scene: Any, job: dict[str, Any]) -> tuple[Any, CompiledOrde
         removed_subject_emitters=removed_subject_emitters,
         camera_position_m=(None if pose is None else tuple(float(v) for v in pose["position"])),
         camera_target_m=(None if pose is None else tuple(float(v) for v in pose["target"])),
+        camera_manifest_hash=_resolved_camera.hash,
+        optical_compatibility_key=_resolved_camera.compatibility_key("optical_geometry"),
+        flash_spectrum_compatibility_key=_resolved_camera.compatibility_key("flash_spectrum"),
     )
     return scene, report

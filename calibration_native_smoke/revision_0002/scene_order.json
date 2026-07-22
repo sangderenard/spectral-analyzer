@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "image": {
+      "width": 120,
+      "height": 80,
+      "region": {
+        "x": 48,
+        "y": 32,
+        "width": 24,
+        "height": 16
+      }
+    },
+    "camera": {
+      "focal_mm": 35.0,
+      "aperture_mm": 25.0,
+      "position_m": [
+        3.0,
+        -2.0,
+        1.0
+      ],
+      "target_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "focus_target_m": [
+        0.0014726639859765896,
+        -0.0009817759906510597,
+        0.0004908879953255299
+      ],
+      "up": [
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    "exposure": {
+      "time_s": 0.016666666666666666,
+      "iso": 100.0,
+      "sensor_sweeps": 1,
+      "t5_pair_budget": 20000000
+    },
+    "flash": {
+      "intensity_scale": 1.0
+    },
+    "font": {
+      "family": "DejaVu Sans",
+      "weight": "bold",
+      "style": "normal"
+    },
+    "planes": [
+      {
+        "id": "background",
+        "center_m": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "normal": [
+          0.8017837257,
+          -0.5345224838,
+          0.2672612419
+        ],
+        "up": [
+          -0.222374795,
+          0.1482498633,
+          0.9636241117
+        ],
+        "size_m": [
+          1.4,
+          1.0
+        ],
+        "thickness_m": 0.018,
+        "material": "quiet_background"
+      }
+    ],
+    "materials": {
+      "quiet_background": {
+        "albedo_rgb": [
+          0.018,
+          0.021,
+          0.022
+        ],
+        "reflectivity": 0.065,
+        "diffusion": 0.98,
+        "absorption": 0.92,
+        "roughness": 0.98,
+        "metallic": 0.0
+      },
+      "text_surface": {
+        "albedo_rgb": [
+          0.82,
+          0.76,
+          0.62
+        ],
+        "reflectivity": 0.58,
+        "diffusion": 0.72,
+        "absorption": 0.25,
+        "roughness": 0.3,
+        "metallic": 0.0,
+        "ior": 1.5
+      }
+    },
+    "geometry": {
+      "embed_plane": "background",
+      "height_m": 0.055,
+      "line_height_m": 0.055,
+      "line_spacing": 1.22,
+      "text_box_m": [
+        0.31,
+        0.18
+      ],
+      "horizontal_align": "center",
+      "vertical_align": "center",
+      "extrusion_depth_ratio": 0.08,
+      "embed_fraction": 0.25,
+      "offset_m": [
+        0.0,
+        0.0
+      ],
+      "profile": "straight",
+      "outline_subdivisions": 4,
+      "cap_grid": 64,
+      "material": "text_surface"
+    }
+  },
+  "jobs": [
+    {
+      "id": "live_paragraph",
+      "token": "ACTIVE SENSOR SITE\nSPECTRAL TRANSPORT SANITY"
+    }
+  ],
+  "runtime": {
+    "work_kind": "calibration",
+    "max_sensor_epochs": 1,
+    "ordinary_work": false,
+    "total_rays": 256,
+    "rays_per_batch": 256,
+    "startup_validation_key": "spectral:1"
+  },
+  "transport": {
+    "domain": "sampled_continuous_spectral",
+    "lane_table": {
+      "abi_version": 1,
+      "domain": "sampled_continuous_spectral",
+      "cohort_id": "native-smoke",
+      "lanes": [
+        {
+          "lane_id": 0,
+          "identity": "continuous-frequency:0x1.e7b2a2387b332p+48",
+          "frequency_hz": 536229388516147.1,
+          "sampling_pdf": 4.385147953753854e-15,
+          "proposal_profile_key": "sha256:86f5b179543d1e1010c3824988609221565eec54043d5b81685b26b5442f8fc2",
+          "sample_u": 0.32383276483316237,
+          "sensor_weight_xyz": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      ]
+    },
+    "integration_span_hz": 321206205000000.0,
+    "calibration_mode": "transport-sanity"
+  }
+}

@@ -58,22 +58,46 @@ void main() {
     if (node_id >= control[0]) return;
     SensorMipNode parent = nodes[node_id];
     if (parent.level != target_level || parent.first_child_id == NO_NODE) return;
+    bool even_division = (control[8] & 1u) == 0u;
+    uint first = parent.first_child_id;
 
-    float evidence = 3.402823466e+38;
-    for (uint slot = 0u; slot < 9u; ++slot) {
-        uint child_id = parent.first_child_id + slot;
-        float child_ev = child_evidence(child_id);
-        if (!(child_ev > 0.0) || isnan(child_ev) || isinf(child_ev)) {
-            rollup_evidence[node_id] = floatBitsToUint(0.0);
-            atomicAnd(nodes[node_id].flags, ~NODE_ROLL_VALID);
-            return;
-        }
-        evidence = min(evidence, child_ev);
+    float e0 = child_evidence(first + 0u);
+    float e1 = child_evidence(first + 1u);
+    float e2 = child_evidence(first + 2u);
+    float e3 = child_evidence(first + 3u);
+    float evidence = min(min(e0, e1), min(e2, e3));
+    bool valid = e0 > 0.0 && e1 > 0.0 && e2 > 0.0 && e3 > 0.0;
+    if (!even_division) {
+        float e4 = child_evidence(first + 4u);
+        float e5 = child_evidence(first + 5u);
+        float e6 = child_evidence(first + 6u);
+        float e7 = child_evidence(first + 7u);
+        float e8 = child_evidence(first + 8u);
+        valid = valid && e4 > 0.0 && e5 > 0.0 && e6 > 0.0
+            && e7 > 0.0 && e8 > 0.0;
+        evidence = min(evidence, min(min(e4, e5), min(min(e6, e7), e8)));
+    }
+    if (!valid || isnan(evidence) || isinf(evidence)) {
+        rollup_evidence[node_id] = floatBitsToUint(0.0);
+        atomicAnd(nodes[node_id].flags, ~NODE_ROLL_VALID);
+        return;
     }
     for (uint band = 0u; band < n_bands; ++band) {
-        float mean = 0.0;
-        for (uint slot = 0u; slot < 9u; ++slot)
-            mean += child_mean(parent.first_child_id + slot, band) / 9.0;
+        float mean;
+        if (even_division) {
+            mean = (
+                child_mean(first + 0u, band) + child_mean(first + 1u, band)
+                + child_mean(first + 2u, band) + child_mean(first + 3u, band)
+            ) * 0.25;
+        } else {
+            mean = (
+                child_mean(first + 0u, band) + child_mean(first + 1u, band)
+                + child_mean(first + 2u, band) + child_mean(first + 3u, band)
+                + child_mean(first + 4u, band) + child_mean(first + 5u, band)
+                + child_mean(first + 6u, band) + child_mean(first + 7u, band)
+                + child_mean(first + 8u, band)
+            ) * (1.0 / 9.0);
+        }
         rollup_mean[parent.rollup_moment_offset + band] = floatBitsToUint(mean);
     }
     rollup_evidence[node_id] = floatBitsToUint(evidence);

@@ -39,6 +39,7 @@
  *    [0] = hit count  (from T1, used as n_hits here)
  *    [3] = cpu_refine count  (incremented for complex-kind fallbacks)
  *    [4] = BDPT optical-event count
+ *    [12..23] = exact camera-lens traversal telemetry (see C++ log)
  *
  * NEURAL_ASSEMBLY policy:
  *   T2 sets bit 3 of color_flag (HitBuf[16]) to absorb the ray.  The intended
@@ -51,7 +52,7 @@ layout(local_size_x = 64) in;
 
 /* ── Layout constants ───────────────────────────────────────────────────── */
 #define MAX_GPU_BANDS         32
-#define HIT_STRIDE            (27 + 2*MAX_GPU_BANDS)  /* 91 with MAX_GPU_BANDS=32 */
+#define HIT_STRIDE            (29 + 2*MAX_GPU_BANDS)
 #define TRI_FULL_STRIDE       16
 #define GROUP_PAYLOAD_STRIDE  16
 #define MAX_NEURAL_DIM        512   /* max hidden_dim supported */
@@ -162,7 +163,7 @@ void emit_bdpt_optical(int hb, uint reason, uint element_index, uint flags,
                        float transverse_r, float dist_past_aperture,
                        float phase_space_j)
 {
-    uint sid = hit_u(hb, 26 + 2*MAX_GPU_BANDS);
+    uint sid = hit_u(hb, 28 + 2*MAX_GPU_BANDS);
     if (sid == 0u || bdpt_max_optical <= 0) return;
     uint slot = atomicAdd(counters[4], 1u);
     if (int(slot) >= bdpt_max_optical) return;
@@ -201,6 +202,13 @@ void absorb_with_optical_event(int hb, uint reason, uint element_index,
                                float opl, float geom_len, float aperture_r,
                                float transverse_r, float dist_past_aperture)
 {
+    bool camera_path = ((hit_u(hb, 16) & 1u) != 0u);
+    if (camera_path) {
+        if (reason == BDPT_OPT_APERTURE_CLIP) atomicAdd(counters[16], 1u);
+        else if (reason == BDPT_OPT_VIGNETTE_CLIP) atomicAdd(counters[17], 1u);
+        else if (reason == BDPT_OPT_TIR) atomicAdd(counters[18], 1u);
+        else atomicAdd(counters[23], 1u);
+    }
     emit_bdpt_optical(hb, reason, element_index, 0u,
                       pos, vec3(0.0), dir_in, vec3(0.0),
                       0.0, 0.0, eta_i, eta_t,
@@ -355,6 +363,8 @@ void parametric_lens_teleport(int hb, int pay_off)
     vec3 ray_pos = vec3(hit_f(hb, 0), hit_f(hb, 1), hit_f(hb, 2));
     vec3 ray_dir = normalize(vec3(hit_f(hb, 6), hit_f(hb, 7), hit_f(hb, 8)));
     bool is_backward = ((hit_u(hb, 16) & 1u) != 0u);
+    uint surfaces_traversed = 0u;
+    if (is_backward) atomicAdd(counters[12], 1u);
     int spectral_count = max(0, int(npay[pay_off + PLENS_N_SPECTRAL]));
     int spectral_offset = max(0, int(npay[pay_off + PLENS_SPEC_OFFSET]));
     int spectral_stride = max(0, int(npay[pay_off + PLENS_SPEC_STRIDE]));
@@ -365,8 +375,8 @@ void parametric_lens_teleport(int hb, int pay_off)
     float active_power = -1.0;
     int active_count = min(n_bands, MAX_GPU_BANDS);
     for (int b = 0; b < active_count; ++b) {
-        float ar = hit_f(hb, 26 + b);
-        float ai = hit_f(hb, 26 + MAX_GPU_BANDS + b);
+        float ar = hit_f(hb, 28 + b);
+        float ai = hit_f(hb, 28 + MAX_GPU_BANDS + b);
         float power = ar*ar + ai*ai;
         if (power > active_power) {
             active_power = power;
@@ -507,6 +517,8 @@ void parametric_lens_teleport(int hb, int pay_off)
             seg_opl = n_bef * t;
             opl     += seg_opl;
             ray_pos += t * ray_dir;
+            surfaces_traversed += 1u;
+            if (is_backward) atomicAdd(counters[13], 1u);
         }
 
         /* ── Aperture / stop check ───────────────────────────────────────── */
@@ -517,7 +529,10 @@ void parametric_lens_teleport(int hb, int pay_off)
                                       seg_opl, abs(seg_t), ap_r, r_tr, r_tr - ap_r);
             return;
         }
-        if (is_stop) continue;   /* stop passed — no refraction, advance to next */
+        if (is_stop) {
+            if (is_backward) atomicAdd(counters[15], 1u);
+            continue;   /* stop passed — no refraction, advance to next */
+        }
 
         /* ── Exact surface normal (gradient of conic equation) ───────────── */
         vec3 surf_n;
@@ -538,6 +553,10 @@ void parametric_lens_teleport(int hb, int pay_off)
         float sin2_t = eta * eta * max(0.0, 1.0 - cos_i*cos_i);
         if (sin2_t > 1.0) {
             /* TIR */
+            if (is_backward) {
+                atomicAdd(counters[18], 1u);
+                atomicAdd(counters[23], 1u);
+            }
             emit_bdpt_optical(hb, BDPT_OPT_TIR, uint(s), 0u,
                               ray_pos, surf_n, ray_dir, vec3(0.0),
                               cos_i, 0.0, n_bef, n_aft,
@@ -550,6 +569,7 @@ void parametric_lens_teleport(int hb, int pay_off)
         float cos_t = sqrt(1.0 - sin2_t);
         vec3 dir_before = ray_dir;
         ray_dir = normalize(eta * ray_dir + (eta * cos_i - cos_t) * surf_n);
+        if (is_backward) atomicAdd(counters[14], 1u);
         float Rf = fresnel_R(cos_i, cos_t, n_bef, n_aft);
         float J = (cos_i > EPS && cos_t > EPS) ? (eta * eta) * (cos_t / cos_i) : 0.0;
         emit_bdpt_optical(hb, BDPT_OPT_REFRACTION, uint(s), 0u,
@@ -562,14 +582,14 @@ void parametric_lens_teleport(int hb, int pay_off)
     /* ── Apply accumulated OPL phase to all spectral bands ──────────────── */
     int nb = min(n_bands, MAX_GPU_BANDS);
     for (int b = 0; b < nb; b++) {
-        float freq = freq_hz[b];
+        float freq = hit_f(hb, 26) > 0.0 ? hit_f(hb, 26) : freq_hz[b];
         if (freq <= 0.0) continue;
         float phase = TWO_PI * freq * opl / SPEED_LIGHT;
         float ph_c  = cos(phase), ph_s = sin(phase);
-        float ar = hit_f(hb, 26 + b);
-        float ai = hit_f(hb, 26 + MAX_GPU_BANDS + b);
-        hit_wf(hb, 26 + b,                ar*ph_c - ai*ph_s);
-        hit_wf(hb, 26 + MAX_GPU_BANDS + b, ar*ph_s + ai*ph_c);
+        float ar = hit_f(hb, 28 + b);
+        float ai = hit_f(hb, 28 + MAX_GPU_BANDS + b);
+        hit_wf(hb, 28 + b,                ar*ph_c - ai*ph_s);
+        hit_wf(hb, 28 + MAX_GPU_BANDS + b, ar*ph_s + ai*ph_c);
     }
 
     /* ── Write exit state and set bit 4 (teleport) ───────────────────────── */
@@ -580,6 +600,12 @@ void parametric_lens_teleport(int hb, int pay_off)
     hit_wf(hb, 12, hit_f(hb, 12) + opl);
     uint cflag = floatBitsToUint(hit_f(hb, 16));
     hit_wf(hb, 16, uintBitsToFloat(cflag | 4u));
+    if (is_backward) {
+        atomicAdd(counters[19], 1u);
+        atomicAdd(counters[20], surfaces_traversed);
+        atomicMin(counters[21], surfaces_traversed);
+        atomicMax(counters[22], surfaces_traversed);
+    }
 }
 
 /* ── Main ───────────────────────────────────────────────────────────────── */

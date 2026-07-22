@@ -7,7 +7,8 @@ parametric_surfaces   Closed-form surface primitives (CPU + GLSL)
 camera_preset         CameraPreset dataclass + built-in presets
 emitter_profile       Physical emitter profiles (spectral, phase, directional,
                       polarization, UV texture)
-wave_tube             ADI-BPM wave context + surrogate emitter (WaveTube)
+wave_tube             Retired standalone ADI-BPM validation reference; import
+                      explicitly when comparing historical results
 """
 from .parametric_surfaces import (
     ParametricSurface,
@@ -75,7 +76,6 @@ from .neural_assembly import (
     infer_payload,
     MAGIC_NEURAL,
 )
-from .wave_tube import WaveTube, WaveTubeConfig
 
 
 __all__ = [
@@ -109,6 +109,4 @@ __all__ = [
     "export_neural_payload",
     "load_training_data", "infer_payload",
     "MAGIC_NEURAL",
-    # wave tube
-    "WaveTube", "WaveTubeConfig",
 ]

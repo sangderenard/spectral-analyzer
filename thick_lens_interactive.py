@@ -222,7 +222,7 @@ class SceneUpdateWorker(threading.Thread):
                     aperture_stop_ids, suppress_ids, lens_surface_groups,
                     object_ids, tube_baffle_ids, camera_barrel_ids,
                     camera_rear_cap_ids, camera_front_cap_ids, camera_frustum_ids,
-                    red_probe_ids, diffuser_wave_specs,
+                    red_probe_ids, subject_group_tri_map,
                 ) = mesh_tuple
                 optics = _compound_lens_from_scene(base_scene)
                 field_pair = optics.profile_field_pair(

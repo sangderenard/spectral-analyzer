@@ -1086,21 +1086,6 @@ class StageLightTubeConfig:
 
 
 @dataclass
-class DiffuserWaveTubeSpec:
-    """Geometry for one diffuser disc, ready for WaveTube.register()."""
-    entry_tri_ids:      np.ndarray   # c1 face (tube-interior side) int32
-    exit_tri_ids:       np.ndarray   # c0 face (stage side) int32
-    entry_pos:          np.ndarray   # centre of entry face (3,) metres
-    exit_pos:           np.ndarray   # centre of exit face  (3,) metres
-    axis:               np.ndarray   # unit vec from entry to exit
-    tube_radius_m:      float
-    diffuser_thickness: float
-    ior_real:           float = 1.45
-    ior_imag:           float = 0.002
-
-
-@dataclass
-@dataclass
 class PipeCSGSpec:
     center: np.ndarray
     axis_dir: np.ndarray
@@ -1334,7 +1319,6 @@ def _build_stage_light_tube(
     tri_list: List[np.ndarray],
     mat_ids: List[int],
     source_tri_ids: List[int],
-    wave_spec_out: Optional[List["DiffuserWaveTubeSpec"]] = None,
 ) -> PipeCSGSpec:
     open_pt = np.array([float(cfg.opening_x), float(cfg.opening_y), float(cfg.opening_z)], dtype=np.float64)
     axis = np.array([float(cfg.axis_x), float(cfg.axis_y), float(cfg.axis_z)], dtype=np.float64)
@@ -1402,8 +1386,6 @@ def _build_stage_light_tube(
             1.0e-4,
             diffuser_fit_r,
         ))
-        _diff_entry_ids: List[int] = [] if wave_spec_out is not None else None  # type: ignore[assignment]
-        _diff_exit_ids:  List[int] = [] if wave_spec_out is not None else None  # type: ignore[assignment]
         _build_thin_disc_element_oriented(
             center=np.ascontiguousarray(diff_center, dtype=np.float64),
             normal=np.ascontiguousarray(axis, dtype=np.float64),
@@ -1413,19 +1395,7 @@ def _build_stage_light_tube(
             mat_ids=mat_ids,
             mat_idx=idx_diffuser,
             n_theta=96,
-            entry_tri_ids=_diff_entry_ids,
-            exit_tri_ids=_diff_exit_ids,
         )
-        if wave_spec_out is not None:
-            wave_spec_out.append(DiffuserWaveTubeSpec(
-                entry_tri_ids      = np.ascontiguousarray(_diff_entry_ids, dtype=np.int32),
-                exit_tri_ids       = np.ascontiguousarray(_diff_exit_ids,  dtype=np.int32),
-                entry_pos          = np.ascontiguousarray(diff_center + diff_half * axis, dtype=np.float64),
-                exit_pos           = np.ascontiguousarray(diff_center - diff_half * axis, dtype=np.float64),
-                axis               = np.ascontiguousarray(-axis, dtype=np.float64),
-                tube_radius_m      = diff_r,
-                diffuser_thickness = diff_thick,
-            ))
 
     emit_t = float(np.clip(cfg.emitter_depth_frac, 0.55, 0.97)) * depth
     emit_center = open_pt + axis * emit_t
@@ -3990,7 +3960,6 @@ def _build_scene_mesh(
     # Track source triangles so they can be suppressed from the surface tone map.
     source_tri_ids: List[int] = []
     stage_light_cutters: List[PipeCSGSpec] = []
-    diffuser_wave_specs: List[DiffuserWaveTubeSpec] = []
 
     _subject_group_tri_map: Dict[int, Tuple[int, int]] = {}
     if bool(getattr(scene, "include_legacy_stage", False)):
@@ -4024,7 +3993,6 @@ def _build_scene_mesh(
                 tri_list=tris,
                 mat_ids=mats,
                 source_tri_ids=source_tri_ids,
-                wave_spec_out=diffuser_wave_specs,
             )
             stage_light_cutters.append(cut_spec)
 
@@ -4593,7 +4561,6 @@ def _build_scene_mesh(
         np.ascontiguousarray(np.asarray(camera_front_cap_tri_ids, dtype=np.int32)),
         np.ascontiguousarray(np.asarray(camera_frustum_tri_ids, dtype=np.int32)),
         np.ascontiguousarray(np.asarray(red_probe_tri_ids, dtype=np.int32)),
-        diffuser_wave_specs,
         _subject_group_tri_map,
     )
 
@@ -6139,9 +6106,8 @@ class ForwardCppLensBench:
             aperture_stop_ids, tube_wall_ids, lens_surface_groups,
             object_ids, tube_baffle_ids, camera_barrel_ids,
             camera_rear_cap_ids, camera_front_cap_ids, camera_frustum_ids,
-            red_probe_ids, diffuser_wave_specs, subject_group_tri_map,
+            red_probe_ids, subject_group_tri_map,
         ) = _build_scene_mesh(self.scene, self.sidecar)
-        self._diffuser_wave_specs: List[DiffuserWaveTubeSpec] = list(diffuser_wave_specs)
         self.lens_surface_groups = lens_surface_groups
         self._subject_group_tri_map: Dict[int, Tuple[int, int]] = dict(subject_group_tri_map)
         self.tri_vertices = np.ascontiguousarray(tri_arr, dtype=np.float64)
@@ -7042,93 +7008,7 @@ class ForwardCppLensBench:
             f"uv_groups={len(self.uv_page_bank.groups) if self.uv_page_bank is not None else 0}",
             flush=True,
         )
-        self._register_wave_tubes()
         return int(self.bdpt_last_sensor_gid)
-
-    def _register_wave_tubes(self) -> None:
-        """Register a WaveTube surrogate emitter for every diffuser disc in the scene.
-
-        Called at the end of _configure_sensor_film_pipeline() so groups survive
-        clear_tri_groups().  Wave tubes are stored in self._wave_tubes.
-        """
-        from camera_designer.wave_tube import WaveTube, WaveTubeConfig
-        specs = getattr(self, "_diffuser_wave_specs", [])
-        wavelengths_m = (C_LIGHT / np.maximum(
-            np.asarray(self.freq_hz, dtype=np.float64), 1.0
-        )).astype(np.float64)
-        self._wave_tubes: List[WaveTube] = []
-        for spec in specs:
-            if not int(spec.entry_tri_ids.size) or not int(spec.exit_tri_ids.size):
-                continue
-            cfg = WaveTubeConfig(
-                axis            = spec.axis,
-                entry_pos       = spec.entry_pos,
-                exit_pos        = spec.exit_pos,
-                tube_radius_m   = spec.tube_radius_m,
-                n_medium        = spec.ior_real,
-                n_imag          = spec.ior_imag,
-                wavelengths_m   = wavelengths_m,
-                nx              = 64,
-                ny              = 64,
-                dx_m            = 0.0,
-                n_bpm_steps     = 0,
-                pre_roll_frames = 8,
-            )
-            # Exit face centroids for BPM→tri_illum_accum spatial mapping.
-            exit_cents = np.mean(
-                self.tri_vertices[spec.exit_tri_ids], axis=1
-            ).astype(np.float64)
-            try:
-                wt = WaveTube.register(
-                    self.tracer,
-                    spec.entry_tri_ids,
-                    spec.exit_tri_ids,
-                    cfg,
-                    exit_tri_centroids=exit_cents,
-                )
-                self._wave_tubes.append(wt)
-            except Exception as exc:
-                print(f"[wave-tube] registration failed: {exc}", flush=True)
-        # Ensure tri_illum_accum is sized for the full scene so write_tri_illum
-        # has a valid buffer to target.
-        if self._wave_tubes:
-            try:
-                self.tracer.init_illum_accum()
-            except Exception:
-                pass
-        if self._wave_tubes:
-            print(
-                "[wave-tube]",
-                f"registered={len(self._wave_tubes)}",
-                f"pre_roll_frames={self._wave_tubes[0].config.pre_roll_frames}",
-                "exit_role=pending_write_api",
-                flush=True,
-            )
-
-    def solve_wave_tubes(self) -> int:
-        """Advance all wave-tube BPM solvers by one frame.
-
-        During pre-roll the accumulator warms up; on the pre-roll completion
-        frame it is cleared so the live integral starts from zero.  After
-        pre-roll each call propagates the captured entry field through the ADI
-        BPM and stores the exit irradiance in wt._exit_field for downstream
-        use (e.g., writing into tri_illum_accum when the API is available).
-
-        Returns the number of tubes that are live (past pre-roll).
-        """
-        tubes = getattr(self, "_wave_tubes", [])
-        if not tubes:
-            return 0
-        n_live = 0
-        for wt in tubes:
-            try:
-                ef = wt.solve(self.tracer)
-            except Exception as exc:
-                print(f"[wave-tube] solve error: {exc}", flush=True)
-                continue
-            if ef is not None and wt._frames_collected > wt.config.pre_roll_frames:
-                n_live += 1
-        return n_live
 
     def reset_visual_integrators(self) -> None:
         with self._trace_lock:
@@ -7694,13 +7574,6 @@ class ForwardCppLensBench:
         ``bake_directions`` to bypass emitter sampling entirely (sequential tags,
         single child per ray — intended for baking training data).
         """
-        # Advance wave-tube BPM solvers before submitting the next ray batch.
-        # Uses the entry-accumulator data collected during the previous drain
-        # cycle.  Bake calls bypass this (bake_origins implies a controlled
-        # single-pass trace that should not disturb the wave-tube state).
-        if bake_origins is None:
-            self.solve_wave_tubes()
-
         _use_gpu = self.compute_mode in ("gpu", "mixed")
         _all_gpu = self.compute_mode == "gpu"
 

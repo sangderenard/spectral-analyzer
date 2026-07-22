@@ -1,5 +1,6 @@
+#version 430 core
 /*
- * ray_wave_bpm.comp.glsl — GPU compute T4: 2-D ADI Crank-Nicolson BPM step.
+ * ray_wave_bpm.comp.glsl — legacy/calibration T4 backend: 2-D ADI-CN BPM.
  *
  * Computes one longitudinal step (dz) of the paraxial BPM operator for a
  * 2-D transverse wave field of shape [n_bands][ny][nx].
@@ -41,12 +42,12 @@
  *   dz         : longitudinal step [m]
  *   wavelengths: float array [MAX_GPU_BANDS], wavelength per band [m]
  */
-#version 430 core
-
 layout(local_size_x = 1) in;
 
 /* ── Constants ──────────────────────────────────────────────────────────── */
-#define MAX_GPU_BANDS 16
+#ifndef WAVE_BANDS
+#define WAVE_BANDS 1
+#endif
 #define MAX_WAVE_DIM  1024   /* max nx or ny supported */
 #define TWO_PI        6.28318530717958647692
 
@@ -67,7 +68,9 @@ uniform int   ny;
 uniform int   n_bands;
 uniform float dx;
 uniform float dz;
-uniform float wavelengths[MAX_GPU_BANDS];   /* wavelength per band [m]  */
+uniform float wavelengths[WAVE_BANDS];   /* exact-specialization wavelength lanes */
+uniform int   absorber_cells;
+uniform float absorber_step_strength;
 
 /* ── Complex arithmetic (vec2 = {re, im}) ───────────────────────────────── */
 vec2 cmul(vec2 a, vec2 b) { return vec2(a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x); }
@@ -175,8 +178,17 @@ void main() {
         uint idx = band * npix + pix;
         float re = wave_re[idx];
         float im = wave_im[idx];
-        wave_re[idx] = re * cos_kdz - im * sin_kdz;
-        wave_im[idx] = re * sin_kdz + im * cos_kdz;
+        int ix = int(pix % uint(nx));
+        int iy = int(pix / uint(nx));
+        int edge_distance = min(min(ix, nx - 1 - ix), min(iy, ny - 1 - iy));
+        float attenuation = 1.0;
+        if (absorber_cells > 0 && edge_distance < absorber_cells) {
+            float u = float(absorber_cells - edge_distance) / float(absorber_cells);
+            float u2 = u * u;
+            attenuation = exp(-absorber_step_strength * u2 * u2);
+        }
+        wave_re[idx] = attenuation * (re * cos_kdz - im * sin_kdz);
+        wave_im[idx] = attenuation * (re * sin_kdz + im * cos_kdz);
         return;
     }
 

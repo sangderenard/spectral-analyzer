@@ -1283,7 +1283,7 @@ def _build_thick_lens_lab_tracer_scene() -> TracerScene:
         aperture_stop_ids, _tube_wall_ids, lens_surface_groups,
         object_ids, _tube_baffle_ids, _camera_barrel_ids,
         _camera_rear_cap_ids, _camera_front_cap_ids, _camera_frustum_ids,
-        red_probe_ids, _diffuser_wave_specs, _subject_group_tri_map,
+        red_probe_ids, _subject_group_tri_map,
     ) = tll._build_scene_mesh(lab_scene, sidecar)
 
     verts_flat = np.ascontiguousarray(verts_flat, dtype=np.float64)

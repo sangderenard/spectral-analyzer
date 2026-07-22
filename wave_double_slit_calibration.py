@@ -123,13 +123,21 @@ def run_gpu_steps(
         pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE
     )
     pygame.display.set_mode((1, 1), pygame.OPENGL | pygame.HIDDEN)
+    bands, height, width = re.shape
     shader_source = SHADER_PATH.read_text(encoding="utf-8")
+    first_newline = shader_source.find("\n")
+    shader_source = (
+        shader_source[:first_newline + 1]
+        + f"#define WAVE_BANDS {bands}\n"
+        + shader_source[first_newline + 1:]
+    )
     program = shaders.compileProgram(
         shaders.compileShader(shader_source, GL.GL_COMPUTE_SHADER)
     )
-    bands, height, width = re.shape
-    if bands > 16 or max(width, height) > 1024:
-        raise ValueError("GPU BPM shader supports at most 16 bands and 1024x1024")
+    if bands not in (1, 3, 4, 8, 16, 32) or max(width, height) > 1024:
+        raise ValueError(
+            "GPU BPM shader requires 1,3,4,8,16,or 32 bands and at most 1024x1024"
+        )
     arrays = [
         np.ascontiguousarray(re.reshape(-1), np.float32),
         np.ascontiguousarray(im.reshape(-1), np.float32),
@@ -251,7 +259,7 @@ def _comparison(cpu_path: Path, gpu_path: Path, output: Path) -> None:
 def run_calibration(work_dir: str, width: int = 200, height: int = 200, steps: int = 100) -> dict[str, Any]:
     root = Path(work_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    wavelengths_nm = np.asarray([450.0, 500.0, 550.0, 600.0, 650.0], np.float64)
+    wavelengths_nm = np.linspace(420.0, 680.0, 8, dtype=np.float64)
     wavelengths_m = wavelengths_nm * 1.0e-9
     dx_m, dz_m = 2.0e-6, 20.0e-6
     state_path = root / "wave_checkpoint.json"

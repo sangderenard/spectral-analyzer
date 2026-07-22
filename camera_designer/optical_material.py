@@ -16,6 +16,12 @@ Material catalog
 ----------------
 air, BK7, SF5, SiO2, water, oil_immersion,
 flocking_black, aluminum_mirror, chrome_mirror, blackened_steel
+
+This catalog describes homogeneous bulk media used by camera geometry. It is
+not the authoring home for structural-colour microgeometry. Such a surface is
+declared by ``spectral_material.Material.maxwell_patch`` and compiled to a
+localized scattering artifact; the resulting ordinary bulk fallback may still
+reference an ``OpticalMaterial`` here. See ``MAXWELL_PATCH_CONTEXT.md``.
 """
 from __future__ import annotations
 

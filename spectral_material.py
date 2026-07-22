@@ -8,6 +8,11 @@ Unified material definition system shared by:
   - DepthMesh / duty_station geometry pieces
   - Acoustic AND electromagnetic domains (same schema, different freq ranges)
 
+Localized structural-colour and metasurface declarations may be carried in a
+``maxwell_patch`` mapping.  This is cold authoring metadata for the future
+localized Maxwell compiler described in ``MAXWELL_PATCH_CONTEXT.md``.  It is
+round-tripped but is not evaluated by the current material or hot shader paths.
+
 Domain awareness
 ----------------
 Every material carries a ``domain`` field:
@@ -620,6 +625,11 @@ class Material:
     reemission_matrix : ReemissionMatrix | None
         Per-band input→output re-emission mapping (fluorescence, Stokes shift,
         acoustic mode conversion).
+    maxwell_patch : dict | None
+        Cold localized microstructure declaration. It is resolved into a
+        versioned polarized scattering artifact by a scene-compile step; it is
+        never packed into ordinary hot material rows or solved in a shader hit.
+        See ``MAXWELL_PATCH_CONTEXT.md`` for the schema and runtime contract.
     """
     name:          str   = "unnamed"
     domain:        str   = "acoustic"
@@ -642,6 +652,7 @@ class Material:
     enamel:            Optional["EnamelCoating"]      = None
     radiance:          Optional["RadianceProfile"]    = None
     reemission_matrix: Optional["ReemissionMatrix"]   = None
+    maxwell_patch:     Optional[dict]                 = None
 
     # ── Synthetic band fallback ───────────────────────────────────────────────
 
@@ -925,6 +936,12 @@ class Material:
         spectral_identity = (SpectralHistogram.from_dict(si_raw)
                              if si_raw else None)
 
+        maxwell_patch_raw = d.get("maxwell_patch")
+        if maxwell_patch_raw is not None and not isinstance(maxwell_patch_raw, dict):
+            raise ValueError("maxwell_patch must be a mapping")
+        maxwell_patch = (dict(maxwell_patch_raw)
+                         if maxwell_patch_raw is not None else None)
+
         return cls(
             name              = name,
             domain            = str(d.get("domain", "acoustic")),
@@ -942,6 +959,7 @@ class Material:
             enamel            = enamel,
             radiance          = radiance,
             reemission_matrix = reemission_matrix,
+            maxwell_patch     = maxwell_patch,
         )
 
     def to_dict(self) -> dict:
@@ -970,6 +988,8 @@ class Material:
             d["radiance"] = self.radiance.to_dict()
         if self.reemission_matrix:
             d["reemission_matrix"] = self.reemission_matrix.to_dict()
+        if self.maxwell_patch is not None:
+            d["maxwell_patch"] = dict(self.maxwell_patch)
         return d
 
 

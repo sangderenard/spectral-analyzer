@@ -2,6 +2,11 @@
 ================
 Central material registry with chunked tensor export.
 
+``Material.maxwell_patch`` declarations are intentionally cold metadata.  The
+future localized Maxwell compiler resolves them into a separate cache-addressed
+artifact table as documented in ``MAXWELL_PATCH_CONTEXT.md``.  They must not be
+added to every PBR/spectral row or evaluated in the hot material lookup.
+
 Architecture
 ------------
 Every material in the scene is registered by name once at startup.  At the
@@ -1480,6 +1485,15 @@ class MaterialDatabase:
     legacy mat11 raytracer feed).  They are derivatives, not authoring
     surfaces.  They are computed once at build_tensors() and frozen until
     the next material registration.
+
+    Maxwell patch boundary
+    ----------------------
+    A registered ``spectral_material.Material`` may carry ``maxwell_patch``
+    authoring metadata. ``build_tensors()`` deliberately does not pack it.
+    A cold scene compiler will resolve only those declarations into a separate
+    immutable scattering-artifact table. This preserves the fixed-memory hot
+    rows and gives ray transport and T4 one shared polarized patch contract.
+    See ``MAXWELL_PATCH_CONTEXT.md``.
 
     GPU upload (example)
     --------------------

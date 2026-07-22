@@ -124,7 +124,7 @@ flowchart TD
     T7 -. worker thread .-> U1
 
     subgraph ForwardTrace["trace_forward(...)"]
-        V1["solve_wave_tubes() unless baking"]
+        V1["Native pipeline schedules T4 only when a ray crosses a field arena"]
         V2["Sample cosine-hemisphere rays from emitter triangle centroids"]
         V3["Build origins, directions, complex spectral amplitudes, source ids, tags"]
         V4["tracer.submit_rays(..., color_flags=0, max_children=2)"]

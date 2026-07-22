@@ -8,8 +8,8 @@
  *   T2 refiner      — parametric surface point / normal refinement.
  *   T3 material     — Fresnel / Snell / diffuse / specular physics.
  *                     Emits child RayIntents back into T1.
- *   T4 wave solver  — per-arena 2-D ADI-CN BPM march.
- *                     Exit rays re-enter T1.
+ *   T4 field stage  — pipeline-scheduled, persistent per-arena complex state;
+ *                     backend-selected propagation; exit work re-enters T1.
  *
  * Usage:
  *   RayPipelineState* ps = ray_pipeline_create(st, &cfg);
@@ -30,10 +30,12 @@
 #include <random>
 #include <array>
 #include "sensor_mipmap.h"
+#include "wave_t4.h"
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
 #include "bdpt_record.h"
+#include "complex_transport.h"
 
 struct RayTracerState;
 
@@ -119,6 +121,9 @@ struct ChildRay {
 struct WaveIntent {
     RayIntent ray;
     int       arena_id = -1;
+    /* Small scheduling sidecar.  Exact N-lane field blocks belong to the
+     * arena/backend and are not replicated on every geometric ray. */
+    complex_transport::RaySidecar complex{};
 };
 
 /* ─── Per-stage profiling with adaptive batch control ───────────────────── */
@@ -722,6 +727,7 @@ struct WaveArena {
     double           radius  = 0.0;
     double           radius_sq = 0.0;
     double           n_real  = 1.0;
+    double           speed_m_s = 299792458.0;
     Eigen::Vector3d  axis_z;
     Eigen::Vector3d  axis_x, axis_y;
     int              nx = 0, ny = 0;
@@ -729,10 +735,42 @@ struct WaveArena {
     double           dx = 0.0;
     double           dz = 0.0;
     int              n_bands = 0;
+    int              band_specialization = -1;
+    wave_t4::SpectralMode spectral_mode = wave_t4::SpectralMode::FixedBands;
+    wave_t4::BackendKind backend = wave_t4::BackendKind::LegacyAdiCalibration;
+    std::array<wave_t4::SpectralLane, 32> spectral_lanes = {};
+    wave_t4::BoundaryConfig boundary;
+    wave_t4::Progress       progress;
     double           wavelengths_m[32] = {};
-    std::vector<float> re_buf;
-    std::vector<float> im_buf;
-    std::mutex         mu;
+    double           fixed_wavelengths_m[32] = {};
+    /* Persistent T4 numerical state buffer. T4 remains pipeline-scheduled:
+     * WaveIntent enters the stage, this state is updated in place, and a
+     * continuation returns to T1. */
+    std::vector<float> state_block;
+    size_t re_offset = 0;
+    size_t im_offset = 0;
+    size_t tmp_re_offset = 0;
+    size_t tmp_im_offset = 0;
+    size_t rhs_re_offset = 0;
+    size_t rhs_im_offset = 0;
+    size_t cp_re_offset = 0;
+    size_t cp_im_offset = 0;
+    size_t dp_re_offset = 0;
+    size_t dp_im_offset = 0;
+    size_t plane_size = 0;
+    float* re_data() noexcept { return state_block.data() + re_offset; }
+    float* im_data() noexcept { return state_block.data() + im_offset; }
+    const float* re_data() const noexcept { return state_block.data() + re_offset; }
+    const float* im_data() const noexcept { return state_block.data() + im_offset; }
+    float* tmp_re_data() noexcept { return state_block.data() + tmp_re_offset; }
+    float* tmp_im_data() noexcept { return state_block.data() + tmp_im_offset; }
+    float* rhs_re_data() noexcept { return state_block.data() + rhs_re_offset; }
+    float* rhs_im_data() noexcept { return state_block.data() + rhs_im_offset; }
+    float* cp_re_data() noexcept { return state_block.data() + cp_re_offset; }
+    float* cp_im_data() noexcept { return state_block.data() + cp_im_offset; }
+    float* dp_re_data() noexcept { return state_block.data() + dp_re_offset; }
+    float* dp_im_data() noexcept { return state_block.data() + dp_im_offset; }
+    mutable std::mutex mu;
 };
 
 /* ── T5 GPU connection pass types ────────────────────────────────────────── */
@@ -1038,8 +1076,40 @@ uint64_t ray_pipeline_get_uv_pages_tex_id(const RayPipelineState* ps);
 /* Return the latest shared GPU field-display volume texture (GL_TEXTURE_3D), or 0. */
 uint64_t ray_pipeline_get_field_display_tex_id(const RayPipelineState* ps);
 
+/* Latest completed deterministic center-site surface scan texture (RGBA32F).
+ * The getter adopts a pending back buffer; the worker never writes the active
+ * texture until a later generation has been adopted. */
+uint64_t ray_pipeline_get_surface_scan_tex_id(RayPipelineState* ps);
+
 /* Ask the GPU dispatch thread to clear the field-display accumulator. */
 void ray_pipeline_request_field_display_clear(RayPipelineState* ps);
+
+struct WaveArenaSnapshot {
+    int arena_id;
+    int bands;
+    int band_specialization;
+    int spectral_mode;
+    int backend;
+    int nx;
+    int ny;
+    int longitudinal_steps;
+    int absorber_cells;
+    uint64_t generation;
+    uint64_t completed_steps;
+    double input_power;
+    double field_power;
+    double border_power;
+    double absorbed_power;
+    double frequency_hz[32];
+    float spectral_pdf[32];
+    uint32_t coherence_id[32];
+    uint32_t lane_active[32];
+};
+
+int ray_pipeline_wave_arena_count(const RayPipelineState* ps);
+int ray_pipeline_get_wave_arena_snapshot(const RayPipelineState* ps,
+                                         int arena_id,
+                                         WaveArenaSnapshot* out);
 
 /* Upload per-band RGB weights for the GPU UV blit shader.
  * weights : float array of length n_bands*3 (interleaved r,g,b per band).

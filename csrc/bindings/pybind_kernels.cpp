@@ -614,6 +614,7 @@ struct PyRayTracer
     std::vector<float> _sensor_restore_weight;
     std::vector<uint32_t> _sensor_dirty_sites;
     uint32_t _sensor_restore_res = 0;
+    std::vector<RayIntent> _surface_scan_rays; /* cold pose/res cache */
 
     RayPipelineState* _get_pipeline(int max_children = 2, int seed = 42) {
         std::lock_guard<std::mutex> lk(_pipeline_mu);
@@ -2298,6 +2299,7 @@ struct PyRayTracer
         _sensor_target_z     = target_z;
         _sensor_target_r     = target_r;
         _sensor_target_mode  = (target_mode == 1) ? 1 : 0;
+        _surface_scan_rays.clear();
         if (_pipeline)
             ray_pipeline_configure_sensor_image(_pipeline, plate_x, plate_half_w, plate_half_h,
                                                 res, bdpt_eps,
@@ -2351,6 +2353,7 @@ struct PyRayTracer
         normalize_pair(_sensor_right, _sensor_up, "sensor");
         normalize_pair(_aperture_right, _aperture_up, "aperture");
         _sensor_pose_configured = true;
+        _surface_scan_rays.clear();
         if (_pipeline)
             ray_pipeline_configure_sensor_pose(
                 _pipeline, _sensor_center.data(), _sensor_right.data(), _sensor_up.data(),
@@ -3210,6 +3213,60 @@ struct PyRayTracer
         return _pipeline ? ray_pipeline_in_flight(_pipeline) : 0;
     }
 
+    int submit_surface_scan(float min_amplitude = 1.0e-8f, int seed = 42)
+    {
+        if (!_sensor_pose_configured || _sensor_res <= 0
+            || !(_sensor_plate_half_w > 0.0f) || !(_sensor_plate_half_h > 0.0f))
+            throw std::runtime_error(
+                "configure_sensor_image and configure_sensor_pose before surface scan");
+        if (!_use_gpu_compute)
+            throw std::runtime_error("surface scan requires the GPU pipeline");
+        RayPipelineState* ps = _get_pipeline(/*max_children=*/1, seed);
+        if (ray_pipeline_in_flight(ps) != 0)
+            throw std::runtime_error(
+                "surface scan requires an idle pipeline so subbatches publish atomically");
+        const int res = _sensor_res;
+        if (_surface_scan_rays.size() != static_cast<size_t>(res) * res) {
+            _surface_scan_rays.resize(static_cast<size_t>(res) * res);
+            const Eigen::Vector3d center(_sensor_center[0], _sensor_center[1], _sensor_center[2]);
+            const Eigen::Vector3d right(_sensor_right[0], _sensor_right[1], _sensor_right[2]);
+            const Eigen::Vector3d up(_sensor_up[0], _sensor_up[1], _sensor_up[2]);
+            const Eigen::Vector3d aperture(_aperture_center[0], _aperture_center[1], _aperture_center[2]);
+            for (int py = 0; py < res; ++py) {
+                const double z = -_sensor_plate_half_h
+                    + (static_cast<double>(py) + 0.5) * (2.0 * _sensor_plate_half_h / res);
+                for (int px = 0; px < res; ++px) {
+                    const double y = -_sensor_plate_half_w
+                        + (static_cast<double>(px) + 0.5) * (2.0 * _sensor_plate_half_w / res);
+                    const size_t index = static_cast<size_t>(py) * res + px;
+                    RayIntent& ray = _surface_scan_rays[index];
+                    ray.pos = center + right*y + up*z;
+                    ray.dir = (aperture - ray.pos).normalized();
+                    ray.pos += ray.dir * 2.56e-8;
+                    ray.amp_scalar = 1.0f;
+                    ray.amp_n_bands = static_cast<int8_t>(_n_bands);
+                    ray.src_id = static_cast<int>(index);
+                    ray.tag = 0xD000000000000000ull | static_cast<uint64_t>(index);
+                    ray.color_flag = 1u | 32u;
+                    ray.priority = 1.0e9f;
+                    ray.sensor_origin_y = static_cast<float>(y);
+                    ray.sensor_origin_z = static_cast<float>(z);
+                    ray.bounces_left = 8;
+                }
+            }
+        }
+        for (RayIntent& ray : _surface_scan_rays)
+            ray.min_amplitude = min_amplitude;
+        ray_pipeline_submit(ps, _surface_scan_rays.data(),
+                            static_cast<int>(_surface_scan_rays.size()));
+        return static_cast<int>(_surface_scan_rays.size());
+    }
+
+    uint64_t surface_scan_texture_id()
+    {
+        return _pipeline ? ray_pipeline_get_surface_scan_tex_id(_pipeline) : 0u;
+    }
+
     /* Snapshot of pipeline throughput / batch-size / queue-depth for all stages. */
     py::dict pipeline_stats() const
     {
@@ -3256,6 +3313,45 @@ struct PyRayTracer
         out["gpu_dispatch_status"] = (gds >= 0 && gds <= 5) ? _gds_names[gds] : "unknown";
         out["gpu_ok"] = (gds == 3 || gds == 5);
         return out;
+    }
+
+    py::list wave_arena_stats() const
+    {
+        py::list result;
+        const int count = ray_pipeline_wave_arena_count(_pipeline);
+        for (int i = 0; i < count; ++i) {
+            WaveArenaSnapshot s{};
+            if (ray_pipeline_get_wave_arena_snapshot(_pipeline, i, &s) != SK_OK)
+                continue;
+            py::dict d;
+            d["arena_id"] = s.arena_id;
+            d["bands"] = s.bands;
+            d["band_specialization"] = s.band_specialization;
+            d["spectral_mode"] = s.spectral_mode;
+            d["backend"] = s.backend;
+            d["nx"] = s.nx;
+            d["ny"] = s.ny;
+            d["longitudinal_steps"] = s.longitudinal_steps;
+            d["absorber_cells"] = s.absorber_cells;
+            d["generation"] = s.generation;
+            d["completed_steps"] = s.completed_steps;
+            d["input_power"] = s.input_power;
+            d["field_power"] = s.field_power;
+            d["border_power"] = s.border_power;
+            d["absorbed_power"] = s.absorbed_power;
+            py::list lanes;
+            for (int b = 0; b < s.bands; ++b) {
+                py::dict lane;
+                lane["frequency_hz"] = s.frequency_hz[b];
+                lane["pdf"] = s.spectral_pdf[b];
+                lane["coherence_id"] = s.coherence_id[b];
+                lane["active"] = (s.lane_active[b] != 0u);
+                lanes.append(std::move(lane));
+            }
+            d["lanes"] = std::move(lanes);
+            result.append(std::move(d));
+        }
+        return result;
     }
 
     void report_display_frame_time(double frame_ms, double target_ms = 16.667)
@@ -6242,10 +6338,22 @@ kind: 0=STRIKE 1=TERMINAL 2=MISS 3=FIELD)doc")
         .def("in_flight_count", &PyRayTracer::in_flight_count,
 R"doc(Return the number of ray paths currently live in the persistent pipeline.
 Zero means all previously submitted rays have completed.)doc")
+        .def("submit_surface_scan", &PyRayTracer::submit_surface_scan,
+             py::arg("min_amplitude") = 1.0e-8f,
+             py::arg("seed") = 42,
+R"doc(Submit one deterministic center-site camera ray per sensor pixel.
+Rays use normal pipeline lens transport and stop at the first scene surface.
+The GPU resolver writes a transparent-background RGBA32F back texture.)doc")
+        .def("surface_scan_texture_id", &PyRayTracer::surface_scan_texture_id,
+R"doc(Adopt and return the latest completed double-buffered surface-scan texture.)doc")
         .def("pipeline_stats", &PyRayTracer::pipeline_stats,
 R"doc(Snapshot of pipeline throughput/batch-size/queue-depth for all four stages.
 Returns dict with keys t1, t2, t3, t4, t5 (each a dict with throughput, processed,
 batch_size, queue_depth) plus output_queue_depth and in_flight.)doc")
+        .def("wave_arena_stats", &PyRayTracer::wave_arena_stats,
+R"doc(Return stateful T4 arena telemetry, including exact band specialization,
+fixed/continuous spectral mode, per-lane frequency/PDF/coherence metadata,
+progress generations, and numerical-border power accounting.)doc")
         .def("report_display_frame_time", &PyRayTracer::report_display_frame_time,
              py::arg("frame_ms"),
              py::arg("target_ms") = 16.667,
@@ -7135,9 +7243,9 @@ Returns assigned group_id (>= 0).  Raises on failure.
              py::arg("power_W_per_band"),
              R"doc(Update the per-band emission power of an already-registered EMISSIVE group.
 
-Call between tracing passes (never during an active trace).  The primary use
-case is the WaveTube surrogate emitter: after BPM solve the exit group's power
-is set to the BPM-integrated exit flux ∫|E(x,y)|² dx dy per band.
+Call between tracing passes (never during an active trace). This is a generic
+emissive-group control; native T4 field arenas remain pipeline stages and do
+not convert their exit fields into surrogate emitters.
 
 group_id          : int — group_id returned by register_tri_group()
 power_W_per_band  : float32 (n_bands,) — physical power in watts per band

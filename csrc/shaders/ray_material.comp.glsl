@@ -52,7 +52,7 @@
  *   [26+MAX_BANDS .. 26+2*MAX_BANDS-1] amp_im[MAX_BANDS]
  *   [58]     bdpt_subpath_id  (uintBitsToFloat; 0=untracked)
  *
- * RayIntent  (INTENT_STRIDE = 20 + 2*MAX_BANDS floats):
+ * RayIntent  (INTENT_STRIDE = 22 + 2*MAX_BANDS floats):
  *   [0..2]   pos xyz
  *   [3..5]   dir xyz
  *   [6]      path_len
@@ -64,7 +64,7 @@
  *   [12]     min_amplitude
  *   [13]     tag_lo           (uintBitsToFloat)
  *   [14]     tag_hi           (uintBitsToFloat)
- *   [15]     color_flag       (uintBitsToFloat)
+ *   [15]     color/spectral metadata (low byte color flag; uintBitsToFloat)
  *   [16]     priority
  *   [17]     sensor_origin_y
  *   [18]     sensor_origin_z
@@ -770,6 +770,14 @@ void main() {
                 }
             }
         }
+    }
+
+    /* Deterministic preview shunt: T2 lens/neural teleports returned above,
+     * so this is the first ordinary authored surface after lens transport. */
+    if ((cflag & 32u) != 0u) {
+        uint tslot = atomicAdd(meta[1], 1u);
+        write_terminal(tslot, hbase, (flags & MAT_FLAG_EMISSIVE) != 0);
+        return;
     }
 
     /* ── Terminal: aperture stop ── */

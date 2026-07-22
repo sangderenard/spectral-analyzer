@@ -1,8 +1,14 @@
 #version 430 core
 /*
- * t0_intent_pack.comp.glsl — GPU-side RayIntent → SSBO intent format conversion.
+ * t0_intent_pack.comp.glsl — RETIRED/UNWIRED raw RayIntent experiment.
  *
- * Replaces the CPU packing loop in dispatch_t1_t2_t3 for generation 0.
+ * This shader is not compiled or dispatched by ray_tracer.cpp.  Its raw C++
+ * object upload cannot safely follow Eigen::VectorXcd heap storage and its
+ * historical layout predates the current continuous-spectral fields.  Do not
+ * revive it as the wave sidecar packer.  The authoritative wave ABI is
+ * complex_transport.h + complex_transport.glsl.inc.
+ *
+ * It was intended to replace the CPU packing loop for generation 0.
  * The host uploads the raw RayIntent array (straight memcpy, no field extraction),
  * then dispatches this shader to convert each ray in parallel.
  *

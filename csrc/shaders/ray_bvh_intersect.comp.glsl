@@ -7,7 +7,7 @@
  *
  * Flat buffer layouts (must match GlPipelineDispatch packing):
  *
- *  IntentBuf  (INTENT_STRIDE = 20 + 2*MAX_GPU_BANDS floats = 84 with MAX_GPU_BANDS=32):
+ *  IntentBuf  (INTENT_STRIDE = 22 + 2*MAX_GPU_BANDS floats = 86 with MAX_GPU_BANDS=32):
  *    [0..2]   pos xyz
  *    [3..5]   dir xyz
  *    [6]      path_len
@@ -19,15 +19,17 @@
  *    [12]     min_amplitude
  *    [13]     tag_lo          (uintBitsToFloat)
  *    [14]     tag_hi          (uintBitsToFloat)
- *    [15]     color_flag      (uintBitsToFloat)
+ *    [15]     color/spectral metadata (low byte color flag; uintBitsToFloat)
  *    [16]     priority
  *    [17]     sensor_origin_y
  *    [18]     sensor_origin_z
- *    [19]     _pad
- *    [20..51] amp_re[MAX_GPU_BANDS]
- *    [52..83] amp_im[MAX_GPU_BANDS]
+ *    [19]     continuous frequency_hz
+ *    [20]     spectral PDF
+ *    [21]     bdpt_subpath_id (uintBitsToFloat)
+ *    [22..53] amp_re[MAX_GPU_BANDS]
+ *    [54..85] amp_im[MAX_GPU_BANDS]
  *
- *  HitBuf  (REFINED_HIT_STRIDE = 27 + 2*MAX_GPU_BANDS floats = 91 with MAX_GPU_BANDS=32, written by this shader):
+ *  HitBuf  (REFINED_HIT_STRIDE = 29 + 2*MAX_GPU_BANDS floats = 93 with MAX_GPU_BANDS=32, written by this shader):
  *    [0..2]   refined_pos xyz  (= hit_pos, T2 may update for parametric)
  *    [3..5]   refined_n xyz    (= oriented tri normal, T2 may update)
  *    [6..8]   incoming_dir xyz
@@ -71,15 +73,24 @@
  *    mat_band(m,b,field) = mat_bands[(m * 32 + b) * 12 + field]
  *    field 7 = n_real, field 8 = n_imag
  *
- *  SceneBandBuf  (2 × n_bands floats):
+ *  SceneBandBuf  (2 × n_bands + 4 × n_arenas floats):
  *    [0..nb-1]     k_real[b]    (= 2π*freq[b]/c)
  *    [nb..2nb-1]   atmo_abs[b]
+ *    [2nb..]        arena center xyz + radius
  *
  *  WaveArenaBuf  (ARENA_STRIDE = 4 floats):
  *    [0..2] center xyz   [3] radius
  *
  *  TriSensorGroupBuf  (int per triangle): sensor_group_id (-1 = not sensor)
  *  CounterBuf  (uint):  [0]=hit_count  [1]=miss_count  [2]=wave_count
+ *
+ *  WaveIntent tail (starts at wave_base_floats in HitBuf):
+ *    [0] arena_id, [1..3] entry position, [4..6] direction,
+ *    [7] path_len, [8] medium, [9] interaction_flags, [10] src_id,
+ *    [11] bounce, [12] bounces_left, [13] min_amplitude,
+ *    [14..15] tag lo/hi, [16] packed color/spectral metadata,
+ *    [17] priority, [18..19] sensor origin, [20] frequency, [21] PDF,
+ *    [22] bdpt_subpath_id, then n_bands real and n_bands imaginary values.
  */
 #version 430 core
 
@@ -118,10 +129,6 @@ layout(std430, binding = 6) readonly buffer MatBandBuf { float mat_bands[];};
 layout(std430, binding = 7) readonly buffer SceneBandBuf{ float scene_bands[];};
 /* bdpt_subpath_id is written to hit[26+2*MAX_GPU_BANDS] (as uintBitsToFloat) — no extra binding needed. */
 
-/* Wave arenas passed as uniform array (max 16 arenas × 4 floats each).
- * Avoids needing binding slots beyond 7. */
-uniform vec4  u_arenas[16];   /* xyz=center, w=radius */
-
 /* ── Uniforms ───────────────────────────────────────────────────────────── */
 /* n_intents is now read from counters[8] (written by post_t3_prep for bounce>0
  * and by the C++ host for bounce 0).  The uniform is kept as a compile-time
@@ -132,6 +139,9 @@ uniform int   n_bands;
 uniform int   n_mats;
 uniform int   n_arenas;
 uniform int   n_tris;
+uniform int   wave_base_floats;
+uniform int   wave_stride;
+uniform int   wave_capacity;
 
 /* ── Helpers: load intent field ─────────────────────────────────────────── */
 
@@ -250,7 +260,11 @@ void main() {
     float min_amp    = intent_f(ib, 12);
     uint  tag_lo     = intent_u(ib, 13);
     uint  tag_hi     = intent_u(ib, 14);
-    uint  color_flag = intent_u(ib, 15);
+    /* Low byte is the ordinary color flag. Upper bits are a zero-cost GPU
+     * sidecar: bits 8..13 source lane, bit 14 continuous-resolved. */
+    uint  color_meta = intent_u(ib, 15);
+    uint  color_flag = color_meta & 0xffu;
+    float priority   = intent_f(ib, 16);
     float sensor_oy  = intent_f(ib, 17);
     float sensor_oz  = intent_f(ib, 18);
     float spectral_frequency_hz = intent_f(ib, 19);
@@ -281,6 +295,27 @@ void main() {
     float best_t   = 1e30;
     float best_u   = 0.0;
     float best_v   = 0.0;
+
+    /* Seed the nearest-event distance with the nearest arena boundary. BVH
+     * traversal replaces it only when authored geometry is closer. */
+    int wave_arena_id = -1;
+    for (int ai = 0; ai < n_arenas; ++ai) {
+        int ab = 2 * n_bands + 4 * ai;
+        vec3 center = vec3(scene_bands[ab], scene_bands[ab+1], scene_bands[ab+2]);
+        vec3 oc = pos - center;
+        float radius = scene_bands[ab+3];
+        float qb = dot(oc, dir);
+        float qc = dot(oc, oc) - radius * radius;
+        float disc = qb * qb - qc;
+        if (disc < 0.0) continue;
+        float root = sqrt(disc);
+        float candidate = -qb - root;
+        if (candidate <= T_SELF) candidate = -qb + root;
+        if (candidate > T_SELF && candidate < best_t) {
+            best_t = candidate;
+            wave_arena_id = ai;
+        }
+    }
 
     stack[sp++] = 0;  /* root node */
 
@@ -323,7 +358,7 @@ void main() {
     }
 
     /* ── Miss ───────────────────────────────────────────────────────────── */
-    if (hit_tri < 0) {
+    if (hit_tri < 0 && wave_arena_id < 0) {
         atomicAdd(counters[1], 1u);
         return;
     }
@@ -355,6 +390,40 @@ void main() {
         amp_im[b] = amp_scale * (re * sin_p + im * cos_p);
     }
 
+    /* ── Wave-port event ─────────────────────────────────────────────────── */
+    if (hit_tri < 0 && wave_arena_id >= 0) {
+        uint wave_idx = atomicAdd(counters[2], 1u);
+        if (wave_idx >= uint(wave_capacity)) {
+            atomicAdd(counters[22], 1u);
+            return;
+        }
+        int wb = wave_base_floats + int(wave_idx) * wave_stride;
+        hits[wb +  0] = uintBitsToFloat(uint(wave_arena_id));
+        hits[wb +  1] = hit_pos.x; hits[wb +  2] = hit_pos.y; hits[wb +  3] = hit_pos.z;
+        hits[wb +  4] = dir.x;     hits[wb +  5] = dir.y;     hits[wb +  6] = dir.z;
+        hits[wb +  7] = tot_len;
+        hits[wb +  8] = intBitsToFloat(medium_mat);
+        hits[wb +  9] = uintBitsToFloat(iflags | (1u << 1u));
+        hits[wb + 10] = intBitsToFloat(src_id);
+        hits[wb + 11] = intBitsToFloat(bounce);
+        hits[wb + 12] = intBitsToFloat(bounces_left);
+        hits[wb + 13] = min_amp;
+        hits[wb + 14] = uintBitsToFloat(tag_lo);
+        hits[wb + 15] = uintBitsToFloat(tag_hi);
+        hits[wb + 16] = uintBitsToFloat(color_meta);
+        hits[wb + 17] = priority;
+        hits[wb + 18] = sensor_oy;
+        hits[wb + 19] = sensor_oz;
+        hits[wb + 20] = spectral_frequency_hz;
+        hits[wb + 21] = spectral_pdf;
+        hits[wb + 22] = uintBitsToFloat(bdpt_sid);
+        for (int b = 0; b < nb; ++b) {
+            hits[wb + 23 + b]      = amp_re[b];
+            hits[wb + 23 + nb + b] = amp_im[b];
+        }
+        return;
+    }
+
     /* ── Triangle data ───────────────────────────────────────────────────── */
     int tb = hit_tri * TRI_FULL_STRIDE;
     vec3 tri_n = vec3(trifull[tb+9], trifull[tb+10], trifull[tb+11]);
@@ -363,17 +432,6 @@ void main() {
 
     /* Orient normal toward incoming ray (front-face convention) */
     if (dot(dir, tri_n) > 0.0) tri_n = -tri_n;
-
-    /* ── Wave arena check ────────────────────────────────────────────────── */
-    int wave_arena_id = -1;
-    for (int ai = 0; ai < n_arenas; ++ai) {
-        vec3 acenter = u_arenas[ai].xyz;
-        float aradius = u_arenas[ai].w;
-        if (length(hit_pos - acenter) <= aradius) {
-            wave_arena_id = ai;
-            break;
-        }
-    }
 
     /* ── Write hit record to HitBuf ─────────────────────────────────────── */
     uint out_idx = atomicAdd(counters[0], 1u);
@@ -387,7 +445,7 @@ void main() {
     hit_wf(ob, 13, path_len);
     hit_wi(ob, 14, hit_tri);
     hit_wi(ob, 15, tri_mat);
-    hit_wu(ob, 16, color_flag);
+    hit_wu(ob, 16, color_meta);
     hit_wi(ob, 17, bounce);
     hit_wi(ob, 18, bounces_left);
     hit_wf(ob, 19, min_amp);
@@ -406,7 +464,4 @@ void main() {
     }
     hit_wu(ob, 28 + 2*MAX_GPU_BANDS, bdpt_sid);
 
-    /* ── Wave intent counter (C++ dispatcher routes these to Q_wave) ─────── */
-    if (wave_arena_id >= 0)
-        atomicAdd(counters[2], 1u);
 }

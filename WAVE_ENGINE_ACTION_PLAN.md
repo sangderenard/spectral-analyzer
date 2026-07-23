@@ -5,6 +5,11 @@ Baseline before the current wave/T1 work: `c4cb29f`
 
 ## Destination
 
+Terminology clarification: component-facing code and UI call the ordinary
+engine the **complex-field angular-spectrum engine**. “Helmholtz” below names
+the homogeneous-span dispersion relation, not a generic EM volume solver and
+not the retired field marcher.
+
 There are two electromagnetic engines with one shared transport contract:
 
 1. **Ordinary wave context:** a bidirectional, two-component vector

@@ -49,6 +49,33 @@ class OpticalPortDirection(str, Enum):
     BIDIRECTIONAL = "bidirectional"
 
 
+class OpticalEngine(str, Enum):
+    AUTO = "auto"
+    RAY = "ray"
+    PARAMETRIC = "parametric"
+    WAVE = "wave"
+    HYBRID = "hybrid"
+    MAXWELL = "maxwell"
+
+
+def _select_engine(
+    component_key: str,
+    requested: OpticalEngine | str,
+    supported: Sequence[OpticalEngine],
+    default: OpticalEngine,
+) -> OpticalEngine:
+    selection = OpticalEngine(requested)
+    if selection is OpticalEngine.AUTO:
+        return default
+    if selection not in supported:
+        names = ", ".join(value.value for value in supported)
+        raise RuntimeError(
+            f"component {component_key!r} does not implement engine "
+            f"{selection.value!r}; available: {names}. Refusing fallback."
+        )
+    return selection
+
+
 @dataclass(frozen=True)
 class OpticalPortSpec:
     key: str
@@ -228,7 +255,11 @@ class NativeOpticalComponentScene:
 class OpticalComponent(Protocol):
     key: str
 
-    def compile(self, lane_count: int) -> CompiledOpticalComponent:
+    def compile(
+        self,
+        lane_count: int,
+        engine: OpticalEngine | str = OpticalEngine.AUTO,
+    ) -> CompiledOpticalComponent:
         ...
 
 
@@ -395,8 +426,17 @@ class PhysicalApertureComponent:
     def key(self) -> str:
         return self.aperture.key
 
-    def compile(self, lane_count: int) -> CompiledOpticalComponent:
+    def compile(
+        self,
+        lane_count: int,
+        engine: OpticalEngine | str = OpticalEngine.AUTO,
+    ) -> CompiledOpticalComponent:
         self.aperture.validate()
+        selected_engine = _select_engine(
+            self.key, engine,
+            (OpticalEngine.WAVE, OpticalEngine.HYBRID),
+            OpticalEngine.WAVE,
+        )
         axis = _unit(self.axis, "aperture axis")
         extent = self.aperture.assembly_radius_m*self.field_margin
         step = self.aperture.thickness_m/max(1, int(self.longitudinal_steps))
@@ -467,6 +507,8 @@ class PhysicalApertureComponent:
             metadata={
                 "aperture": self.aperture.graph_parameters(),
                 "wave_localization": "material-bounds-only",
+                "selected_engine": selected_engine.value,
+                "supported_engines": ("wave", "hybrid"),
             },
         )
         component.validate()
@@ -478,7 +520,15 @@ class CompoundLensComponent:
     lens: CompoundLens
     key: str = "lens.default-camera"
 
-    def compile(self, lane_count: int) -> CompiledOpticalComponent:
+    def compile(
+        self,
+        lane_count: int,
+        engine: OpticalEngine | str = OpticalEngine.AUTO,
+    ) -> CompiledOpticalComponent:
+        selected_engine = _select_engine(
+            self.key, engine, (OpticalEngine.PARAMETRIC,),
+            OpticalEngine.PARAMETRIC,
+        )
         graph = compile_compound_lens_graph(self.lens, lane_count=lane_count)
         front = self.lens.side("front")
         back = self.lens.side("back")
@@ -509,6 +559,8 @@ class CompoundLensComponent:
                 "surface_count": len(self.lens.registered_faces()),
                 "execution": "existing-fused-exact-t2",
                 "hot_interpreter": False,
+                "selected_engine": selected_engine.value,
+                "supported_engines": ("parametric",),
             },
         )
         component.validate()
@@ -554,7 +606,14 @@ class PlaneMirrorComponent:
             triangles, ("reflective_surface",)*len(triangles)
         )
 
-    def compile(self, lane_count: int) -> CompiledOpticalComponent:
+    def compile(
+        self,
+        lane_count: int,
+        engine: OpticalEngine | str = OpticalEngine.AUTO,
+    ) -> CompiledOpticalComponent:
+        selected_engine = _select_engine(
+            self.key, engine, (OpticalEngine.RAY,), OpticalEngine.RAY
+        )
         normal = _unit(self.normal, "mirror normal")
         graph = _compile_linear_material_graph(
             prefix=self.key,
@@ -603,7 +662,12 @@ class PlaneMirrorComponent:
                     "analytic-specular-reflection",
                 ),
             ),
-            metadata={"surface": "plane", "ideal_reflector": False},
+            metadata={
+                "surface": "plane",
+                "ideal_reflector": False,
+                "selected_engine": selected_engine.value,
+                "supported_engines": ("ray",),
+            },
         )
         component.validate()
         return component
@@ -614,7 +678,14 @@ class PentaprismComponent:
     spec: PentaprismSpec
     key: str = "pentaprism.finder"
 
-    def compile(self, lane_count: int) -> CompiledOpticalComponent:
+    def compile(
+        self,
+        lane_count: int,
+        engine: OpticalEngine | str = OpticalEngine.AUTO,
+    ) -> CompiledOpticalComponent:
+        selected_engine = _select_engine(
+            self.key, engine, (OpticalEngine.RAY,), OpticalEngine.RAY
+        )
         assembly = self.spec.build()
         operations = (
             ("entrance", "dielectric-interface", {
@@ -690,6 +761,8 @@ class PentaprismComponent:
                     for point in assembly.primary_path
                 ],
                 "constant_deviation_rad": 0.5*math.pi,
+                "selected_engine": selected_engine.value,
+                "supported_engines": ("ray",),
             },
         )
         component.validate()
@@ -724,8 +797,13 @@ class OpticalComponentRegistry:
             ) from exc
         return factory(int(lane_count))
 
-    def compile(self, key: str, lane_count: int) -> CompiledOpticalComponent:
-        return self.create(key, lane_count).compile(int(lane_count))
+    def compile(
+        self,
+        key: str,
+        lane_count: int,
+        engine: OpticalEngine | str = OpticalEngine.AUTO,
+    ) -> CompiledOpticalComponent:
+        return self.create(key, lane_count).compile(int(lane_count), engine)
 
 
 def default_optical_component_registry() -> OpticalComponentRegistry:
@@ -762,6 +840,7 @@ def default_optical_component_registry() -> OpticalComponentRegistry:
 
 __all__ = [
     "OPTICAL_COMPONENT_SCHEMA",
+    "OpticalEngine",
     "OpticalPortDirection",
     "OpticalPortSpec",
     "OpticalControlSpec",

@@ -352,6 +352,7 @@ from .optical_transport_graph import (
 )
 from .optical_components import (
     OPTICAL_COMPONENT_SCHEMA,
+    OpticalEngine,
     OpticalPortDirection,
     OpticalPortSpec,
     OpticalControlSpec,
@@ -749,6 +750,7 @@ __all__ = [
     "compile_compound_lens_graph",
     "compile_projector_back_graph",
     "OPTICAL_COMPONENT_SCHEMA",
+    "OpticalEngine",
     "OpticalPortDirection",
     "OpticalPortSpec",
     "OpticalControlSpec",

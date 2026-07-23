@@ -10,6 +10,7 @@ from camera_designer.compound_optics import CompoundLens
 from camera_software.optical_components import (
     OPTICAL_COMPONENT_SCHEMA,
     CompoundLensComponent,
+    OpticalEngine,
     PentaprismComponent,
     PhysicalApertureComponent,
     PlaneMirrorComponent,
@@ -120,6 +121,19 @@ def test_pentaprism_is_a_material_bound_composite_graph() -> None:
 def test_registry_rejects_unknown_component_without_fallback() -> None:
     with pytest.raises(KeyError, match="unknown optical component"):
         default_optical_component_registry().compile("not-a-component", 4)
+
+
+def test_engine_selection_is_explicit_and_never_falls_back() -> None:
+    registry = default_optical_component_registry()
+
+    aperture = registry.compile("aperture.iris", 4, OpticalEngine.WAVE)
+    assert aperture.metadata["selected_engine"] == "wave"
+    lens = registry.compile("lens.default-camera", 4, "parametric")
+    assert lens.metadata["selected_engine"] == "parametric"
+    with pytest.raises(RuntimeError, match="Refusing fallback"):
+        registry.compile("pentaprism.finder", 4, "wave")
+    with pytest.raises(RuntimeError, match="Refusing fallback"):
+        registry.compile("lens.default-camera", 4, "ray")
 
 
 def _wait(tracer, timeout_s: float = 5.0) -> None:

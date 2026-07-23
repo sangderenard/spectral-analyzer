@@ -52,10 +52,13 @@ python wave_transform_visual_demo.py --component-live `
   --component mirror.plane --component-lanes 16 --size 384
 
 python wave_transform_visual_demo.py --component-live `
-  --component pentaprism.finder --component-lanes 16 --size 384
+  --component pentaprism.finder --component-lanes 16 `
+  --component-engine ray --component-size 512
 ```
 
-The six panes have stable meanings:
+One square product owns the viewport; this is not a six-up contact sheet.
+Use `1` through `6`, arrow keys, or Tab to select products. The six products
+have stable meanings:
 
 1. representative/transport geometry;
 2. the authoritative transport probe;
@@ -80,6 +83,14 @@ consume the visualization. A pane names the provenance of what it shows:
 This provenance labeling is a rule for future arena products: a beautiful
 diagnostic must state which physical quantity supplies color, opacity, and
 brightness. Decorative rays must never masquerade as measured light state.
+
+`--component-engine` accepts `auto`, `ray`, `parametric`, `wave`, `hybrid`,
+and `maxwell`. Selection is a requirement, not a preference: unsupported
+component/backend pairs fail with their available engines and never substitute
+a sparse ray view for requested wave transport. At this revision the physical
+aperture supports wave/hybrid, the exact lens supports parametric, and the
+mirror and pentaprism support ray. The rotated complex-field port chain needed
+for a truthful wave pentaprism remains an explicit acceptance gate.
 
 For the aperture, the panes are the production vector-field products. Its
 animated opening is derived from the loaded `LivePhysicalAperture`, preserving

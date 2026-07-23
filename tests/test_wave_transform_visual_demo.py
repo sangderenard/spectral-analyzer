@@ -8,6 +8,7 @@ from wave_transform_visual_demo import (
     _aperture_sweep_radius,
     _aperture_spectral_samples,
     _remove_piston_phase,
+    _signed_scalar_rgba,
     render_aperture_bake,
     render_sequence,
     run_aperture_live,
@@ -134,3 +135,13 @@ def test_ultra_bake_recipes_are_detached_and_validate():
     assert ultra_bake_presets()["iris-spectrum-fixed"]["size"] == 64
     with pytest.raises(ValueError, match="unknown ultra bake"):
         render_aperture_bake(".", preset="made-up")
+
+
+def test_signed_stokes_display_opacity_follows_beam_support():
+    y, x = np.mgrid[-1.0:1.0:17j, -1.0:1.0:17j]
+    support = np.exp(-8.0*(x*x+y*y))
+    rgba = _signed_scalar_rgba(support, support)
+
+    assert rgba[8, 8, 0] > rgba[8, 8, 2]
+    assert rgba[8, 8, 3] == 255
+    assert rgba[0, 0, 3] < 8

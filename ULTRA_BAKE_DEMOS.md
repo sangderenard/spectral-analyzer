@@ -19,7 +19,8 @@ Perceptually divided 32-band visible spectrum through the moving material iris:
 python wave_transform_visual_demo.py --ultra-bake iris-spectrum-fixed --output-dir exposures/ultra_bakes
 ```
 
-Resampled 32-lane continuous-frequency cohorts through the same iris:
+Resampled 32-lane continuous-frequency cohorts with an azimuthal source through
+the same iris:
 
 ```powershell
 python wave_transform_visual_demo.py --ultra-bake iris-spectrum-continuous --output-dir exposures/ultra_bakes

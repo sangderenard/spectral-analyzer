@@ -179,7 +179,9 @@ def _signed_scalar_rgba(values: np.ndarray, scale: np.ndarray) -> np.ndarray:
     """Diverging blue/black/red display for signed Stokes components."""
 
     signed = np.asarray(values, np.float64)
-    denominator = np.maximum(np.asarray(scale, np.float64), 1.0e-30)
+    support_value = np.maximum(np.asarray(scale, np.float64), 0.0)
+    support_peak = float(np.max(support_value))
+    denominator = np.maximum(support_value, 1.0e-30)
     normalized = np.clip(signed / denominator, -1.0, 1.0)
     magnitude = np.sqrt(np.abs(normalized))
     rgb = np.zeros((*signed.shape, 3), np.float64)
@@ -187,8 +189,10 @@ def _signed_scalar_rgba(values: np.ndarray, scale: np.ndarray) -> np.ndarray:
     rgb[..., 0] = np.where(positive, magnitude, 0.12 * magnitude)
     rgb[..., 1] = 0.16 * magnitude
     rgb[..., 2] = np.where(positive, 0.12 * magnitude, magnitude)
-    alpha = (denominator > float(np.max(denominator)) * 1.0e-10).astype(
-        np.float64
+    alpha = (
+        np.zeros_like(support_value)
+        if support_peak <= 0.0 else
+        np.power(np.clip(support_value/support_peak, 0.0, 1.0), 0.35)
     )
     return np.clip(
         np.concatenate((rgb, alpha[..., None]), axis=2) * 255.0,
@@ -915,7 +919,7 @@ _ULTRA_BAKE_PRESETS: dict[str, dict[str, object]] = {
         "quality": "bake",
         "spectral_mode": "continuous",
         "lane_count": 32,
-        "polarizations": ("circular+",),
+        "polarizations": ("azimuthal",),
         "vector_page": True,
         "spectral_panel": True,
         "phase_mode": "sweep",
@@ -1017,8 +1021,14 @@ def render_aperture_bake(
         cycle_phases = np.linspace(0.0, np.pi, active_frames)
 
     hero_index = active_frames//2
+    polarization_offset = (
+        len(polarizations)//2
+        if active_frames == 1 and len(polarizations) > 1 else 0
+    )
     for frame_index, cycle_phase in enumerate(cycle_phases):
-        polarization = polarizations[frame_index % len(polarizations)]
+        polarization = polarizations[
+            (frame_index+polarization_offset) % len(polarizations)
+        ]
         print(
             f"[ultra-bake] start {preset} {frame_index+1}/{active_frames} "
             f"visible={active_size} quality={active_quality} "

@@ -5246,137 +5246,6 @@ int ray_tracer_rs_propagate(
     return SK_OK;
 }
 
-/* ── Beam Propagation Method — batchwise PDE z-stepper ──────────────────────
- *
- * Solves ∂U/∂z = (i/2k) ∇_T² U  (paraxial Helmholtz PDE) using ADI
- * Crank-Nicolson dimensional splitting.  Steps all n_bands simultaneously.
- *
- * Each call:
- *   1.  Apply carrier phase   U *= exp(ik·dz)   (global z-advance of carrier)
- *   2a. x-sweep (implicit x, explicit done in previous step):
- *         (I − β Lx) U* = (I + β Lx) U
- *       where β = i·dz/(4k·dx²), Lx = 1D 2nd-difference operator
- *   2b. y-sweep (implicit y, explicit x already propagated):
- *         (I − β Ly) U^{n+1} = (I + β Ly) U*
- *
- * Both sweeps use the Thomas algorithm (O(N) tridiagonal solve per row/col).
- * Total cost: O(n_bands × w × h) per call.
- *
- * Boundary: Dirichlet U=0 at all four edges (absorbing frame).
- * ─────────────────────────────────────────────────────────────────────────── */
-
-int ray_tracer_wave_bpm_step(
-    int             n_bands,
-    int             w,
-    int             h,
-    double          dx,
-    double          dz,
-    const double*   wavelengths_m,
-    float*          re_buf,
-    float*          im_buf)
-{
-    if (!re_buf || !im_buf || !wavelengths_m)  return SK_ERR_NULL_STATE;
-    if (w < 2 || h < 2 || n_bands < 1 || dx <= 0.0 || dz == 0.0)
-        return SK_ERR_NULL_STATE;
-
-    const size_t npix = static_cast<size_t>(w) * h;
-    const double dx2  = dx * dx;
-    const int    maxn = std::max(w, h);
-
-    /* Working field: double-precision complex for accuracy */
-    std::vector<cd> field(npix);
-    std::vector<cd> tmp(npix);
-    /* Thomas algorithm scratch — one row or column at a time */
-    std::vector<cd> rhs(maxn);
-    std::vector<cd> c_prime(maxn);   /* upper-diagonal sweep coefficients  */
-    std::vector<cd> d_prime(maxn);   /* RHS sweep values                   */
-
-    /* Thomas algorithm for the uniform tridiagonal system:
-     *   -beta · x[i-1] + (1 + 2·beta) · x[i] - beta · x[i+1] = rhs[i]
-     * with Dirichlet x[0] = x[n-1] = 0.
-     * Solution is written back into rhs[0..n-1]. */
-    auto thomas = [&](int n, const cd& beta) {
-        const cd diag = cd(1.0, 0.0) + 2.0 * beta;
-        const cd off  = -beta;
-        rhs[0]     = cd(0.0, 0.0);   /* absorbing left/top boundary  */
-        rhs[n - 1] = cd(0.0, 0.0);   /* absorbing right/bottom boundary */
-        /* Forward sweep */
-        c_prime[0] = off / diag;
-        d_prime[0] = rhs[0] / diag;
-        for (int i = 1; i < n; ++i) {
-            const cd denom = diag - off * c_prime[i - 1];
-            c_prime[i]     = off / denom;
-            d_prime[i]     = (rhs[i] - off * d_prime[i - 1]) / denom;
-        }
-        /* Back substitution */
-        rhs[n - 1] = d_prime[n - 1];
-        for (int i = n - 2; i >= 0; --i)
-            rhs[i] = d_prime[i] - c_prime[i] * rhs[i + 1];
-    };
-
-    for (int b = 0; b < n_bands; ++b) {
-        const size_t boff = static_cast<size_t>(b) * npix;
-        const double lam  = wavelengths_m[b];
-        if (lam <= 0.0) continue;
-        const double k = 2.0 * M_PI / lam;
-
-        /* Load field (float32 → double complex) */
-        for (size_t i = 0; i < npix; ++i)
-            field[i] = cd(static_cast<double>(re_buf[boff + i]),
-                          static_cast<double>(im_buf[boff + i]));
-
-        /* ── Step 1: carrier phase advance  U *= exp(i k dz) ───────────── */
-        const double cos_kdz = std::cos(k * dz);
-        const double sin_kdz = std::sin(k * dz);
-        for (size_t i = 0; i < npix; ++i) {
-            const double re = field[i].real(), im = field[i].imag();
-            field[i] = cd(re * cos_kdz - im * sin_kdz,
-                          re * sin_kdz + im * cos_kdz);
-        }
-
-        /* ── Step 2: ADI diffraction  exp(i dz ∇_T² / 2k) ─────────────── *
-         * β = i dz / (4k dx²)  — ADI coupling coefficient                 */
-        const cd beta = cd(0.0, dz / (4.0 * k * dx2));
-
-        /* Half-step 2a: implicit in x, row by row ─────────────────────── */
-        for (int row = 0; row < h; ++row) {
-            const size_t rbase = static_cast<size_t>(row) * w;
-            for (int col = 0; col < w; ++col) {
-                const cd u  = field[rbase + col];
-                const cd uw = (col > 0)     ? field[rbase + col - 1] : cd(0.0, 0.0);
-                const cd ue = (col < w - 1) ? field[rbase + col + 1] : cd(0.0, 0.0);
-                /* RHS = (I + β Lx) u = u + β(uw + ue − 2u) */
-                rhs[col] = u + beta * (uw + ue - 2.0 * u);
-            }
-            thomas(w, beta);
-            for (int col = 0; col < w; ++col)
-                tmp[rbase + col] = rhs[col];
-        }
-
-        /* Half-step 2b: implicit in y, column by column ────────────────── */
-        for (int col = 0; col < w; ++col) {
-            for (int row = 0; row < h; ++row) {
-                const size_t idx = static_cast<size_t>(row) * w + col;
-                const cd u  = tmp[idx];
-                const cd un = (row > 0)     ? tmp[idx - w] : cd(0.0, 0.0);
-                const cd us = (row < h - 1) ? tmp[idx + w] : cd(0.0, 0.0);
-                rhs[row] = u + beta * (un + us - 2.0 * u);
-            }
-            thomas(h, beta);
-            for (int row = 0; row < h; ++row)
-                field[static_cast<size_t>(row) * w + col] = rhs[row];
-        }
-
-        /* Write back (double complex → float32) */
-        for (size_t i = 0; i < npix; ++i) {
-            re_buf[boff + i] = static_cast<float>(field[i].real());
-            im_buf[boff + i] = static_cast<float>(field[i].imag());
-        }
-    }
-
-    return SK_OK;
-}
-
 /* ── Stateful ray scheduler ──────────────────────────────────────────────────
  *
  * API: ray_tracer_spawn / ray_tracer_step / ray_tracer_clear_rays /
@@ -8119,6 +7988,7 @@ static void band_to_display_rgb(int b, int n_bands,
 static void wave_arena_seed(WaveArena& arena, const RayIntent& ray);
 static void wave_arena_seed_continuous_cohort(
     WaveArena& arena, const std::array<WaveIntent*, 32>& cohort, int count);
+static bool wave_arena_march(WaveArena& arena);
 static ChildRay wave_arena_extract(const WaveArena& arena, const RayIntent& src,
                                    int state_lane = -1);
 static void wave_arena_complete(RayPipelineState& ps,
@@ -8144,9 +8014,9 @@ static void pipeline_finish_ray(RayPipelineState& ps, uint8_t color_flag = 255);
  *   batches) to absorb more work when the queue is deep, and fall back to CPU
  *   when the queue is thin — automatically balancing the two operators.
  *
- *   T4 (wave BPM) runs on the GPU when a WaveIntent is popped from Q_wave.
- *   The CPU pipeline_wave_solver thread is NOT spawned when use_gpu_compute
- *   is set; T4 runs exclusively on GPU in that mode.
+ *   T4 routing remains owned by this thread when GPU compute is active. The
+ *   angular-spectrum executor currently runs on the CPU-owned arena block;
+ *   its staged GPU FFT plan is a distinct backend still to be attached.
  *
  * Per-stage profiling:
  *   After each GPU dispatch the elapsed wall time is reported via
@@ -8168,8 +8038,6 @@ public:
         (29 + 2 * MAX_SPECTRAL_BANDS) * static_cast<int>(sizeof(float));
 
     GLuint prog_t1 = 0, prog_t2 = 0, prog_t3 = 0;
-    std::array<GLuint, wave_t4::kBandCounts.size()> prog_t4 = {};
-    std::string wave_t4_shader_source;
     GLuint prog_field_accum = 0, prog_field_resolve = 0;
     GLuint prog_surface_scan_resolve = 0;
     std::string surface_scan_shader_source;
@@ -8428,13 +8296,6 @@ public:
                    bdpt_betas_base,
                    n_hits; }
         uloc_t3 = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
-    struct T4Uniforms {
-        GLint mode = -1, nx = -1, ny = -1, n_bands = -1;
-        GLint dx = -1, dz = -1, wavelengths = -1;
-        GLint absorber_cells = -1, absorber_step_strength = -1;
-    };
-    std::array<T4Uniforms, wave_t4::kBandCounts.size()> uloc_t4 = {};
-
     /* Per-stage SSBOs allocated once and resized as needed */
     /* T1 inputs */
     GLuint ssbo_intent      = 0; /* RayIntent flat float buffer */
@@ -8478,17 +8339,11 @@ public:
     GLuint ssbo_uv_accum   = 0;  /* binding 6: flat uint32 accumulator             */
     /* T4 numerical system state: one cold-allocated persistent GPU buffer.
      * Bindings 0..5 receive fixed ranges into this block. */
-    GLuint ssbo_wave_state = 0;
-    std::array<GLintptr, 6> wave_state_offset = {};
-    std::array<GLsizeiptr, 6> wave_state_size = {};
-    GLsizeiptr wave_state_total = 0;
-
     /* Capacities to know when realloc is needed */
     int cap_intents  = 0;
     int cap_hits     = 0;     /* capacity of both ssbo_hit and ssbo_hit_b (kept in lockstep) */
     int cap_hit_wave_stride = 0; /* arena-only tail words per possible input */
     int cap_children = 0; /* also gates terminal capacity: buffer = cap*(INTENT_STRIDE+TERMINAL_STRIDE) */
-    int cap_wave_pix = 0; /* total pixels across exact lanes */
 
     /* CPU-side staging buffers — grown as needed, never shrunk.
      * Eliminates large malloc/free pairs per dispatch batch. */
@@ -8584,46 +8439,6 @@ public:
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         if (error != GL_NO_ERROR) return false;
         ssbo_capacity_bytes[id] = allocation;
-        return true;
-    }
-
-    bool ensure_t4_program(size_t spec) {
-        if (spec >= wave_t4::kBandCounts.size()) return false;
-        if (prog_t4[spec]) return true;
-        if (wave_t4_shader_source.empty()) return false;
-
-        char error[1024] = {};
-        const int bands = wave_t4::kBandCounts[spec];
-        /* WAVE_BANDS is compile-time constant. Band loops in the shared shader
-         * therefore specialize/unroll without maintaining duplicated sources. */
-        const std::string preamble =
-            "#define WAVE_BANDS " + std::to_string(bands) + "\n";
-        const GLuint program = gl_compute_build_program2(
-            wave_t4_shader_source.c_str(), preamble.c_str(),
-            error, sizeof(error)
-        );
-        if (!program) {
-            fprintf(stderr,
-                    "[T4] ray_wave_bpm compile failed bands=%d: %s\n",
-                    bands, error);
-            fflush(stderr);
-            return false;
-        }
-        prog_t4[spec] = program;
-        auto& u = uloc_t4[spec];
-        u.mode        = glc_GetUniformLocation(program, "mode");
-        u.nx          = glc_GetUniformLocation(program, "nx");
-        u.ny          = glc_GetUniformLocation(program, "ny");
-        u.n_bands     = glc_GetUniformLocation(program, "n_bands");
-        u.dx          = glc_GetUniformLocation(program, "dx");
-        u.dz          = glc_GetUniformLocation(program, "dz");
-        u.wavelengths = glc_GetUniformLocation(program, "wavelengths");
-        u.absorber_cells = glc_GetUniformLocation(program, "absorber_cells");
-        u.absorber_step_strength = glc_GetUniformLocation(
-            program, "absorber_step_strength"
-        );
-        fprintf(stderr, "[T4] compiled exact %d-lane shader on first use\n", bands);
-        fflush(stderr);
         return true;
     }
 
@@ -12177,15 +11992,6 @@ public:
         if (!load("ray_bvh_intersect.comp.glsl", prog_t1)) { snprintf(ctx.error, sizeof(ctx.error), "ray_bvh_intersect.comp.glsl: %s", err); return false; }
         if (!load("ray_refine.comp.glsl", prog_t2)) { snprintf(ctx.error, sizeof(ctx.error), "ray_refine.comp.glsl: %s", err); return false; }
         if (!load("ray_material.comp.glsl", prog_t3)) { snprintf(ctx.error, sizeof(ctx.error), "ray_material.comp.glsl: %s", err); return false; }
-        {
-            if (!read_shader_file(
-                    "ray_wave_bpm.comp.glsl", wave_t4_shader_source)) {
-                snprintf(ctx.error, sizeof(ctx.error), "ray_wave_bpm.comp.glsl: %s", err);
-                return false;
-            }
-            /* Exact lane variants compile lazily on the GPU owner thread.
-             * Non-wave renders pay one file read and zero T4 driver compiles. */
-        }
         if (!load("field_display_accum.comp.glsl", prog_field_accum)) { snprintf(ctx.error, sizeof(ctx.error), "field_display_accum.comp.glsl: %s", err); return false; }
         if (!load("field_display_resolve.comp.glsl", prog_field_resolve)) { snprintf(ctx.error, sizeof(ctx.error), "field_display_resolve.comp.glsl: %s", err); return false; }
         if (!read_shader_file(
@@ -13972,149 +13778,28 @@ public:
     }
 
     void prepare_t4_state_buffer(const RayPipelineState& ps) {
-        size_t max_pix = 0;
-        size_t max_thomas_floats = 0;
-        for (const WaveArena& arena : ps.arenas) {
-            max_pix = std::max(max_pix,
-                static_cast<size_t>(arena.n_bands) * arena.nx * arena.ny);
-            max_thomas_floats = std::max(max_thomas_floats,
-                static_cast<size_t>(arena.n_bands)
-                * static_cast<size_t>(std::max(arena.nx, arena.ny))
-                * 1024u * 2u);
-        }
-        if (max_pix == 0) return;
-
-        GLint alignment = 256;
-        static constexpr GLenum kSsboOffsetAlignment = 0x90DF;
-        glGetIntegerv(kSsboOffsetAlignment, &alignment);
-        const size_t a = static_cast<size_t>(std::max(alignment, 1));
-        auto align_up = [a](size_t value) { return (value + a - 1u) / a * a; };
-        const size_t plane_bytes = max_pix * sizeof(float);
-        const size_t scratch_bytes = max_thomas_floats * sizeof(float);
-        size_t cursor = 0;
-        for (int slot = 0; slot < 6; ++slot) {
-            cursor = align_up(cursor);
-            wave_state_offset[static_cast<size_t>(slot)] = static_cast<GLintptr>(cursor);
-            const size_t bytes = slot < 4 ? plane_bytes : scratch_bytes;
-            wave_state_size[static_cast<size_t>(slot)] = static_cast<GLsizeiptr>(bytes);
-            cursor += bytes;
-        }
-        wave_state_total = static_cast<GLsizeiptr>(cursor);
-        if (!ensure_ssbo(ssbo_wave_state, wave_state_total)) {
-            fprintf(stderr, "[T4] failed to allocate persistent state buffer (%llu bytes)\n",
-                    static_cast<unsigned long long>(cursor));
-            fflush(stderr);
-            cap_wave_pix = 0;
-            return;
-        }
-        cap_wave_pix = static_cast<int>(max_pix);
+        (void)ps;
+        /* The final arena state is already one persistent CPU-owned contiguous
+         * block.  The GPU angular-spectrum executor will bind that schema
+         * through its own staged FFT plan; no obsolete scalar work buffers are
+         * allocated speculatively here. */
     }
 
-    void bind_t4_state_range(GLuint binding, int slot) {
-        glc_BindBufferRange(GL_SHADER_STORAGE_BUFFER, binding, ssbo_wave_state,
-                            wave_state_offset[static_cast<size_t>(slot)],
-                            wave_state_size[static_cast<size_t>(slot)]);
-    }
-
-    /* ── dispatch_t4_march: complete configured BPM march ─────────────── */
+    /* GPU T1 still owns routing. Until the staged GLSL FFT executor lands,
+     * execute the same final angular-spectrum kernel on the GPU owner thread.
+     * This is an explicit CPU backend, not a scalar numerical substitution. */
     bool dispatch_t4_march(RayPipelineState& ps,
                            WaveArena& arena,
                            const RayIntent& source,
                            bool state_preseeded = false) {
         using Clock = std::chrono::high_resolution_clock;
-        const int nx     = arena.nx;
-        const int ny     = arena.ny;
-        const int nb     = arena.n_bands;
-        const int n_pix  = nx * ny * nb;
-
-        if (n_pix <= 0 || nb <= 0) return false;
-
-        const int spec = wave_t4::specialization_index(nb);
-        if (spec < 0) {
-            fprintf(stderr,
-                    "[T4] unsupported exact band count %d; supported: 1,3,4,8,16,32\n",
-                    nb);
-            fflush(stderr);
-            return false;
-        }
-        if (!ensure_t4_program(static_cast<size_t>(spec))) return false;
-        const GLuint t4_program = prog_t4[static_cast<size_t>(spec)];
-        const T4Uniforms& t4_u = uloc_t4[static_cast<size_t>(spec)];
-
         if (!state_preseeded)
             wave_arena_seed(arena, source);
-
-        if (n_pix > cap_wave_pix || ssbo_wave_state == 0) {
-            fprintf(stderr,
-                    "[T4] persistent state buffer is missing or undersized; "
-                    "cold reconfiguration is required\n");
-            fflush(stderr);
-            return false;
-        }
-
-        /* Upload field */
-        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_wave_state);
-        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, wave_state_offset[0],
-                          (GLsizeiptr)(n_pix * sizeof(float)), arena.re_data());
-        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, wave_state_offset[1],
-                          (GLsizeiptr)(n_pix * sizeof(float)), arena.im_data());
-        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-
         auto t4_start = Clock::now();
-        glc_UseProgram(t4_program);
-        auto set_bpm_uniforms = [&](int mode) {
-            glc_Uniform1i(t4_u.mode,    mode);
-            glc_Uniform1i(t4_u.nx,      nx);
-            glc_Uniform1i(t4_u.ny,      ny);
-            glc_Uniform1i(t4_u.n_bands, nb);
-            glc_Uniform1f(t4_u.dx,      (float)arena.dx);
-            glc_Uniform1f(t4_u.dz,      (float)arena.dz);
-            glc_Uniform1i(t4_u.absorber_cells, arena.boundary.absorber_cells);
-            glc_Uniform1f(t4_u.absorber_step_strength,
-                          arena.boundary.absorber_strength
-                          / static_cast<float>(std::max(1, arena.nz)));
-            /* Upload wavelengths array */
-            float wl[MAX_SPECTRAL_BANDS] = {};
-            for (int b = 0; b < std::min(nb, MAX_SPECTRAL_BANDS); ++b)
-                wl[b] = (float)arena.wavelengths_m[b];
-            glc_Uniform1fv(t4_u.wavelengths, nb, wl);
-        };
-
-        for (int slot = 0; slot < 6; ++slot)
-            bind_t4_state_range(static_cast<GLuint>(slot), slot);
-
-        for (int step = 0; step < arena.nz; ++step) {
-            /* Mode 0: carrier advance */
-            set_bpm_uniforms(0);
-            GLC_DISPATCH_CHECKED("T4:BPM-m0", (GLuint)n_pix, 1, 1);
-            glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-            /* Mode 1: horizontal sweep */
-            set_bpm_uniforms(1);
-            GLC_DISPATCH_CHECKED("T4:BPM-m1", (GLuint)(nb * ny), 1, 1);
-            glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-            /* Mode 2: vertical sweep */
-            set_bpm_uniforms(2);
-            GLC_DISPATCH_CHECKED("T4:BPM-m2", (GLuint)(nb * nx), 1, 1);
-            glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-        }
-
+        const bool marched = wave_arena_march(arena);
         ps.stats[3].record_gpu(1, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
             Clock::now() - t4_start).count(), ps.Q_wave.size());
-
-        /* Read back updated field */
-        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_wave_state);
-        glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, wave_state_offset[0],
-                             (GLsizeiptr)(n_pix * sizeof(float)), arena.re_data());
-        glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, wave_state_offset[1],
-                             (GLsizeiptr)(n_pix * sizeof(float)), arena.im_data());
-        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-        arena.progress.completed_steps += static_cast<unsigned long long>(arena.nz);
-        ++arena.progress.generation;
-        wave_t4::measure(nb, nx, ny, arena.boundary,
-                         arena.re_data(), arena.im_data(), &arena.progress);
-        arena.progress.absorbed_power = std::max(
-            0.0, arena.progress.input_power - arena.progress.field_power);
-        return true;
+        return marched;
     }
 
     /* ── thread_main: GPU dispatch loop ──────────────────────────────────── */
@@ -14847,19 +14532,34 @@ static void wave_arena_build(
         arena.spectral_lanes[static_cast<size_t>(b)].coherence_id = static_cast<unsigned int>(b);
         arena.spectral_lanes[static_cast<size_t>(b)].active = 1u;
     }
-    arena.plane_size = static_cast<size_t>(arena.n_bands) * arena.ny * arena.nx;
-    const size_t line_size = static_cast<size_t>(std::max(arena.nx, arena.ny));
-    arena.re_offset = 0;
-    arena.im_offset = arena.plane_size;
-    arena.tmp_re_offset = arena.plane_size * 2u;
-    arena.tmp_im_offset = arena.plane_size * 3u;
-    arena.rhs_re_offset = arena.plane_size * 4u;
-    arena.rhs_im_offset = arena.rhs_re_offset + line_size;
-    arena.cp_re_offset = arena.rhs_im_offset + line_size;
-    arena.cp_im_offset = arena.cp_re_offset + line_size;
-    arena.dp_re_offset = arena.cp_im_offset + line_size;
-    arena.dp_im_offset = arena.dp_re_offset + line_size;
-    arena.state_block.assign(arena.dp_im_offset + line_size, 0.0f);
+    auto next_power_of_two = [](int value) {
+        int result = 1;
+        while (result < value) result <<= 1;
+        return result;
+    };
+    const int guard = std::max(
+        arena.boundary.guard_cells, arena.boundary.absorber_cells);
+    arena.fft_nx = next_power_of_two(arena.nx + 2 * guard);
+    arena.fft_ny = next_power_of_two(arena.ny + 2 * guard);
+    arena.pad_x = (arena.fft_nx - arena.nx) / 2;
+    arena.pad_y = (arena.fft_ny - arena.ny) / 2;
+    if (!wave_t4::build_angular_spectrum_plan(
+            arena.fft_nx, arena.fft_ny, &arena.angular_plan)) {
+        fprintf(stderr,
+                "[T4] failed to build angular-spectrum plan for %dx%d arena\n",
+                arena.fft_nx, arena.fft_ny);
+        fflush(stderr);
+    }
+    arena.plane_size = static_cast<size_t>(arena.n_bands)
+                     * arena.fft_ny * arena.fft_nx;
+    size_t cursor = 0;
+    for (int field = 0; field < wave_t4::kFieldCount; ++field) {
+        arena.re_offsets[static_cast<size_t>(field)] = cursor;
+        cursor += arena.plane_size;
+        arena.im_offsets[static_cast<size_t>(field)] = cursor;
+        cursor += arena.plane_size;
+    }
+    arena.state_block.assign(cursor, 0.0f);
 }
 
 static V3d wave_arena_to_local(const WaveArena& a, const V3d& wp)
@@ -14868,10 +14568,43 @@ static V3d wave_arena_to_local(const WaveArena& a, const V3d& wp)
     return V3d(off.dot(a.axis_x), off.dot(a.axis_y), off.dot(a.axis_z));
 }
 
+static wave_t4::Direction wave_arena_direction(
+    const WaveArena& arena, const RayIntent& ray) noexcept
+{
+    return ray.dir.dot(arena.axis_z) >= 0.0
+        ? wave_t4::Direction::Forward
+        : wave_t4::Direction::Backward;
+}
+
+static void wave_arena_measure_all(WaveArena& arena)
+{
+    double field_power = 0.0;
+    double border_power = 0.0;
+    for (int direction = 0; direction < wave_t4::kDirectionCount; ++direction) {
+        for (int component = 0;
+             component < wave_t4::kTransverseComponentCount; ++component) {
+            const auto d = static_cast<wave_t4::Direction>(direction);
+            const auto c = static_cast<wave_t4::TransverseComponent>(component);
+            const int field = wave_t4::field_index(d, c);
+            if (!arena.field_active[static_cast<size_t>(field)]) continue;
+            wave_t4::Progress measured{};
+            if (wave_t4::measure(
+                    arena.n_bands, arena.fft_nx, arena.fft_ny, arena.boundary,
+                    arena.field_re(d, c), arena.field_im(d, c), &measured)) {
+                field_power += measured.field_power;
+                border_power += measured.border_power;
+            }
+        }
+    }
+    arena.progress.field_power = field_power;
+    arena.progress.border_power = border_power;
+}
+
 /* Seed the entry plane from a ray: Gaussian envelope centred at entry point. */
 static void wave_arena_seed(WaveArena& arena, const RayIntent& ray)
 {
     std::fill(arena.state_block.begin(), arena.state_block.end(), 0.0f);
+    arena.field_active.fill(0u);
 
     if (ray.spectral_resolved && ray.spectral_frequency_hz > 0.0) {
         arena.spectral_mode = wave_t4::SpectralMode::ContinuousCohort;
@@ -14908,6 +14641,14 @@ static void wave_arena_seed(WaveArena& arena, const RayIntent& ray)
     double ox  = ((arena.nx - 1) * 0.5) * arena.dx;
     double oy  = ((arena.ny - 1) * 0.5) * arena.dx;
     const double sigma = 3.0 * arena.dx;
+    const auto direction = wave_arena_direction(arena, ray);
+    const auto component = wave_t4::TransverseComponent::S;
+    arena.field_active[static_cast<size_t>(
+        wave_t4::field_index(direction, component))] = 1u;
+    float* field_re = arena.field_re(direction, component);
+    float* field_im = arena.field_im(direction, component);
+    const size_t fft_plane =
+        static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
 
     for (int iy = 0; iy < arena.ny; ++iy) {
         for (int ix = 0; ix < arena.nx; ++ix) {
@@ -14916,18 +14657,19 @@ static void wave_arena_seed(WaveArena& arena, const RayIntent& ray)
             double r2 = (xm - lx)*(xm - lx) + (ym - ly)*(ym - ly);
             float  env = static_cast<float>(std::exp(-r2 / (2.0 * sigma * sigma)));
             if (env < 1e-9f) continue;
-            size_t xy_off = static_cast<size_t>(iy) * arena.nx + ix;
+            size_t xy_off =
+                static_cast<size_t>(iy + arena.pad_y) * arena.fft_nx
+                + static_cast<size_t>(ix + arena.pad_x);
             for (int b = 0; b < arena.n_bands && b < (int)ray.amp.size(); ++b) {
                 cd a = ray.amp[b] * static_cast<double>(env);
-                size_t idx = static_cast<size_t>(b) * arena.ny * arena.nx + xy_off;
-                arena.re_data()[idx] = static_cast<float>(a.real());
-                arena.im_data()[idx] = static_cast<float>(a.imag());
+                size_t idx = static_cast<size_t>(b) * fft_plane + xy_off;
+                field_re[idx] = static_cast<float>(a.real());
+                field_im[idx] = static_cast<float>(a.imag());
             }
         }
     }
     arena.progress = {};
-    wave_t4::measure(arena.n_bands, arena.nx, arena.ny, arena.boundary,
-                     arena.re_data(), arena.im_data(), &arena.progress);
+    wave_arena_measure_all(arena);
     arena.progress.input_power = arena.progress.field_power;
 }
 
@@ -14938,15 +14680,23 @@ static void wave_arena_seed_continuous_cohort(
     WaveArena& arena, const std::array<WaveIntent*, 32>& cohort, int count)
 {
     std::fill(arena.state_block.begin(), arena.state_block.end(), 0.0f);
+    arena.field_active.fill(0u);
     arena.spectral_mode = wave_t4::SpectralMode::ContinuousCohort;
     for (int b = 0; b < arena.n_bands; ++b)
         arena.spectral_lanes[static_cast<size_t>(b)].active = 0u;
 
     const int used = std::min(count, arena.n_bands);
-    const size_t npix = static_cast<size_t>(arena.nx) * arena.ny;
+    const size_t npix = static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
     const double ox = ((arena.nx - 1) * 0.5) * arena.dx;
     const double oy = ((arena.ny - 1) * 0.5) * arena.dx;
     const double sigma = 3.0 * arena.dx;
+    const auto direction =
+        wave_arena_direction(arena, cohort[0]->ray);
+    const auto component = wave_t4::TransverseComponent::S;
+    arena.field_active[static_cast<size_t>(
+        wave_t4::field_index(direction, component))] = 1u;
+    float* state_re = arena.field_re(direction, component);
+    float* state_im = arena.field_im(direction, component);
     for (int state_lane = 0; state_lane < used; ++state_lane) {
         const RayIntent& ray = cohort[static_cast<size_t>(state_lane)]->ray;
         auto& lane = arena.spectral_lanes[static_cast<size_t>(state_lane)];
@@ -14964,8 +14714,8 @@ static void wave_arena_seed_continuous_cohort(
             ? std::min<int>(ray.spectral_lane_id, static_cast<int>(ray.amp.size()) - 1) : 0;
         const cd source_amp = ray.amp.size() > 0 ? ray.amp[source_lane] : cd(0.0, 0.0);
         const V3d local = wave_arena_to_local(arena, ray.pos);
-        float* re = arena.re_data() + static_cast<size_t>(state_lane) * npix;
-        float* im = arena.im_data() + static_cast<size_t>(state_lane) * npix;
+        float* re = state_re + static_cast<size_t>(state_lane) * npix;
+        float* im = state_im + static_cast<size_t>(state_lane) * npix;
         for (int iy = 0; iy < arena.ny; ++iy) {
             const double ym = iy * arena.dx - oy;
             for (int ix = 0; ix < arena.nx; ++ix) {
@@ -14974,7 +14724,9 @@ static void wave_arena_seed_continuous_cohort(
                                 + (ym-local.y())*(ym-local.y());
                 const double env = std::exp(-r2 / (2.0 * sigma * sigma));
                 if (env < 1.0e-9) continue;
-                const size_t p = static_cast<size_t>(iy) * arena.nx + ix;
+                const size_t p =
+                    static_cast<size_t>(iy + arena.pad_y) * arena.fft_nx
+                    + static_cast<size_t>(ix + arena.pad_x);
                 const cd value = source_amp * env;
                 re[p] = static_cast<float>(value.real());
                 im[p] = static_cast<float>(value.imag());
@@ -14982,30 +14734,44 @@ static void wave_arena_seed_continuous_cohort(
         }
     }
     arena.progress = {};
-    wave_t4::measure(arena.n_bands, arena.nx, arena.ny, arena.boundary,
-                     arena.re_data(), arena.im_data(), &arena.progress);
+    wave_arena_measure_all(arena);
     arena.progress.input_power = arena.progress.field_power;
 }
 
-/* March BPM from entry to exit plane (nz ADI-CN steps). */
+/* March both transverse components in the active propagation direction. */
 static bool wave_arena_march(WaveArena& arena)
 {
     const float step_fraction = 1.0f / static_cast<float>(std::max(1, arena.nz));
     for (int step = 0; step < arena.nz; ++step) {
-        if (!wave_t4::legacy_adi_step(
-            arena.n_bands, arena.nx, arena.ny,
-            static_cast<float>(arena.dx), static_cast<float>(arena.dz),
-            arena.wavelengths_m,
-            arena.re_data(), arena.im_data(),
-            arena.tmp_re_data(), arena.tmp_im_data(),
-            arena.rhs_re_data(), arena.rhs_im_data(),
-            arena.cp_re_data(), arena.cp_im_data(),
-            arena.dp_re_data(), arena.dp_im_data()))
-            return false;
-        wave_t4::apply_absorbing_border(
-            arena.n_bands, arena.nx, arena.ny, arena.boundary,
-            step_fraction, arena.re_data(), arena.im_data(),
-            &arena.progress);
+        for (int direction = 0;
+             direction < wave_t4::kDirectionCount; ++direction) {
+            for (int component = 0;
+                 component < wave_t4::kTransverseComponentCount; ++component) {
+                const auto d = static_cast<wave_t4::Direction>(direction);
+                const auto c =
+                    static_cast<wave_t4::TransverseComponent>(component);
+                const int field = wave_t4::field_index(d, c);
+                if (!arena.field_active[static_cast<size_t>(field)]) continue;
+                const int sign =
+                    d == wave_t4::Direction::Forward ? 1 : -1;
+                float* re = arena.field_re(d, c);
+                float* im = arena.field_im(d, c);
+                if (!wave_t4::angular_spectrum_step(
+                        arena.n_bands, arena.fft_nx, arena.fft_ny,
+                        arena.dx, arena.dz, arena.wavelengths_m,
+                        sign, &arena.angular_plan, re, im))
+                    return false;
+                wave_t4::Progress field_progress{};
+                wave_t4::apply_absorbing_border(
+                    arena.n_bands, arena.fft_nx, arena.fft_ny,
+                    arena.boundary, step_fraction, re, im,
+                    &field_progress);
+                arena.progress.absorbed_power +=
+                    field_progress.absorbed_power;
+            }
+        }
+        ++arena.progress.completed_steps;
+        wave_arena_measure_all(arena);
     }
     ++arena.progress.generation;
     return true;
@@ -15018,21 +14784,41 @@ static ChildRay wave_arena_extract(const WaveArena& arena, const RayIntent& src,
 {
     const int    nb   = arena.n_bands;
     const int    nx   = arena.nx, ny = arena.ny;
-    const size_t npix = static_cast<size_t>(nx * ny);
+    const size_t npix =
+        static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
     const int band_begin = state_lane >= 0 ? state_lane : 0;
     const int band_end = state_lane >= 0 ? state_lane + 1 : nb;
+    const auto direction = wave_arena_direction(arena, src);
+    const float* s_re_all = arena.field_re(
+        direction, wave_t4::TransverseComponent::S);
+    const float* s_im_all = arena.field_im(
+        direction, wave_t4::TransverseComponent::S);
+    const float* p_re_all = arena.field_re(
+        direction, wave_t4::TransverseComponent::P);
+    const float* p_im_all = arena.field_im(
+        direction, wave_t4::TransverseComponent::P);
+    auto padded_index = [&](int ix, int iy) -> size_t {
+        return static_cast<size_t>(iy + arena.pad_y) * arena.fft_nx
+             + static_cast<size_t>(ix + arena.pad_x);
+    };
 
     double sum_pow = 0.0, cx = 0.0, cy = 0.0;
     for (int b = band_begin; b < band_end; ++b) {
-        const float* re = arena.re_data() + static_cast<size_t>(b) * npix;
-        const float* im = arena.im_data() + static_cast<size_t>(b) * npix;
+        const float* s_re = s_re_all + static_cast<size_t>(b) * npix;
+        const float* s_im = s_im_all + static_cast<size_t>(b) * npix;
+        const float* p_re = p_re_all + static_cast<size_t>(b) * npix;
+        const float* p_im = p_im_all + static_cast<size_t>(b) * npix;
         for (int iy = 0; iy < ny; ++iy) {
             for (int ix = 0; ix < nx; ++ix) {
-                size_t i = static_cast<size_t>(iy * nx + ix);
-                double p = (double)re[i]*re[i] + (double)im[i]*im[i];
-                sum_pow += p;
-                cx += p * ix;
-                cy += p * iy;
+                const size_t i = padded_index(ix, iy);
+                const double power =
+                    static_cast<double>(s_re[i]) * s_re[i]
+                    + static_cast<double>(s_im[i]) * s_im[i]
+                    + static_cast<double>(p_re[i]) * p_re[i]
+                    + static_cast<double>(p_im[i]) * p_im[i];
+                sum_pow += power;
+                cx += power * ix;
+                cy += power * iy;
             }
         }
     }
@@ -15045,10 +14831,11 @@ static ChildRay wave_arena_extract(const WaveArena& arena, const RayIntent& src,
     double kx_sum = 0.0, ky_sum = 0.0;
     int    k_count = 0;
     for (int b = band_begin; b < band_end; ++b) {
-        const float* re = arena.re_data() + static_cast<size_t>(b) * npix;
-        const float* im = arena.im_data() + static_cast<size_t>(b) * npix;
+        const float* re = s_re_all + static_cast<size_t>(b) * npix;
+        const float* im = s_im_all + static_cast<size_t>(b) * npix;
         auto at = [&](int ix, int iy) -> cd {
-            return cd(re[iy*nx+ix], im[iy*nx+ix]);
+            const size_t i = padded_index(ix, iy);
+            return cd(re[i], im[i]);
         };
         cd Ux_fwd = at(ic_x+1, ic_y), Ux_bwd = at(ic_x-1, ic_y);
         cd Uy_fwd = at(ic_x, ic_y+1), Uy_bwd = at(ic_x, ic_y-1);
@@ -15082,11 +14869,12 @@ static ChildRay wave_arena_extract(const WaveArena& arena, const RayIntent& src,
         ? VXcd::Zero(std::max<int>(static_cast<int>(src.amp.size()), nb))
         : VXcd(nb);
     for (int b = band_begin; b < band_end; ++b) {
-        const float* re = arena.re_data() + static_cast<size_t>(b) * npix;
-        const float* im = arena.im_data() + static_cast<size_t>(b) * npix;
+        const float* re = s_re_all + static_cast<size_t>(b) * npix;
+        const float* im = s_im_all + static_cast<size_t>(b) * npix;
         const int dst = state_lane >= 0
             ? std::min<int>(src.spectral_lane_id, static_cast<int>(exit_amp.size()) - 1) : b;
-        exit_amp[dst] = cd(re[ic_y*nx+ic_x], im[ic_y*nx+ic_x]);
+        const size_t sample = padded_index(ic_x, ic_y);
+        exit_amp[dst] = cd(re[sample], im[sample]);
     }
 
     ChildRay cr;
@@ -18651,6 +18439,13 @@ int ray_pipeline_get_wave_arena_snapshot(const RayPipelineState* ps,
     out->backend = static_cast<int>(arena.backend);
     out->nx = arena.nx;
     out->ny = arena.ny;
+    out->fft_nx = arena.fft_nx;
+    out->fft_ny = arena.fft_ny;
+    out->pad_x = arena.pad_x;
+    out->pad_y = arena.pad_y;
+    out->field_count = wave_t4::kFieldCount;
+    out->state_float_count =
+        static_cast<uint64_t>(arena.state_block.size());
     out->longitudinal_steps = arena.nz;
     out->absorber_cells = arena.boundary.absorber_cells;
     out->generation = arena.progress.generation;
@@ -18666,6 +18461,9 @@ int ray_pipeline_get_wave_arena_snapshot(const RayPipelineState* ps,
         out->coherence_id[b] = lane.coherence_id;
         out->lane_active[b] = lane.active;
     }
+    for (int field = 0; field < wave_t4::kFieldCount; ++field)
+        out->field_active[field] =
+            arena.field_active[static_cast<size_t>(field)];
     return SK_OK;
 }
 
@@ -19434,7 +19232,7 @@ extern "C" SK_API int ray_tracer_write_tri_illum(
         if (t < 0 || t >= n_scene_tris) continue;
         const int base = t * stride;
         if (base + stride > static_cast<int>(st->tri_illum_accum.size())) continue;
-        /* Zero existing Monte Carlo data for this triangle, then write BPM values.
+        /* Zero existing Monte Carlo data for this triangle, then write T4 values.
          * Use relaxed atomic stores — we run between drain batches (Python side
          * guarantees the forward pipeline is idle at this call site). */
         for (int off = 0; off < stride; ++off)
@@ -19453,7 +19251,7 @@ extern "C" SK_API int ray_tracer_write_tri_illum(
         reinterpret_cast<std::atomic<uint32_t>&>(
             st->tri_illum_accum[static_cast<size_t>(base + 2*nb)])
             .store(fp32(cos_avg[i]), std::memory_order_relaxed);
-        /* count = 1: the BPM result is treated as a single synthetic forward hit */
+        /* count = 1: the field result is one synthetic forward hit */
         reinterpret_cast<std::atomic<uint32_t>&>(
             st->tri_illum_accum[static_cast<size_t>(base + 2*nb + 1)])
             .store(1u, std::memory_order_relaxed);

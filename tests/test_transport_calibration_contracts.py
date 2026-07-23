@@ -111,12 +111,6 @@ def test_calibration_modes_are_off_by_default_and_validators_pass() -> None:
     assert depth_scene["gpu_required"] is True
     assert depth_scene["scene_bounces"] == 1
     assert depth_scene["camera_optics_traversed"] is True
-    double_slit = calibration_mode("double-slit")
-    assert double_slit.transport is None
-    assert double_slit.scene_manifest["ray_transport_allowed"] is False
-    assert all(
-        result.passed for result in run_calibration_validators("double-slit")
-    )
     mirror = calibration_mode("mirror-box")
     assert mirror.transport.payload_variant == 32
     assert mirror.transport.lane_table.active_lane_count == 32

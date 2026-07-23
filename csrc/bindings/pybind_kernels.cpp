@@ -3354,6 +3354,13 @@ struct PyRayTracer
             d["backend"] = s.backend;
             d["nx"] = s.nx;
             d["ny"] = s.ny;
+            d["fft_nx"] = s.fft_nx;
+            d["fft_ny"] = s.fft_ny;
+            d["pad_x"] = s.pad_x;
+            d["pad_y"] = s.pad_y;
+            d["field_count"] = s.field_count;
+            d["state_float_count"] =
+                static_cast<unsigned long long>(s.state_float_count);
             d["longitudinal_steps"] = s.longitudinal_steps;
             d["absorber_cells"] = s.absorber_cells;
             d["generation"] = s.generation;
@@ -3372,6 +3379,10 @@ struct PyRayTracer
                 lanes.append(std::move(lane));
             }
             d["lanes"] = std::move(lanes);
+            py::list fields;
+            for (int field = 0; field < wave_t4::kFieldCount; ++field)
+                fields.append(s.field_active[field] != 0u);
+            d["field_active"] = std::move(fields);
             result.append(std::move(d));
         }
         return result;
@@ -4273,28 +4284,36 @@ struct PyRayTracer
         return py::make_tuple(out_re, out_im);
     }
 
-    /* ── BPM wave-PDE z-stepper (in-place, batchwise) ──────────────────── */
-
-    void wave_bpm_step(
+    void t4_angular_spectrum_step(
         int n_bands,
         int w,
         int h,
         double dx,
         double dz,
+        int direction_sign,
         py::array_t<double, py::array::c_style> wavelengths_arr,
-        py::array_t<float,  py::array::c_style> re_arr,
-        py::array_t<float,  py::array::c_style> im_arr)
+        py::array_t<float, py::array::c_style> re_arr,
+        py::array_t<float, py::array::c_style> im_arr)
     {
-        auto wi  = wavelengths_arr.request();
-        auto rei = re_arr.request();
-        auto imi = im_arr.request();
-        int rc = ray_tracer_wave_bpm_step(
-            n_bands, w, h, dx, dz,
-            static_cast<const double*>(wi.ptr),
-            static_cast<float*>(rei.ptr),
-            static_cast<float*>(imi.ptr));
-        if (rc != SK_OK)
-            throw std::runtime_error("ray_tracer_wave_bpm_step failed: rc=" + std::to_string(rc));
+        auto wavelengths = wavelengths_arr.request();
+        auto re = re_arr.request();
+        auto im = im_arr.request();
+        const py::ssize_t expected =
+            static_cast<py::ssize_t>(n_bands) * w * h;
+        if (wavelengths.size != n_bands
+            || re.size != expected || im.size != expected)
+            throw std::invalid_argument(
+                "T4 angular-spectrum buffers do not match band/grid dimensions");
+        wave_t4::AngularSpectrumPlan plan;
+        if (!wave_t4::build_angular_spectrum_plan(w, h, &plan)
+            || !wave_t4::angular_spectrum_step(
+                n_bands, w, h, dx, dz,
+                static_cast<const double*>(wavelengths.ptr),
+                direction_sign, &plan,
+                static_cast<float*>(re.ptr),
+                static_cast<float*>(im.ptr)))
+            throw std::runtime_error(
+                "T4 angular-spectrum step rejected its dimensions or lane count");
     }
 
     /* ── Stateful scheduler ─────────────────────────────────────────────── */
@@ -6882,8 +6901,8 @@ Transmission/refraction is inferred from the material MatBuf record
 (transmittance and ior_real). TIR is handled automatically.
 
 When MAT_FLAG_APERTURE_STOP is set the surface absorbs the ray.
-Diffraction is handled by the near-field pipeline (coherent_accumulate +
-rs_propagate / wave_bpm_step).
+Diffraction is handled by the near-field pipeline (coherent accumulation,
+Rayleigh-Sommerfeld jumps, and the stateful T4 angular-spectrum engine).
 )doc")
                 .def("set_tri_boundary_media", &PyRayTracer::set_tri_boundary_media,
                          py::arg("tri_start"),
@@ -6966,39 +6985,26 @@ the exact non-paraxial RS kernel:
 
 Returns (out_re, out_im) as float32 arrays of shape (n_bands, h, w).
 
-Use wave_bpm_step for multi-step volume propagation; use rs_propagate for a
-single exact jump (e.g. aperture → sensor in one call).
+Use rs_propagate for a single exact jump (e.g. aperture → sensor). Stateful
+multi-step propagation belongs to an authored T4 wave context.
 )doc")
-        .def("wave_bpm_step", &PyRayTracer::wave_bpm_step,
+        .def("t4_angular_spectrum_step",
+             &PyRayTracer::t4_angular_spectrum_step,
              py::arg("n_bands"),
              py::arg("w"),
              py::arg("h"),
              py::arg("dx"),
              py::arg("dz"),
+             py::arg("direction_sign"),
              py::arg("wavelengths_m"),
              py::arg("re"),
              py::arg("im"),
              R"doc(
-Beam Propagation Method — batchwise PDE z-stepper (in-place).
+Run one exact homogeneous step through the production T4 kernel.
 
-Advances the complex field U[band][y][x] by one step dz by solving the
-paraxial Helmholtz PDE:
-
-    ∂U/∂z = (i/2k) ∇_T² U
-
-using an ADI Crank-Nicolson finite-difference scheme (unconditionally stable,
-second-order in dz and dx).  The carrier phase exp(ik dz) is also applied so
-both the optical path length and the transverse spreading are correct.
-
-Call repeatedly to build a coherent 3-D near-field volume step-by-step:
-each call is one z-slice of the true wave PDE solution.  Bokeh, diffraction
-rings, Airy patterns, near-field evanescent tails, and all other wave effects
-emerge from the field evolution — no approximations or post-processes.
-
-re, im        : float32 (n_bands, h, w) — field modified in-place.
-dx            : pixel pitch in metres (same in x and y).
-dz            : propagation step in metres (positive = forward along z).
-wavelengths_m : float64 (n_bands,) — wavelength per band in metres.
+This is a calibration aperture into the same native implementation used by
+wave arenas, not a separate solver. Width and height must be powers of two.
+The buffers are band-major float32 complex planes and are modified in place.
 )doc")
         .def("spawn", &PyRayTracer::spawn,
              py::arg("src_pos"),
@@ -7435,7 +7441,7 @@ Two-pass protocol:
   tracer.reset_illum_accum()   # between forward-pass batches
   tracer.trace_forward(...)    # forward paths populate the accumulator
   tracer.trace_backward(...)   # backward paths query the accumulator
-  data = tracer.export_illum_accum()  # optional: inspect or feed T4 BPM
+  data = tracer.export_illum_accum()  # optional: inspect or feed T4
 )doc")
         .def("reset_illum_accum",
              [](PyRayTracer& self) {
@@ -7477,8 +7483,8 @@ stride = 2 * n_bands + 2.  Layout per triangle row:
 Divide re/im by count to get the average forward amplitude at each surface.
 cos_sum / count gives avg_cos for the Lambertian coupling weight.
 
-This array can be used to seed a T4 BPM wave-solver run: replace the
-Monte Carlo averages with diffraction-correct BPM exit-plane amplitudes
+This array can be used to seed a T4 field run: replace the Monte Carlo
+averages with diffraction-correct exit-plane amplitudes
 for a more physically accurate BSSRDF contribution.)doc")
         .def("write_tri_illum",
              [](PyRayTracer& self,
@@ -7505,16 +7511,16 @@ for a more physically accurate BSSRDF contribution.)doc")
              py::arg("amp_re"),
              py::arg("amp_im"),
              py::arg("cos_avg"),
-             R"doc(Write BPM-computed amplitudes into tri_illum_accum for specific triangles.
+             R"doc(Write T4-computed amplitudes into tri_illum_accum for specific triangles.
 
-Replaces any Monte Carlo data at those triangles with the BPM exit field.
+Replaces any Monte Carlo data at those triangles with the T4 exit field.
 Backward rays that subsequently hit those triangles receive diffraction-correct
 illumination from the BSSRDF analytical path.
 
 Parameters
 ----------
 tri_ids  : int32  (n_tris,)          triangle indices
-amp_re   : float32 (n_tris, n_bands) real part of BPM exit field per triangle
+amp_re   : float32 (n_tris, n_bands) real part of T4 exit field per triangle
 amp_im   : float32 (n_tris, n_bands) imaginary part
 cos_avg  : float32 (n_tris,)         mean |cos θ| of incidence; use 1.0 for
                                      normal incidence at a flat diffuser face)doc")

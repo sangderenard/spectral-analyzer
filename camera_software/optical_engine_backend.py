@@ -189,7 +189,7 @@ class OpticalEngineBackend:
             print(
                 "[optical-backend] installed graph transport "
                 f"t2=exact t4={len(installation.wave_arenas)} "
-                f"backend=adi-reference",
+                f"backend=angular-spectrum-fft",
                 flush=True,
             )
         preview = SurfaceScanPreview(

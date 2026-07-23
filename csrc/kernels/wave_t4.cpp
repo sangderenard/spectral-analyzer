@@ -13,112 +13,145 @@
 namespace wave_t4 {
 namespace {
 
-struct ComplexPair {
-    double r;
-    double i;
-};
-
-inline ComplexPair c_add(ComplexPair a, ComplexPair b) noexcept
-{ return {a.r + b.r, a.i + b.i}; }
-inline ComplexPair c_sub(ComplexPair a, ComplexPair b) noexcept
-{ return {a.r - b.r, a.i - b.i}; }
-inline ComplexPair c_mul(ComplexPair a, ComplexPair b) noexcept
-{ return {a.r*b.r - a.i*b.i, a.r*b.i + a.i*b.r}; }
-inline ComplexPair c_scale(ComplexPair a, double s) noexcept
-{ return {a.r*s, a.i*s}; }
-inline ComplexPair c_div(ComplexPair a, ComplexPair b) noexcept
+inline bool is_power_of_two(int value) noexcept
 {
-    const double d = b.r*b.r + b.i*b.i;
-    return d > 0.0
-        ? ComplexPair{(a.r*b.r + a.i*b.i)/d, (a.i*b.r - a.r*b.i)/d}
-        : ComplexPair{0.0, 0.0};
+    return value > 0 && (value & (value - 1)) == 0;
+}
+
+inline void swap_complex(float* re, float* im,
+                         std::size_t a, std::size_t b) noexcept
+{
+    std::swap(re[a], re[b]);
+    std::swap(im[a], im[b]);
+}
+
+void fft_strided(float* re,
+                 float* im,
+                 std::size_t base,
+                 std::size_t stride,
+                 const FftAxisPlan& plan,
+                 bool inverse) noexcept
+{
+    const int count = plan.size;
+    for (int i = 1; i < count; ++i) {
+        const int j = static_cast<int>(
+            plan.bit_reverse[static_cast<std::size_t>(i)]);
+        if (i < j)
+            swap_complex(re, im,
+                         base + static_cast<std::size_t>(i) * stride,
+                         base + static_cast<std::size_t>(j) * stride);
+    }
+
+    for (int length = 2; length <= count; length <<= 1) {
+        const int half = length >> 1;
+        const int root_stride = count / length;
+        for (int start = 0; start < count; start += length) {
+            for (int j = 0; j < half; ++j) {
+                const std::size_t root =
+                    static_cast<std::size_t>(j * root_stride);
+                const double wr = plan.root_re[root];
+                const double wi = inverse
+                    ? -static_cast<double>(plan.root_im[root])
+                    : static_cast<double>(plan.root_im[root]);
+                const std::size_t even_i =
+                    base + static_cast<std::size_t>(start + j) * stride;
+                const std::size_t odd_i =
+                    base + static_cast<std::size_t>(start + j + half) * stride;
+                const double odd_re = re[odd_i] * wr - im[odd_i] * wi;
+                const double odd_im = re[odd_i] * wi + im[odd_i] * wr;
+                const double even_re = re[even_i];
+                const double even_im = im[even_i];
+                re[even_i] = static_cast<float>(even_re + odd_re);
+                im[even_i] = static_cast<float>(even_im + odd_im);
+                re[odd_i] = static_cast<float>(even_re - odd_re);
+                im[odd_i] = static_cast<float>(even_im - odd_im);
+            }
+        }
+    }
+
+    if (inverse) {
+        const float scale = 1.0f / static_cast<float>(count);
+        for (int i = 0; i < count; ++i) {
+            const std::size_t index =
+                base + static_cast<std::size_t>(i) * stride;
+            re[index] *= scale;
+            im[index] *= scale;
+        }
+    }
+}
+
+void fft_2d(float* re,
+            float* im,
+            const AngularSpectrumPlan& plan,
+            bool inverse) noexcept
+{
+    const int nx = plan.nx;
+    const int ny = plan.ny;
+    for (int y = 0; y < ny; ++y)
+        fft_strided(re, im, static_cast<std::size_t>(y) * nx,
+                    1u, plan.x, inverse);
+    for (int x = 0; x < nx; ++x)
+        fft_strided(re, im, static_cast<std::size_t>(x),
+                    static_cast<std::size_t>(nx), plan.y, inverse);
 }
 
 template <int B>
-bool adi_exact(int nx, int ny, float dx, float dz,
-               const double* wavelengths_m,
-               float* re, float* im, float* tmp_re, float* tmp_im,
-               float* rhs_re, float* rhs_im,
-               float* cp_re, float* cp_im,
-               float* dp_re, float* dp_im) noexcept
+bool angular_spectrum_exact(int nx,
+                            int ny,
+                            double dx,
+                            double dz,
+                            const double* wavelengths_m,
+                            int direction_sign,
+                            const AngularSpectrumPlan* plan,
+                            float* re,
+                            float* im) noexcept
 {
-    if (!wavelengths_m || !re || !im || !tmp_re || !tmp_im
-        || !rhs_re || !rhs_im || !cp_re || !cp_im || !dp_re || !dp_im
-        || nx < 2 || ny < 2 || !(dx > 0.0f) || dz == 0.0f)
+    if (!re || !im || !wavelengths_m || !is_power_of_two(nx)
+        || !is_power_of_two(ny) || !(dx > 0.0) || dz == 0.0
+        || (direction_sign != 1 && direction_sign != -1)
+        || !plan || plan->nx != nx || plan->ny != ny)
         return false;
+
+    constexpr double tau = 6.283185307179586476925286766559;
     const std::size_t plane = static_cast<std::size_t>(nx) * ny;
-    const double dx2 = static_cast<double>(dx) * dx;
-
-    auto rhs_at = [&](int i) -> ComplexPair { return {rhs_re[i], rhs_im[i]}; };
-    auto cp_at = [&](int i) -> ComplexPair { return {cp_re[i], cp_im[i]}; };
-    auto dp_at = [&](int i) -> ComplexPair { return {dp_re[i], dp_im[i]}; };
-    auto store_rhs = [&](int i, ComplexPair v) { rhs_re[i]=(float)v.r; rhs_im[i]=(float)v.i; };
-    auto store_cp = [&](int i, ComplexPair v) { cp_re[i]=(float)v.r; cp_im[i]=(float)v.i; };
-    auto store_dp = [&](int i, ComplexPair v) { dp_re[i]=(float)v.r; dp_im[i]=(float)v.i; };
-
-    auto thomas = [&](int n, ComplexPair beta) {
-        const ComplexPair diag{1.0 + 2.0*beta.r, 2.0*beta.i};
-        const ComplexPair off{-beta.r, -beta.i};
-        store_rhs(0, {0.0, 0.0});
-        store_rhs(n - 1, {0.0, 0.0});
-        store_cp(0, c_div(off, diag));
-        store_dp(0, c_div(rhs_at(0), diag));
-        for (int i = 1; i < n; ++i) {
-            const ComplexPair denom = c_sub(diag, c_mul(off, cp_at(i - 1)));
-            store_cp(i, c_div(off, denom));
-            store_dp(i, c_div(c_sub(rhs_at(i), c_mul(off, dp_at(i - 1))), denom));
-        }
-        store_rhs(n - 1, dp_at(n - 1));
-        for (int i = n - 2; i >= 0; --i)
-            store_rhs(i, c_sub(dp_at(i), c_mul(cp_at(i), rhs_at(i + 1))));
-    };
-
+    const double signed_distance = direction_sign * dz;
     for (int band = 0; band < B; ++band) {
-        if (!(wavelengths_m[band] > 0.0)) continue;
-        const std::size_t boff = static_cast<std::size_t>(band) * plane;
-        const double k = 6.283185307179586476925286766559 / wavelengths_m[band];
-        const double phase = k * dz;
-        const double pc = std::cos(phase), ps = std::sin(phase);
-        for (std::size_t p = 0; p < plane; ++p) {
-            const std::size_t i = boff + p;
-            const double ar = re[i], ai = im[i];
-            re[i] = static_cast<float>(ar*pc - ai*ps);
-            im[i] = static_cast<float>(ar*ps + ai*pc);
-        }
-        const ComplexPair beta{0.0, static_cast<double>(dz) / (4.0*k*dx2)};
+        const double wavelength = wavelengths_m[band];
+        if (!(wavelength > 0.0)) continue;
+        float* band_re = re + static_cast<std::size_t>(band) * plane;
+        float* band_im = im + static_cast<std::size_t>(band) * plane;
+        fft_2d(band_re, band_im, *plan, false);
+
+        const double k = tau / wavelength;
         for (int y = 0; y < ny; ++y) {
-            const std::size_t row = boff + static_cast<std::size_t>(y) * nx;
+            const int fy = y <= ny / 2 ? y : y - ny;
+            const double ky = tau * fy / (static_cast<double>(ny) * dx);
             for (int x = 0; x < nx; ++x) {
-                const ComplexPair u{re[row+x], im[row+x]};
-                const ComplexPair w = x > 0
-                    ? ComplexPair{re[row+x-1], im[row+x-1]} : ComplexPair{0.0,0.0};
-                const ComplexPair e = x+1 < nx
-                    ? ComplexPair{re[row+x+1], im[row+x+1]} : ComplexPair{0.0,0.0};
-                store_rhs(x, c_add(u, c_mul(beta, c_sub(c_add(w,e), c_scale(u,2.0)))));
-            }
-            thomas(nx, beta);
-            for (int x = 0; x < nx; ++x) {
-                const ComplexPair v = rhs_at(x);
-                tmp_re[row+x]=(float)v.r; tmp_im[row+x]=(float)v.i;
+                const int fx = x <= nx / 2 ? x : x - nx;
+                const double kx = tau * fx / (static_cast<double>(nx) * dx);
+                const double kz2 = k * k - kx * kx - ky * ky;
+                double transfer_re = 0.0;
+                double transfer_im = 0.0;
+                if (kz2 >= 0.0) {
+                    const double phase = signed_distance * std::sqrt(kz2);
+                    transfer_re = std::cos(phase);
+                    transfer_im = std::sin(phase);
+                } else {
+                    const double decay =
+                        std::exp(-std::abs(dz) * std::sqrt(-kz2));
+                    transfer_re = decay;
+                }
+                const std::size_t index =
+                    static_cast<std::size_t>(y) * nx + x;
+                const double ar = band_re[index];
+                const double ai = band_im[index];
+                band_re[index] =
+                    static_cast<float>(ar * transfer_re - ai * transfer_im);
+                band_im[index] =
+                    static_cast<float>(ar * transfer_im + ai * transfer_re);
             }
         }
-        for (int x = 0; x < nx; ++x) {
-            for (int y = 0; y < ny; ++y) {
-                const std::size_t i = boff + static_cast<std::size_t>(y)*nx + x;
-                const ComplexPair u{tmp_re[i], tmp_im[i]};
-                const ComplexPair n = y > 0
-                    ? ComplexPair{tmp_re[i-nx], tmp_im[i-nx]} : ComplexPair{0.0,0.0};
-                const ComplexPair s = y+1 < ny
-                    ? ComplexPair{tmp_re[i+nx], tmp_im[i+nx]} : ComplexPair{0.0,0.0};
-                store_rhs(y, c_add(u, c_mul(beta, c_sub(c_add(n,s), c_scale(u,2.0)))));
-            }
-            thomas(ny, beta);
-            for (int y = 0; y < ny; ++y) {
-                const std::size_t i = boff + static_cast<std::size_t>(y)*nx + x;
-                const ComplexPair v = rhs_at(y);
-                re[i]=(float)v.r; im[i]=(float)v.i;
-            }
-        }
+        fft_2d(band_re, band_im, *plan, true);
     }
     return true;
 }
@@ -204,6 +237,49 @@ bool absorb_exact(int nx,
 
 }  // namespace
 
+bool build_angular_spectrum_plan(int nx,
+                                 int ny,
+                                 AngularSpectrumPlan* plan) noexcept
+{
+    if (!plan || !is_power_of_two(nx) || !is_power_of_two(ny))
+        return false;
+    auto build_axis = [](int size, FftAxisPlan& axis) {
+        axis.size = size;
+        axis.bit_reverse.resize(static_cast<std::size_t>(size));
+        axis.root_re.resize(static_cast<std::size_t>(size / 2));
+        axis.root_im.resize(static_cast<std::size_t>(size / 2));
+        int bits = 0;
+        while ((1 << bits) < size) ++bits;
+        for (int value = 0; value < size; ++value) {
+            std::uint32_t source = static_cast<std::uint32_t>(value);
+            std::uint32_t reversed = 0u;
+            for (int bit = 0; bit < bits; ++bit) {
+                reversed = (reversed << 1u) | (source & 1u);
+                source >>= 1u;
+            }
+            axis.bit_reverse[static_cast<std::size_t>(value)] = reversed;
+        }
+        constexpr double tau = 6.283185307179586476925286766559;
+        for (int root = 0; root < size / 2; ++root) {
+            const double angle = -tau * root / size;
+            axis.root_re[static_cast<std::size_t>(root)] =
+                static_cast<float>(std::cos(angle));
+            axis.root_im[static_cast<std::size_t>(root)] =
+                static_cast<float>(std::sin(angle));
+        }
+    };
+    try {
+        plan->nx = nx;
+        plan->ny = ny;
+        build_axis(nx, plan->x);
+        build_axis(ny, plan->y);
+    } catch (...) {
+        *plan = {};
+        return false;
+    }
+    return true;
+}
+
 bool apply_absorbing_border(int bands,
                             int nx,
                             int ny,
@@ -243,35 +319,29 @@ bool measure(int bands,
     }
 }
 
-bool legacy_adi_step(int bands,
-                     int nx,
-                     int ny,
-                     float dx,
-                     float dz,
-                     const double* wavelengths_m,
-                     float* re,
-                     float* im,
-                     float* tmp_re,
-                     float* tmp_im,
-                     float* rhs_re,
-                     float* rhs_im,
-                     float* cp_re,
-                     float* cp_im,
-                     float* dp_re,
-                     float* dp_im) noexcept
+bool angular_spectrum_step(int bands,
+                           int nx,
+                           int ny,
+                           double dx,
+                           double dz,
+                           const double* wavelengths_m,
+                           int direction_sign,
+                           const AngularSpectrumPlan* plan,
+                           float* re,
+                           float* im) noexcept
 {
-#define WAVE_ADI_CASE(B) case B: return adi_exact<B>(nx, ny, dx, dz, wavelengths_m, \
-    re, im, tmp_re, tmp_im, rhs_re, rhs_im, cp_re, cp_im, dp_re, dp_im)
+#define WAVE_AS_CASE(B) case B: return angular_spectrum_exact<B>( \
+    nx, ny, dx, dz, wavelengths_m, direction_sign, plan, re, im)
     switch (bands) {
-        WAVE_ADI_CASE(1);
-        WAVE_ADI_CASE(3);
-        WAVE_ADI_CASE(4);
-        WAVE_ADI_CASE(8);
-        WAVE_ADI_CASE(16);
-        WAVE_ADI_CASE(32);
+        WAVE_AS_CASE(1);
+        WAVE_AS_CASE(3);
+        WAVE_AS_CASE(4);
+        WAVE_AS_CASE(8);
+        WAVE_AS_CASE(16);
+        WAVE_AS_CASE(32);
         default: return false;
     }
-#undef WAVE_ADI_CASE
+#undef WAVE_AS_CASE
 }
 
 }  // namespace wave_t4

@@ -146,8 +146,9 @@ exact lane widths `1, 3, 4, 8, 16, 32`.
   controlled by per-bounce counter or payload readback.
 - Preserve fixed-band and continuous-cohort semantics in every specialization.
 
-Exit gate: the legacy ADI calibration backend and a no-op/reference backend can
-run through the same state lifecycle without hot allocation.
+Exit gate (completed 2026-07-23): one padded, exact-lane, bidirectional S/P
+state block runs through the pipeline lifecycle without hot allocation. The
+discarded calibration backend is available only through Git history.
 
 ### 3. Implement the vector angular-spectrum backend
 

@@ -731,45 +731,53 @@ struct WaveArena {
     Eigen::Vector3d  axis_z;
     Eigen::Vector3d  axis_x, axis_y;
     int              nx = 0, ny = 0;
+    int              fft_nx = 0, fft_ny = 0;
+    int              pad_x = 0, pad_y = 0;
     int              nz = 0;
     double           dx = 0.0;
     double           dz = 0.0;
     int              n_bands = 0;
     int              band_specialization = -1;
     wave_t4::SpectralMode spectral_mode = wave_t4::SpectralMode::FixedBands;
-    wave_t4::BackendKind backend = wave_t4::BackendKind::LegacyAdiCalibration;
+    wave_t4::BackendKind backend = wave_t4::BackendKind::AngularSpectrum;
     std::array<wave_t4::SpectralLane, 32> spectral_lanes = {};
     wave_t4::BoundaryConfig boundary;
     wave_t4::Progress       progress;
+    wave_t4::AngularSpectrumPlan angular_plan;
     double           wavelengths_m[32] = {};
     double           fixed_wavelengths_m[32] = {};
     /* Persistent T4 numerical state buffer. T4 remains pipeline-scheduled:
      * WaveIntent enters the stage, this state is updated in place, and a
      * continuation returns to T1. */
     std::vector<float> state_block;
-    size_t re_offset = 0;
-    size_t im_offset = 0;
-    size_t tmp_re_offset = 0;
-    size_t tmp_im_offset = 0;
-    size_t rhs_re_offset = 0;
-    size_t rhs_im_offset = 0;
-    size_t cp_re_offset = 0;
-    size_t cp_im_offset = 0;
-    size_t dp_re_offset = 0;
-    size_t dp_im_offset = 0;
+    std::array<size_t, wave_t4::kFieldCount> re_offsets = {};
+    std::array<size_t, wave_t4::kFieldCount> im_offsets = {};
+    std::array<unsigned char, wave_t4::kFieldCount> field_active = {};
     size_t plane_size = 0;
-    float* re_data() noexcept { return state_block.data() + re_offset; }
-    float* im_data() noexcept { return state_block.data() + im_offset; }
-    const float* re_data() const noexcept { return state_block.data() + re_offset; }
-    const float* im_data() const noexcept { return state_block.data() + im_offset; }
-    float* tmp_re_data() noexcept { return state_block.data() + tmp_re_offset; }
-    float* tmp_im_data() noexcept { return state_block.data() + tmp_im_offset; }
-    float* rhs_re_data() noexcept { return state_block.data() + rhs_re_offset; }
-    float* rhs_im_data() noexcept { return state_block.data() + rhs_im_offset; }
-    float* cp_re_data() noexcept { return state_block.data() + cp_re_offset; }
-    float* cp_im_data() noexcept { return state_block.data() + cp_im_offset; }
-    float* dp_re_data() noexcept { return state_block.data() + dp_re_offset; }
-    float* dp_im_data() noexcept { return state_block.data() + dp_im_offset; }
+    float* field_re(wave_t4::Direction direction,
+                    wave_t4::TransverseComponent component) noexcept {
+        return state_block.data()
+             + re_offsets[static_cast<size_t>(
+                 wave_t4::field_index(direction, component))];
+    }
+    float* field_im(wave_t4::Direction direction,
+                    wave_t4::TransverseComponent component) noexcept {
+        return state_block.data()
+             + im_offsets[static_cast<size_t>(
+                 wave_t4::field_index(direction, component))];
+    }
+    const float* field_re(wave_t4::Direction direction,
+                          wave_t4::TransverseComponent component) const noexcept {
+        return state_block.data()
+             + re_offsets[static_cast<size_t>(
+                 wave_t4::field_index(direction, component))];
+    }
+    const float* field_im(wave_t4::Direction direction,
+                          wave_t4::TransverseComponent component) const noexcept {
+        return state_block.data()
+             + im_offsets[static_cast<size_t>(
+                 wave_t4::field_index(direction, component))];
+    }
     mutable std::mutex mu;
 };
 
@@ -1100,6 +1108,12 @@ struct WaveArenaSnapshot {
     int backend;
     int nx;
     int ny;
+    int fft_nx;
+    int fft_ny;
+    int pad_x;
+    int pad_y;
+    int field_count;
+    uint64_t state_float_count;
     int longitudinal_steps;
     int absorber_cells;
     uint64_t generation;
@@ -1112,6 +1126,7 @@ struct WaveArenaSnapshot {
     float spectral_pdf[32];
     uint32_t coherence_id[32];
     uint32_t lane_active[32];
+    uint32_t field_active[wave_t4::kFieldCount];
 };
 
 int ray_pipeline_wave_arena_count(const RayPipelineState* ps);

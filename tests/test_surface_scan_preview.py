@@ -42,7 +42,7 @@ def _pose(x=0.0):
     )
 
 
-def test_surface_scan_is_one_idle_native_submission_and_no_wave_contexts(tmp_path):
+def test_surface_scan_is_one_idle_native_submission_and_preserves_contexts(tmp_path):
     tracer = _FakeTracer()
     preview = SurfaceScanPreview(
         tracer, _pose(), shader_dir=str(tmp_path),
@@ -52,7 +52,7 @@ def test_surface_scan_is_one_idle_native_submission_and_no_wave_contexts(tmp_pat
     preview.poll()
     preview.poll()
     assert [call[0] for call in tracer.calls].count("submit") == 1
-    assert ("clear-contexts",) in tracer.calls
+    assert ("clear-contexts",) not in tracer.calls
     assert ("skip-readback", True) in tracer.calls
     pipeline = next(call[1] for call in tracer.calls if call[0] == "pipeline")
     assert pipeline["use_gpu_compute"] is True

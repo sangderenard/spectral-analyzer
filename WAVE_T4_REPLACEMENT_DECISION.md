@@ -1,7 +1,7 @@
 # Wave/T4 replacement decision
 
 Date: 2026-07-22  
-Baseline: `c4cb29f`
+Implementation cut: 2026-07-23, checkpoint `5c459e4`
 
 ## Decision
 
@@ -14,10 +14,9 @@ work, but it must not contain a second field solver. Python may configure and
 inspect T4; it must not perform production propagation.
 
 The production field representation is a bidirectional, two-component vector
-angular-spectrum field. Scalar propagation remains an exact-width fast
-specialization for scalar-valid calibration cases; it does not define the
-permanent ABI. This reduced Helmholtz engine reconstructs the longitudinal
-component from transversality and uses explicit polarized interface scattering.
+angular-spectrum field. Every exact lane width uses that same permanent ABI.
+This reduced Helmholtz engine reconstructs the longitudinal component from
+transversality and uses explicit polarized interface scattering.
 It is deliberately not described as a volumetric full-vector Maxwell solver.
 
 Localized full-Maxwell work is a separate patch compiler described in
@@ -42,15 +41,19 @@ camera-scale hot propagation loop. The ordered implementation program is in
 - `coherent_accumulate.comp.glsl` as an alleged diffraction solver. It deposits
   ray crossings coherently but does not propagate a field.
 
+### Removed at the implementation cut
+
+- The standalone NumPy wave tube, public scalar marcher, matching compute
+  shader, and their double-slit runner were removed together after checkpoint
+  `5c459e4`. They are recoverable from Git history, not callable production
+  alternatives.
+
 ### Preserve as isolated validation oracles
 
-- Compiled CPU ADI-BPM (`ray_tracer_wave_bpm_step`).
-- `ray_wave_bpm.comp.glsl` until the new T4 backend passes parity and physical
-  calibration gates.
 - Direct CPU Rayleigh-Sommerfeld propagation for small scalar reference cases;
   its documentation must not claim a GPU backend that is absent.
-- The double-slit calibration structure, after replacing its hard array mask
-  with physical blade geometry for production acceptance tests.
+- A future slit acceptance scene must use physical blade geometry and the
+  production arena rather than resurrecting a separate numerical runner.
 
 ### Preserve as shared infrastructure
 

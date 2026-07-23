@@ -157,11 +157,11 @@ class _RecordingTracer:
         return len(self.contexts) - 1
 
 
-def test_installer_places_real_adi_arena_without_registering_a_surrogate_lens():
+def test_installer_places_real_angular_arena_without_registering_surrogate_lens():
     nodes, links = wave_context_nodes(
         "bench.wave",
         8,
-        propagation=WavePropagationStyle.ADI_REFERENCE,
+        propagation=WavePropagationStyle.ANGULAR_SPECTRUM_FFT,
         center_m=(0.1, 0.2, 0.3),
         axis=(2.0, 0.0, 0.0),
         radius_m=0.012,
@@ -197,10 +197,11 @@ def test_installer_places_real_adi_arena_without_registering_a_surrogate_lens():
     ] == "not-yet-published-from-t4-state"
 
 
-def test_installer_refuses_to_pass_planned_fft_off_as_current_adi_backend():
+def test_installer_refuses_unsupported_split_step_substitution():
     nodes, links = wave_context_nodes(
         "bench.wave",
         4,
+        propagation=WavePropagationStyle.SPLIT_STEP_FFT,
         center_m=(0.0, 0.0, 0.0),
         radius_m=0.01,
         longitudinal_step_m=1.0e-5,
@@ -234,7 +235,7 @@ def test_installer_requires_camera_builder_confirmation_for_fused_t2():
 
 def test_compound_graph_can_chain_multiple_authored_wave_regions():
     physical = {
-        "propagation": WavePropagationStyle.ADI_REFERENCE,
+        "propagation": WavePropagationStyle.ANGULAR_SPECTRUM_FFT,
         "center_m": (0.0, 0.0, 0.0),
         "radius_m": 0.01,
         "longitudinal_step_m": 1.0e-5,

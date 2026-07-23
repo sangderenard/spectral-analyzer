@@ -13,6 +13,8 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
+#include <vector>
 
 namespace wave_t4 {
 
@@ -38,9 +40,30 @@ enum class SpectralMode : int {
 /* T4 is an execution/ownership slot, not the name of the current numerical
  * method. Backends can change without changing the packed-state contract. */
 enum class BackendKind : int {
-    LegacyAdiCalibration = 0,
-    AngularSpectrum = 1,
+    AngularSpectrum = 0,
 };
+
+enum class Direction : int {
+    Forward = 0,
+    Backward = 1,
+};
+
+enum class TransverseComponent : int {
+    S = 0,
+    P = 1,
+};
+
+inline constexpr int kDirectionCount = 2;
+inline constexpr int kTransverseComponentCount = 2;
+inline constexpr int kFieldCount =
+    kDirectionCount * kTransverseComponentCount;
+
+inline constexpr int field_index(Direction direction,
+                                 TransverseComponent component) noexcept
+{
+    return static_cast<int>(direction) * kTransverseComponentCount
+         + static_cast<int>(component);
+}
 
 struct SpectralLane {
     double frequency_hz = 0.0;
@@ -65,6 +88,25 @@ struct Progress {
     double absorbed_power = 0.0;
 };
 
+struct FftAxisPlan {
+    int size = 0;
+    std::vector<std::uint32_t> bit_reverse;
+    std::vector<float> root_re;
+    std::vector<float> root_im;
+};
+
+struct AngularSpectrumPlan {
+    int nx = 0;
+    int ny = 0;
+    FftAxisPlan x;
+    FftAxisPlan y;
+};
+
+/** Build immutable transform metadata during cold arena construction. */
+bool build_angular_spectrum_plan(int nx,
+                                 int ny,
+                                 AngularSpectrumPlan* plan) noexcept;
+
 /** Apply the numerical exterior absorber in-place using an exact-band CPU
  * specialization. Returns false for unsupported band counts or invalid input. */
 bool apply_absorbing_border(int bands,
@@ -85,23 +127,23 @@ bool measure(int bands,
              const float* im,
              Progress* progress) noexcept;
 
-/** One legacy ADI calibration step using only caller-owned persistent state.
- * Every pointer is a fixed view into the arena's contiguous state block. */
-bool legacy_adi_step(int bands,
-                     int nx,
-                     int ny,
-                     float dx,
-                     float dz,
-                     const double* wavelengths_m,
-                     float* re,
-                     float* im,
-                     float* tmp_re,
-                     float* tmp_im,
-                     float* rhs_re,
-                     float* rhs_im,
-                     float* cp_re,
-                     float* cp_im,
-                     float* dp_re,
-                     float* dp_im) noexcept;
+/** Exact homogeneous angular-spectrum propagation of one transverse field.
+ *
+ * nx and ny are the padded FFT dimensions and must both be powers of two.
+ * The field is laid out band-major as [band][y][x].  Positive direction_sign
+ * advances the forward field; negative advances the backward field.  No
+ * allocation occurs in this call: transforms operate directly on the
+ * caller-owned persistent arena planes.
+ */
+bool angular_spectrum_step(int bands,
+                           int nx,
+                           int ny,
+                           double dx,
+                           double dz,
+                           const double* wavelengths_m,
+                           int direction_sign,
+                           const AngularSpectrumPlan* plan,
+                           float* re,
+                           float* im) noexcept;
 
 }  // namespace wave_t4

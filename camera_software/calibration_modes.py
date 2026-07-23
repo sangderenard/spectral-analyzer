@@ -173,29 +173,6 @@ def mirror_box_scene_manifest() -> dict[str, Any]:
     }
 
 
-def double_slit_scene_manifest() -> dict[str, Any]:
-    return {
-        "scene_type": "wave_double_slit",
-        "units": "metres",
-        "solver_contract": "scalar-adi-bpm-cpu-gpu-parity-v1",
-        "ray_transport_allowed": False,
-        "wavelengths_nm": [450.0, 500.0, 550.0, 600.0, 650.0],
-        "aperture": {
-            "slit_width_m": 8.0e-6,
-            "slit_separation_m": 40.0e-6,
-        },
-        "propagation": {
-            "grid_pitch_m": 2.0e-6,
-            "step_m": 20.0e-6,
-            "steps": 100,
-        },
-        "products": [
-            "cpu_band_strip", "gpu_band_strip", "cpu_gpu_comparison",
-            "complex_field_checkpoints",
-        ],
-    }
-
-
 def _validate_color_science() -> CalibrationValidationResult:
     from thick_lens_focus_lab import _wavelength_to_rgb_weights
 
@@ -324,33 +301,6 @@ def _validate_mirror_box() -> CalibrationValidationResult:
     )
 
 
-def _validate_double_slit() -> CalibrationValidationResult:
-    scene = double_slit_scene_manifest()
-    aperture = dict(scene["aperture"])
-    propagation = dict(scene["propagation"])
-    wavelengths = tuple(float(value) for value in scene["wavelengths_nm"])
-    passed = bool(
-        scene.get("ray_transport_allowed") is False
-        and len(wavelengths) >= 3
-        and min(wavelengths) > 0.0
-        and float(aperture["slit_width_m"]) < float(aperture["slit_separation_m"])
-        and 0 < int(propagation["steps"])
-        and float(propagation["grid_pitch_m"]) > 0.0
-    )
-    return CalibrationValidationResult(
-        "double-slit-wave-contract",
-        passed,
-        {
-            "bands": float(len(wavelengths)),
-            "slit_separation_um": float(aperture["slit_separation_m"]) * 1.0e6,
-            "propagation_mm": (
-                float(propagation["step_m"]) * int(propagation["steps"]) * 1.0e3
-            ),
-        },
-        "CPU and GPU ADI BPM must propagate the same two-slit complex field",
-    )
-
-
 VALIDATORS: dict[str, Callable[[], CalibrationValidationResult]] = {
     "color-science-lines": _validate_color_science,
     "bk7-fraunhofer-lines": _validate_bk7_glass,
@@ -358,7 +308,6 @@ VALIDATORS: dict[str, Callable[[], CalibrationValidationResult]] = {
     "single-lane-ui-contract": _validate_single_lane_ui,
     "prism-room-contract": _validate_prism_room,
     "mirror-box-capacity-contract": _validate_mirror_box,
-    "double-slit-wave-contract": _validate_double_slit,
 }
 
 
@@ -440,13 +389,6 @@ CALIBRATION_MODES: tuple[CalibrationModeSpec, ...] = (
         ("mirror-box-capacity-contract",),
     ),
     CalibrationModeSpec(
-        "double-slit", "Double slit",
-        "The compiled CPU BPM and the actual GPU BPM shader form matched wavelength-band strips.",
-        None,
-        double_slit_scene_manifest(),
-        ("double-slit-wave-contract",),
-    ),
-    CalibrationModeSpec(
         "single-lane-ui", "Single reference line",
         "Whole-interface image formation at one real 587.5618 nm spectral line.",
         _fixed_spectral_contract("single-reference-line-ui", (587.5618,)),
@@ -515,6 +457,5 @@ __all__ = [
     "VALIDATORS", "calibration_mode", "run_calibration_validators",
     "focus_hall_scene_manifest", "CalibrationBootstrapStage",
     "prism_room_scene_manifest", "mirror_box_scene_manifest",
-    "double_slit_scene_manifest",
     "calibration_bootstrap_plan",
 ]

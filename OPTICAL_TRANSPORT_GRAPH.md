@@ -82,9 +82,10 @@ The production default is:
 - padded absorbing borders;
 - explicit Jones/modal scattering at physical interfaces.
 
-Available backend declarations may include scalar FFT, split-step FFT,
-ADI-reference, and Maxwell-patch modes. A declaration selects an existing
-backend; it does not put that backend's numerical implementation in the graph.
+Available backend declarations include the production angular-spectrum
+backend, reserved split-step spans, and Maxwell-patch artifacts. A declaration
+selects an existing backend; it does not put that backend's numerical
+implementation in the graph.
 
 ## FFT and border policy
 
@@ -188,11 +189,13 @@ This equivalence is a regression gate.
 - it returns node-to-context receipts and identifies native
   `wave_arena_stats()` as the transition-telemetry authority.
 
-The installed production code currently identifies itself as
-`LegacyAdiCalibration`. Therefore only graph nodes explicitly declaring
-`adi-reference` can be installed today. An `angular-spectrum-fft` declaration
-is rejected rather than silently executed by ADI. The FFT declaration remains
-the intended production default, not a claim about the present native kernel.
+The installed production code identifies itself as `AngularSpectrum`.
+`angular-spectrum-fft` graph nodes lower directly to the exact-lane native
+arena. The arena owns padded forward/backward S/P complex planes in one
+persistent contiguous block. The current native transform executor is CPU
+radix-2; GPU-routed work uses that same kernel on the GL owner thread until the
+staged GLSL FFT plan is attached. Unsupported split-step and Maxwell
+declarations fail explicitly.
 
 The shared `transport.complex-accumulation` 3D texture is currently resolved
 from ray-hit accumulation. It is an honest complex-ray/path layer, but it is
@@ -233,10 +236,11 @@ required before a UI or capture may label an image as a wave-arena solution.
 - The graph contract is Python-side and not yet generated into native layouts.
 - T2 consumes the exact lens payload directly; it does not yet consume a
   multi-operation graph schedule.
-- T4 descriptors can construct the current native ADI-reference arena, but
-  the planned vector angular-spectrum FFT backend is not implemented.
+- T4 descriptors construct the vector angular-spectrum arena, but the native
+  GPU FFT executor is not implemented; the production CPU kernel is used.
 - Ray/field adapters are declared but not yet implemented as production GPU
-  kernels.
+  kernels. The CPU entry/exit adapter currently maps legacy scalar ray
+  amplitude to S polarization; full Jones sidecar mapping remains.
 - T4 state is not yet published as a zero-copy OpenGL texture; the existing
   complex volume is ray-hit accumulation.
 - Maxwell artifact nodes are reserved contract space, not an implemented patch

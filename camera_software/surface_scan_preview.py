@@ -104,12 +104,10 @@ class SurfaceScanPreview:
         if display_hglrc and callable(getattr(tracer, "set_gl_display_hglrc", None)):
             tracer.set_gl_display_hglrc(int(display_hglrc))
 
-        # Surface scan is deliberately geometric.  Authored wave arenas remain
-        # part of the full engine but must not make an editing preview stochastic
-        # or iterative.
-        clear_contexts = getattr(tracer, "clear_scale_contexts", None)
-        if callable(clear_contexts):
-            clear_contexts()
+        # Context ownership belongs to the optical backend. A ray-only request
+        # installs none; mixed/wave requests keep their compiled graph arenas.
+        # Preview setup must never erase transport authored immediately before
+        # this object is constructed.
         skip_readback = getattr(tracer, "set_gpu_skip_record_readback", None)
         if callable(skip_readback):
             skip_readback(True)

@@ -46,9 +46,9 @@
 #define GPU_DIAG_PASS_T1_BVH     1u
 #define GPU_DIAG_PASS_T2_REFINE  2u
 #define GPU_DIAG_PASS_T3_MAT     3u
-#define GPU_DIAG_PASS_T4_M0      4u
-#define GPU_DIAG_PASS_T4_M1      5u
-#define GPU_DIAG_PASS_T4_M2      6u
+#define GPU_DIAG_PASS_T4_FFT_FORWARD 4u
+#define GPU_DIAG_PASS_T4_TRANSFER    5u
+#define GPU_DIAG_PASS_T4_FFT_INVERSE 6u
 #define GPU_DIAG_PASS_T5         7u
 #define GPU_DIAG_PASS_UV_BLIT    8u
 #define GPU_DIAG_PASS_TILE_OVL   9u

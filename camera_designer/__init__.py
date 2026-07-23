@@ -7,8 +7,6 @@ parametric_surfaces   Closed-form surface primitives (CPU + GLSL)
 camera_preset         CameraPreset dataclass + built-in presets
 emitter_profile       Physical emitter profiles (spectral, phase, directional,
                       polarization, UV texture)
-wave_tube             Retired standalone ADI-BPM validation reference; import
-                      explicitly when comparing historical results
 """
 from .parametric_surfaces import (
     ParametricSurface,

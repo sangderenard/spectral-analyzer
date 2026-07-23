@@ -84,7 +84,7 @@ def test_compiled_optical_graph_installs_and_drives_native_t4():
     nodes, links = wave_context_nodes(
         "bench.wave",
         1,
-        propagation=WavePropagationStyle.ADI_REFERENCE,
+        propagation=WavePropagationStyle.ANGULAR_SPECTRUM_FFT,
         center_m=(0.0, 0.0, 0.0),
         axis=(0.0, 0.0, 1.0),
         radius_m=0.02,
@@ -116,7 +116,41 @@ def test_compiled_optical_graph_installs_and_drives_native_t4():
     assert receipt.wave_arenas[0].node_key == "bench.wave.arena"
     assert arena["generation"] == 1
     assert arena["bands"] == 1
-    assert arena["backend"] == 0  # LegacyAdiCalibration
+    assert arena["backend"] == 0  # AngularSpectrum
+    assert arena["field_count"] == 4
+    assert arena["state_float_count"] == (
+        arena["bands"] * arena["fft_nx"] * arena["fft_ny"] * 8
+    )
+    assert sum(arena["field_active"]) == 1
+
+
+def test_production_angular_spectrum_plane_wave_phase_and_reverse():
+    wavelength = 550.0e-9
+    tracer = _tracer(np.array([wavelength]))
+    width = height = 8
+    dz = 1.25e-6
+    re = np.ones((1, height, width), np.float32)
+    im = np.zeros_like(re)
+    original = re.astype(np.complex64) + 1j * im.astype(np.complex64)
+
+    tracer.t4_angular_spectrum_step(
+        1, width, height, 1.0e-6, dz, 1,
+        np.array([wavelength], np.float64), re, im,
+    )
+    expected = np.exp(1j * (2.0 * np.pi / wavelength) * dz)
+    propagated = re.astype(np.complex64) + 1j * im.astype(np.complex64)
+    np.testing.assert_allclose(
+        propagated, original * expected, rtol=2.0e-5, atol=2.0e-5
+    )
+
+    tracer.t4_angular_spectrum_step(
+        1, width, height, 1.0e-6, dz, -1,
+        np.array([wavelength], np.float64), re, im,
+    )
+    recovered = re.astype(np.complex64) + 1j * im.astype(np.complex64)
+    np.testing.assert_allclose(
+        recovered, original, rtol=3.0e-5, atol=3.0e-5
+    )
 
 
 def test_continuous_paths_share_one_exact_width_complex_dispatch():

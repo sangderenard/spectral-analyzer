@@ -648,13 +648,11 @@ class RenderWorkBrowser:
             summary = [str(mode.description)]
             if mode.key == "focus-hall":
                 summary.insert(0, f"focus distance: {self._focus_distance_m:.2f} m")
-            elif mode.key == "double-slit":
-                summary.insert(0, "CPU strip + GPU strip; wave solvers only")
             calibration_rows.append((
                 f"calibration:{mode.key}",
                 f"  {mode.label.upper()} CALIBRATION ROOM",
                 summary,
-                (90, 150, 205) if mode.key != "double-slit" else (145, 105, 205),
+                (90, 150, 205),
                 {"kind": "calibration", "mode": mode.key, "status": "ready"},
             ))
         rows = validation_rows + calibration_rows + [(

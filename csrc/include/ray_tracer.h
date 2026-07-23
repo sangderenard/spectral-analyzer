@@ -1147,49 +1147,6 @@ SK_API int ray_tracer_rs_propagate(
     float*          out_im
 );
 
-/**
- * Beam Propagation Method (BPM) — batchwise PDE z-stepper.
- *
- * Propagates a complex scalar field U[band][y][x] forward by dz by solving
- * the paraxial Helmholtz PDE:
- *
- *   ∂U/∂z = (i/2k) ∇_T² U
- *
- * using an ADI (Alternating Direction Implicit) Crank-Nicolson finite-
- * difference scheme.  The scheme is unconditionally stable and second-order
- * accurate in both dz and dx.  All bands are stepped in a single batched
- * loop.
- *
- * Each call advances the field by exactly one step dz.  Call repeatedly to
- * propagate through a volume: the field evolves continuously through empty
- * space with correct diffraction, interference, and near-field spreading at
- * every point — this is the genuine PDE solution, not a post-process.
- *
- * The carrier phase exp(ik dz) is applied first so both the fast oscillation
- * and the transverse spreading are correct when building coherent volumes.
- *
- * Boundary: Dirichlet U = 0 at all four grid edges (absorbing frame).
- *
- * @param n_bands       Number of frequency bands.
- * @param w, h          Grid width and height (pixels).
- * @param dx            Pixel pitch in metres (same in x and y).
- * @param dz            Propagation step in metres (positive = forward along z).
- * @param wavelengths_m Double array [n_bands], wavelength per band in metres.
- * @param re_buf        float32 [n_bands * h * w] real part  (modified in-place).
- * @param im_buf        float32 [n_bands * h * w] imag part  (modified in-place).
- * @return SK_OK or SK_ERR_NULL_STATE.
- */
-SK_API int ray_tracer_wave_bpm_step(
-    int             n_bands,
-    int             w,
-    int             h,
-    double          dx,
-    double          dz,
-    const double*   wavelengths_m,
-    float*          re_buf,
-    float*          im_buf
-);
-
 /* ── Stateful ray scheduler ──────────────────────────────────────────────── */
 
 /**
@@ -1476,7 +1433,7 @@ SK_API int ray_tracer_clear_group_uv_accum(
  * Update the per-band emission power of an already-registered EMISSIVE group.
  *
  * This is the primary mechanism for surrogate emitters whose power is
- * determined by an external solver (BPM wave tube, neural network, measured
+ * determined by an external field solver, neural network, or measured
  * radiance) rather than a fixed material property.  Safe to call between
  * tracing passes; never safe to call concurrently with an active trace.
  *
@@ -1503,8 +1460,8 @@ SK_API int ray_tracer_set_tri_group_power(
  *   4. Run backward tracing pass (reads the now-populated accumulator).
  *   5. ray_tracer_export_illum_accum() — optional GPU SSBO / Python inspection.
  *
- * BPM wave solver seeding (optional, wave-domain alternative to Monte Carlo):
- *   After T4 BPM propagates the emitter field through a diffusing volume,
+ * T4 field seeding (optional, wave-domain alternative to Monte Carlo):
+ *   After T4 propagates the emitter field through a diffusing volume,
  *   write the exit-plane amplitude directly into the accumulator via
  *   ray_tracer_export_illum_accum() + modify + set_illum_accum() (TBD).
  *   Backward rays then receive diffraction-correct illumination automatically.
@@ -1518,10 +1475,10 @@ SK_API int ray_tracer_export_illum_accum(
     int*                  out_n_tris,
     int*                  out_stride); /* stride = 2*n_bands + 2 */
 
-/* Write BPM-computed complex amplitudes directly into tri_illum_accum for
+/* Write field-computed complex amplitudes directly into tri_illum_accum for
  * the specified triangles, replacing any Monte Carlo data already there.
  * After this call backward rays at those triangles receive diffraction-correct
- * BPM illumination instead of a Monte Carlo average.
+ * field illumination instead of a Monte Carlo average.
  *
  *   tri_ids  : (n_tris,) int32  — triangle indices
  *   amp_re   : (n_tris, n_bands) float32 row-major — real part of field amplitude

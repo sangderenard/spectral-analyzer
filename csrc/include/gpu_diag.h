@@ -21,7 +21,7 @@
  *
  *   seq    : monotonic dispatch counter (identifies ordering across passes)
  *   wall_s : seconds since first dispatch (correlates with heartbeat logs)
- *   label  : caller-supplied tag (e.g. "T1:BVH", "T4:BPM-m0")
+ *   label  : caller-supplied tag (e.g. "T1:BVH", "T4:FFT-forward")
  *   wg     : workgroup count actually dispatched
  *   code   : raw GL error hex
  *   name   : human-readable GL error constant
@@ -52,9 +52,9 @@ enum class GpuPassId : uint32_t {
     T1_BVH_INTERSECT =  1u,
     T2_REFINE        =  2u,
     T3_MATERIAL      =  3u,
-    T4_BPM_M0        =  4u,
-    T4_BPM_M1        =  5u,
-    T4_BPM_M2        =  6u,
+    T4_FFT_FORWARD   =  4u,
+    T4_TRANSFER      =  5u,
+    T4_FFT_INVERSE   =  6u,
     T5_CONNECT       =  7u,
     UV_BLIT          =  8u,
     TILE_OVERLAP     =  9u,

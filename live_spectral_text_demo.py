@@ -3515,82 +3515,6 @@ def make_subprocess_renderer(
                 int(runtime["sensor_work_tile_width"]),
                 int(runtime["sensor_work_tile_height"]),
             )
-        if str(runtime.get("work_kind", "")) == "wave_calibration":
-            region = order["defaults"]["image"]["region"]
-            wave_work_dir = os.path.abspath(str(runtime["wave_work_dir"]))
-            command = [
-                sys.executable,
-                os.path.join(script_dir, "wave_double_slit_calibration.py"),
-                "--work-dir", wave_work_dir,
-                "--width", str(int(region["width"])),
-                "--height", str(int(region["height"])),
-                "--steps", str(max(1, int(runtime.get("wave_steps", 100)))),
-            ]
-            log_path = os.path.join(revision_dir, "render.log")
-            process = subprocess.Popen(
-                command, cwd=script_dir, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                errors="replace", bufsize=1,
-            )
-            with process_lock:
-                active_process[0] = process
-                active_suspended[0] = False
-            forwarded = 0
-            latest_preview = ""
-            wave_result: dict[str, Any] = {}
-            with open(log_path, "w", encoding="utf-8", newline="\n") as log:
-                assert process.stdout is not None
-                for line in process.stdout:
-                    log.write(line); log.flush()
-                    print(line.rstrip("\r\n"), flush=True)
-                    if line.startswith("[wave-progress] "):
-                        payload = json.loads(line[len("[wave-progress] "):])
-                        forwarded += 1
-                        latest_preview = str(payload.get("preview_path", ""))
-                        completed = int(payload.get("completed", 0))
-                        total = max(1, int(payload.get("total", 1)))
-                        progress_sink(ExposureProgressEvent(
-                            exposure_id=f"revision-{sequence:04d}",
-                            sequence=forwarded,
-                            kind=ExposureProgressKind.LAYER_AVAILABLE,
-                            region=SensorRegion(
-                                x=int(region.get("x", 0)), y=int(region.get("y", 0)),
-                                width=int(region["width"]), height=int(region["height"]),
-                            ),
-                            pass_index=completed,
-                            completed_work=completed, total_work=total,
-                            progress_fraction=float(completed) / float(total),
-                            elapsed_s=time.perf_counter() - started,
-                            preview_path=latest_preview,
-                            message=(
-                                f"double slit {payload.get('backend', 'wave')} "
-                                f"step {completed}/{total}"
-                            ),
-                        ))
-                    elif line.startswith("[wave-result] "):
-                        wave_result = json.loads(line[len("[wave-result] "):])
-            return_code = process.wait()
-            with process_lock:
-                active_process[0] = None
-                active_suspended[0] = False
-            if cancel_requested[0]:
-                raise RenderCancelled("wave calibration cancelled")
-            if return_code != 0:
-                raise RuntimeError(
-                    f"double-slit wave calibration exited with code {return_code}; "
-                    f"see {log_path}"
-                )
-            image_path = str(wave_result.get(
-                "preview_path", os.path.join(wave_work_dir, "comparison.png")
-            ))
-            manifest_path = os.path.join(wave_work_dir, "wave_checkpoint.json")
-            linear_path = os.path.join(wave_work_dir, "cpu", "intensity.npy")
-            elapsed_s = time.perf_counter() - started
-            return RenderedTextRevision(
-                sequence=sequence, text=text, image_path=image_path,
-                linear_path=linear_path, manifest_path=manifest_path,
-                elapsed_s=elapsed_s, diagnostic_image_path=image_path,
-            )
         next_scan_path = ""
         native_delta_restore = None
         repeat_evidence = None
@@ -5055,51 +4979,25 @@ def run_window(
             return f"mode={mode_key} {status}; no exposure"
         work_key = calibration_work_key(mode_key, manifest)
         work_dir = os.path.join(calibration_work_catalog.root, work_key)
-        if mode_key == "double-slit":
-            wave_scene = dict(manifest.get("scene", {}))
-            propagation = dict(wave_scene.get("propagation", {}))
-            manifest["wave_solver"] = {
-                "cpu": "compiled RayTracer.wave_bpm_step",
-                "gpu": "csrc/shaders/ray_wave_bpm.comp.glsl",
-                "ray_transport_allowed": False,
-                "checkpoint_steps": 5,
-            }
-            # Recompute after adding the wave solver contract.
-            work_key = calibration_work_key(mode_key, manifest)
-            work_dir = os.path.join(calibration_work_catalog.root, work_key)
-            calibration_order = {
-                "schema_version": 1,
-                "defaults": {"image": {"region": {
-                    "x": 0, "y": 0, "width": work_width, "height": work_height,
-                }}},
-                "runtime": {
-                    "work_kind": "wave_calibration",
-                    "calibration_mode": mode_key,
-                    "wave_work_dir": work_dir,
-                    "wave_steps": int(propagation.get("steps", 100)),
-                },
-                "jobs": [{"id": "double_slit_wave", "token": ""}],
-            }
-        else:
-            calibration_order = build_calibration_render_order(
-                mode_key,
-                display_width=work_width,
-                display_height=work_height,
-                sensor_sweeps=1,
-                cohort_seed=worker.snapshot()[3] + 1,
-                transport_option=resolved_trace_settings.transport_option,
-                render_budget=resolved_trace_settings.render_budget(
-                    sensor_top_k=max(work_width, work_height)
-                ),
-                **work_browser.calibration_parameters(mode_key),
-            )
-            exposure_toolbar.settings.apply_to_order(calibration_order)
-            apply_toolbar_render_mode(
-                calibration_order, resolved_trace_settings.transport_mode
-            )
-            calibration_order.setdefault("runtime", {})["wave_contexts"] = bool(
-                resolved_trace_settings.wave_mode
-            )
+        calibration_order = build_calibration_render_order(
+            mode_key,
+            display_width=work_width,
+            display_height=work_height,
+            sensor_sweeps=1,
+            cohort_seed=worker.snapshot()[3] + 1,
+            transport_option=resolved_trace_settings.transport_option,
+            render_budget=resolved_trace_settings.render_budget(
+                sensor_top_k=max(work_width, work_height)
+            ),
+            **work_browser.calibration_parameters(mode_key),
+        )
+        exposure_toolbar.settings.apply_to_order(calibration_order)
+        apply_toolbar_render_mode(
+            calibration_order, resolved_trace_settings.transport_mode
+        )
+        calibration_order.setdefault("runtime", {})["wave_contexts"] = bool(
+            resolved_trace_settings.wave_mode
+        )
         checkpoint_interrupted_calibration()
         sequence = worker.submit(
             f"CALIBRATION / {mode_key}", calibration_order, None
@@ -5984,10 +5882,6 @@ def run_window(
                 )
                 displaying_calibration[0] = completed_calibration is not None
                 if completed_calibration is not None:
-                    if str(completed_calibration.get("runtime", {}).get(
-                        "work_kind", ""
-                    )) == "wave_calibration":
-                        texture = pygame.image.load(latest.image_path).convert()
                     if completed_work_key:
                         calibration_work_catalog.complete(
                             completed_work_key,
@@ -5997,10 +5891,7 @@ def run_window(
                             result_manifest_path=latest.manifest_path,
                             elapsed_s=latest.elapsed_s,
                         )
-                    if str(completed_calibration.get("runtime", {}).get(
-                        "work_kind", ""
-                    )) != "wave_calibration":
-                        camera_fallback_order[0] = completed_calibration
+                    camera_fallback_order[0] = completed_calibration
                     startup_key = str(
                         completed_calibration.get("runtime", {}).get(
                             "startup_validation_key", ""

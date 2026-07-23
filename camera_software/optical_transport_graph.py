@@ -39,9 +39,7 @@ class OpticalRepresentation(str, Enum):
 
 class WavePropagationStyle(str, Enum):
     ANGULAR_SPECTRUM_FFT = "angular-spectrum-fft"
-    SCALAR_ANGULAR_SPECTRUM_FFT = "scalar-angular-spectrum-fft"
     SPLIT_STEP_FFT = "split-step-fft"
-    ADI_REFERENCE = "adi-reference"
     MAXWELL_PATCH = "maxwell-patch"
 
 
@@ -85,11 +83,8 @@ class OpticalNodeSpec:
         if (
             self.output_representation is OpticalRepresentation.TRANSVERSE_FIELD
             and self.polarization_components != 2
-            and not bool(self.parameters.get("scalar_valid", False))
         ):
-            raise ValueError(
-                "transverse field nodes require two components unless scalar_valid"
-            )
+            raise ValueError("transverse field nodes require two components")
 
 
 @dataclass(frozen=True)
@@ -237,7 +232,6 @@ def wave_context_nodes(
     *,
     propagation: WavePropagationStyle = WavePropagationStyle.ANGULAR_SPECTRUM_FFT,
     boundary: WaveBoundaryStyle = WaveBoundaryStyle.PADDED_ABSORBING,
-    scalar_valid: bool = False,
     periodic_explicit: bool = False,
     center_m: Sequence[float] | None = None,
     axis: Sequence[float] = (0.0, 0.0, 1.0),
@@ -251,11 +245,6 @@ def wave_context_nodes(
 
     if boundary is WaveBoundaryStyle.PERIODIC and not periodic_explicit:
         raise ValueError("periodic FFT boundaries must be explicitly authored")
-    if (
-        propagation is WavePropagationStyle.SCALAR_ANGULAR_SPECTRUM_FFT
-        and not scalar_valid
-    ):
-        raise ValueError("scalar propagation requires scalar_valid=True")
     prefix = str(key)
     entry = OpticalNodeSpec(
         key=f"{prefix}.entry",
@@ -303,12 +292,11 @@ def wave_context_nodes(
         input_representation=OpticalRepresentation.TRANSVERSE_FIELD,
         output_representation=OpticalRepresentation.TRANSVERSE_FIELD,
         lane_count=lane_count,
-        polarization_components=1 if scalar_valid else 2,
+        polarization_components=2,
         persistent_state=True,
         parameters={
             "propagation": propagation.value,
             "boundary": boundary.value,
-            "scalar_valid": bool(scalar_valid),
             "state_layout": "solid-contiguous-state-block",
             "allocation": "cold-only",
             "medium_n_real": float(medium_n_real),
@@ -347,9 +335,9 @@ def install_optical_graph(
     already have been installed by the authoritative camera builder, and the
     caller must explicitly attest to that fact.
 
-    The current native implementation is the exact-lane persistent ADI
-    calibration backend.  Planned FFT descriptors are rejected rather than
-    silently relabeling ADI work as angular-spectrum propagation.
+    The native implementation owns an exact-lane, padded, bidirectional
+    two-component angular-spectrum arena. Unsupported propagation styles are
+    rejected rather than silently substituted.
     """
 
     if compiled.t2_payloads and not exact_t2_registered:
@@ -373,10 +361,10 @@ def install_optical_graph(
             continue
         descriptor = compiled.t4_descriptors[node.key]
         propagation = str(descriptor.get("propagation", ""))
-        if propagation != WavePropagationStyle.ADI_REFERENCE.value:
+        if propagation != WavePropagationStyle.ANGULAR_SPECTRUM_FFT.value:
             raise RuntimeError(
                 f"T4 node {node.key!r} requests {propagation!r}, but the live "
-                "native backend currently implements only 'adi-reference'; "
+                "native backend implements only 'angular-spectrum-fft'; "
                 "refusing a scientifically false backend substitution"
             )
         missing = [

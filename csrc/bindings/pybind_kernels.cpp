@@ -4695,6 +4695,56 @@ struct PyRayTracer
                 "T4 reference step rejected its dimensions or lane count");
     }
 
+    py::tuple t4_apply_rigid_field_interface(
+        int n_bands,
+        int w,
+        int h,
+        int coordinate_map,
+        py::array_t<float, py::array::c_style> jones_re_arr,
+        py::array_t<float, py::array::c_style> jones_im_arr,
+        py::array_t<float, py::array::c_style> in_s_re_arr,
+        py::array_t<float, py::array::c_style> in_s_im_arr,
+        py::array_t<float, py::array::c_style> in_p_re_arr,
+        py::array_t<float, py::array::c_style> in_p_im_arr)
+    {
+        auto jones_re = jones_re_arr.request();
+        auto jones_im = jones_im_arr.request();
+        auto in_s_re = in_s_re_arr.request();
+        auto in_s_im = in_s_im_arr.request();
+        auto in_p_re = in_p_re_arr.request();
+        auto in_p_im = in_p_im_arr.request();
+        const py::ssize_t field_values =
+            static_cast<py::ssize_t>(n_bands) * w * h;
+        const py::ssize_t operator_values =
+            static_cast<py::ssize_t>(n_bands) * 4;
+        if (jones_re.size != operator_values
+            || jones_im.size != operator_values
+            || in_s_re.size != field_values
+            || in_s_im.size != field_values
+            || in_p_re.size != field_values
+            || in_p_im.size != field_values)
+            throw std::invalid_argument(
+                "T4 rigid interface buffers do not match band/grid dimensions");
+        py::array_t<float> out_s_re({n_bands, h, w});
+        py::array_t<float> out_s_im({n_bands, h, w});
+        py::array_t<float> out_p_re({n_bands, h, w});
+        py::array_t<float> out_p_im({n_bands, h, w});
+        if (!wave_t4::apply_rigid_field_interface(
+                n_bands, w, h,
+                static_cast<wave_t4::RigidFieldMap>(coordinate_map),
+                static_cast<const float*>(jones_re.ptr),
+                static_cast<const float*>(jones_im.ptr),
+                static_cast<const float*>(in_s_re.ptr),
+                static_cast<const float*>(in_s_im.ptr),
+                static_cast<const float*>(in_p_re.ptr),
+                static_cast<const float*>(in_p_im.ptr),
+                out_s_re.mutable_data(), out_s_im.mutable_data(),
+                out_p_re.mutable_data(), out_p_im.mutable_data()))
+            throw std::runtime_error(
+                "T4 rigid interface rejected its map, dimensions, or lanes");
+        return py::make_tuple(out_s_re, out_s_im, out_p_re, out_p_im);
+    }
+
     py::dict t4_apply_aperture_material(
         int n_bands,
         int w,
@@ -7546,6 +7596,27 @@ The buffers are band-major float32 complex planes and are modified in place.
              py::arg("re"),
              py::arg("im"),
              "Diagnostic split-complex reference transform for parity tests.")
+        .def("t4_apply_rigid_field_interface",
+             &PyRayTracer::t4_apply_rigid_field_interface,
+             py::arg("n_bands"),
+             py::arg("w"),
+             py::arg("h"),
+             py::arg("coordinate_map"),
+             py::arg("jones_re"),
+             py::arg("jones_im"),
+             py::arg("in_s_re"),
+             py::arg("in_s_im"),
+             py::arg("in_p_re"),
+             py::arg("in_p_im"),
+             R"doc(
+Apply an exact sampled-coordinate field interface through the production T4
+operator core.
+
+coordinate_map is a RigidFieldMap integer (identity/flips/transposes). Jones
+arrays are [bands,2,2] split-complex matrices; input fields are [bands,h,w].
+The returned S/P split-complex planes own their output storage. General tilted
+resampling is rejected rather than approximated by this rigid-port operator.
+)doc")
         .def("t4_apply_aperture_material",
              &PyRayTracer::t4_apply_aperture_material,
              py::arg("n_bands"),

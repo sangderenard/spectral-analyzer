@@ -63,6 +63,21 @@ enum class TransverseComponent : int {
     P = 1,
 };
 
+/* Exact sampled-coordinate transforms used by rigid planar field ports.
+ * They cover interfaces whose outgoing transverse basis is an axis-aligned
+ * reflection/permutation of the incoming basis. General tilted-plane
+ * interpolation is deliberately not hidden behind this ABI. */
+enum class RigidFieldMap : int {
+    Identity = 0,
+    FlipX = 1,
+    FlipY = 2,
+    FlipXY = 3,
+    Transpose = 4,
+    TransposeFlipX = 5,
+    TransposeFlipY = 6,
+    TransposeFlipXY = 7,
+};
+
 inline constexpr int kDirectionCount = 2;
 inline constexpr int kTransverseComponentCount = 2;
 inline constexpr int kFieldCount =
@@ -210,5 +225,27 @@ bool apply_aperture_material(int bands,
                              float* re,
                              float* im,
                              Progress* progress) noexcept;
+
+/** Apply one cold-compiled rigid interface operator.
+ *
+ * Input/output are split-complex transverse fields laid out
+ * [band][y][x]. jones_{re,im} contain [band][out_component][in_component].
+ * Source and destination buffers must not alias. No allocation occurs.
+ */
+bool apply_rigid_field_interface(
+    int bands,
+    int nx,
+    int ny,
+    RigidFieldMap coordinate_map,
+    const float* jones_re,
+    const float* jones_im,
+    const float* in_s_re,
+    const float* in_s_im,
+    const float* in_p_re,
+    const float* in_p_im,
+    float* out_s_re,
+    float* out_s_im,
+    float* out_p_re,
+    float* out_p_im) noexcept;
 
 }  // namespace wave_t4

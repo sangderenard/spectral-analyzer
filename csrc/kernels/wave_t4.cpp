@@ -604,4 +604,106 @@ bool apply_aperture_material(int bands,
 #undef WAVE_APERTURE_CASE
 }
 
+template<int Bands>
+static bool rigid_interface_exact(
+    int nx,
+    int ny,
+    RigidFieldMap coordinate_map,
+    const float* jones_re,
+    const float* jones_im,
+    const float* in_s_re,
+    const float* in_s_im,
+    const float* in_p_re,
+    const float* in_p_im,
+    float* out_s_re,
+    float* out_s_im,
+    float* out_p_re,
+    float* out_p_im) noexcept
+{
+    if (nx <= 0 || ny <= 0 || !jones_re || !jones_im
+        || !in_s_re || !in_s_im || !in_p_re || !in_p_im
+        || !out_s_re || !out_s_im || !out_p_re || !out_p_im)
+        return false;
+    const int map = static_cast<int>(coordinate_map);
+    if (map < 0 || map > 7 || ((map & 4) && nx != ny))
+        return false;
+    const bool transpose = (map & 4) != 0;
+    const bool flip_x = (map & 1) != 0;
+    const bool flip_y = (map & 2) != 0;
+    const std::size_t plane =
+        static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny);
+    for (int band = 0; band < Bands; ++band) {
+        const std::size_t band_base = static_cast<std::size_t>(band) * plane;
+        const std::size_t matrix_base = static_cast<std::size_t>(band) * 4u;
+        for (int y = 0; y < ny; ++y) {
+            for (int x = 0; x < nx; ++x) {
+                int sx = transpose ? y : x;
+                int sy = transpose ? x : y;
+                if (flip_x) sx = nx - 1 - sx;
+                if (flip_y) sy = ny - 1 - sy;
+                const std::size_t source =
+                    band_base + static_cast<std::size_t>(sy) * nx + sx;
+                const std::size_t destination =
+                    band_base + static_cast<std::size_t>(y) * nx + x;
+                const float sr = in_s_re[source];
+                const float si = in_s_im[source];
+                const float pr = in_p_re[source];
+                const float pi = in_p_im[source];
+                for (int output = 0; output < 2; ++output) {
+                    const std::size_t j0 =
+                        matrix_base + static_cast<std::size_t>(output) * 2u;
+                    const float a_re = jones_re[j0];
+                    const float a_im = jones_im[j0];
+                    const float b_re = jones_re[j0 + 1u];
+                    const float b_im = jones_im[j0 + 1u];
+                    const float value_re =
+                        a_re*sr - a_im*si + b_re*pr - b_im*pi;
+                    const float value_im =
+                        a_re*si + a_im*sr + b_re*pi + b_im*pr;
+                    if (output == 0) {
+                        out_s_re[destination] = value_re;
+                        out_s_im[destination] = value_im;
+                    } else {
+                        out_p_re[destination] = value_re;
+                        out_p_im[destination] = value_im;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool apply_rigid_field_interface(
+    int bands,
+    int nx,
+    int ny,
+    RigidFieldMap coordinate_map,
+    const float* jones_re,
+    const float* jones_im,
+    const float* in_s_re,
+    const float* in_s_im,
+    const float* in_p_re,
+    const float* in_p_im,
+    float* out_s_re,
+    float* out_s_im,
+    float* out_p_re,
+    float* out_p_im) noexcept
+{
+#define WAVE_INTERFACE_CASE(B) case B: return rigid_interface_exact<B>( \
+    nx, ny, coordinate_map, jones_re, jones_im, \
+    in_s_re, in_s_im, in_p_re, in_p_im, \
+    out_s_re, out_s_im, out_p_re, out_p_im)
+    switch (bands) {
+        WAVE_INTERFACE_CASE(1);
+        WAVE_INTERFACE_CASE(3);
+        WAVE_INTERFACE_CASE(4);
+        WAVE_INTERFACE_CASE(8);
+        WAVE_INTERFACE_CASE(16);
+        WAVE_INTERFACE_CASE(32);
+        default: return false;
+    }
+#undef WAVE_INTERFACE_CASE
+}
+
 }  // namespace wave_t4

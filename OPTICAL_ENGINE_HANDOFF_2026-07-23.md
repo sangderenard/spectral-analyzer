@@ -154,7 +154,10 @@ Do not weaken these while continuing:
   record.
 - T4 entry is Jones-complete for configured source records in fixed and
   continuous modes; the legacy no-record specialization remains s-only.
-- T4 exit still collapses vector field state to scalar complex ray amplitude.
+- T4 still uses a scalar first-moment `RayIntent` continuation, but every
+  active exit lane now publishes a correlated 160-byte wave-exit record with
+  complex S/P amplitudes, basis, frequency/PDF/coherence, and reduction
+  provenance. Later T3/T4 stages do not consume that record yet.
 - Full Jones projector textures are lowered at distributed source-plane UV
   sites into the shared source-mode block. Intensity, phase/coherence
   overrides, local polarization, and complex Jones channels no longer collapse
@@ -207,11 +210,16 @@ Acceptance:
 
 ### 3. Jones-complete T4 exit
 
-- Extract complex first moments per component without merging polarization.
-- Return a complex-ray sidecar handle or retain the full field when one-ray
-  reduction is invalid.
-- Compose the exit basis and differential operator.
+- Completed first vertical slice: extract component powers and independent
+  phase anchors without merging polarization, publish an explicit
+  right-handed basis, and bind the fixed-stride record to the exact exit-ray
+  lineage.
+- Next: install those records in a pipeline-owned contiguous state block and
+  carry a verified compact handle so a later interface/T4 entry consumes the
+  state. Do not add a hot hash lookup or widen every ray.
+- Next: compose the differential operator and true segment-wise OPL.
 - Route singular/caustic reductions to a declared wave continuation.
+- Retain the full field when one-ray reduction is invalid.
 
 Acceptance:
 

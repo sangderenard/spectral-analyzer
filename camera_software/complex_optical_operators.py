@@ -25,6 +25,51 @@ from typing import Any, Callable, Sequence
 import numpy as np
 
 
+WAVE_EXIT_STATE_DTYPE = np.dtype({
+    "names": (
+        "ray_tag", "subpath_id", "vertex_index", "stream", "direction",
+        "arena_id", "state_lane", "band_id", "record_flags",
+        "position_m", "path_length_m", "ray_direction",
+        "phase_anchor_quality", "basis_s", "basis_p",
+        "frequency_hi", "frequency_lo", "optical_path_hi",
+        "optical_path_lo", "spectral_pdf", "transport_jacobian",
+        "amplitude_s_re", "amplitude_s_im", "amplitude_p_re",
+        "amplitude_p_im", "coherence_lo", "coherence_hi", "sample_id",
+        "lane_flags", "basis_id", "operator_id",
+    ),
+    "formats": (
+        "<u8", "<u4", "<u2", "u1", "u1",
+        "<i4", "<i4", "<u4", "<u4",
+        ("<f4", (3,)), "<f4", ("<f4", (3,)),
+        "<f4", ("<f4", (4,)), ("<f4", (4,)),
+        "<f4", "<f4", "<f4", "<f4", "<f4", "<f4",
+        "<f4", "<f4", "<f4", "<f4", "<u4", "<u4", "<u4",
+        "<u4", "<u4", "<u4",
+    ),
+    "offsets": (
+        0, 8, 12, 14, 15,
+        16, 20, 24, 28,
+        32, 44, 48,
+        60, 64, 80,
+        96, 100, 104, 108, 112, 116,
+        120, 124, 128, 132, 136, 140, 144,
+        148, 152, 156,
+    ),
+    "itemsize": 160,
+})
+
+
+def parse_wave_exit_states(raw: np.ndarray) -> np.ndarray:
+    """View native 160-byte T4 exit rows as immutable structured records."""
+
+    values = np.ascontiguousarray(raw, dtype=np.uint8)
+    if values.ndim != 2 or values.shape[1] != WAVE_EXIT_STATE_DTYPE.itemsize:
+        raise ValueError("wave exit records must have uint8 shape (N, 160)")
+    records = values.reshape(-1).view(WAVE_EXIT_STATE_DTYPE).reshape(-1)
+    records.flags.writeable = False
+    return records
+
+
 COMPLEX_OPTICAL_OPERATOR_SCHEMA = "complex-optical-operators-v1"
 _EPS = 1.0e-12
 _C_M_S = 299_792_458.0
@@ -676,6 +721,8 @@ def canonical_operator_contract() -> dict[str, Any]:
 
 __all__ = [
     "COMPLEX_OPTICAL_OPERATOR_SCHEMA",
+    "WAVE_EXIT_STATE_DTYPE",
+    "parse_wave_exit_states",
     "TransverseBasis",
     "JonesOperator",
     "DielectricInterfaceResult",

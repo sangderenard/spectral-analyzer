@@ -7742,6 +7742,7 @@ struct RayPipelineState {
     PipelineQueue<RefinedHit> Q_refined;
     PipelineQueue<WaveIntent> Q_wave;
     PipelineQueue<RayRecord>  Q_out;    /* output records drained by the caller */
+    PipelineQueue<WaveExitStateRecord> Q_wave_exit_states;
 
     /* Cold-built, solid contiguous Jones source state. Ray tags are the
      * stable handles, so ordinary CPU/GPU ray records do not grow. The block
@@ -8149,9 +8150,14 @@ static bool wave_arena_transfer(
     WaveArena& src, WaveArena& dst, wave_t4::Direction direction);
 static bool wave_arena_follow_link(
     RayPipelineState& ps, WaveArena& arena, RayIntent& lineage,
-    int state_lane, ChildRay& out, int& terminal_arena, int depth);
+    int state_lane, ChildRay& out, int& terminal_arena, int depth,
+    std::array<WaveExitStateRecord, 32>* exit_records,
+    int* exit_record_count);
 static ChildRay wave_arena_extract(WaveArena& arena, const RayIntent& src,
-                                   int state_lane = -1);
+                                   int state_lane = -1,
+                                   std::array<WaveExitStateRecord, 32>*
+                                       exit_records = nullptr,
+                                   int* exit_record_count = nullptr);
 static void wave_arena_complete(RayPipelineState& ps,
                                 WaveIntent& wi,
                                 WaveArena& arena,
@@ -15380,8 +15386,12 @@ static bool wave_arena_march(WaveArena& arena)
  * and direction are the first spatial/angular moments. Per-lane amplitude
  * magnitude is sqrt(total field power), so the deliberate single-ray
  * reduction preserves power while exposing its unavoidable loss of shape. */
-static ChildRay wave_arena_extract(WaveArena& arena, const RayIntent& src,
-                                   int state_lane)
+static ChildRay wave_arena_extract(
+    WaveArena& arena,
+    const RayIntent& src,
+    int state_lane,
+    std::array<WaveExitStateRecord, 32>* exit_records,
+    int* exit_record_count)
 {
     const int nb = arena.n_bands;
     const int nx = arena.nx, ny = arena.ny;
@@ -15396,6 +15406,8 @@ static ChildRay wave_arena_extract(WaveArena& arena, const RayIntent& src,
     };
 
     std::array<double, 32> band_power{};
+    std::array<std::array<double, 2>, 32> component_power{};
+    std::array<std::array<cd, 2>, 32> component_sum{};
     double sum_power = 0.0, centroid_x = 0.0, centroid_y = 0.0;
     for (int b = band_begin; b < band_end; ++b) {
         for (int component = 0;
@@ -15413,6 +15425,11 @@ static ChildRay wave_arena_extract(WaveArena& arena, const RayIntent& src,
                         static_cast<double>(re[i])*re[i]
                         + static_cast<double>(im[i])*im[i];
                     band_power[static_cast<size_t>(b)] += power;
+                    component_power[static_cast<size_t>(b)]
+                                   [static_cast<size_t>(component)] += power;
+                    component_sum[static_cast<size_t>(b)]
+                                 [static_cast<size_t>(component)] +=
+                        cd(re[i], im[i]);
                     sum_power += power;
                     centroid_x += power * ix;
                     centroid_y += power * iy;
@@ -15528,6 +15545,118 @@ static ChildRay wave_arena_extract(WaveArena& arena, const RayIntent& src,
     if (child.intent.bdpt_vertex < 0xFFFFu)
         child.intent.bdpt_vertex += 1u;
 
+    if (exit_records && exit_record_count) {
+        *exit_record_count = 0;
+        V3d basis_s = arena.axis_x
+            - exit_dir*arena.axis_x.dot(exit_dir);
+        if (basis_s.squaredNorm() <= 1.0e-20) {
+            basis_s = arena.axis_y
+                - exit_dir*arena.axis_y.dot(exit_dir);
+        }
+        basis_s.normalize();
+        const V3d basis_p = exit_dir.cross(basis_s).normalized();
+        for (int b = band_begin; b < band_end; ++b) {
+            if (*exit_record_count >= 32) break;
+            WaveExitStateRecord record{};
+            record.ray_tag = child.intent.tag;
+            record.subpath_id = child.intent.bdpt_subpath_id;
+            record.vertex_index = child.intent.bdpt_vertex;
+            record.stream = child.intent.bdpt_stream;
+            record.direction = static_cast<std::uint8_t>(direction);
+            record.arena_id = arena.id;
+            record.state_lane = state_lane;
+            record.band_id = static_cast<std::uint32_t>(b);
+            record.flags =
+                WAVE_EXIT_REPRESENTATIVE_RAY | WAVE_EXIT_JONES_VALID;
+            if (arena.spectral_mode
+                    == wave_t4::SpectralMode::ContinuousCohort)
+                record.flags |= WAVE_EXIT_CONTINUOUS_SAMPLE;
+            for (int axis = 0; axis < 3; ++axis) {
+                record.position_m[static_cast<size_t>(axis)] =
+                    static_cast<float>(exit_pos[axis]);
+                record.ray_direction[static_cast<size_t>(axis)] =
+                    static_cast<float>(exit_dir[axis]);
+                record.basis_s[static_cast<size_t>(axis)] =
+                    static_cast<float>(basis_s[axis]);
+                record.basis_p[static_cast<size_t>(axis)] =
+                    static_cast<float>(basis_p[axis]);
+            }
+            record.path_length_m =
+                static_cast<float>(child.intent.path_len);
+
+            complex_transport::ComplexLane lane{};
+            const auto& spectral =
+                arena.spectral_lanes[static_cast<size_t>(b)];
+            lane.meta.frequency_hz = spectral.frequency_hz > 0.0
+                ? spectral.frequency_hz
+                : arena.speed_m_s/std::max(
+                    arena.wavelengths_m[b]*arena.n_real, 1.0e-30);
+            /* RayIntent currently accumulates geometric distance, not OPL.
+             * Do not manufacture an optical path by multiplying the complete
+             * lineage by this terminal arena's index: earlier segments may
+             * have crossed different media.  A later lineage accumulator can
+             * set OpticalPathValid without changing this record ABI. */
+            lane.meta.optical_path_m = 0.0;
+            lane.meta.spectral_pdf =
+                std::max(static_cast<double>(spectral.pdf), 1.0e-30);
+            lane.meta.transport_jacobian = 1.0;
+            lane.meta.coherence_id = spectral.coherence_id;
+            lane.meta.sample_id = child.intent.bdpt_subpath_id;
+            lane.meta.source_lane = static_cast<std::uint16_t>(
+                state_lane >= 0 ? child.intent.spectral_lane_id : b);
+            lane.meta.flags =
+                complex_transport::LaneActive
+              | complex_transport::JonesValid
+              | complex_transport::FieldReduction
+              | complex_transport::WaveExit;
+            if (spectral.coherence_id != 0u)
+                lane.meta.flags |= complex_transport::Coherent;
+            if (arena.spectral_mode
+                    == wave_t4::SpectralMode::ContinuousCohort)
+                lane.meta.flags |= complex_transport::ContinuousSample;
+
+            double anchor_power = 0.0;
+            for (int component = 0;
+                 component < wave_t4::kTransverseComponentCount;
+                 ++component) {
+                const auto c = static_cast<
+                    wave_t4::TransverseComponent>(component);
+                const float* re = arena.field_re(direction, c)
+                    + static_cast<size_t>(b)*npix;
+                const float* im = arena.field_im(direction, c)
+                    + static_cast<size_t>(b)*npix;
+                cd anchor(re[sample], im[sample]);
+                const double power =
+                    component_power[static_cast<size_t>(b)]
+                                   [static_cast<size_t>(component)];
+                if (std::abs(anchor) <= 1.0e-30)
+                    anchor = component_sum[static_cast<size_t>(b)]
+                                          [static_cast<size_t>(component)];
+                const double phase = std::abs(anchor) > 0.0
+                    ? std::arg(anchor) : 0.0;
+                const cd amplitude = std::polar(std::sqrt(power), phase);
+                if (component == static_cast<int>(
+                        wave_t4::TransverseComponent::S))
+                    lane.amplitude_s = amplitude;
+                else
+                    lane.amplitude_p = amplitude;
+                anchor_power += static_cast<double>(re[sample])*re[sample]
+                              + static_cast<double>(im[sample])*im[sample];
+            }
+            const double total_band_power =
+                band_power[static_cast<size_t>(b)];
+            record.phase_anchor_quality = static_cast<float>(
+                total_band_power > 0.0
+                    ? std::min(1.0, anchor_power/total_band_power)
+                    : 0.0);
+            if (anchor_power > 0.0)
+                record.flags |= WAVE_EXIT_PHASE_ANCHOR_VALID;
+            record.lane = complex_transport::pack_gpu(lane);
+            (*exit_records)[static_cast<size_t>(
+                (*exit_record_count)++)] = record;
+        }
+    }
+
     arena.boundary_telemetry.generation = arena.progress.generation;
     arena.boundary_telemetry.state_lane = state_lane;
     arena.boundary_telemetry.direction = static_cast<int>(direction);
@@ -15612,14 +15741,17 @@ static void pipeline_spawn_child(RayPipelineState& ps, RayIntent child)
  * native client from turning a cycle into unbounded recursion. */
 static bool wave_arena_follow_link(
     RayPipelineState& ps, WaveArena& arena, RayIntent& lineage,
-    int state_lane, ChildRay& out, int& terminal_arena, int depth)
+    int state_lane, ChildRay& out, int& terminal_arena, int depth,
+    std::array<WaveExitStateRecord, 32>* exit_records,
+    int* exit_record_count)
 {
     if (depth >= static_cast<int>(ps.arenas.size())) return false;
     const auto direction = wave_arena_direction(arena, lineage);
     const int next = direction == wave_t4::Direction::Forward
         ? arena.next_forward : arena.next_backward;
     if (next < 0) {
-        out = wave_arena_extract(arena, lineage, state_lane);
+        out = wave_arena_extract(
+            arena, lineage, state_lane, exit_records, exit_record_count);
         terminal_arena = arena.id;
         return true;
     }
@@ -15648,7 +15780,8 @@ static bool wave_arena_follow_link(
     if (!wave_arena_march(destination)) return false;
     return wave_arena_follow_link(
         ps, destination, lineage, state_lane,
-        out, terminal_arena, depth + 1);
+        out, terminal_arena, depth + 1,
+        exit_records, exit_record_count);
 }
 
 /* Publish one completed arena traversal and return its extracted continuation
@@ -15660,6 +15793,15 @@ static void wave_arena_complete(RayPipelineState& ps,
                                 int state_lane)
 {
     ChildRay cr;
+    std::array<WaveExitStateRecord, 32>* exit_records = nullptr;
+    if (ps.cfg.capture_wave_exit_states) {
+        /* One persistent scratch block per T4 execution thread: no hot heap
+         * allocation and no cost on the default non-capture path. */
+        thread_local std::array<WaveExitStateRecord, 32>
+            exit_record_scratch{};
+        exit_records = &exit_record_scratch;
+    }
+    int exit_record_count = 0;
     RayIntent lineage = wi.ray;
     int terminal_arena = arena.id;
     const bool cached_link = arena.linked_terminal_arena >= 0
@@ -15688,10 +15830,13 @@ static void wave_arena_complete(RayPipelineState& ps,
             return;
         }
         std::lock_guard<std::mutex> terminal_lock(cursor->mu);
-        cr = wave_arena_extract(*cursor, lineage, state_lane);
+        cr = wave_arena_extract(
+            *cursor, lineage, state_lane,
+            exit_records, &exit_record_count);
     } else {
         if (!wave_arena_follow_link(
-                ps, arena, lineage, state_lane, cr, terminal_arena, 0)) {
+                ps, arena, lineage, state_lane, cr, terminal_arena, 0,
+                exit_records, &exit_record_count)) {
             pipeline_finish_ray(ps, wi.ray.color_flag);
             return;
         }
@@ -15700,6 +15845,10 @@ static void wave_arena_complete(RayPipelineState& ps,
             arena.linked_terminal_arena = terminal_arena;
         }
     }
+
+    for (int index = 0; index < exit_record_count; ++index)
+        ps.Q_wave_exit_states.push(
+            std::move((*exit_records)[static_cast<size_t>(index)]));
 
     RayRecord rec;
     rec.kind       = RayRecordKind::FIELD;
@@ -17143,6 +17292,7 @@ void ray_pipeline_destroy(RayPipelineState* ps)
     ps->Q_bdpt_pdfs.set_done();
     ps->Q_bdpt_optical.set_done();
     ps->Q_bdpt_connections.set_done();
+    ps->Q_wave_exit_states.set_done();
     ps->Q_t5_ready.set_done();         /* unblocks the KPN T5 worker so it can exit */
     for (auto& t : ps->workers) if (t.joinable()) t.join();
     if (ps->bdpt_t5_worker.joinable()) ps->bdpt_t5_worker.join();
@@ -17999,6 +18149,15 @@ int ray_pipeline_drain_bdpt_connections(RayPipelineState* ps,
 {
     if (!ps || max_n <= 0) return 0;
     return ps->Q_bdpt_connections.drain(out, max_n);
+}
+
+int ray_pipeline_drain_wave_exit_states(
+    RayPipelineState* ps,
+    std::vector<WaveExitStateRecord>& out,
+    int max_n)
+{
+    if (!ps || max_n <= 0) return 0;
+    return ps->Q_wave_exit_states.drain(out, max_n);
 }
 
 static bool bdpt_find_parametric_stop_target(const RayTracerState& st,

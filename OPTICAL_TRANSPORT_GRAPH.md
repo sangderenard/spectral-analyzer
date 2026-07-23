@@ -236,6 +236,22 @@ it `power-preserving-first-moment-ray`. Systems requiring the complete exit
 field must connect it to another field/operator port rather than use this
 reduction.
 
+The scalar continuation is now accompanied by one fixed-stride
+`WaveExitStateRecord` per active lane. Ray tag plus BDPT subpath/vertex join the
+record to the ordinary continuation. It preserves independent complex S/P
+amplitudes, an explicit exit basis, exact continuous-frequency/PDF/coherence
+identity, and reduction flags without changing the ordinary ray or GPU SSBO
+layout. The native drain API is `drain_wave_exit_states()` and the Python
+structured view is `parse_wave_exit_states()`.
+Capture is opt-in at pipeline creation, so ordinary production wave work does
+not accumulate an unbounded diagnostic queue or pay the extra reduction.
+
+This is an observable boundary record, not yet a downstream mutable registry.
+Later T3 and later T4 encounters still use the scalar ray/source-mode path.
+The next transport step is a cold-allocated contiguous state block plus compact
+handle semantics; a per-ray heap payload or hot unordered lookup is not an
+acceptable substitute.
+
 That complete-field connection now exists for identity-compatible ports. It
 copies active S/P complex planes directly between already-allocated contiguous
 state blocks and marches the destination before any ray extraction. There is
@@ -327,9 +343,10 @@ and illumination-optics modules are the next source-optics layer.
 - The live T4 texture is currently staged from CPU-resident production state.
   It is never generated unless requested, but will become a direct GPU resolve
   when the GLSL FFT executor owns the arena state.
-- Ray/field adapters are declared but not yet implemented as production GPU
-  kernels. The CPU entry/exit adapter currently maps legacy scalar ray
-  amplitude to S polarization; full Jones sidecar mapping remains.
+- Ray/field adapters are not yet implemented as production GPU kernels. Native
+  CPU T4 entry accepts configured Jones source records and native terminal
+  extraction publishes Jones-complete exit records, but downstream T3/T4
+  consumption of those exit records remains.
 - Projector launch currently maps its authored frequency to an exact fixed
   lane. Continuous-frequency source launch needs the planned frequency
   sidecar; it is not represented by an arbitrary nearest-lane approximation.

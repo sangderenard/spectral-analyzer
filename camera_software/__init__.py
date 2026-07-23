@@ -358,6 +358,8 @@ from .projector_back_transport import (
 )
 from .complex_optical_operators import (
     COMPLEX_OPTICAL_OPERATOR_SCHEMA,
+    WAVE_EXIT_STATE_DTYPE,
+    parse_wave_exit_states,
     TransverseBasis,
     JonesOperator,
     DielectricInterfaceResult,
@@ -734,6 +736,8 @@ __all__ = [
     "prepare_projector_back_launch",
     "submit_projector_back",
     "COMPLEX_OPTICAL_OPERATOR_SCHEMA",
+    "WAVE_EXIT_STATE_DTYPE",
+    "parse_wave_exit_states",
     "TransverseBasis",
     "JonesOperator",
     "DielectricInterfaceResult",

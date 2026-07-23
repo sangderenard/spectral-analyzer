@@ -38,6 +38,8 @@ enum LaneFlags : std::uint16_t {
     JonesValid       = 1u << 3,
     OpticalPathValid = 1u << 4,
     JacobianValid    = 1u << 5,
+    FieldReduction   = 1u << 6,
+    WaveExit         = 1u << 7,
 };
 
 /* Scheduling sidecar for one ray/sample.  Amplitude remains in RayIntent so

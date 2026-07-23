@@ -36,6 +36,7 @@
 #include <algorithm>
 #include "bdpt_record.h"
 #include "complex_transport.h"
+#include "wave_exit_state.h"
 
 struct RayTracerState;
 
@@ -1083,6 +1084,11 @@ struct RayPipelineConfig {
      * Settable at runtime via ray_pipeline_set_skip_record_readback(). */
     bool        gpu_skip_record_readback = false;
 
+    /* Diagnostic/scientific capture of fixed-stride Jones state at terminal
+     * T4 reductions. Off by default so ordinary wave work pays neither the
+     * component reduction nor the output-queue memory cost. */
+    bool        capture_wave_exit_states = false;
+
     /* Sparse recursive sensor mipmap. Axis parity dispatches one of two
      * hard-unrolled kernels: even=2×2, odd=3×3. Disabled until explicitly
      * configured; legacy fixed-sweep rendering remains unchanged. */
@@ -1504,6 +1510,14 @@ int ray_pipeline_drain(
     RayPipelineState*        ps,
     std::vector<RayRecord>&  out,
     int                      max_n);
+
+/* Drain fixed-stride Jones wave-exit side records. These are emitted before
+ * the representative continuation re-enters T1 and are joined to that ray by
+ * ray_tag plus (subpath_id, vertex_index). */
+int ray_pipeline_drain_wave_exit_states(
+    RayPipelineState*                 ps,
+    std::vector<WaveExitStateRecord>& out,
+    int                               max_n);
 
 /* How many ray paths are currently live inside the pipeline. */
 int ray_pipeline_in_flight(const RayPipelineState* ps);

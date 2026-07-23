@@ -664,6 +664,7 @@ struct PyRayTracer
     bool        _force_cpu_t5 = false;
     bool        _gpu_all_stages  = false;
     bool        _gpu_skip_record_readback = false;
+    bool        _capture_wave_exit_states = false;
     std::string _shader_dir;
     uint64_t    _gl_display_hglrc = 0;  /* Pygame display HGLRC for WGL object sharing */
     uint64_t    _gl_display_hdc   = 0;  /* Pygame display HDC for pixel-format matching */
@@ -698,6 +699,7 @@ struct PyRayTracer
             cfg.force_cpu_t5                = _force_cpu_t5;
             cfg.gpu_all_stages              = _gpu_all_stages;
             cfg.gpu_skip_record_readback    = _gpu_skip_record_readback;
+            cfg.capture_wave_exit_states    = _capture_wave_exit_states;
             cfg.sensor_mipmap_enabled = _sensor_mipmap_enabled;
             cfg.sensor_mipmap_max_nodes = _sensor_mipmap_max_nodes;
             cfg.sensor_mipmap_max_depth = _sensor_mipmap_max_depth;
@@ -1764,7 +1766,8 @@ struct PyRayTracer
         double               min_amplitude = 1e-6,
         bool                 use_gpu_compute = false,
         bool                 gpu_all_stages  = false,
-        std::string          shader_dir      = "")
+        std::string          shader_dir      = "",
+        bool                 capture_wave_exit_states = false)
     {
         {
             std::lock_guard<std::mutex> lk(_pipeline_mu);
@@ -1772,6 +1775,7 @@ struct PyRayTracer
                 _default_min_amplitude = min_amplitude;
                 _use_gpu_compute = use_gpu_compute;
                 _gpu_all_stages  = gpu_all_stages;
+                _capture_wave_exit_states = capture_wave_exit_states;
                 if (!shader_dir.empty()) _shader_dir = shader_dir;
             }
         }
@@ -3261,6 +3265,28 @@ struct PyRayTracer
         auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{n, stride});
         std::memcpy(arr.mutable_data(), batch.data(),
                     static_cast<size_t>(n) * sizeof(BdptConnectionRecord));
+        return arr;
+    }
+
+    py::array_t<uint8_t> drain_wave_exit_states(int max_n = 100000) {
+        constexpr py::ssize_t stride =
+            static_cast<py::ssize_t>(sizeof(WaveExitStateRecord));
+        auto* pl = _pipeline;
+        if (!pl || max_n <= 0)
+            return py::array_t<uint8_t>(
+                std::vector<py::ssize_t>{0, stride});
+        std::vector<WaveExitStateRecord> batch;
+        ray_pipeline_drain_wave_exit_states(pl, batch, max_n);
+        const py::ssize_t n =
+            static_cast<py::ssize_t>(batch.size());
+        if (n == 0)
+            return py::array_t<uint8_t>(
+                std::vector<py::ssize_t>{0, stride});
+        auto arr = py::array_t<uint8_t>(
+            std::vector<py::ssize_t>{n, stride});
+        std::memcpy(
+            arr.mutable_data(), batch.data(),
+            static_cast<size_t>(n)*sizeof(WaveExitStateRecord));
         return arr;
     }
 
@@ -6832,9 +6858,12 @@ intersect it are not launched.)doc")
              py::arg("use_gpu_compute") = false,
              py::arg("gpu_all_stages") = false,
              py::arg("shader_dir") = "",
+             py::arg("capture_wave_exit_states") = false,
 R"doc(Force creation of the persistent ray pipeline without submitting rays.
 Use this on the display thread when the pipeline needs to share with the
-currently-bound OpenGL display context.)doc")
+currently-bound OpenGL display context. Set capture_wave_exit_states before
+creation to retain 160-byte Jones companion rows at terminal T4 reductions;
+it is off by default so production wave work pays no capture or queue cost.)doc")
         .def("configure_complex_source_modes",
              &PyRayTracer::configure_complex_source_modes,
              py::arg("ray_tags"),
@@ -7128,6 +7157,14 @@ Returns shape (0, 112) when the queue is empty.)doc")
 R"doc(Non-blocking drain from the BDPT connection side-queue.
 Returns uint8 ndarray of shape (n, 80).  One row per attempted MIS connection.
 Returns shape (0, 80) when the queue is empty.)doc")
+        .def("drain_wave_exit_states",
+             &PyRayTracer::drain_wave_exit_states,
+             py::arg("max_n") = 100000,
+R"doc(Drain fixed-stride complex state records emitted when T4 reduces a field
+to representative exit rays. Returns uint8 ndarray shape (n, 160), one row per
+active exiting spectral lane. Records retain ray/subpath/vertex identity,
+frequency/PDF/coherence metadata, complex Jones s/p amplitudes, and an explicit
+right-handed exit basis without widening ordinary ray intents.)doc")
         .def("get_bdpt_overflow",
              &PyRayTracer::get_bdpt_overflow,
 R"doc(Cumulative overflow counts for BDPT side queues.

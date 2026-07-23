@@ -255,8 +255,11 @@ determinant and symplectic residual. Production T4 entry now resolves a stable
 ray tag through a compact binding into the single-allocation, deduplicated
 source/basis/operator state and seeds both s and p for fixed bands and
 continuous cohorts. Legacy rays with no source record remain explicitly
-s-only. T4 still reduces s/p output to a scalar ray; replacing that exit
-adapter is an explicit remaining gate.
+s-only. T4 still routes a scalar representative `RayIntent`, but terminal
+reduction now emits a correlated fixed-stride companion record containing
+independent complex s/p amplitudes and its explicit exit basis. Consuming that
+record through subsequent parametric/material/wave stages, and retaining a
+full field where reduction is invalid, remain explicit gates.
 
 A shared `JonesFieldState` reference adapter now keeps coherent source modes
 separate, drives both s and p components through the production native T4

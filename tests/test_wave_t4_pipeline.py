@@ -81,6 +81,7 @@ def test_empty_space_crossing_routes_through_t4():
     p_field = tracer.wave_arena_field_snapshot(0, 0, 1, 0)
     assert np.count_nonzero(p_field["re"]) == 0
     assert np.count_nonzero(p_field["im"]) == 0
+    assert tracer.drain_wave_exit_states(16).shape == (0, 160)
 
 
 def test_fixed_band_source_mode_seeds_both_components_and_full_coherence():
@@ -91,6 +92,7 @@ def test_fixed_band_source_mode_seeds_both_components_and_full_coherence():
         JonesOperator,
         TransverseBasis,
         install_source_mode_block,
+        parse_wave_exit_states,
     )
 
     tracer = _tracer(np.array([550e-9]))
@@ -114,7 +116,11 @@ def test_fixed_band_source_mode_seeds_both_components_and_full_coherence():
         block,
         mode_indices=np.zeros(2, np.uint32),
     )
-    tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+    tracer.ensure_pipeline(
+        max_children=1,
+        min_amplitude=1e-12,
+        capture_wave_exit_states=True,
+    )
     tracer.submit_rays(
         np.array([[0.0, 0.0, -0.05]]),
         np.array([[0.0, 0.0, 1.0]]),
@@ -134,6 +140,55 @@ def test_fixed_band_source_mode_seeds_both_components_and_full_coherence():
     arena = tracer.wave_arena_stats()[0]
     assert arena["lanes"][0]["coherence_id"] == coherence
     assert arena["field_active"][:2] == [1, 1]
+
+    exits = parse_wave_exit_states(tracer.drain_wave_exit_states(16))
+    assert exits.shape == (1,)
+    exit_state = exits[0]
+    assert int(exit_state["ray_tag"]) == tag
+    assert int(exit_state["arena_id"]) == 0
+    assert int(exit_state["state_lane"]) == -1
+    assert int(exit_state["band_id"]) == 0
+    assert int(exit_state["record_flags"]) & 0x3 == 0x3
+    lane_flags = int(exit_state["lane_flags"]) & 0xFFFF
+    assert lane_flags & (1 << 0)  # active
+    assert lane_flags & (1 << 3)  # Jones valid
+    assert not lane_flags & (1 << 4)  # no fabricated optical path
+    assert lane_flags & (1 << 6)  # field reduction
+    assert lane_flags & (1 << 7)  # wave exit
+    assert int(exit_state["coherence_lo"]) | (
+        int(exit_state["coherence_hi"]) << 32
+    ) == coherence
+    frequency_hz = float(exit_state["frequency_hi"]) + float(
+        exit_state["frequency_lo"]
+    )
+    assert frequency_hz == pytest.approx(299_792_458.0 / 550e-9, rel=2e-7)
+    assert float(exit_state["optical_path_hi"]) == 0.0
+    assert float(exit_state["optical_path_lo"]) == 0.0
+
+    direction = np.asarray(exit_state["ray_direction"], np.float64)
+    basis_s = np.asarray(exit_state["basis_s"][:3], np.float64)
+    basis_p = np.asarray(exit_state["basis_p"][:3], np.float64)
+    np.testing.assert_allclose(np.cross(basis_s, basis_p), direction, atol=2e-6)
+    assert np.dot(basis_s, direction) == pytest.approx(0.0, abs=2e-6)
+    assert np.dot(basis_p, direction) == pytest.approx(0.0, abs=2e-6)
+
+    amplitude_s = complex(
+        float(exit_state["amplitude_s_re"]),
+        float(exit_state["amplitude_s_im"]),
+    )
+    amplitude_p = complex(
+        float(exit_state["amplitude_p_re"]),
+        float(exit_state["amplitude_p_im"]),
+    )
+    assert amplitude_p / amplitude_s == pytest.approx(1j, rel=4e-5, abs=4e-5)
+    retained_power = abs(amplitude_s) ** 2 + abs(amplitude_p) ** 2
+    assert retained_power == pytest.approx(
+        arena["boundary"]["propagated_field_power"], rel=3e-5
+    )
+
+    field_records = tracer.drain_records(16)
+    assert np.asarray(field_records["kind"]).tolist() == [3]
+    assert int(np.asarray(field_records["tag"])[0]) == tag
 
 
 def test_compiled_optical_graph_installs_and_drives_native_t4():
@@ -407,6 +462,7 @@ def test_continuous_cohort_uses_same_jones_source_block():
         ComplexSourceMode,
         TransverseBasis,
         install_source_mode_block,
+        parse_wave_exit_states,
     )
 
     tracer = _tracer(np.array([450e-9, 500e-9, 600e-9, 700e-9]))
@@ -434,7 +490,11 @@ def test_continuous_cohort_uses_same_jones_source_block():
             basis_id=0,
         ))
     install_source_mode_block(tracer, tags, block)
-    tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+    tracer.ensure_pipeline(
+        max_children=1,
+        min_amplitude=1e-12,
+        capture_wave_exit_states=True,
+    )
     tracer.submit_rays(
         np.array([
             [x, 0.0, -0.05] for x in (-0.003, -0.001, 0.001, 0.003)
@@ -457,6 +517,27 @@ def test_continuous_cohort_uses_same_jones_source_block():
         s = np.asarray(s_field["re"]) + 1j*np.asarray(s_field["im"])
         p = np.asarray(p_field["re"]) + 1j*np.asarray(p_field["im"])
         np.testing.assert_allclose(p, s, rtol=4e-5, atol=2e-7)
+
+    exits = parse_wave_exit_states(tracer.drain_wave_exit_states(16))
+    assert exits.shape == (4,)
+    by_tag = {int(row["ray_tag"]): row for row in exits}
+    assert set(by_tag) == set(map(int, tags))
+    exit_frequencies = []
+    for tag, coherence in zip(tags, coherences):
+        row = by_tag[int(tag)]
+        assert int(row["record_flags"]) & (1 << 3)
+        lane_flags = int(row["lane_flags"]) & 0xFFFF
+        assert lane_flags & (1 << 1)  # continuous sample
+        assert lane_flags & (1 << 3)  # Jones valid
+        assert lane_flags & (1 << 7)  # wave exit
+        recovered_coherence = int(row["coherence_lo"]) | (
+            int(row["coherence_hi"]) << 32
+        )
+        assert recovered_coherence == coherence
+        exit_frequencies.append(
+            float(row["frequency_hi"]) + float(row["frequency_lo"])
+        )
+    assert len(set(exit_frequencies)) == 4
 
 
 def test_continuous_cohort_marches_linked_field_chain_only_once():

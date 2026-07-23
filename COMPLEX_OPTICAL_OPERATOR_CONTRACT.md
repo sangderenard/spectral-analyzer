@@ -161,17 +161,34 @@ reference adapter and production ray-pipeline entry now seed and propagate both
 components when a source-mode handle is installed. Fixed bands and continuous
 cohorts use the same entry contract; continuous lanes retain arbitrary
 frequency, PDF, and full 64-bit coherence identity. Unconfigured legacy rays
-remain an explicit s-only scalar specialization. T4 exit still reduces the
-field to one scalar ray amplitude.
+remain an explicit s-only scalar specialization.
+
+T4 exit still emits one power-preserving first-moment scalar continuation into
+the ordinary ray pipeline, but it no longer throws away the vector state
+silently. Every active exit lane also emits one fixed-stride 160-byte
+`WaveExitStateRecord`, joined to that continuation by ray tag plus BDPT
+subpath/vertex identity. The record retains exact frequency/PDF/coherence
+metadata, complex S/P amplitudes, the explicit right-handed exit basis,
+position/direction, and reduction provenance. Capture is explicitly enabled
+when the pipeline is created and lives in a dedicated output queue; the
+production default performs no extra component reduction or queue writes.
+`RayIntent` and all GPU intent SSBO strides remain unchanged.
+
+The record deliberately does **not** claim a valid OPL. Current `RayIntent`
+accumulates geometric path length, so multiplying the complete lineage by the
+terminal arena index would be wrong for mixed media. Geometric length is
+recorded separately and `OpticalPathValid` remains clear until a true
+segment-by-segment OPL accumulator exists.
 
 The next implementation gate is:
 
 1. apply interface Jones operators at physical material boundaries;
 2. compose indexed basis/operator state through exact T2;
-3. extract a Jones complex ray or retain the full field when reduction is
-   scientifically invalid;
-4. propagate and compose the canonical 4x4 map and OPL through exact T2;
-5. qualify CPU/GLSL parity, Fresnel power, reciprocity, and caustic behavior.
+3. consume the exit record on later ray/field boundaries through a
+   pipeline-owned contiguous state block, without a hot hash table;
+4. retain the full field when one-ray reduction is scientifically invalid;
+5. propagate and compose the canonical 4x4 map and OPL through exact T2;
+6. qualify CPU/GLSL parity, Fresnel power, reciprocity, and caustic behavior.
 
 No new per-ray N-lane payload and no shader-hot object construction are
 authorized by this contract.

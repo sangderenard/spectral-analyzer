@@ -64,3 +64,18 @@ Calibration selection remains explicit (`AUTO: OFF`). Fixed prism modes use
 fixed frequencies. Continuous prism modes use the LUT contract at payload
 widths 1, 3, 8, 16, or 32. Every calibration result is a real exposure of its
 real scene through the physical camera path.
+
+## Wave-exit companion records
+
+Terminal T4 reduction publishes one 160-byte record for every active fixed or
+continuous lane. It retains the lane's invariant frequency, sampling PDF,
+64-bit coherence identity, complex S/P amplitudes, and explicit right-handed
+exit basis. Ray tag plus BDPT subpath/vertex identity correlate it with the
+ordinary representative continuation. Continuous lane width remains cohort
+concurrency; the record does not turn continuous samples into fixed bins.
+
+This is an opt-in side queue and does not widen `RayIntent` or consume another
+hot GPU SSBO channel. The default production path performs no record
+construction or queue write. Geometric path length is present, but
+`OpticalPathValid` remains clear because a true mixed-medium optical-path
+accumulator is not yet carried through the complete ray lineage.

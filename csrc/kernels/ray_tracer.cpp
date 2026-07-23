@@ -8373,6 +8373,16 @@ public:
     std::atomic<bool> field_display_clear_requested{false};
     static constexpr float FIELD_DISPLAY_FIXED_SCALE = 1048576.0f;
 
+    GLuint tex_wave_arena_display = 0; /* phase-hue/amplitude RGBA32F view */
+    int wave_arena_display_w = 0, wave_arena_display_h = 0;
+    int wave_arena_display_id = -1;
+    int wave_arena_display_band = -1;
+    int wave_arena_display_direction = 0;
+    uint64_t wave_arena_display_generation = 0;
+    std::vector<float> stg_wave_arena_rgba;
+    mutable std::mutex wave_arena_display_mu;
+    std::atomic<bool> wave_arena_display_enabled{false};
+
     std::array<GLuint, 2> tex_surface_scan = {};
     int surface_scan_res = 0;
     int surface_scan_active_slot = -1;
@@ -11650,6 +11660,152 @@ public:
         return texture != 0u && nx > 0 && ny > 0 && nz > 0;
     }
 
+    bool publish_wave_arena_display(const WaveArena& arena,
+                                    const RayIntent& source) {
+        if (!display_context_shared || arena.nx <= 0 || arena.ny <= 0
+            || arena.n_bands <= 0)
+            return false;
+        const auto direction = source.dir.dot(arena.axis_z) >= 0.0
+            ? wave_t4::Direction::Forward
+            : wave_t4::Direction::Backward;
+        int band = 0;
+        for (int candidate = 0; candidate < arena.n_bands; ++candidate) {
+            if (arena.spectral_lanes[static_cast<size_t>(candidate)].active) {
+                band = candidate;
+                break;
+            }
+        }
+        const size_t fft_plane =
+            static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
+        const float* s_re = arena.field_re(
+            direction, wave_t4::TransverseComponent::S)
+            + static_cast<size_t>(band) * fft_plane;
+        const float* s_im = arena.field_im(
+            direction, wave_t4::TransverseComponent::S)
+            + static_cast<size_t>(band) * fft_plane;
+        const float* p_re = arena.field_re(
+            direction, wave_t4::TransverseComponent::P)
+            + static_cast<size_t>(band) * fft_plane;
+        const float* p_im = arena.field_im(
+            direction, wave_t4::TransverseComponent::P)
+            + static_cast<size_t>(band) * fft_plane;
+
+        const size_t pixels = static_cast<size_t>(arena.nx) * arena.ny;
+        stg_wave_arena_rgba.resize(pixels * 4u);
+        double peak_power = 0.0;
+        for (int y = 0; y < arena.ny; ++y) {
+            for (int x = 0; x < arena.nx; ++x) {
+                const size_t source_i =
+                    static_cast<size_t>(y + arena.pad_y) * arena.fft_nx
+                    + static_cast<size_t>(x + arena.pad_x);
+                const double power =
+                    static_cast<double>(s_re[source_i]) * s_re[source_i]
+                    + static_cast<double>(s_im[source_i]) * s_im[source_i]
+                    + static_cast<double>(p_re[source_i]) * p_re[source_i]
+                    + static_cast<double>(p_im[source_i]) * p_im[source_i];
+                peak_power = std::max(peak_power, power);
+            }
+        }
+        const double inv_peak = peak_power > 0.0 ? 1.0 / peak_power : 0.0;
+        constexpr double tau = 6.283185307179586476925286766559;
+        auto hsv_to_rgb = [](double h, double s, double v,
+                             float& r, float& g, float& b) {
+            const double scaled = h * 6.0;
+            const int sector = static_cast<int>(std::floor(scaled)) % 6;
+            const double fraction = scaled - std::floor(scaled);
+            const double p = v * (1.0 - s);
+            const double q = v * (1.0 - fraction * s);
+            const double t = v * (1.0 - (1.0 - fraction) * s);
+            double rr = v, gg = t, bb = p;
+            switch (sector) {
+                case 0: rr=v; gg=t; bb=p; break;
+                case 1: rr=q; gg=v; bb=p; break;
+                case 2: rr=p; gg=v; bb=t; break;
+                case 3: rr=p; gg=q; bb=v; break;
+                case 4: rr=t; gg=p; bb=v; break;
+                default: rr=v; gg=p; bb=q; break;
+            }
+            r = static_cast<float>(rr);
+            g = static_cast<float>(gg);
+            b = static_cast<float>(bb);
+        };
+        for (int y = 0; y < arena.ny; ++y) {
+            for (int x = 0; x < arena.nx; ++x) {
+                const size_t source_i =
+                    static_cast<size_t>(y + arena.pad_y) * arena.fft_nx
+                    + static_cast<size_t>(x + arena.pad_x);
+                const size_t destination =
+                    (static_cast<size_t>(y) * arena.nx + x) * 4u;
+                const double s_power =
+                    static_cast<double>(s_re[source_i]) * s_re[source_i]
+                    + static_cast<double>(s_im[source_i]) * s_im[source_i];
+                const double p_power =
+                    static_cast<double>(p_re[source_i]) * p_re[source_i]
+                    + static_cast<double>(p_im[source_i]) * p_im[source_i];
+                const double power = s_power + p_power;
+                const bool p_dominant = p_power > s_power;
+                const double phase = p_dominant
+                    ? std::atan2(p_im[source_i], p_re[source_i])
+                    : std::atan2(s_im[source_i], s_re[source_i]);
+                const double hue = (phase + 3.14159265358979323846) / tau;
+                const double value = std::pow(power * inv_peak, 0.25);
+                float r = 0.0f, g = 0.0f, b = 0.0f;
+                hsv_to_rgb(hue, 0.88, value, r, g, b);
+                stg_wave_arena_rgba[destination + 0u] = r;
+                stg_wave_arena_rgba[destination + 1u] = g;
+                stg_wave_arena_rgba[destination + 2u] = b;
+                stg_wave_arena_rgba[destination + 3u] =
+                    power > peak_power * 1.0e-10 ? 1.0f : 0.0f;
+            }
+        }
+
+        if (!tex_wave_arena_display)
+            glGenTextures(1, &tex_wave_arena_display);
+        glBindTexture(GL_TEXTURE_2D, tex_wave_arena_display);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        if (wave_arena_display_w != arena.nx
+            || wave_arena_display_h != arena.ny) {
+            glTexImage2D(
+                GL_TEXTURE_2D, 0, GL_RGBA32F, arena.nx, arena.ny, 0,
+                GL_RGBA, GL_FLOAT, stg_wave_arena_rgba.data());
+        } else {
+            glTexSubImage2D(
+                GL_TEXTURE_2D, 0, 0, 0, arena.nx, arena.ny,
+                GL_RGBA, GL_FLOAT, stg_wave_arena_rgba.data());
+        }
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glFlush();
+        if (glGetError() != GL_NO_ERROR) return false;
+        {
+            std::lock_guard<std::mutex> lk(wave_arena_display_mu);
+            wave_arena_display_w = arena.nx;
+            wave_arena_display_h = arena.ny;
+            wave_arena_display_id = arena.id;
+            wave_arena_display_band = band;
+            wave_arena_display_direction =
+                static_cast<int>(direction);
+            wave_arena_display_generation = arena.progress.generation;
+        }
+        return true;
+    }
+
+    bool published_wave_arena_display_info(
+        uint64_t& texture, int& width, int& height, int& arena_id,
+        int& band, int& direction, uint64_t& generation) const {
+        std::lock_guard<std::mutex> lk(wave_arena_display_mu);
+        texture = static_cast<uint64_t>(tex_wave_arena_display);
+        width = wave_arena_display_w;
+        height = wave_arena_display_h;
+        arena_id = wave_arena_display_id;
+        band = wave_arena_display_band;
+        direction = wave_arena_display_direction;
+        generation = wave_arena_display_generation;
+        return texture != 0u && width > 0 && height > 0 && generation > 0;
+    }
+
     int begin_surface_scan(RayPipelineState& ps) {
         if (!display_context_shared || ps.sensor_res <= 0
             || !ensure_surface_scan_program())
@@ -13797,6 +13953,9 @@ public:
             wave_arena_seed(arena, source);
         auto t4_start = Clock::now();
         const bool marched = wave_arena_march(arena);
+        if (marched
+            && wave_arena_display_enabled.load(std::memory_order_acquire))
+            publish_wave_arena_display(arena, source);
         ps.stats[3].record_gpu(1, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
             Clock::now() - t4_start).count(), ps.Q_wave.size());
         return marched;
@@ -18401,6 +18560,31 @@ void ray_pipeline_request_field_display_clear(RayPipelineState* ps)
     ps->gpu_dispatch->field_display_clear_requested.store(true, std::memory_order_release);
 }
 
+void ray_pipeline_set_wave_arena_display_enabled(RayPipelineState* ps,
+                                                 bool enabled)
+{
+    if (!ps || !ps->gpu_dispatch) return;
+    ps->gpu_dispatch->wave_arena_display_enabled.store(
+        enabled, std::memory_order_release);
+}
+
+int ray_pipeline_get_wave_arena_display_info(const RayPipelineState* ps,
+                                             uint64_t* texture_id,
+                                             int* width,
+                                             int* height,
+                                             int* arena_id,
+                                             int* band,
+                                             int* direction,
+                                             uint64_t* generation)
+{
+    if (!ps || !ps->gpu_dispatch || !texture_id || !width || !height
+        || !arena_id || !band || !direction || !generation)
+        return 0;
+    return ps->gpu_dispatch->published_wave_arena_display_info(
+        *texture_id, *width, *height, *arena_id,
+        *band, *direction, *generation) ? 1 : 0;
+}
+
 uint64_t ray_pipeline_get_surface_scan_tex_id(RayPipelineState* ps)
 {
     if (!ps || !ps->gpu_dispatch) return 0;
@@ -18464,6 +18648,59 @@ int ray_pipeline_get_wave_arena_snapshot(const RayPipelineState* ps,
     for (int field = 0; field < wave_t4::kFieldCount; ++field)
         out->field_active[field] =
             arena.field_active[static_cast<size_t>(field)];
+    return SK_OK;
+}
+
+int ray_pipeline_copy_wave_arena_field(const RayPipelineState* ps,
+                                       int arena_id,
+                                       int direction,
+                                       int component,
+                                       int band,
+                                       float* out_re,
+                                       float* out_im,
+                                       int capacity,
+                                       int* out_nx,
+                                       int* out_ny,
+                                       uint64_t* out_generation)
+{
+    if (!ps || !out_nx || !out_ny || !out_generation)
+        return SK_ERR_NULL_STATE;
+    if (arena_id < 0 || arena_id >= static_cast<int>(ps->arenas.size())
+        || direction < 0 || direction >= wave_t4::kDirectionCount
+        || component < 0
+        || component >= wave_t4::kTransverseComponentCount)
+        return SK_ERR_DIM_MISMATCH;
+    const WaveArena& arena = ps->arenas[static_cast<size_t>(arena_id)];
+    std::lock_guard<std::mutex> lk(arena.mu);
+    if (band < 0 || band >= arena.n_bands)
+        return SK_ERR_DIM_MISMATCH;
+    *out_nx = arena.nx;
+    *out_ny = arena.ny;
+    *out_generation = arena.progress.generation;
+    if (!out_re && !out_im) return SK_OK;
+    if (!out_re || !out_im || capacity < arena.nx * arena.ny)
+        return SK_ERR_DIM_MISMATCH;
+
+    const auto field_direction =
+        static_cast<wave_t4::Direction>(direction);
+    const auto field_component =
+        static_cast<wave_t4::TransverseComponent>(component);
+    const size_t fft_plane =
+        static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
+    const float* source_re =
+        arena.field_re(field_direction, field_component)
+        + static_cast<size_t>(band) * fft_plane;
+    const float* source_im =
+        arena.field_im(field_direction, field_component)
+        + static_cast<size_t>(band) * fft_plane;
+    for (int y = 0; y < arena.ny; ++y) {
+        const size_t source =
+            static_cast<size_t>(y + arena.pad_y) * arena.fft_nx
+            + static_cast<size_t>(arena.pad_x);
+        const size_t destination = static_cast<size_t>(y) * arena.nx;
+        std::copy_n(source_re + source, arena.nx, out_re + destination);
+        std::copy_n(source_im + source, arena.nx, out_im + destination);
+    }
     return SK_OK;
 }
 

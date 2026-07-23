@@ -69,6 +69,18 @@ def test_empty_space_crossing_routes_through_t4():
     records = tracer.drain_records(16)
     assert np.asarray(records["kind"]).tolist() == [3]
     assert tracer.wave_arena_stats()[0]["generation"] == 1
+    field = tracer.wave_arena_field_snapshot(0, 0, 0, 0)
+    assert field["generation"] == 1
+    assert np.asarray(field["re"]).shape == (
+        tracer.wave_arena_stats()[0]["ny"],
+        tracer.wave_arena_stats()[0]["nx"],
+    )
+    assert np.max(np.abs(
+        np.asarray(field["re"]) + 1j * np.asarray(field["im"])
+    )) > 0.0
+    p_field = tracer.wave_arena_field_snapshot(0, 0, 1, 0)
+    assert np.count_nonzero(p_field["re"]) == 0
+    assert np.count_nonzero(p_field["im"]) == 0
 
 
 def test_compiled_optical_graph_installs_and_drives_native_t4():

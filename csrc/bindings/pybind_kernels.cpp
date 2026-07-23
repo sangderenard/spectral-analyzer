@@ -3388,6 +3388,43 @@ struct PyRayTracer
         return result;
     }
 
+    py::dict wave_arena_field_snapshot(int arena_id,
+                                       int direction,
+                                       int component,
+                                       int band)
+    {
+        std::lock_guard<std::mutex> lk(_pipeline_mu);
+        if (!_pipeline)
+            throw std::runtime_error("wave arena snapshot requires a live pipeline");
+        int nx = 0, ny = 0;
+        uint64_t generation = 0;
+        int rc = ray_pipeline_copy_wave_arena_field(
+            _pipeline, arena_id, direction, component, band,
+            nullptr, nullptr, 0, &nx, &ny, &generation);
+        if (rc != SK_OK)
+            throw std::runtime_error(
+                "wave arena snapshot query failed: rc=" + std::to_string(rc));
+        py::array_t<float> re({ny, nx});
+        py::array_t<float> im({ny, nx});
+        rc = ray_pipeline_copy_wave_arena_field(
+            _pipeline, arena_id, direction, component, band,
+            static_cast<float*>(re.mutable_data()),
+            static_cast<float*>(im.mutable_data()),
+            nx * ny, &nx, &ny, &generation);
+        if (rc != SK_OK)
+            throw std::runtime_error(
+                "wave arena snapshot copy failed: rc=" + std::to_string(rc));
+        py::dict out;
+        out["arena_id"] = arena_id;
+        out["direction"] = direction;
+        out["component"] = component;
+        out["band"] = band;
+        out["generation"] = generation;
+        out["re"] = std::move(re);
+        out["im"] = std::move(im);
+        return out;
+    }
+
     void report_display_frame_time(double frame_ms, double target_ms = 16.667)
     {
         if (_pipeline)
@@ -6398,6 +6435,15 @@ batch_size, queue_depth) plus output_queue_depth and in_flight.)doc")
 R"doc(Return stateful T4 arena telemetry, including exact band specialization,
 fixed/continuous spectral mode, per-lane frequency/PDF/coherence metadata,
 progress generations, and numerical-border power accounting.)doc")
+        .def("wave_arena_field_snapshot",
+             &PyRayTracer::wave_arena_field_snapshot,
+             py::arg("arena_id") = 0,
+             py::arg("direction") = 0,
+             py::arg("component") = 0,
+             py::arg("band") = 0,
+R"doc(Copy one bounded physical T4 complex plane for scientific inspection.
+direction is 0=forward or 1=backward; component is 0=S or 1=P. This method
+copies only the selected unpadded plane and is not used by the display hot path.)doc")
         .def("report_display_frame_time", &PyRayTracer::report_display_frame_time,
              py::arg("frame_ms"),
              py::arg("target_ms") = 16.667,
@@ -7682,6 +7728,42 @@ GL_TEXTURE_3D (RGBA32F). Returns 0 if GPU field display is unavailable.)doc")
                  return out;
              },
 R"doc(Describe the shared live field/complex accumulation volume without readback.)doc")
+        .def("get_wave_arena_texture_info",
+             [](PyRayTracer& self) -> py::dict {
+                 std::lock_guard<std::mutex> lk(self._pipeline_mu);
+                 py::dict out;
+                 uint64_t texture = 0, generation = 0;
+                 int width = 0, height = 0, arena_id = -1;
+                 int band = -1, direction = 0;
+                 if (ray_pipeline_get_wave_arena_display_info(
+                         self._pipeline, &texture, &width, &height,
+                         &arena_id, &band, &direction, &generation)) {
+                     out["texture_id"] = texture;
+                     out["width"] = width;
+                     out["height"] = height;
+                     out["depth"] = 1;
+                     out["arena_id"] = arena_id;
+                     out["band"] = band;
+                     out["direction"] = direction;
+                     out["generation"] = generation;
+                     out["texture_target"] = 0x0DE1;
+                     out["internal_format"] = 0x8814;
+                 }
+                 return out;
+             },
+R"doc(Describe the latest shared T4 phase-hue/amplitude display texture.
+This texture is resolved from the persistent wave arena and is distinct from
+the ray-hit complex accumulation volume.)doc")
+        .def("set_wave_arena_display_enabled",
+             [](PyRayTracer& self, bool enabled) {
+                 std::lock_guard<std::mutex> lk(self._pipeline_mu);
+                 ray_pipeline_set_wave_arena_display_enabled(
+                     self._pipeline, enabled);
+             },
+             py::arg("enabled"),
+R"doc(Opt in to the shared T4 phase/amplitude presentation resolve.
+The resolve is disabled by default, so unobserved wave transport performs no
+display staging or texture upload.)doc")
         .def("request_field_display_clear",
              [](PyRayTracer& self) {
                  std::lock_guard<std::mutex> lk(self._pipeline_mu);

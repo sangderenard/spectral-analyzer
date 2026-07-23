@@ -169,6 +169,28 @@ def test_camera_designer_exposes_pluck_render_contract():
     assert check.returncode == 0, check.stdout + check.stderr
 
 
+def test_camera_designer_accepts_authored_transport_without_owning_a_solver():
+    check = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import camera_designer_station as s; "
+                "o=s.CameraDesignerStation.__new__(s.CameraDesignerStation); "
+                "calls=[]; o._request_optical_preview=lambda:calls.append(1); "
+                "o.configure_transport('mixed', ({'transport':'wave','key':'w'},)); "
+                "assert o._transport_mode=='mixed'; "
+                "assert o._transport_contexts[0]['key']=='w'; "
+                "assert calls==[1]"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode == 0, check.stdout + check.stderr
+
+
 def test_sensor_drag_invalidates_the_optical_backend():
     check = subprocess.run(
         [

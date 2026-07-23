@@ -1100,6 +1100,12 @@ int ray_pipeline_get_surface_scan_info(RayPipelineState* ps,
 /* Ask the GPU dispatch thread to clear the field-display accumulator. */
 void ray_pipeline_request_field_display_clear(RayPipelineState* ps);
 
+/* Enable the optional presentation resolve of persistent T4 state.  Disabled
+ * by default so an unobserved wave arena pays no CPU staging or texture-upload
+ * cost in the transport hot path. */
+void ray_pipeline_set_wave_arena_display_enabled(RayPipelineState* ps,
+                                                 bool enabled);
+
 struct WaveArenaSnapshot {
     int arena_id;
     int bands;
@@ -1133,6 +1139,32 @@ int ray_pipeline_wave_arena_count(const RayPipelineState* ps);
 int ray_pipeline_get_wave_arena_snapshot(const RayPipelineState* ps,
                                          int arena_id,
                                          WaveArenaSnapshot* out);
+
+/* Copy one physical (unpadded) complex T4 plane for bounded diagnostics,
+ * calibration, and scientific capture. direction: 0=forward, 1=backward;
+ * component: 0=S, 1=P.  Pass null output buffers to query dimensions. */
+int ray_pipeline_copy_wave_arena_field(const RayPipelineState* ps,
+                                       int arena_id,
+                                       int direction,
+                                       int component,
+                                       int band,
+                                       float* out_re,
+                                       float* out_im,
+                                       int capacity,
+                                       int* out_nx,
+                                       int* out_ny,
+                                       uint64_t* out_generation);
+
+/* Latest display-resolved T4 arena texture. This is distinct from the
+ * ray-hit complex accumulation volume above. */
+int ray_pipeline_get_wave_arena_display_info(const RayPipelineState* ps,
+                                             uint64_t* texture_id,
+                                             int* width,
+                                             int* height,
+                                             int* arena_id,
+                                             int* band,
+                                             int* direction,
+                                             uint64_t* generation);
 
 /* Upload per-band RGB weights for the GPU UV blit shader.
  * weights : float array of length n_bands*3 (interleaved r,g,b per band).

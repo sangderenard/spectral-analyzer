@@ -194,7 +194,8 @@ def test_installer_places_real_angular_arena_without_registering_surrogate_lens(
     assert receipt.borrowed_payloads[0] is context["payload"]
     assert receipt.contract()["transition_telemetry"][
         "field_texture_source"
-    ] == "not-yet-published-from-t4-state"
+    ] == "persistent-t4-state-display-resolve"
+    assert receipt.contract()["transition_telemetry"]["field_texture_opt_in"] is True
 
 
 def test_installer_refuses_unsupported_split_step_substitution():

@@ -199,6 +199,21 @@ class OpticalEngineBackend:
             display_hglrc=self.share_group.context_handle,
             display_hdc=self.share_group.device_context_handle,
         )
+        requested_products = {
+            str(value).strip().lower()
+            for value in payload.get("requested_products", ())
+        }
+        enable_wave_display = "wave_arena" in requested_products
+        set_wave_display = getattr(
+            tracer, "set_wave_arena_display_enabled", None
+        )
+        if enable_wave_display and not callable(set_wave_display):
+            preview.close()
+            raise RuntimeError(
+                "loaded _spectral_kernels needs rebuilding for T4 display"
+            )
+        if callable(set_wave_display):
+            set_wave_display(enable_wave_display)
         job = OpticalEngineJob(
             request_revision=revision,
             backend_mode=mode,

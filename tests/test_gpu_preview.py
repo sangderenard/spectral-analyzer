@@ -78,6 +78,11 @@ def test_native_pipeline_bridge_publishes_surface_and_field_generations():
             return {"texture_id": 10, "width": 16, "height": 8,
                     "depth": 12, "generation": 7, "texture_target": 0x806F}
 
+        def get_wave_arena_texture_info(self):
+            return {"texture_id": 13, "width": 64, "height": 64,
+                    "depth": 1, "generation": 5, "arena_id": 2,
+                    "band": 1, "direction": 0}
+
         def get_camera_geometry_texture_info(self):
             return {"texture_id": 11, "width": 320, "height": 180,
                     "depth": 1, "generation": 2}
@@ -90,6 +95,7 @@ def test_native_pipeline_bridge_publishes_surface_and_field_generations():
     products = RayPipelinePreviewBridge(registry, Tracer()).poll()
     assert [item.product_id for item in products] == [
         "camera.surface-scan", "transport.complex-accumulation",
+        "wave.arena-state",
         "camera.geometry", "camera.light-field",
     ]
     field = registry.get("transport.complex-accumulation")
@@ -97,5 +103,9 @@ def test_native_pipeline_bridge_publishes_surface_and_field_generations():
     assert field.tab_label == "COMPLEX TRANSPORT"
     assert field.metadata["representation"] == "ray-carried-complex-amplitude"
     assert field.metadata["wave_solver"] is False
+    wave = registry.get("wave.arena-state")
+    assert wave.tab_label == "WAVE ARENA"
+    assert wave.metadata["wave_solver"] is True
+    assert wave.metadata["arena_id"] == 2
     assert registry.get("camera.geometry").kind is PreviewProductKind.CAMERA_GEOMETRY
     assert registry.get("camera.light-field").kind is PreviewProductKind.LIGHT_FIELD

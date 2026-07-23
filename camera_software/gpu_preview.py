@@ -260,6 +260,9 @@ class RayPipelinePreviewBridge:
         self.field = PreviewProductPublisher(
             registry, "optical-complex-transport", group_id="camera-pipeline"
         )
+        self.wave = PreviewProductPublisher(
+            registry, "wave-arena", group_id="camera-pipeline"
+        )
 
     def poll(self) -> tuple[PreviewTextureProduct, ...]:
         """Publish newly completed native generations without pixel readback."""
@@ -284,6 +287,26 @@ class RayPipelinePreviewBridge:
                     "slice": 0.5,
                     "representation": "ray-carried-complex-amplitude",
                     "wave_solver": False,
+                },
+            )
+            if item is not None:
+                published.append(item)
+        wave_info = getattr(self.tracer, "get_wave_arena_texture_info", None)
+        if callable(wave_info):
+            info = wave_info()
+            item = self.wave.publish_texture_info(
+                "wave.arena-state", "WAVE ARENA", info,
+                kind=PreviewProductKind.COMPLEX_FIELD,
+                metadata={
+                    "stage": "t4-angular-spectrum",
+                    "view": "physical-exit-plane",
+                    "encoding": "phase-hue-amplitude-value",
+                    "representation": "transverse-complex-field",
+                    "wave_solver": True,
+                    "arena_id": int(info.get("arena_id", -1)) if info else -1,
+                    "band": int(info.get("band", -1)) if info else -1,
+                    "direction": int(info.get("direction", 0)) if info else 0,
+                    "capture": "presentation-rgba",
                 },
             )
             if item is not None:

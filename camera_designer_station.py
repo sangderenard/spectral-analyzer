@@ -33,7 +33,7 @@ import math
 import os
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pygame
@@ -925,12 +925,13 @@ class _ElementPropsPanel:
     MODE_H = 28
 
     _BR_VIEWS    = (
-        'surface_scan', 'complex_transport', 'gpu_field',
+        'surface_scan', 'wave_arena', 'complex_transport', 'gpu_field',
         'sensor', 'plate', 'manifold_bdpt',
     )
     _BR_LABELS   = {'gpu_field': 'GPU field', 'sensor': 'sensor',
                     'plate': 'plate', 'manifold_bdpt': 'manifold BDPT',
                     'surface_scan': 'pixel-ray preview',
+                    'wave_arena': 'wave arena',
                     'complex_transport': 'complex transport'}
     _PLACE_MODES = ('mesh',)
     _PLACE_LABELS = {'mesh': 'mesh'}
@@ -1397,6 +1398,8 @@ class CameraDesignerStation:
         win_h: int = 720,
         preview_registry: Optional[Any] = None,
         engine_graph: Optional[Any] = None,
+        transport_mode: str = "ray",
+        transport_contexts: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> None:
         if not _HAS_CAMERA_DESIGNER:
             raise ImportError("camera_designer package not found.")
@@ -1415,6 +1418,12 @@ class CameraDesignerStation:
         self.preset: CameraPreset = preset
         self.win_w  = win_w
         self.win_h  = win_h
+        self._transport_mode = str(transport_mode).strip().lower()
+        if self._transport_mode not in {"ray", "wave", "mixed"}:
+            raise ValueError("transport_mode must be ray, wave, or mixed")
+        self._transport_contexts = tuple(
+            dict(value) for value in (transport_contexts or ())
+        )
 
         # ── Scene state (init first so panel can hold reference) ──────────────
         self._scene_lights:  List[dict]  = []
@@ -1909,6 +1918,12 @@ class CameraDesignerStation:
 
             pose = self._surface_scan_pose().validated()
             self._preview_request_revision += 1
+            requested_products = [
+                "surface_scan", "camera_geometry", "light_field",
+                "transport_diagnostics",
+            ]
+            if self._right_panel.bottom_right_view == "wave_arena":
+                requested_products.append("wave_arena")
             payload = {
                 "bench_id": "camera-designer",
                 "scene_manifest": camera_bell_jar_scene_manifest(
@@ -1916,7 +1931,12 @@ class CameraDesignerStation:
                 ),
                 "scene_object": dict(self._scene_object or {}),
                 "lights": [dict(light) for light in self._scene_lights],
-                "transport_mode": OpticalTransportMode.RAY.value,
+                "transport_mode": OpticalTransportMode(
+                    self._transport_mode
+                ).value,
+                "contexts": [
+                    dict(context) for context in self._transport_contexts
+                ],
                 "backend_mode": "fast_preview",
                 "execution_policy": "interactive_preview",
                 "sensor_pose": {
@@ -1927,10 +1947,7 @@ class CameraDesignerStation:
                     "resolution": int(pose.resolution),
                 },
                 "revision": self._preview_request_revision,
-                "requested_products": [
-                    "surface_scan", "camera_geometry", "light_field",
-                    "transport_diagnostics",
-                ],
+                "requested_products": requested_products,
             }
             request = EngineRequest.create(
                 "optical",
@@ -1957,6 +1974,26 @@ class CameraDesignerStation:
 
     def _build_surface_scan(self) -> None:
         """Request the backend-owned fast transport mode."""
+        self._request_optical_preview()
+
+    def configure_transport(
+        self,
+        mode: str,
+        contexts: Sequence[Mapping[str, Any]] = (),
+    ) -> None:
+        """Adopt graph-authored transport without constructing station physics."""
+
+        resolved = str(mode).strip().lower()
+        if resolved not in {"ray", "wave", "mixed"}:
+            raise ValueError("transport mode must be ray, wave, or mixed")
+        values = tuple(dict(value) for value in contexts)
+        if resolved == "ray" and any(
+            str(value.get("transport", "ray")).strip().lower() == "wave"
+            for value in values
+        ):
+            raise ValueError("ray transport cannot install wave contexts")
+        self._transport_mode = resolved
+        self._transport_contexts = values
         self._request_optical_preview()
 
     def _poll_surface_scan(self) -> dict:
@@ -2207,6 +2244,7 @@ class CameraDesignerStation:
             _br_title = {'gpu_field': 'Sensor plane (GPU)',
                          'sensor':    'Sensor accumulation',
                          'plate':     'Plate accumulation',
+                         'wave_arena': 'Wave arena phase / amplitude',
                          'complex_transport': 'Complex ray transport',
                          'surface_scan': 'Pixel-ray camera preview'}.get(_br_view, _br_view)
             if _br_view == 'surface_scan':
@@ -2237,7 +2275,7 @@ class CameraDesignerStation:
                             half_vp_w, half_vp_h,
                             scan_tex, win_w, win_h,
                         )
-            elif _br_view == 'complex_transport':
+            elif _br_view in {'wave_arena', 'complex_transport'}:
                 self._draw_cross_section(
                     vp_x + half_vp_w, 0,
                     half_vp_w, half_vp_h,
@@ -2249,7 +2287,8 @@ class CameraDesignerStation:
                 product = (
                     None if self._preview_registry is None
                     else self._preview_registry.get(
-                        "transport.complex-accumulation"
+                        "wave.arena-state" if _br_view == "wave_arena"
+                        else "transport.complex-accumulation"
                     )
                 )
                 if self._preview_compositor is not None and product is not None:
@@ -2719,6 +2758,8 @@ class CameraDesignerStation:
             if rp_action and (rp_action.startswith('ctx_')
                               or rp_action == 'sim_max_bounces'):
                 self._build_gpu_dispatch()
+            elif rp_action == "bottom_right_view":
+                self._request_optical_preview()
             return True
 
         # Right-click in viewport → add point light at clicked position

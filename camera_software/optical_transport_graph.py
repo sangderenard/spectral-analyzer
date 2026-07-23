@@ -221,7 +221,8 @@ class InstalledOpticalTransportGraph:
             "transition_telemetry": {
                 "source": "native-wave-arena-stats",
                 "available_after_pipeline_start": True,
-                "field_texture_source": "not-yet-published-from-t4-state",
+                "field_texture_source": "persistent-t4-state-display-resolve",
+                "field_texture_opt_in": True,
             },
         }
 

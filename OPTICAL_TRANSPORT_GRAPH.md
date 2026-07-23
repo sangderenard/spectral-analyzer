@@ -197,10 +197,17 @@ radix-2; GPU-routed work uses that same kernel on the GL owner thread until the
 staged GLSL FFT plan is attached. Unsupported split-step and Maxwell
 declarations fail explicitly.
 
-The shared `transport.complex-accumulation` 3D texture is currently resolved
-from ray-hit accumulation. It is an honest complex-ray/path layer, but it is
-not a readout of the persistent T4 state block. A distinct T4 state texture is
-required before a UI or capture may label an image as a wave-arena solution.
+The shared `transport.complex-accumulation` 3D texture is resolved from ray-hit
+accumulation. It is an honest complex-ray/path layer, but it is not a readout
+of the persistent T4 state block.
+
+The separate `wave.arena-state` 2D texture is now resolved from one selected
+band and direction of that persistent block. Hue encodes phase and value
+encodes fourth-root field power; alpha is zero only where field power is zero.
+It is a presentation product, while `wave_arena_field_snapshot()` is the
+bounded raw complex-field calibration/capture API. The display resolve is
+opt-in through the optical request's `wave_arena` product so an unobserved
+arena does not pay CPU staging or texture-upload cost.
 
 ## Adoption gates
 
@@ -222,6 +229,8 @@ required before a UI or capture may label an image as a wave-arena solution.
 5. **T4 transition runner**
    - use graph port metadata to seed/extract persistent arenas;
    - replace readback-steered arena routing with GPU-resident cohort assembly.
+   - bounded raw field snapshots and an opt-in shared display texture are
+     complete; direct GPU FFT state-to-display resolution remains.
 6. **Scientific equivalence**
    - compare graph-compiled camera transport against the current exact camera;
    - pass reciprocity, energy, phase, polarization, prism, aperture, and lens
@@ -238,6 +247,9 @@ required before a UI or capture may label an image as a wave-arena solution.
   multi-operation graph schedule.
 - T4 descriptors construct the vector angular-spectrum arena, but the native
   GPU FFT executor is not implemented; the production CPU kernel is used.
+- The live T4 texture is currently staged from CPU-resident production state.
+  It is never generated unless requested, but will become a direct GPU resolve
+  when the GLSL FFT executor owns the arena state.
 - Ray/field adapters are declared but not yet implemented as production GPU
   kernels. The CPU entry/exit adapter currently maps legacy scalar ray
   amplitude to S polarization; full Jones sidecar mapping remains.

@@ -7,7 +7,7 @@
 #ifndef COMPLEX_TRANSPORT_GLSL_INC
 #define COMPLEX_TRANSPORT_GLSL_INC
 
-#define COMPLEX_SCHEMA_VERSION       1u
+#define COMPLEX_SCHEMA_VERSION       2u
 #define COMPLEX_LANE_WORDS          16u
 #define COMPLEX_LANE_BYTES          64u
 
@@ -25,8 +25,9 @@
 #define COMPLEX_COHERENCE_HI        11u
 #define COMPLEX_SAMPLE_ID           12u
 #define COMPLEX_LANE_FLAGS          13u
-#define COMPLEX_RESERVED_0          14u
-#define COMPLEX_RESERVED_1          15u
+#define COMPLEX_BASIS_ID            14u
+#define COMPLEX_OPERATOR_ID         15u
+#define COMPLEX_INVALID_OPERATOR_ID 0xffffffffu
 
 #define COMPLEX_FLAG_ACTIVE          (1u << 0u)
 #define COMPLEX_FLAG_CONTINUOUS      (1u << 1u)

@@ -23,9 +23,12 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "complex_optical_operators.h"
+
 namespace complex_transport {
 
-constexpr std::uint32_t kSchemaVersion = 1u;
+constexpr std::uint32_t kSchemaVersion = 2u;
+constexpr std::uint32_t kInvalidOperatorIndex = 0xffffffffu;
 constexpr std::array<int, 6> kLaneCounts = {1, 3, 4, 8, 16, 32};
 
 enum LaneFlags : std::uint16_t {
@@ -80,8 +83,8 @@ struct alignas(16) PackedComplexLaneGpu {
 
     std::uint32_t sample_id;
     std::uint32_t lane_flags; /* low 16 flags, high 16 source_lane */
-    std::uint32_t reserved0;
-    std::uint32_t reserved1;
+    std::uint32_t basis_id;    /* persistent TransverseBasis table index */
+    std::uint32_t operator_id; /* persistent Jones+4x4 operator table index */
 };
 
 template <int B>
@@ -103,7 +106,10 @@ inline void split_double(double value, float& hi, float& lo) noexcept
     lo = static_cast<float>(value - static_cast<double>(hi));
 }
 
-inline PackedComplexLaneGpu pack_gpu(const ComplexLane& lane) noexcept
+inline PackedComplexLaneGpu pack_gpu(
+    const ComplexLane& lane,
+    std::uint32_t basis_id = kInvalidOperatorIndex,
+    std::uint32_t operator_id = kInvalidOperatorIndex) noexcept
 {
     PackedComplexLaneGpu out{};
     split_double(lane.meta.frequency_hz, out.frequency_hi, out.frequency_lo);
@@ -119,6 +125,8 @@ inline PackedComplexLaneGpu pack_gpu(const ComplexLane& lane) noexcept
     out.sample_id          = lane.meta.sample_id;
     out.lane_flags         = static_cast<std::uint32_t>(lane.meta.flags)
                            | (static_cast<std::uint32_t>(lane.meta.source_lane) << 16u);
+    out.basis_id           = basis_id;
+    out.operator_id        = operator_id;
     return out;
 }
 

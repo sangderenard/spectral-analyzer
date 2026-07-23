@@ -105,6 +105,56 @@ static py::tuple estimate_lens_camera_jacobians_py(
     return py::make_tuple(ap_jac, phase_jac);
 }
 
+static py::tuple estimate_lens_phase_space_jacobians_py(
+    py::array_t<float, py::array::c_style | py::array::forcecast> payload,
+    py::array_t<double, py::array::c_style | py::array::forcecast> origins,
+    py::array_t<double, py::array::c_style | py::array::forcecast> directions,
+    int spectral_lane,
+    double n_input,
+    double n_output,
+    double q_step_m,
+    double p_step,
+    int n_threads)
+{
+    auto p = payload.request();
+    auto o = origins.request();
+    auto d = directions.request();
+    if (p.ndim != 1)
+        throw std::runtime_error("payload must be 1-D float32");
+    if (o.ndim != 2 || d.ndim != 2 || o.shape[1] != 3 || d.shape[1] != 3)
+        throw std::runtime_error("origins and directions must have shape (N, 3)");
+    if (o.shape[0] != d.shape[0])
+        throw std::runtime_error("origins and directions must have the same N");
+    const int n = static_cast<int>(o.shape[0]);
+    py::array_t<double> matrices({n, 4, 4});
+    py::array_t<double> determinants(n);
+    py::array_t<double> residuals(n);
+    py::array_t<std::uint8_t> valid(n);
+    {
+        py::gil_scoped_release release;
+        const int rc = lens_optics_estimate_phase_space_jacobians(
+            static_cast<const float*>(p.ptr),
+            static_cast<int>(p.size),
+            static_cast<const double*>(o.ptr),
+            static_cast<const double*>(d.ptr),
+            n,
+            spectral_lane,
+            n_input,
+            n_output,
+            q_step_m,
+            p_step,
+            n_threads,
+            matrices.mutable_data(),
+            determinants.mutable_data(),
+            residuals.mutable_data(),
+            valid.mutable_data());
+        if (rc != 0)
+            throw std::runtime_error(
+                "lens_optics_estimate_phase_space_jacobians failed");
+    }
+    return py::make_tuple(matrices, determinants, residuals, valid);
+}
+
 /* ── Forward declarations for PicardSCC (defined in transforms/picard_step.cpp) */
 
 struct PicardSCCState;
@@ -5999,6 +6049,25 @@ Threaded C++/Eigen finite-difference camera transfer Jacobians.
 
 Returns (aperture_to_solid_angle_jac, phase_space_jac) for a batch of
 parametric compound-lens camera samples using the compact PLENS payload.
+)doc");
+
+    m.def("estimate_lens_phase_space_jacobians",
+          &estimate_lens_phase_space_jacobians_py,
+          py::arg("payload"),
+          py::arg("origins"),
+          py::arg("directions"),
+          py::arg("spectral_lane") = -1,
+          py::arg("n_input") = 1.0,
+          py::arg("n_output") = 1.0,
+          py::arg("q_step_m") = 1.0e-6,
+          py::arg("p_step") = 1.0e-6,
+          py::arg("n_threads") = 0,
+          R"doc(
+Threaded full canonical compound-lens tangent maps.
+
+Returns (matrix, signed_determinant, symplectic_residual, valid), where matrix
+has shape (N,4,4) in [q_y,q_z,n*d_y,n*d_z] coordinates. A spectral lane selects
+the same per-surface refractive-index table used by exact native T2.
 )doc");
 
     py::class_<PyRouterStep>(m, "RouterStep",

@@ -27,7 +27,8 @@ struct Surface {
     bool is_stop = false;
 };
 
-inline Surface surface_at(const float* p, int i)
+inline Surface surface_at(
+    const float* p, int payload_len, int i, int spectral_lane = -1)
 {
     const int off = PLENS_HEADER + i * PLENS_STRIDE;
     Surface s;
@@ -38,6 +39,18 @@ inline Surface surface_at(const float* p, int i)
     s.aperture = static_cast<double>(p[off + 4]);
     s.k = static_cast<double>(p[off + 5]);
     s.is_stop = static_cast<double>(p[off + 6]) != 0.0;
+    const int n_spectral = static_cast<int>(p[5]);
+    const int spectral_offset = static_cast<int>(p[6]);
+    const int spectral_stride = static_cast<int>(p[7]);
+    if (!s.is_stop && spectral_lane >= 0 && spectral_lane < n_spectral
+        && spectral_stride >= 2*n_spectral) {
+        const int base = spectral_offset + i*spectral_stride;
+        if (base >= 0 && base + n_spectral + spectral_lane < payload_len) {
+            s.n_before = static_cast<double>(p[base + spectral_lane]);
+            s.n_after =
+                static_cast<double>(p[base + n_spectral + spectral_lane]);
+        }
+    }
     return s;
 }
 
@@ -112,7 +125,8 @@ inline bool trace_payload(
     const V3& origin,
     const V3& direction,
     V3& out_origin,
-    V3& out_dir)
+    V3& out_dir,
+    int spectral_lane = -1)
 {
     if (!payload || payload_len < PLENS_HEADER) return false;
     const int n = static_cast<int>(payload[1]);
@@ -126,7 +140,7 @@ inline bool trace_payload(
     const bool forward = d.x() >= 0.0;
     for (int step = 0; step < n; ++step) {
         const int si = forward ? step : (n - 1 - step);
-        Surface s = surface_at(payload, si);
+        Surface s = surface_at(payload, payload_len, si, spectral_lane);
         if (!forward && !s.is_stop) std::swap(s.n_before, s.n_after);
         if (std::abs(d.x()) < EPS) return false;
         const double t = s.is_stop || std::abs(s.R) < EPS
@@ -241,3 +255,104 @@ int lens_optics_estimate_camera_jacobians(
     return 0;
 }
 
+int lens_optics_estimate_phase_space_jacobians(
+    const float* payload,
+    int payload_len,
+    const double* origins,
+    const double* directions,
+    int n,
+    int spectral_lane,
+    double n_input,
+    double n_output,
+    double q_step_m,
+    double p_step,
+    int n_threads,
+    double* matrices_out,
+    double* determinants_out,
+    double* symplectic_residuals_out,
+    unsigned char* valid_out)
+{
+    if (!payload || !origins || !directions || n < 0
+        || !matrices_out || !determinants_out
+        || !symplectic_residuals_out || !valid_out
+        || !(n_input > 0.0) || !(n_output > 0.0)
+        || !(q_step_m > 0.0) || !(p_step > 0.0))
+        return -1;
+
+    M4 omega = M4::Zero();
+    omega.block<2,2>(0,2) = Eigen::Matrix2d::Identity();
+    omega.block<2,2>(2,0) = -Eigen::Matrix2d::Identity();
+
+    auto body = [&](size_t ii) {
+        const int i = static_cast<int>(ii);
+        double* out = matrices_out + static_cast<size_t>(i)*16u;
+        std::fill(out, out + 16, 0.0);
+        determinants_out[i] = 0.0;
+        symplectic_residuals_out[i] =
+            std::numeric_limits<double>::infinity();
+        valid_out[i] = 0u;
+
+        const V3 base_origin = load3(origins, i);
+        V3 base_direction = load3(directions, i);
+        const double direction_norm = base_direction.norm();
+        if (!(direction_norm > EPS)) return;
+        base_direction /= direction_norm;
+        const double axial_sign = base_direction.x() >= 0.0 ? 1.0 : -1.0;
+        const double base_state[4] = {
+            base_origin.y(), base_origin.z(),
+            n_input*base_direction.y(), n_input*base_direction.z()
+        };
+
+        auto trace_state = [&](const double state[4], double output[4]) -> bool {
+            const double py = state[2], pz = state[3];
+            const double transverse2 = (py*py + pz*pz)/(n_input*n_input);
+            if (!(transverse2 < 1.0)) return false;
+            V3 origin(base_origin.x(), state[0], state[1]);
+            V3 direction(
+                axial_sign*std::sqrt(std::max(0.0, 1.0-transverse2)),
+                py/n_input, pz/n_input);
+            V3 exit_origin, exit_direction;
+            if (!trace_payload(
+                    payload, payload_len, origin, direction,
+                    exit_origin, exit_direction, spectral_lane))
+                return false;
+            output[0] = exit_origin.y();
+            output[1] = exit_origin.z();
+            output[2] = n_output*exit_direction.y();
+            output[3] = n_output*exit_direction.z();
+            return true;
+        };
+
+        M4 jacobian;
+        for (int column = 0; column < 4; ++column) {
+            double plus_state[4], minus_state[4];
+            std::copy(base_state, base_state + 4, plus_state);
+            std::copy(base_state, base_state + 4, minus_state);
+            const double step = column < 2 ? q_step_m : p_step;
+            plus_state[column] += step;
+            minus_state[column] -= step;
+            double plus[4], minus[4];
+            if (!trace_state(plus_state, plus)
+                || !trace_state(minus_state, minus))
+                return;
+            for (int row = 0; row < 4; ++row)
+                jacobian(row, column) = (plus[row]-minus[row])/(2.0*step);
+        }
+        if (!jacobian.allFinite()) return;
+        const double determinant = jacobian.determinant();
+        const double residual =
+            (jacobian.transpose()*omega*jacobian-omega).norm();
+        if (!std::isfinite(determinant) || !std::isfinite(residual)) return;
+        for (int row = 0; row < 4; ++row)
+            for (int column = 0; column < 4; ++column)
+                out[row*4 + column] = jacobian(row, column);
+        determinants_out[i] = determinant;
+        symplectic_residuals_out[i] = residual;
+        valid_out[i] = 1u;
+    };
+
+    if (n == 0) return 0;
+    ThreadPool pool(static_cast<size_t>(n_threads > 0 ? n_threads : 0));
+    ThreadPool::parallel_for(pool, size_t(0), static_cast<size_t>(n), body);
+    return 0;
+}

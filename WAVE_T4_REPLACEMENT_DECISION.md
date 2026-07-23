@@ -239,6 +239,22 @@ The orphaned `t0_intent_pack.comp.glsl` raw-object experiment is separately and
 explicitly retired: it is unwired, cannot dereference Eigen amplitude storage,
 and predates the current intent layout. It is not the SSBO rechanneler.
 
+### Jones and differential operators
+
+`COMPLEX_OPTICAL_OPERATOR_CONTRACT.md` defines the canonical boundary math.
+Complex transport schema v2 keeps the lane at 64 bytes and assigns its former
+reserved words to stable basis/operator indices. Persistent arena-owned tables
+hold right-handed transverse bases, complex 2x2 Jones operators, and signed
+canonical 4x4 tangent maps.
+
+The reference and shader ABIs now agree on basis rotation, Jones application,
+power-normalized dielectric Fresnel scattering, canonical phase-space
+coordinates, reference-OPL carrier phase, and caustic-safe ray/field gain. The
+native exact-lens helper returns full spectral-lane-specific 4x4 maps plus
+determinant and symplectic residual. T4 still seeds only its s field and reduces
+s/p output to a scalar ray; replacing those two boundary adapters is an
+explicit remaining gate, not an implied capability.
+
 ## Removal gates
 
 Legacy production paths are deleted only after the replacement passes:

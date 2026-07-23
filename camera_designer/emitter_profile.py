@@ -525,17 +525,79 @@ class PolarizationState:
 
     @property
     def jones_vector(self) -> np.ndarray:
-        """Complex Jones vector as a 2-element complex128 array."""
-        j = self.jones
-        if len(j) >= 4:
-            return np.array([j[0] + 1j * j[1], j[2] + 1j * j[3]], dtype=np.complex128)
+        """Normalised polarized component as a complex Jones vector.
+
+        Unpolarized power is not represented by this one vector; use
+        :meth:`coherent_mode_decomposition` for transport.
+        """
         if self.mode == PolarizationMode.LINEAR:
             a = math.radians(self.angle_deg)
-            return np.array([math.cos(a), math.sin(a)], dtype=np.complex128)
-        if self.mode == PolarizationMode.CIRCULAR:
+            value = np.array([math.cos(a), math.sin(a)], dtype=np.complex128)
+        elif self.mode == PolarizationMode.CIRCULAR:
             s = 1.0 / math.sqrt(2.0)
-            return np.array([s, 1j * self.handedness * s], dtype=np.complex128)
-        return np.array([1.0, 0.0], dtype=np.complex128)
+            value = np.array(
+                [s, 1j * (1 if self.handedness >= 0 else -1) * s],
+                dtype=np.complex128,
+            )
+        elif self.mode == PolarizationMode.ELLIPTICAL:
+            j = self.jones
+            if len(j) < 4:
+                raise ValueError("elliptical polarization requires four Jones values")
+            value = np.array(
+                [j[0] + 1j * j[1], j[2] + 1j * j[3]],
+                dtype=np.complex128,
+            )
+        else:
+            # UNPOLARIZED uses two incoherent modes below. RADIAL/AZIMUTHAL
+            # use the zero-azimuth local value unless jones_vector_at is used.
+            value = self.jones_vector_at(0.0)
+        norm = float(np.linalg.norm(value))
+        if not math.isfinite(norm) or norm <= 1.0e-15:
+            raise ValueError("polarization Jones vector must be finite and non-zero")
+        return value / norm
+
+    def jones_vector_at(self, azimuth_rad: float) -> np.ndarray:
+        """Return the local vector for spatially varying cylindrical modes."""
+        angle = float(azimuth_rad)
+        if self.mode == PolarizationMode.RADIAL:
+            return np.asarray((math.cos(angle), math.sin(angle)), np.complex128)
+        if self.mode == PolarizationMode.AZIMUTHAL:
+            return np.asarray((-math.sin(angle), math.cos(angle)), np.complex128)
+        if self.mode == PolarizationMode.UNPOLARIZED:
+            return np.asarray((1.0, 0.0), np.complex128)
+        return self.jones_vector
+
+    def coherent_mode_decomposition(
+        self,
+        azimuth_rad: float = 0.0,
+    ) -> Tuple[Tuple[float, np.ndarray], ...]:
+        """Decompose partial/unpolarized light into incoherent Jones modes.
+
+        Returned weights are power fractions. Modes must be propagated with
+        distinct coherence identities and combined in intensity, never by
+        adding their Jones amplitudes.
+        """
+        if self.mode == PolarizationMode.UNPOLARIZED:
+            degree = 0.0
+            primary = np.asarray((1.0, 0.0), np.complex128)
+        else:
+            degree = min(1.0, max(0.0, float(self.degree_of_polarization)))
+            primary = (
+                self.jones_vector_at(azimuth_rad)
+                if self.mode in (PolarizationMode.RADIAL, PolarizationMode.AZIMUTHAL)
+                else self.jones_vector
+            )
+        primary = primary / max(float(np.linalg.norm(primary)), 1.0e-30)
+        orthogonal = np.asarray(
+            (-np.conj(primary[1]), np.conj(primary[0])),
+            np.complex128,
+        )
+        principal_weight = 0.5 * (1.0 + degree)
+        orthogonal_weight = 0.5 * (1.0 - degree)
+        modes = [(principal_weight, primary)]
+        if orthogonal_weight > 1.0e-15:
+            modes.append((orthogonal_weight, orthogonal))
+        return tuple(modes)
 
     def to_dict(self) -> dict:
         return {

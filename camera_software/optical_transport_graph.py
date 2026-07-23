@@ -18,6 +18,13 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from .complex_optical_operators import (
+    ComplexOpticalOperator,
+    ComplexOperatorStateBlock,
+    TransverseBasis,
+    canonical_operator_contract,
+)
+
 
 OPTICAL_GRAPH_SCHEMA = "optical-transport-graph-v1"
 SUPPORTED_LANE_COUNTS = (1, 3, 4, 8, 16, 32)
@@ -141,6 +148,7 @@ class CompiledOpticalTransportGraph:
     topology_solver: Any
     t2_payloads: dict[str, np.ndarray]
     t4_descriptors: dict[str, dict[str, Any]]
+    operator_state_block: dict[str, Any]
 
     def contract(self) -> dict[str, Any]:
         stats = self.topology_solver.graph_stats()
@@ -148,6 +156,21 @@ class CompiledOpticalTransportGraph:
             "schema": self.spec.schema,
             "graph_engine": "GraphSolver",
             "execution": "compiled-not-hot-interpreted",
+            "complex_operator_contract": canonical_operator_contract(),
+            "operator_state_block": {
+                "schema": self.operator_state_block["schema"],
+                "basis_count": int(self.operator_state_block["bases"].shape[0]),
+                "operator_count": int(
+                    self.operator_state_block["operators"].shape[0]
+                ),
+                "basis_stride_bytes": int(
+                    self.operator_state_block["basis_stride_bytes"]
+                ),
+                "operator_stride_bytes": int(
+                    self.operator_state_block["operator_stride_bytes"]
+                ),
+                "ownership": "compiled-graph-persistent",
+            },
             "entry_keys": list(self.spec.entry_keys),
             "product_keys": list(self.spec.product_keys),
             "nodes": [{
@@ -160,6 +183,7 @@ class CompiledOpticalTransportGraph:
                 "polarization_components": node.polarization_components,
                 "directionality": node.directionality,
                 "persistent_state": node.persistent_state,
+                "parameters": dict(node.parameters),
             } for node in self.spec.nodes],
             "links": [{
                 "src": link.src_key,
@@ -581,7 +605,15 @@ def compile_optical_graph(
         for node in spec.nodes
         if node.domain is OpticalExecutionDomain.T4_WAVE_ARENA
     }
-    return CompiledOpticalTransportGraph(spec, solver, payload_map, t4)
+    operator_builder = ComplexOperatorStateBlock()
+    operator_builder.add_basis(
+        TransverseBasis.from_direction((1.0, 0.0, 0.0))
+    )
+    operator_builder.add_operator(ComplexOpticalOperator())
+    operator_state = operator_builder.freeze()
+    return CompiledOpticalTransportGraph(
+        spec, solver, payload_map, t4, operator_state
+    )
 
 
 def compile_compound_lens_graph(
@@ -635,6 +667,10 @@ def compile_compound_lens_graph(
             "execution": "existing-t2-parametric-core",
             "hot_interpreter": False,
             "reciprocal_direction": transport_direction,
+            "complex_operator_schema": canonical_operator_contract()["schema"],
+            "jones_transport": "indexed-2x2-complex",
+            "differential_transport": "indexed-canonical-4x4",
+            "operator_state": "persistent-contiguous-block",
         },
     )
     sensor = OpticalNodeSpec(

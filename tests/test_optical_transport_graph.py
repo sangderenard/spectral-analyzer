@@ -16,6 +16,7 @@ from camera_software.optical_transport_graph import (
     WavePropagationStyle,
     compile_compound_lens_graph,
     compile_optical_graph,
+    compile_projector_back_graph,
     install_optical_graph,
     wave_context_nodes,
 )
@@ -45,6 +46,25 @@ def test_exact_compound_payload_is_the_fused_t2_graph_artifact(lane_count):
     assert contract["execution"] == "compiled-not-hot-interpreted"
     assert contract["t2_payload_keys"] == ["camera.exact-compound-lens"]
     assert contract["t4_descriptor_keys"] == []
+
+
+def test_projector_back_uses_reciprocal_exact_lens_graph():
+    compiled = compile_projector_back_graph(_lens(4), lane_count=4)
+    contract = compiled.contract()
+    nodes = {node["key"]: node for node in contract["nodes"]}
+
+    assert contract["entry_keys"] == ["camera.projector-back-port"]
+    assert contract["product_keys"] == ["scene.projected-field"]
+    assert nodes["camera.projector-back-port"]["directionality"] == "backward"
+    assert nodes["camera.exact-compound-lens"]["directionality"] == "backward"
+    assert np.array_equal(
+        compiled.t2_payloads["camera.exact-compound-lens"],
+        _lens(4).build_gpu_payload(),
+    )
+    assert [link["semantic_role"] for link in contract["links"]] == [
+        "projector-back-entry",
+        "projected-scene-product",
+    ]
 
 
 def test_wave_context_defaults_to_vector_fft_and_absorbing_padding():

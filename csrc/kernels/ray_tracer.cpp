@@ -15942,7 +15942,10 @@ static void pipeline_refiner(RayPipelineState& ps)
                     } else if (magic == 14949.0f) {
                         absorbed = apply_parametric_lens_from_f32(
                             st, mpp, nb_mfld, tpos, tdir, tamp, &tpl,
-                            hr.ray.bdpt_stream == BDPT_SIDE_SENSOR, &lens_trace);
+                            hr.ray.bdpt_stream == BDPT_SIDE_SENSOR
+                                || ((hr.ray.color_flag
+                                     & RT_COLOR_FLAG_REVERSE_OPTICS) != 0u),
+                            &lens_trace);
                         lens_trace_valid = true;
                     } else if (magic == 14946.0f || magic == 14947.0f ||
                                magic == 14950.0f || magic == 14951.0f) {

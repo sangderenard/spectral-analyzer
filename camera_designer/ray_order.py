@@ -640,7 +640,7 @@ class RayOrder:
         specs:                Sequence[EmitterSpec],
         wavelengths_um:       np.ndarray,
         emitter_transform:    Optional[np.ndarray] = None,
-        n_spatial_samples:    int   = 1,
+        n_spatial_samples:    Optional[int] = None,
         n_rays_per_source:    int   = 512,
         max_bounces:          int   = 8,
         min_amplitude:        float = 1e-4,
@@ -655,7 +655,8 @@ class RayOrder:
         wavelengths_um      : (n_bands,) float64 — wavelength grid
         emitter_transform   : (4, 4) float64 world transform applied to
                               emitter positions and normals; None = identity
-        n_spatial_samples   : number of disc sample points per component.
+        n_spatial_samples   : optional global override for disc quadrature.
+                              None uses each EmitterSpec.spatial_samples.
                               1 = point source at disc centre (fastest).
                               N > 1 = Fibonacci disc grid (extended source).
                               TRACER GAP: C tracer treats each sample as an
@@ -695,6 +696,11 @@ class RayOrder:
             spec_pos    = np.asarray(spec.pos,    dtype=np.float64)
             spec_normal = np.asarray(spec.normal, dtype=np.float64)
             spec_radius = float(spec.radius)
+            spec_spatial_samples = (
+                max(1, int(n_spatial_samples))
+                if n_spatial_samples is not None
+                else max(1, int(getattr(spec, "spatial_samples", 1)))
+            )
             spec_label  = str(spec.label)
 
             # Apply world transform to position and normal
@@ -711,7 +717,7 @@ class RayOrder:
 
             # Spatial sample positions on disc
             disc_pts = _sample_disc(spec_pos, spec_normal, spec_radius,
-                                    n_spatial_samples, rng)
+                                    spec_spatial_samples, rng)
 
             for comp_weight, leaf in component_pairs:
                 comp_label = leaf.name
@@ -730,9 +736,10 @@ class RayOrder:
 
                 # Spectral amplitude weights at each wavelength
                 raw_spec = leaf.spectral.sample_array(wl)   # preserves dtype
-                # Scale by component weight and radiant_exitance
-                amp_weights = (comp_weight * leaf.spectral.radiant_exitance
-                               * raw_spec).astype(np.float64)
+                # ``sample_array`` already includes radiant_exitance.  Apply
+                # the composite weight exactly once; multiplying exitance
+                # again made source power quadratic.
+                amp_weights = (comp_weight * raw_spec).astype(np.float64)
 
                 # Best-fit directivity
                 row_gaps: List[TracerGap] = []
@@ -759,13 +766,13 @@ class RayOrder:
                 row_gaps.extend(_polarization_gaps(leaf.polarization, comp_label))
 
                 # Spatial extension gap (if n_spatial_samples > 1)
-                if n_spatial_samples > 1:
+                if spec_spatial_samples > 1:
                     row_gaps.append(TracerGap(
                         source_label  = comp_label,
                         property_name = "spatial_coherence",
                         severity      = "dropped",
                         detail        = (
-                            f"n_spatial_samples={n_spatial_samples}: each disc sample "
+                            f"n_spatial_samples={spec_spatial_samples}: each disc sample "
                             "is an independent C-tracer point source. Mutual spatial "
                             "coherence between samples is not modelled. Interference "
                             "fringes from extended coherent sources will not appear."
@@ -940,10 +947,27 @@ class RayOrder:
 
         rng = np.random.default_rng(seed)
         n_src = len(self.sources)
-        rays_per_src = max(1, n_rays // n_src)
+        if n_src == 0:
+            return np.zeros((1, 12), np.float32)
+        requested = max(1, int(n_rays))
+        rays_per_source = np.zeros(n_src, np.int64)
+        if requested >= n_src:
+            rays_per_source[:] = requested // n_src
+            rays_per_source[:requested % n_src] += 1
+        else:
+            # Retain even spatial coverage when the requested batch is smaller
+            # than the expanded source quadrature.
+            selected = np.floor(
+                (np.arange(requested, dtype=np.float64) + 0.5)
+                * n_src / requested
+            ).astype(np.int64)
+            rays_per_source[selected] = 1
         rows: list = []
 
-        for sr in self.sources:
+        for source_index, sr in enumerate(self.sources):
+            rays_for_source = int(rays_per_source[source_index])
+            if rays_for_source == 0:
+                continue
             phase  = sr.phase_state
             prof   = sr.profile
 
@@ -988,7 +1012,7 @@ class RayOrder:
             model = sr.directional_model
             ang   = prof.directional
 
-            for _ri in range(rays_per_src):
+            for _ri in range(rays_for_source):
                 u1, u2 = float(rng.random()), float(rng.random())
 
                 # ── Direction sampling from model ─────────────────────────
@@ -1087,6 +1111,38 @@ class RayOrder:
         if not rows:
             return np.zeros((1, 12), np.float32)
         return np.array(rows, np.float32)
+
+    def bake_pipeline_submission(
+        self,
+        n_rays: int,
+        seed: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Lower source records to the native fixed-lane complex-ray ABI.
+
+        The returned tuple is ``(origins, directions, amplitudes)`` with a
+        complex128 ``(N, n_bands)`` amplitude matrix.  Every ray occupies its
+        sampled wavelength lane and carries the authored carrier phase.
+        Continuous-frequency launch needs its own sidecar ABI and is not
+        silently approximated by this fixed-lane method.
+        """
+        rows = self.bake_rays(n_rays, seed=seed).astype(np.float64, copy=False)
+        origins = np.ascontiguousarray(rows[:, 0:3], np.float64)
+        directions = np.ascontiguousarray(rows[:, 4:7], np.float64)
+        amplitudes = np.zeros(
+            (len(rows), len(self.wavelengths_um)), np.complex128
+        )
+        frequency_grid = 2.998e14 / np.maximum(
+            self.wavelengths_um, 1.0e-12
+        )
+        lane = np.argmin(
+            np.abs(rows[:, 8, None] - frequency_grid[None, :]),
+            axis=1,
+        )
+        magnitude = np.sqrt(np.maximum(0.0, rows[:, 3] * rows[:, 10]))
+        amplitudes[np.arange(len(rows)), lane] = (
+            magnitude * np.exp(1j * rows[:, 9])
+        )
+        return origins, directions, np.ascontiguousarray(amplitudes)
 
     def bake_backward_sensor_rays(self,
                                   sensor_bundles: Sequence[dict],

@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -206,6 +206,7 @@ class EmitterSpec:
                      coordinates (z-axis = optical axis, origin = mount face)
     normal         : outward emission direction unit vector (default −Z = into lens)
     radius         : emitter disc radius in metres
+    spatial_samples: launch quadrature sites across the physical emitter disc
     enabled        : False = geometry present but emits no light
 
     Profile reference
@@ -224,6 +225,7 @@ class EmitterSpec:
     pos:            Tuple[float, float, float] = (0.0, 0.0, -0.010)
     normal:         Tuple[float, float, float] = (0.0, 0.0, -1.0)
     radius:         float                      = 0.005
+    spatial_samples: int                       = 1
     enabled:        bool                       = True
     profile_name:   str                        = "led_warm_white"
     profile_inline: Optional[dict]             = field(default=None)
@@ -274,6 +276,7 @@ class EmitterSpec:
             "pos":          list(self.pos),
             "normal":       list(self.normal),
             "radius":       self.radius,
+            "spatial_samples": self.spatial_samples,
             "enabled":      self.enabled,
             "profile_name": self.profile_name,
             "label":        self.label,
@@ -288,6 +291,7 @@ class EmitterSpec:
             pos            = tuple(float(v) for v in d.get("pos",    [0., 0., -0.010])),
             normal         = tuple(float(v) for v in d.get("normal", [0., 0., -1.])),
             radius         = float(d.get("radius", 0.005)),
+            spatial_samples = max(1, int(d.get("spatial_samples", 1))),
             enabled        = bool(d.get("enabled", True)),
             profile_name   = str(d.get("profile_name", "led_warm_white")),
             profile_inline = d.get("profile_inline", None),
@@ -310,13 +314,11 @@ class ProjectorBackSpec:
 
     Concept
     -------
-    White broadband light from the panel is filtered by ``spectral_weights``,
-    one entry per wavelength band in ``CameraPreset.wavelengths``.  The
-    weights represent the sensor’s quantum-efficiency response: only the
-    wavelengths the sensor ‘accepts’ are strongly emitted, so the projector
-    output spectrum mirrors what the sensor would image.  Running the scene
-    ray tracer forward from these sources therefore shows exactly the spectral
-    bands the sensor would reconstruct.
+    The back remains a sensor-sized physical source plane.  Its emission is
+    described by the same ``EmitterProfile`` contract as every other source,
+    so spectrum, coherence, phase, directionality, polarization, and an
+    optional Jones-field texture survive lowering into the optical backend.
+    Empty profile fields retain the legacy QE-weighted broadband panel.
 
     Fields
     ------
@@ -331,6 +333,14 @@ class ProjectorBackSpec:
                         when the scene is built; extra entries are ignored,
                         missing entries are padded with 1.0.
     color             : GL display tint (r,g,b), 0–1 each
+    profile_name      : optional key in ``EMITTER_CATALOG``.  A named profile
+                        takes precedence over ``profile_inline``.
+    profile_inline    : optional embedded ``EmitterProfile`` dictionary.
+    spatial_samples   : source-plane sites used when ray packets are launched.
+                        This changes source quadrature, never panel geometry.
+    scrim_transmission: per-lane transmission of the sensor layer in projector
+                        mode; empty reuses ``spectral_weights``.
+    scrim_diffusion   : diffuse fraction of that transmissive sensor layer.
     label             : identifier string
     """
     enabled:          bool                        = False
@@ -339,6 +349,11 @@ class ProjectorBackSpec:
     radius_scale:     float                       = 1.0     # match sensor size
     spectral_weights: List[float]                 = field(default_factory=list)
     color:            Tuple[float, float, float]  = (0.95, 0.97, 1.0)  # cool white
+    profile_name:     str                          = ""
+    profile_inline:   Optional[dict]               = field(default=None)
+    spatial_samples:  int                          = 64
+    scrim_transmission: List[float]                 = field(default_factory=list)
+    scrim_diffusion:  float                         = 0.02
     label:            str                         = "projector_back"
 
     # ── Helpers ─────────────────────────────────────────────────────────────
@@ -356,18 +371,119 @@ class ProjectorBackSpec:
             w.append(1.0)
         return w[:n_bands]
 
+    def resolved_scrim_transmission(self, n_bands: int) -> List[float]:
+        authored = self.scrim_transmission or self.spectral_weights
+        if not authored:
+            return [1.0] * n_bands
+        values = [min(1.0, max(0.0, float(v))) for v in authored]
+        while len(values) < n_bands:
+            values.append(1.0)
+        return values[:n_bands]
+
+    def resolve_profile(self, wavelengths_um: Sequence[float]):
+        """Return an isolated, power-scaled physical emitter profile.
+
+        Catalog profiles are cloned before their power is changed.  With no
+        authored profile, the old per-lane panel weights become a histogram
+        profile, preserving old manifests without retaining the legacy
+        point-light launch.
+        """
+        from .emitter_profile import (
+            AngularDistribution,
+            CoherenceModel,
+            DirectionalModel,
+            EMITTER_CATALOG,
+            EmitterProfile,
+            PhaseState,
+            PolarizationMode,
+            PolarizationState,
+            SpectralDistribution,
+            SpectralModel,
+        )
+
+        profile = None
+        if self.profile_name:
+            catalog_profile = EMITTER_CATALOG.get(self.profile_name)
+            if catalog_profile is None:
+                raise ValueError(
+                    f"unknown projector-back emitter profile {self.profile_name!r}"
+                )
+            profile = EmitterProfile.from_dict(catalog_profile.to_dict())
+        elif self.profile_inline is not None:
+            profile = EmitterProfile.from_dict(self.profile_inline)
+
+        if profile is None:
+            wavelengths = [float(v) for v in wavelengths_um]
+            if not wavelengths:
+                wavelengths = [0.550]
+            profile = EmitterProfile(
+                name="projector_back_legacy_panel",
+                label="QE-weighted broadband projector back",
+                spectral=SpectralDistribution(
+                    model=SpectralModel.HISTOGRAM,
+                    wavelengths_um=wavelengths,
+                    weights=self.resolved_weights(len(wavelengths)),
+                ),
+                phase=PhaseState(model=CoherenceModel.INCOHERENT),
+                directional=AngularDistribution(
+                    model=DirectionalModel.LAMBERTIAN
+                ),
+                polarization=PolarizationState(
+                    mode=PolarizationMode.UNPOLARIZED
+                ),
+                display_tint=self.color,
+                notes="Legacy projector-back spectrum lowered to EmitterProfile.",
+            )
+
+        def _scale_exitance(node) -> None:
+            if node.components:
+                for _weight, child in node.components:
+                    _scale_exitance(child)
+            else:
+                node.spectral.radiant_exitance *= max(0.0, float(self.power))
+
+        _scale_exitance(profile)
+        return profile
+
+    def as_emitter_spec(
+        self,
+        *,
+        sensor_z_pos: float,
+        sensor_radius: float,
+        wavelengths_um: Sequence[float],
+    ) -> EmitterSpec:
+        """Lower this panel into the common physical source-placement ABI."""
+        profile = self.resolve_profile(wavelengths_um)
+        return EmitterSpec(
+            pos=(0.0, 0.0, float(sensor_z_pos) - float(self.z_offset)),
+            normal=(0.0, 0.0, 1.0),
+            radius=float(sensor_radius) * float(self.radius_scale),
+            spatial_samples=max(1, int(self.spatial_samples)),
+            enabled=bool(self.enabled),
+            profile_name="",
+            profile_inline=profile.to_dict(),
+            label=str(self.label),
+        )
+
     # ── Serialisation ───────────────────────────────────────────────────────
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "enabled":          self.enabled,
             "power":            self.power,
             "z_offset":         self.z_offset,
             "radius_scale":     self.radius_scale,
             "spectral_weights": list(self.spectral_weights),
             "color":            list(self.color),
+            "profile_name":     self.profile_name,
+            "spatial_samples":  self.spatial_samples,
+            "scrim_transmission": list(self.scrim_transmission),
+            "scrim_diffusion":  self.scrim_diffusion,
             "label":            self.label,
         }
+        if self.profile_inline is not None:
+            d["profile_inline"] = self.profile_inline
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "ProjectorBackSpec":
@@ -378,6 +494,15 @@ class ProjectorBackSpec:
             radius_scale     = float(d.get("radius_scale",    1.0)),
             spectral_weights = [float(v) for v in d.get("spectral_weights", [])],
             color            = tuple(float(v) for v in d.get("color", [0.95, 0.97, 1.0])),
+            profile_name     = str(d.get("profile_name", "")),
+            profile_inline   = d.get("profile_inline", None),
+            spatial_samples  = max(1, int(d.get("spatial_samples", 64))),
+            scrim_transmission = [
+                float(v) for v in d.get("scrim_transmission", [])
+            ],
+            scrim_diffusion  = min(
+                1.0, max(0.0, float(d.get("scrim_diffusion", 0.02)))
+            ),
             label            = str(d.get("label", "projector_back")),
         )
 

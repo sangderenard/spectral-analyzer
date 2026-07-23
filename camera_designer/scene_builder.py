@@ -492,6 +492,7 @@ _GEO_FLAG_APERTURE_BLADE    = "aperture_blade"
 # Sensor surface (subset of APERTURE_STOP) — same material flag (absorber),
 # but tagged separately so register_into() can find the SENSOR tris.
 _GEO_FLAG_SENSOR            = "sensor"
+_GEO_FLAG_SENSOR_SCRIM      = "sensor_scrim"
 # Emissive surface: emits light into the ray tracer (LED, flash, projector).
 # Triangulated as a disc; also synthesises a scene-light dict when enabled.
 _GEO_FLAG_EMITTER           = "emitter"
@@ -839,44 +840,70 @@ def _collect_optical_geometry(
 
     # ── Sensor plane ─────────────────────────────────────────────────────
     sensor = preset.sensor
+    _projector_back_enabled = bool(
+        getattr(getattr(preset, "projector_back", None), "enabled", False)
+    )
+    # In projection mode the sensor remains as the authored color/transparency
+    # scrim between the projector back and lens.  Only its absorber behavior
+    # changes; the opaque bay back wall is omitted below.
     if sensor is not None:
         s_verts, s_normals, _, _ = _triangulate_surface(sensor, n_rings=32, n_sectors=128)
         if len(s_verts) > 0:
             n_new = len(s_verts)
-            refl_re, refl_im = _sensor_reflectances(n_bands)
+            if _projector_back_enabled:
+                _pb_sensor = preset.projector_back
+                _scrim_t = np.asarray(
+                    _pb_sensor.resolved_scrim_transmission(n_bands),
+                    np.float64,
+                )
+                refl_re = np.clip(1.0 - _scrim_t, 0.0, 1.0)
+                refl_im = np.zeros(n_bands, np.float64)
+                _sensor_diff = float(_pb_sensor.scrim_diffusion)
+                _sensor_flag = _GEO_FLAG_SENSOR_SCRIM
+                _sensor_tint = tuple(float(v) for v in _pb_sensor.color)
+                ior_specs.append((
+                    _tri_cursor, n_new, 1.0, 1.0, _GEO_FLAG_SENSOR_SCRIM
+                ))
+            else:
+                refl_re, refl_im = _sensor_reflectances(n_bands)
+                _sensor_diff = 0.9
+                _sensor_flag = _GEO_FLAG_APERTURE_STOP
+                _sensor_tint = (0.25, 0.25, 0.30)
             all_verts.append(s_verts);    all_normals.append(s_normals)
             all_refl_re.append(np.tile(refl_re, (n_new, 1)))
             all_refl_im.append(np.tile(refl_im, (n_new, 1)))
-            all_diff.append(np.full(n_new, 0.9, np.float64))
+            all_diff.append(np.full(n_new, _sensor_diff, np.float64))
             mat_groups.append((
                 _tri_cursor, n_new,
-                (0.25, 0.25, 0.30), (0.0, 0.0, 0.0), (0.2, 0.2, 0.25),
-                1.5, 1.0,
-                _GEO_FLAG_APERTURE_STOP,   # MAT_FLAG_ABSORBER — sensor kills rays
+                _sensor_tint, _sensor_tint, _sensor_tint,
+                1.0 if _projector_back_enabled else 1.5,
+                0.0 if _projector_back_enabled else 1.0,
+                _sensor_flag,
             ))
             _tri_cursor += n_new
 
         # Sensor-bay back wall: a deep-black flat absorber 2 mm behind the sensor.
         # Catches any rays transmitted through or scattered past the sensor face.
-        _back_mat      = MATERIAL_CATALOG.get("back", MATERIAL_CATALOG["flocking_black"])
-        _back_tint_rgb = _back_mat.tint[:3]
-        _snr_z  = float(getattr(sensor, "z_pos", getattr(sensor, "z_vertex", 0.0)))
-        _snr_r  = float(getattr(sensor, "r_max", 0.020))
-        _back_v, _back_n = _triangulate_disk(
-            lambda _r: 0.0, _snr_z - 0.002, 0.0, _snr_r * 1.05,
-            n_rings=16, n_sectors=128, outward_normal_z=1.0)
-        if len(_back_v) > 0:
-            _n_new = len(_back_v)
-            all_verts.append(_back_v);    all_normals.append(_back_n)
-            all_refl_re.append(np.tile(np.zeros(n_bands, np.float64), (_n_new, 1)))
-            all_refl_im.append(np.tile(np.zeros(n_bands, np.float64), (_n_new, 1)))
-            all_diff.append(np.zeros(_n_new, np.float64))
-            mat_groups.append((
-                _tri_cursor, _n_new,
-                _back_tint_rgb, _back_tint_rgb, _back_tint_rgb,
-                1.6, 1.0, _GEO_FLAG_APERTURE_STOP,   # MAT_FLAG_ABSORBER
-            ))
-            _tri_cursor += _n_new
+        if not _projector_back_enabled:
+            _back_mat      = MATERIAL_CATALOG.get("back", MATERIAL_CATALOG["flocking_black"])
+            _back_tint_rgb = _back_mat.tint[:3]
+            _snr_z  = float(getattr(sensor, "z_pos", getattr(sensor, "z_vertex", 0.0)))
+            _snr_r  = float(getattr(sensor, "r_max", 0.020))
+            _back_v, _back_n = _triangulate_disk(
+                lambda _r: 0.0, _snr_z - 0.002, 0.0, _snr_r * 1.05,
+                n_rings=16, n_sectors=128, outward_normal_z=1.0)
+            if len(_back_v) > 0:
+                _n_new = len(_back_v)
+                all_verts.append(_back_v);    all_normals.append(_back_n)
+                all_refl_re.append(np.tile(np.zeros(n_bands, np.float64), (_n_new, 1)))
+                all_refl_im.append(np.tile(np.zeros(n_bands, np.float64), (_n_new, 1)))
+                all_diff.append(np.zeros(_n_new, np.float64))
+                mat_groups.append((
+                    _tri_cursor, _n_new,
+                    _back_tint_rgb, _back_tint_rgb, _back_tint_rgb,
+                    1.6, 1.0, _GEO_FLAG_APERTURE_STOP,
+                ))
+                _tri_cursor += _n_new
 
     # ── Scene object ──────────────────────────────────────────────────
     # ── Emitter discs ────────────────────────────────────────────────
@@ -1173,7 +1200,10 @@ def build_tracer(
         if n_tris_seg > 0:
             sl = slice(tri_start, tri_start + n_tris_seg)
             ior_real_bands[sl, :] = float(n_out)
-            if _flag_str == _GEO_FLAG_TRANSMISSIVE:
+            if _flag_str in (
+                _GEO_FLAG_TRANSMISSIVE,
+                _GEO_FLAG_SENSOR_SCRIM,
+            ):
                 # The current transport ABI enters Snell/Fresnel handling only
                 # for explicitly transmissive MatBuf rows.  IOR alone describes
                 # a boundary; it must not silently turn an opaque material into
@@ -1246,6 +1276,7 @@ def build_tracer(
     # Map abstract flag tokens to C extension constants
     _flag_map = {
         _GEO_FLAG_TRANSMISSIVE:  MAT_FLAG_TRANSMISSIVE,
+        _GEO_FLAG_SENSOR_SCRIM:  MAT_FLAG_TRANSMISSIVE,
         _GEO_FLAG_APERTURE_STOP: MAT_FLAG_APERTURE_STOP,
     }
     for tri_start, n_tris, _n_in, _n_out, flag_str in ior_specs:
@@ -1381,6 +1412,7 @@ def build_gpu_scene(
     # (the single Python source of truth for both backends).
     _glsl_flag = {
         _GEO_FLAG_TRANSMISSIVE:     np.uint32(MAT_FLAG_TRANSMISSIVE),
+        _GEO_FLAG_SENSOR_SCRIM:     np.uint32(MAT_FLAG_TRANSMISSIVE),
         _GEO_FLAG_APERTURE_STOP:    np.uint32(MAT_FLAG_ABSORBER),
         _GEO_FLAG_EMITTER:          np.uint32(MAT_FLAG_EMISSIVE),
         _GEO_FLAG_PROJECTOR_BACK:   np.uint32(MAT_FLAG_EMISSIVE),
@@ -1491,6 +1523,49 @@ def build_gpu_scene(
         sl = slice(tri_start, tri_start + n_tris_seg)
         mat_idx[sl] = mat_db.index_of(material_key)
 
+    # Projector mode retains the physical sensor as a colored transmissive
+    # scrim. Register its per-lane transmission explicitly instead of reducing
+    # it to one RGB opacity in the shared material database.
+    _pb_material = getattr(preset, "projector_back", None)
+    if _pb_material is not None and _pb_material.enabled:
+        transmission = _pb_material.resolved_scrim_transmission(len(freq_hz))
+        diffusion = float(np.clip(_pb_material.scrim_diffusion, 0.0, 1.0))
+        scrim_key = "camera_sensor_scrim:" + repr((
+            tuple(float(v) for v in transmission),
+            diffusion,
+            tuple(float(v) for v in _pb_material.color),
+            tuple(float(v) for v in wavelengths_um),
+        ))
+        if scrim_key not in mat_db:
+            mat_db.register(scrim_key, {
+                "name": "projector sensor spectral scrim",
+                "domain": "em_optical",
+                "albedo": list(_pb_material.color),
+                "roughness": diffusion,
+                "metallic": 0.0,
+                "transmission": float(np.mean(transmission)),
+                "ior": 1.0,
+                "opacity": 0.0,
+                "spectral_bands": [
+                    {
+                        "center_hz": float(f),
+                        "bandwidth_hz": float(bw),
+                        "reflectance": float(max(0.0, 1.0 - t)),
+                        "transmittance": float(t),
+                        "diffuse_frac": diffusion,
+                        "emission": 0.0,
+                        "reemission": 0.0,
+                        "ior_real": 1.0,
+                        "ior_imag": 0.0,
+                    }
+                    for f, bw, t in zip(freq_hz, bandwidths, transmission)
+                ],
+            })
+        scrim_index = mat_db.index_of(scrim_key)
+        for tri_start, n_tris_seg, *_values, flag_str in mat_groups:
+            if flag_str == _GEO_FLAG_SENSOR_SCRIM:
+                mat_idx[tri_start:tri_start + n_tris_seg] = scrim_index
+
     mat_buf = np.ascontiguousarray(mat_db.build_mat_buf(freq_hz=freq_hz),
                                    dtype=np.float32)
     mat_idx_bits = np.frombuffer(mat_idx.astype(np.uint32).tobytes(), np.float32)
@@ -1571,25 +1646,23 @@ def build_gpu_scene(
     for em in getattr(preset, 'emitters', []):
         if em.enabled:
             _spec_list.append(em)
+    _pb = getattr(preset, 'projector_back', None)
+    if _pb is not None and _pb.enabled:
+        _spec_list.append(_pb.as_emitter_spec(
+            sensor_z_pos=float(preset.sensor.z_pos),
+            sensor_radius=float(preset.sensor.r_max),
+            wavelengths_um=_WL_UM,
+        ))
 
     if _spec_list:
         _order = _RayOrder.from_emitter_specs(
-            _spec_list, wavelengths_um=_WL_UM, n_spatial_samples=1,
+            _spec_list, wavelengths_um=_WL_UM,
         )
         source_buf = _order.bake_rays(_PREBAKE_N, seed=42)
     else:
-        # Legacy plain-dict lights and/or projector_back only — build a minimal
-        # RayOrder via from_lights_list, then bake from it.
+        # Legacy plain-dict lights only — build a minimal RayOrder via the
+        # compatibility shim, then bake from it.
         _legacy_lights = [lgt for lgt in lights if "_spec" not in lgt]
-        _pb = getattr(preset, 'projector_back', None)
-        if _pb is not None and _pb.enabled:
-            _pb_z = preset.sensor.z_pos - float(_pb.z_offset)
-            _legacy_lights = list(_legacy_lights) + [{
-                "pos": [0.0, 0.0, float(_pb_z)],
-                "dir": [0.0, 0.0, 1.0],
-                "power": float(_pb.power),
-                "label": "projector_back",
-            }]
         if not _legacy_lights:
             _legacy_lights = [{"pos": [0., 0., 5.], "dir": [0., 0., -1.],
                                 "power": 1.0, "label": "default"}]
@@ -1609,10 +1682,9 @@ def _emitter_lights_from_preset(preset: CameraPreset) -> List[dict]:
     Each enabled EmitterSpec becomes one directional light (disc centre,
     emission normal, EmitterSpec.power).
 
-    A ProjectorBackSpec, when enabled, contributes one large axial source at
-    the back panel position facing +Z (into the lens group).  Its power is
-    scaled by the mean spectral weight so spectrally-narrow presets don't
-    blind the tracer with full white power.
+    A ProjectorBackSpec contributes its common EmitterSpec view.  Consumers
+    that understand ``_spec`` retain its full physical plane, spectral profile,
+    coherence, phase, directionality and polarization contract.
     """
     lights: List[dict] = []
     for em in getattr(preset, 'emitters', []):
@@ -1625,14 +1697,19 @@ def _emitter_lights_from_preset(preset: CameraPreset) -> List[dict]:
             })
     pb = getattr(preset, 'projector_back', None)
     if pb is not None and pb.enabled:
-        _pb_z   = preset.sensor.z_pos - float(pb.z_offset)
-        _n_wl   = len(getattr(preset, 'wavelengths', [0.55]))
-        _w_mean = float(np.mean(pb.resolved_weights(_n_wl)))
+        _wl = getattr(preset, 'wavelengths', [0.55])
+        _spec = pb.as_emitter_spec(
+            sensor_z_pos=float(preset.sensor.z_pos),
+            sensor_radius=float(preset.sensor.r_max),
+            wavelengths_um=_wl,
+        )
         lights.append({
-            "pos":   [0.0, 0.0, _pb_z],
-            "dir":   [0.0, 0.0,  1.0],   # into lens
-            "power": float(pb.power) * _w_mean,
-            "color": list(pb.color),
+            "pos":   list(_spec.pos),
+            "dir":   list(_spec.normal),
+            "power": float(_spec.power),
+            "color": list(_spec.color),
+            "label": str(pb.label),
+            "_spec": _spec,
         })
     return lights
 

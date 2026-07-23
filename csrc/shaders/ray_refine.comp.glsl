@@ -362,7 +362,9 @@ void parametric_lens_teleport(int hb, int pay_off)
 
     vec3 ray_pos = vec3(hit_f(hb, 0), hit_f(hb, 1), hit_f(hb, 2));
     vec3 ray_dir = normalize(vec3(hit_f(hb, 6), hit_f(hb, 7), hit_f(hb, 8)));
-    bool is_backward = ((hit_u(hb, 16) & 1u) != 0u);
+    /* Bit 0 is a sensor/BDPT path. Bit 6 requests reciprocal optical
+     * traversal for a physical forward source such as the projector back. */
+    bool is_backward = ((hit_u(hb, 16) & (1u | 64u)) != 0u);
     uint surfaces_traversed = 0u;
     if (is_backward) atomicAdd(counters[12], 1u);
     int spectral_count = max(0, int(npay[pay_off + PLENS_N_SPECTRAL]));

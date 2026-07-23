@@ -5,7 +5,21 @@ import pytest
 import subprocess
 import sys
 
-from camera_designer.camera_preset import simple_doublet_preset
+from camera_designer.camera_preset import (
+    EmitterSpec,
+    ProjectorBackSpec,
+    simple_doublet_preset,
+)
+from camera_designer.emitter_profile import (
+    CoherenceModel,
+    EMITTER_CATALOG,
+)
+from camera_designer.ray_order import RayOrder
+from camera_software.projector_back_transport import (
+    ProjectorBackPreview,
+    prepare_projector_back_launch,
+    submit_projector_back,
+)
 from camera_designer.scene_builder import (
     build_tracer,
     build_gpu_scene,
@@ -43,6 +57,179 @@ def test_camera_bench_builds_shared_split_gpu_contract(gpu_scene):
     assert shade.flags.c_contiguous
     assert mat_buf.flags.c_contiguous
     assert len(bounds) == 2
+
+
+def test_projector_back_lowers_to_common_coherent_emitter_without_catalog_mutation():
+    preset = simple_doublet_preset()
+    before = EMITTER_CATALOG["laser_532nm_green"].spectral.radiant_exitance
+    preset.projector_back = ProjectorBackSpec(
+        enabled=True,
+        power=3.0,
+        profile_name="laser_532nm_green",
+        spatial_samples=17,
+    )
+
+    spec = preset.projector_back.as_emitter_spec(
+        sensor_z_pos=preset.sensor.z_pos,
+        sensor_radius=preset.sensor.r_max,
+        wavelengths_um=[0.532],
+    )
+    profile = spec.resolve_profile()
+
+    assert isinstance(spec, EmitterSpec)
+    assert spec.radius == pytest.approx(preset.sensor.r_max)
+    assert spec.spatial_samples == 17
+    assert profile.phase.model is CoherenceModel.COHERENT
+    assert profile.spectral.radiant_exitance == pytest.approx(3.0 * before)
+    assert EMITTER_CATALOG["laser_532nm_green"].spectral.radiant_exitance == before
+
+
+def test_projector_back_gpu_launch_covers_large_source_plane_with_fixed_phase():
+    preset = simple_doublet_preset()
+    preset.projector_back = ProjectorBackSpec(
+        enabled=True,
+        power=1.0,
+        profile_name="laser_532nm_green",
+        spatial_samples=32,
+    )
+    *_, source_buf = build_gpu_scene(
+        preset,
+        [],
+        wavelengths_um=[0.532],
+    )
+
+    radial = np.linalg.norm(source_buf[:, :2], axis=1)
+    assert np.count_nonzero(radial > 0.25 * preset.sensor.r_max) > 0
+    assert np.max(radial) <= preset.sensor.r_max * (1.0 + 1.0e-6)
+    assert np.ptp(source_buf[:, 9]) == pytest.approx(0.0, abs=1.0e-7)
+
+
+def test_emitter_exitance_is_linear_not_quadratic():
+    profile = EMITTER_CATALOG["laser_532nm_green"]
+    inline = profile.to_dict()
+    inline["spectral"]["radiant_exitance"] = 3.0
+    order = RayOrder.from_emitter_specs(
+        [EmitterSpec(profile_name="", profile_inline=inline)],
+        wavelengths_um=np.array([0.532]),
+    )
+
+    assert order.sources[0].amplitude_weights[0] == pytest.approx(3.0)
+
+
+def test_projection_geometry_keeps_transmissive_sensor_scrim_without_black_back_wall():
+    preset = simple_doublet_preset()
+    preset.projector_back = ProjectorBackSpec(
+        enabled=True,
+        scrim_transmission=[0.2, 0.5, 0.8],
+        scrim_diffusion=0.07,
+    )
+    result = _collect_optical_geometry(
+        preset, None, preset.wavelengths, None,
+    )
+    verts = result[0]
+    ior_specs = result[5]
+    mat_groups = result[7]
+    points = verts.reshape(-1, 3)
+    sensor_plane_vertices = np.isclose(
+        points[:, 2], preset.sensor.z_pos, atol=1.0e-10
+    )
+
+    assert np.any(sensor_plane_vertices)
+    assert any(spec[-1] == "sensor_scrim" for spec in ior_specs)
+    assert any(group[-1] == "sensor_scrim" for group in mat_groups)
+    assert not any(
+        group[-1] == "aperture_stop"
+        and np.allclose(
+            verts[group[0]:group[0] + group[1], (2, 5, 8)],
+            preset.sensor.z_pos - 0.002,
+        )
+        for group in mat_groups
+    )
+    assert np.any(np.isclose(
+        points[:, 2],
+        preset.sensor.z_pos - preset.projector_back.z_offset,
+        atol=1.0e-10,
+    ))
+
+
+def test_projector_launch_enters_native_exact_camera_frame_as_complex_lanes():
+    preset = simple_doublet_preset()
+    preset.wavelengths = [0.532]
+    preset.projector_back = ProjectorBackSpec(
+        enabled=True,
+        profile_name="laser_532nm_green",
+        spatial_samples=8,
+    )
+    launch = prepare_projector_back_launch(preset, n_rays=64, seed=7)
+
+    assert launch.origins.shape == (64, 3)
+    assert launch.directions.shape == (64, 3)
+    assert launch.amplitudes.shape == (64, 1)
+    assert np.all(launch.directions[:, 0] < 0.0)
+    assert np.ptp(np.angle(launch.amplitudes[:, 0])) == pytest.approx(
+        0.0, abs=1.0e-7
+    )
+    assert launch.profile_contract["source"] == "camera.projector-back-port"
+
+    class RecordingTracer:
+        def submit_rays(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    tracer = RecordingTracer()
+    submitted = submit_projector_back(tracer, launch, shader_dir="shaders")
+    assert submitted == 64
+    assert tracer.args[2] is launch.amplitudes
+    assert np.all(tracer.kwargs["color_flags"] == 64)
+    assert tracer.kwargs["use_gpu_compute"] is True
+    assert tracer.kwargs["gpu_all_stages"] is True
+
+
+def test_projector_preview_only_schedules_the_existing_native_pipeline(tmp_path):
+    preset = simple_doublet_preset()
+    preset.wavelengths = [0.532]
+    preset.projector_back = ProjectorBackSpec(
+        enabled=True,
+        profile_name="laser_532nm_green",
+    )
+
+    class PipelineTracer:
+        def __init__(self):
+            self.busy = 0
+            self.submissions = []
+            self.stopped = False
+
+        def in_flight_count(self):
+            return self.busy
+
+        def submit_rays(self, *args, **kwargs):
+            self.submissions.append((args, kwargs))
+            self.busy = 1
+
+        def stop_pipeline(self):
+            self.stopped = True
+
+    tracer = PipelineTracer()
+    preview = ProjectorBackPreview(
+        tracer,
+        preset,
+        shader_dir=str(tmp_path),
+        ray_count=32,
+    )
+    first = preview.poll()
+    assert first["generation"] == 0
+    assert len(tracer.submissions) == 1
+    assert tracer.submissions[0][0][2].shape == (32, 1)
+    assert np.all(tracer.submissions[0][1]["color_flags"] == 64)
+
+    tracer.busy = 0
+    complete = preview.poll()
+    assert complete["generation"] == 1
+    assert complete["profile_contract"]["source"] == (
+        "camera.projector-back-port"
+    )
+    preview.close()
+    assert tracer.stopped is True
 
 
 def test_camera_glass_keeps_dispersion_in_central_matbuf(gpu_scene):

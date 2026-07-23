@@ -41,6 +41,11 @@ struct RayTracerState;
 
 /* ─── Pipeline data types ───────────────────────────────────────────────── */
 
+/* Reverse traversal through reciprocal parametric optics without declaring a
+ * sensor/BDPT-backward path.  Bit 0 remains sensor ownership; bit 6 selects
+ * only the lens traversal direction. */
+static constexpr uint8_t RT_COLOR_FLAG_REVERSE_OPTICS = 1u << 6;
+
 struct RayIntent {
     Eigen::Vector3d  pos, dir;
     Eigen::VectorXcd amp;

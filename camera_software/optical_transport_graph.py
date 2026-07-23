@@ -592,19 +592,35 @@ def compile_compound_lens_graph(
     wave_regions: Sequence[tuple[str, Mapping[str, Any]]] = (),
     propagation: WavePropagationStyle = WavePropagationStyle.ANGULAR_SPECTRUM_FFT,
     boundary: WaveBoundaryStyle = WaveBoundaryStyle.PADDED_ABSORBING,
+    transport_direction: str = "forward",
 ) -> CompiledOpticalTransportGraph:
-    """Compile the existing exact lens payload as the first fused T2 module."""
+    """Compile the existing exact lens payload as the first fused T2 module.
+
+    ``forward`` is scene-to-sensor camera transport.  ``backward`` starts at
+    the physical projector back and exits toward the scene through the same
+    reciprocal exact lens payload.
+    """
 
     payload = np.ascontiguousarray(lens.build_gpu_payload(), np.float32)
     if int(payload[5]) != int(lane_count):
         raise ValueError("compound lens spectral payload does not match lane_count")
+    if transport_direction not in {"forward", "backward"}:
+        raise ValueError("transport_direction must be 'forward' or 'backward'")
+    is_projection = transport_direction == "backward"
+    entry_key = (
+        "camera.projector-back-port" if is_projection else "scene.complex-rays"
+    )
+    product_key = (
+        "scene.projected-field" if is_projection else "camera.sensor-port"
+    )
     scene = OpticalNodeSpec(
-        "scene.complex-rays",
-        "pipeline-entry",
+        entry_key,
+        "physical-source-plane" if is_projection else "pipeline-entry",
         OpticalExecutionDomain.PIPELINE_PORT,
         OpticalRepresentation.COMPLEX_RAY,
         OpticalRepresentation.COMPLEX_RAY,
         lane_count,
+        directionality=transport_direction,
     )
     fused = OpticalNodeSpec(
         "camera.exact-compound-lens",
@@ -613,23 +629,30 @@ def compile_compound_lens_graph(
         OpticalRepresentation.COMPLEX_RAY,
         OpticalRepresentation.COMPLEX_RAY,
         lane_count,
+        directionality=transport_direction,
         parameters={
             "payload_magic": 14949,
             "execution": "existing-t2-parametric-core",
             "hot_interpreter": False,
+            "reciprocal_direction": transport_direction,
         },
     )
     sensor = OpticalNodeSpec(
-        "camera.sensor-port",
-        "pipeline-product",
+        product_key,
+        "projected-field-product" if is_projection else "pipeline-product",
         OpticalExecutionDomain.PIPELINE_PORT,
         OpticalRepresentation.COMPLEX_RAY,
         OpticalRepresentation.COMPLEX_RAY,
         lane_count,
+        directionality=transport_direction,
     )
     nodes: list[OpticalNodeSpec] = [scene, fused]
     links: list[OpticalLinkSpec] = [
-        OpticalLinkSpec(scene.key, fused.key, "camera-entry")
+        OpticalLinkSpec(
+            scene.key,
+            fused.key,
+            "projector-back-entry" if is_projection else "camera-entry",
+        )
     ]
     tail = fused.key
     authored_regions = list(wave_regions)
@@ -658,7 +681,11 @@ def compile_compound_lens_graph(
         links.extend(wave_links)
         tail = wave_nodes[-1].key
     nodes.append(sensor)
-    links.append(OpticalLinkSpec(tail, sensor.key, "camera-product"))
+    links.append(OpticalLinkSpec(
+        tail,
+        sensor.key,
+        "projected-scene-product" if is_projection else "camera-product",
+    ))
     return compile_optical_graph(
         OpticalTransportGraphSpec(
             nodes=tuple(nodes),
@@ -667,6 +694,27 @@ def compile_compound_lens_graph(
             product_keys=(sensor.key,),
         ),
         t2_payloads={fused.key: payload},
+    )
+
+
+def compile_projector_back_graph(
+    lens: Any,
+    *,
+    lane_count: int,
+    wave_key: str | None = None,
+    wave_regions: Sequence[tuple[str, Mapping[str, Any]]] = (),
+    propagation: WavePropagationStyle = WavePropagationStyle.ANGULAR_SPECTRUM_FFT,
+    boundary: WaveBoundaryStyle = WaveBoundaryStyle.PADDED_ABSORBING,
+) -> CompiledOpticalTransportGraph:
+    """Compile sensor-plane-to-scene projection through reciprocal optics."""
+    return compile_compound_lens_graph(
+        lens,
+        lane_count=lane_count,
+        wave_key=wave_key,
+        wave_regions=wave_regions,
+        propagation=propagation,
+        boundary=boundary,
+        transport_direction="backward",
     )
 
 
@@ -687,4 +735,5 @@ __all__ = [
     "install_optical_graph",
     "compile_optical_graph",
     "compile_compound_lens_graph",
+    "compile_projector_back_graph",
 ]

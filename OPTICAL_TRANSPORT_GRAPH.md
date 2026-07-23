@@ -248,6 +248,39 @@ directions, input/seeded/propagated/output power, adapter identity, and the
 transition generation without adding per-ray state to ordinary pipeline
 records.
 
+## Projector-back source plane
+
+Reverse projection uses the camera's existing large back plane; it is not a
+point light and does not instantiate another tracer. `ProjectorBackSpec`
+lowers to the common `EmitterProfile` contract and may therefore author
+spectrum, coherence, carrier phase, angular distribution, polarization, and
+an emissive/Jones texture. Fixed-lane scalar complex launch is currently
+implemented. Full Jones launch and continuous-frequency source sidecars remain
+explicit follow-on ABI work.
+
+The physical order is:
+
+```text
+projector back source plane
+  -> spectrally colored transmissive sensor scrim
+  -> reciprocal exact compound lens
+  -> optional scene-side T4 regions
+  -> projected scene field
+```
+
+Projector mode retains the sensor geometry as an authored transmissive scrim
+with per-lane transmission and diffusion. It removes only the opaque
+sensor-bay back wall. Ordinary camera mode retains the absorbing sensor and
+back wall.
+
+`compile_projector_back_graph()` declares the reverse route through the same
+magic-14949 T2 payload. Native intents use a dedicated reverse-optics flag,
+separate from the sensor/BDPT-backward bit, so a physical projector source
+does not acquire sensor ownership or sensor splat semantics. The source plane
+is sampled across its full area and aimed through the analytically derived
+exit pupil. Current pupil quadrature uses the center site; finite pupil-fill
+and illumination-optics modules are the next source-optics layer.
+
 ## Adoption gates
 
 1. **Contract scaffold**
@@ -297,6 +330,12 @@ records.
 - Ray/field adapters are declared but not yet implemented as production GPU
   kernels. The CPU entry/exit adapter currently maps legacy scalar ray
   amplitude to S polarization; full Jones sidecar mapping remains.
+- Projector launch currently maps its authored frequency to an exact fixed
+  lane. Continuous-frequency source launch needs the planned frequency
+  sidecar; it is not represented by an arbitrary nearest-lane approximation.
+- Projector pupil quadrature currently aims each source-plane site at the exit
+  pupil center. Finite pupil-fill, condenser/relay optics, and textured Jones
+  field sampling remain light-source-optics work.
 - T4 state is not yet published as a zero-copy OpenGL texture; the existing
   complex volume is ray-hit accumulation.
 - Maxwell artifact nodes are reserved contract space, not an implemented patch

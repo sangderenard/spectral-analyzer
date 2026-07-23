@@ -21,6 +21,7 @@ from .gpu_preview import (
     RayPipelinePreviewBridge,
 )
 from .optical_bench import resolve_bench_camera_manifest
+from .projector_back_transport import ProjectorBackPreview
 from .surface_scan_preview import SurfaceScanPose, SurfaceScanPreview
 
 
@@ -28,7 +29,7 @@ from .surface_scan_preview import SurfaceScanPose, SurfaceScanPreview
 class OpticalEngineJob:
     request_revision: int
     backend_mode: str
-    preview: SurfaceScanPreview
+    preview: Any
     publisher: RayPipelinePreviewBridge
     transport_installation: Any | None = None
     completed_generation: int = 0
@@ -134,6 +135,14 @@ class OpticalEngineBackend:
             )
         manifest = resolve_bench_camera_manifest(self._camera_mapping(payload))
         preset = camera_manifest_to_designer_preset(manifest)
+        projector_back = payload.get("projector_back")
+        if isinstance(projector_back, Mapping):
+            from camera_designer.camera_preset import ProjectorBackSpec
+
+            preset.projector_back = ProjectorBackSpec.from_dict(
+                dict(projector_back)
+            )
+        projector_enabled = bool(preset.projector_back.enabled)
         scene_object = dict(payload.get("scene_object", {})) or None
         lights = [dict(value) for value in payload.get("lights", ())]
         revision = int(payload.get("revision", 0))
@@ -164,6 +173,7 @@ class OpticalEngineBackend:
             from camera_designer.compound_optics import CompoundLens
             from .optical_transport_graph import (
                 compile_compound_lens_graph,
+                compile_projector_back_graph,
                 install_optical_graph,
             )
 
@@ -172,12 +182,17 @@ class OpticalEngineBackend:
                 key = str(context.pop("key", f"bench.wave-{index}"))
                 context.pop("transport", None)
                 wave_regions.append((key, context))
-            graph = compile_compound_lens_graph(
-                CompoundLens.from_preset(
-                    preset,
-                    wavelengths_um=preset.wavelengths,
-                    axial_scale=-1.0,
-                ),
+            lens = CompoundLens.from_preset(
+                preset,
+                wavelengths_um=preset.wavelengths,
+                axial_scale=-1.0,
+            )
+            compiler = (
+                compile_projector_back_graph
+                if projector_enabled else compile_compound_lens_graph
+            )
+            graph = compiler(
+                lens,
                 lane_count=len(preset.wavelengths),
                 wave_regions=tuple(wave_regions),
             )
@@ -192,13 +207,24 @@ class OpticalEngineBackend:
                 f"backend=angular-spectrum-fft",
                 flush=True,
             )
-        preview = SurfaceScanPreview(
-            tracer,
-            self._pose(payload, preset),
-            shader_dir=self.shader_dir,
-            display_hglrc=self.share_group.context_handle,
-            display_hdc=self.share_group.device_context_handle,
-        )
+        if projector_enabled:
+            preview = ProjectorBackPreview(
+                tracer,
+                preset,
+                shader_dir=self.shader_dir,
+                ray_count=int(payload.get("projector_rays", 65_536)),
+                seed=int(payload.get("seed", 42)),
+                display_hglrc=self.share_group.context_handle,
+                display_hdc=self.share_group.device_context_handle,
+            )
+        else:
+            preview = SurfaceScanPreview(
+                tracer,
+                self._pose(payload, preset),
+                shader_dir=self.shader_dir,
+                display_hglrc=self.share_group.context_handle,
+                display_hdc=self.share_group.device_context_handle,
+            )
         requested_products = {
             str(value).strip().lower()
             for value in payload.get("requested_products", ())
@@ -230,7 +256,12 @@ class OpticalEngineBackend:
             previous.preview.close()
         print(
             "[optical-backend] mode=fast_preview owner=optical-engine "
-            f"revision={job.request_revision} resolution={preview._pose.resolution}",
+            f"revision={job.request_revision} "
+            + (
+                f"projector_rays={preview._launch.ray_count}"
+                if projector_enabled
+                else f"resolution={preview._pose.resolution}"
+            ),
             flush=True,
         )
         return job
@@ -248,6 +279,7 @@ class OpticalEngineBackend:
             "generation": generation,
             "backend_mode": job.backend_mode,
             "owner": "optical-engine",
+            "projector_back": info.get("profile_contract"),
             "transport_graph": (
                 None if job.transport_installation is None
                 else job.transport_installation.contract()

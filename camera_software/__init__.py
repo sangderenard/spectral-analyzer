@@ -348,6 +348,13 @@ from .optical_transport_graph import (
     install_optical_graph,
     compile_optical_graph,
     compile_compound_lens_graph,
+    compile_projector_back_graph,
+)
+from .projector_back_transport import (
+    ProjectorBackLaunch,
+    ProjectorBackPreview,
+    prepare_projector_back_launch,
+    submit_projector_back,
 )
 from .physical_aperture import (
     APERTURE_PAYLOAD_MAGIC,
@@ -703,6 +710,11 @@ __all__ = [
     "install_optical_graph",
     "compile_optical_graph",
     "compile_compound_lens_graph",
+    "compile_projector_back_graph",
+    "ProjectorBackLaunch",
+    "ProjectorBackPreview",
+    "prepare_projector_back_launch",
+    "submit_projector_back",
     "APERTURE_PAYLOAD_MAGIC",
     "APERTURE_PAYLOAD_VERSION",
     "APERTURE_PAYLOAD_VALUES",

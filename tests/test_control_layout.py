@@ -122,9 +122,10 @@ def test_program_manifest_owns_three_hosts_and_context_requests():
     }
     assert set(tool_panels) == {
         "camera-toolbar", "lens-toolbar", "light-toolbar", "film-toolbar",
-        "integrator-toolbar", "exposure-toolbar",
+        "arena-toolbar", "integrator-toolbar", "exposure-toolbar",
     }
-    assert len(tool_panels["integrator-toolbar"].knobs) == 8
+    assert len(tool_panels["arena-toolbar"].knobs) == 3
+    assert len(tool_panels["integrator-toolbar"].knobs) == 6
     assert len(tool_panels["exposure-toolbar"].knobs) == 8
     assert all(
         getattr(knob, "control_widget", "") == "stepper"

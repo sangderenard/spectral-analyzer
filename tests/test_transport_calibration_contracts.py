@@ -66,7 +66,7 @@ def test_continuous_lanes_signal_lut_and_resolution_is_cached_per_ray_state() ->
     assert cache.cached_resolution_count == 1
 
 
-@pytest.mark.parametrize("lane_count", (1, 3, 8, 16, 32))
+@pytest.mark.parametrize("lane_count", (1, 3, 4, 8, 16, 32))
 def test_fixed_visible_lanes_are_perceptual_and_have_coloured_sensor_weights(
     lane_count,
 ) -> None:

@@ -8,7 +8,7 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 
-STARTUP_LANE_CONFIGURATIONS = (1, 3, 8, 16, 32)
+STARTUP_LANE_CONFIGURATIONS = (1, 3, 4, 8, 16, 32)
 
 
 @dataclass(frozen=True)

@@ -80,7 +80,7 @@ def _fixed_spectral_contract(
             for i, wavelength_nm in enumerate(wavelengths_nm)
         ),
     )
-    variant = next(size for size in (1, 3, 8, 16, 32) if size >= len(table.lanes))
+    variant = next(size for size in (1, 3, 4, 8, 16, 32) if size >= len(table.lanes))
     return TransportWorkContract(
         lane_table=table,
         material_profile_library_key="canonical-optical-materials",

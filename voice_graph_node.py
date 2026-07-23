@@ -1016,15 +1016,190 @@ class VoiceArchetype(AnalyticArchetype):
                 if raw is not None:
                     mod._pending_atoms = raw if isinstance(raw, list) else [raw]
 
-        # ── Atom synthesis: synthesize_atoms for atom voices; zeros otherwise ─
-        out = torch.zeros((len(mods),) + payload_shape, dtype=_CDTYPE, device=device)
+        # Ordinary continuous voices remain the default batched engine.  Atom
+        # FIFOs are an alternate source for selected rows, not a requirement
+        # that turns every non-atom oscillator into silence.
+        oscillators = [mod.oscillator for mod in mods]
+        sample_rates = torch.stack([
+            osc._sample_rate.to(device=device, dtype=torch.float64).reshape(())
+            for osc in oscillators
+        ], dim=0)
+        durations = torch.stack([
+            osc._duration.to(device=device, dtype=torch.float64).reshape(())
+            for osc in oscillators
+        ], dim=0)
+        sample_idx = torch.stack([
+            osc._sample_idx.to(device=device, dtype=torch.float64).reshape(())
+            for osc in oscillators
+        ], dim=0)
+
+        if payload_shape:
+            t_index = torch.arange(n_time, dtype=torch.float64, device=device)
+            t_shape = [1] * len(payload_shape)
+            t_shape[time_axis_payload] = n_time
+            t_index = t_index.reshape(t_shape)
+            t_abs = (
+                t_index.unsqueeze(0) + self._view_for_payload(sample_idx, payload_shape)
+            ) / self._view_for_payload(sample_rates, payload_shape)
+        else:
+            t_abs = sample_idx / sample_rates
+        t_norm = (
+            t_abs / self._view_for_payload(durations, payload_shape)
+        ).clamp(0.0, 1.0)
+
+        env_mod = self._mod_tensor(
+            mods, "_env_mod", payload_shape, device, default=1.0 + 0.0j,
+        )
+        chirp_mod = self._mod_tensor(
+            mods, "_chirp_mod", payload_shape, device, default=0.0 + 0.0j,
+        )
+        am_mod = self._mod_tensor(
+            mods, "_am_mod", payload_shape, device, default=0.0 + 0.0j,
+        )
+        pitch_in = self._mod_tensor(
+            mods, "_pitch_in", payload_shape, device, default=0.0 + 0.0j,
+        )
+
+        env_z = torch.stack([
+            osc.envelope_curve.evaluate_normalized(t_norm[i]).to(
+                device=device, dtype=_CDTYPE,
+            )
+            for i, osc in enumerate(oscillators)
+        ], dim=0)
+        chirp_z = torch.stack([
+            osc.chirp_curve.evaluate_normalized(t_norm[i]).to(
+                device=device, dtype=_CDTYPE,
+            )
+            for i, osc in enumerate(oscillators)
+        ], dim=0)
+        env_z = env_z * env_mod
+        chirp_hz = torch.stack([
+            osc.chirp_curve.to_physical(
+                chirp_z[i].real.to(torch.float64).clamp(0.0, 1.0)
+            ).to(device=device, dtype=torch.float64)
+            for i, osc in enumerate(oscillators)
+        ], dim=0) + chirp_mod.real.to(torch.float64)
+
+        log_freq = self._voice_tensor(
+            [osc.log_freq for osc in oscillators], payload_shape, device,
+        )
+        log_amplitude = self._voice_tensor(
+            [osc.log_amplitude for osc in oscillators], payload_shape, device,
+        )
+        phase_origin = self._voice_tensor(
+            [osc.phase_origin for osc in oscillators], payload_shape, device,
+        )
+        semitone_offset = self._voice_tensor(
+            [osc.semitone_offset for osc in oscillators], payload_shape, device,
+        )
+        harmonic_brightness = self._voice_tensor(
+            [osc.harmonic_brightness for osc in oscillators], payload_shape, device,
+        )
+        harmonic_warp_strength = self._voice_tensor(
+            [osc.harmonic_warp_strength for osc in oscillators], payload_shape, device,
+        )
+        fm_depth_hz = self._voice_tensor(
+            [osc.fm_depth_hz for osc in oscillators], payload_shape, device,
+        )
+        am_depth_amp = self._voice_tensor(
+            [osc.am_depth_amp for osc in oscillators], payload_shape, device,
+        )
+        tuning_ref_hz = self._voice_tensor(
+            [osc.tuning_ref_hz for osc in oscillators], payload_shape, device,
+        )
+        tuning_ref_note = self._voice_tensor(
+            [osc.tuning_ref_note for osc in oscillators], payload_shape, device,
+        )
+        pre_delay = self._voice_tensor(
+            [osc.pre_delay_s for osc in oscillators], payload_shape, device,
+        )
+        sr_t = self._view_for_payload(sample_rates, payload_shape)
+
+        semitone_shift = torch.pow(
+            torch.tensor(2.0, dtype=torch.float64, device=device),
+            semitone_offset / 12.0,
+        )
+        pitch = pitch_in.real.to(torch.float64)
+        f_hz = pitch.clamp(min=1e-3) * semitone_shift
+        f_midi = tuning_ref_hz * torch.pow(
+            torch.tensor(2.0, dtype=torch.float64, device=device),
+            (pitch - tuning_ref_note) / 12.0,
+        ) * semitone_shift
+        midi_mask = torch.tensor(
+            [osc.pitch_input_mode == "midi" for osc in oscillators],
+            dtype=torch.bool,
+            device=device,
+        ).reshape((len(oscillators),) + (1,) * len(payload_shape))
+        f_pitch = torch.where(midi_mask, f_midi, f_hz)
+        if pitch_in.dim() > 1:
+            pitch_active = (
+                pitch_in.real.abs().amax(
+                    dim=tuple(range(1, pitch_in.dim())), keepdim=True,
+                ) > 0.0
+            )
+        else:
+            pitch_active = pitch_in.real.abs() > 0.0
+        f_base = torch.where(
+            pitch_active,
+            f_pitch,
+            torch.exp(log_freq) * semitone_shift,
+        )
+
+        total_factor = torch.exp(log_amplitude).to(_CDTYPE) * env_z
+        total_factor = total_factor * (
+            1.0 + am_depth_amp.to(_CDTYPE) * am_mod.real.to(_CDTYPE)
+        )
+        total_factor = total_factor * torch.exp(
+            1j * fm_depth_hz.to(_CDTYPE) * x,
+        )
+        amp_total = total_factor.abs().to(torch.float64)
+        phase_add = torch.angle(total_factor).to(torch.float64)
+
+        f_inst = f_base + chirp_hz
+        phase_incr = 2.0 * math.pi * f_inst / sr_t
+        if time_axis is None:
+            phase = phase_incr + phase_origin + phase_add
+        else:
+            phase = torch.cumsum(phase_incr, dim=time_axis) + phase_origin + phase_add
+
+        manifold_types = [osc.manifold_type for osc in oscillators]
+        harmonic_counts = [int(osc.harmonic_count) for osc in oscillators]
+        if (
+            len(set(manifold_types)) == 1
+            and manifold_types[0] in ("harmonic", "harmonic_warp")
+            and len(set(harmonic_counts)) == 1
+            and harmonic_counts[0] > 1
+        ):
+            out = self._harmonic_batch(
+                phase,
+                f_base,
+                amp_total,
+                harmonic_counts[0],
+                harmonic_brightness,
+                harmonic_warp_strength,
+                phase_origin,
+                sr_t,
+            )
+        else:
+            out = amp_total.to(_CDTYPE) * torch.exp(1j * phase.to(_CDTYPE))
+
+        out = torch.where(
+            t_abs < pre_delay,
+            torch.zeros((), dtype=_CDTYPE, device=device),
+            out,
+        )
+
+        # An available atom stream replaces only its own row.
         for i, mod in enumerate(mods):
-            if mod is not None and getattr(mod, "_pending_atoms", None):
+            if getattr(mod, "_pending_atoms", None):
                 sr_val = float(mod.oscillator._sample_rate.item())
                 audio = synthesize_atoms(mod._pending_atoms, n_time, sr_val)
                 out[i] = audio.to(_CDTYPE).to(device).reshape(payload_shape)
 
-        return out
+        with torch.no_grad():
+            for osc in oscillators:
+                osc._sample_idx.add_(n_time)
+        return out.to(_CDTYPE)
 
     def fire(self, forward_fn=None) -> None:  # noqa: ARG002
         if not self._pending:

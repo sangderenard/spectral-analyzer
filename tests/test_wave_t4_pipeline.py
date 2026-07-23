@@ -71,6 +71,54 @@ def test_empty_space_crossing_routes_through_t4():
     assert tracer.wave_arena_stats()[0]["generation"] == 1
 
 
+def test_compiled_optical_graph_installs_and_drives_native_t4():
+    from camera_software.optical_transport_graph import (
+        OpticalTransportGraphSpec,
+        WavePropagationStyle,
+        compile_optical_graph,
+        install_optical_graph,
+        wave_context_nodes,
+    )
+
+    tracer = _tracer(np.array([550e-9]))
+    nodes, links = wave_context_nodes(
+        "bench.wave",
+        1,
+        propagation=WavePropagationStyle.ADI_REFERENCE,
+        center_m=(0.0, 0.0, 0.0),
+        axis=(0.0, 0.0, 1.0),
+        radius_m=0.02,
+        longitudinal_step_m=0.005,
+        longitudinal_steps=3,
+    )
+    compiled = compile_optical_graph(OpticalTransportGraphSpec(
+        nodes=nodes,
+        links=links,
+        entry_keys=(nodes[0].key,),
+        product_keys=(nodes[-1].key,),
+    ))
+    receipt = install_optical_graph(
+        tracer,
+        compiled,
+        exact_t2_registered=False,
+    )
+    tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+    tracer.submit_rays(
+        np.array([[0.0, 0.0, -0.05]]),
+        np.array([[0.0, 0.0, 1.0]]),
+        np.array([[1.0 + 0.0j]]),
+        max_bounces=1,
+        min_amplitude=1e-12,
+    )
+    _wait(tracer)
+
+    arena = tracer.wave_arena_stats()[0]
+    assert receipt.wave_arenas[0].node_key == "bench.wave.arena"
+    assert arena["generation"] == 1
+    assert arena["bands"] == 1
+    assert arena["backend"] == 0  # LegacyAdiCalibration
+
+
 def test_continuous_paths_share_one_exact_width_complex_dispatch():
     tracer = _tracer(np.array([450e-9, 500e-9, 600e-9, 700e-9]))
     tracer.configure_spectral_luts(

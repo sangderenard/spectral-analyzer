@@ -172,6 +172,21 @@ class RebuiltCameraArtifact:
     def backward_target_spec(self) -> Any:
         return self.lens_assembly.backward_ray_target_spec()
 
+    def compile_transport_graph(self, *, wave_key: str | None = None) -> Any:
+        """Cold-compile this exact camera into the shared optical graph ABI.
+
+        This is opt-in until the pipeline consumes compiled graph schedules
+        directly; ordinary camera construction therefore pays no Torch/graph
+        import or compilation cost.
+        """
+        from .optical_transport_graph import compile_compound_lens_graph
+
+        return compile_compound_lens_graph(
+            self.lens_assembly.require_optics(),
+            lane_count=int(self.wavelengths_nm.size),
+            wave_key=wave_key,
+        )
+
     def describe(self) -> str:
         p = self.provenance
         return (

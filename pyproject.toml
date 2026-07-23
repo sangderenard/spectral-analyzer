@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib",
     "soundfile",
     "PyYAML",
+    "usd-core>=25.11,<27",
 ]
 
 [project.optional-dependencies]

@@ -1177,33 +1177,37 @@ def _build_thick_lens_lab_tracer_scene() -> TracerScene:
     sidecar = _active_frequency_sidecar(
         tll, DEFAULT_FREQ_HZ, authored_flash_spectrum
     )
-    ordered_camera_object = None
+    # The canonical manifest owns camera construction even when no scene order
+    # is present.  Previously the default path built an independent SceneConfig
+    # and attached a matching manifest only after the fact, allowing those two
+    # definitions to drift silently.
+    from camera_software.camera_manifest import resolve_camera_manifest
     if ordered_camera_manifest is not None:
-        from camera_software.camera_manifest import resolve_camera_manifest
         ordered_camera_object = resolve_camera_manifest(
             _ORDERED_SCENE_JOB.get("camera", {}),
             _ORDERED_SCENE_JOB.get("image", {}),
             _ORDERED_SCENE_JOB.get("flash", {}),
             wavelengths_nm=sidecar.wavelength_nm,
         )
-        ordered_camera_manifest = ordered_camera_object.mapping()
+    else:
+        ordered_camera_object = resolve_camera_manifest(
+            wavelengths_nm=sidecar.wavelength_nm,
+        )
+    ordered_camera_manifest = ordered_camera_object.mapping()
     if ordered_sensor_focus_m is None:
         lab_scene = tll.SceneConfig()
-        if ordered_camera_manifest is not None:
-            _apply_camera_manifest_to_lab_scene(
-                tll, lab_scene, ordered_camera_manifest
-            )
+        _apply_camera_manifest_to_lab_scene(
+            tll, lab_scene, ordered_camera_manifest
+        )
     else:
         lab_scene = _ordered_lab_scene_for_sensor_focus(
             tll, ordered_sensor_focus_m, ordered_camera_manifest
         )
 
-    camera_manifest_hash = "default"
-    if ordered_camera_object is not None:
-        from camera_software.camera_preparation import CameraPreparationKey
-        camera_manifest_hash = CameraPreparationKey.from_manifest(
-            ordered_camera_object
-        ).cache_key.replace("sha256:", "")[:16]
+    from camera_software.camera_preparation import CameraPreparationKey
+    camera_manifest_hash = CameraPreparationKey.from_manifest(
+        ordered_camera_object
+    ).cache_key.replace("sha256:", "")[:16]
 
     cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".spectral_cache")
     focus_cache_tag = (
@@ -4077,6 +4081,7 @@ class ExposureSession:
                  vcm_radius_mm: float = 2.0,
                  vcm_radius_alpha: float = 0.7,
                  gpu_resident: bool = False,
+                 wave_contexts: bool = False,
                  bdpt_native_packages: int = 1,
                  bdpt_native_sweeps: int = 1):
         self.optics = optics
@@ -4097,6 +4102,7 @@ class ExposureSession:
         self.vcm_enabled = bool(vcm_enabled)
         self.vcm_radius_mm = max(1.0e-4, float(vcm_radius_mm))
         self.vcm_radius_alpha = min(1.0, max(1.0e-4, float(vcm_radius_alpha)))
+        self.wave_contexts = bool(wave_contexts)
         self.scene_mode_schedule = tuple(str(s) for s in scene_mode_schedule) if scene_mode_schedule else None
         self.profile_enabled = bool(profile_enabled)
         self._profiler = StageProfiler(self.profile_enabled)
@@ -4826,8 +4832,11 @@ class ExposureSession:
         except Exception as e:
             print(f"  [warn] sensor_film_ssbo upload failed: {e}")
 
-    def _configure_default_wave_contexts(self, tracer: Any, cam: PhysicalCameraRig, solved: Any | None = None) -> None:
-        """Install default wave contexts so kernel wave path is active in BDPT."""
+    def _configure_default_wave_contexts(
+        self, tracer: Any, cam: PhysicalCameraRig, solved: Any | None = None,
+        *, include_surrogate_lenses: bool = True,
+    ) -> None:
+        """Install explicit wave arenas, optionally with surrogate lens transforms."""
         if tracer is None:
             raise RuntimeError("wave context configuration requires a live tracer")
         if not hasattr(tracer, "clear_scale_contexts") or not hasattr(tracer, "add_scale_context"):
@@ -4857,17 +4866,18 @@ class ExposureSession:
         rt_wave = int(getattr(_sk, "RT_SCALE_WAVE", 1))
 
         thin_payload = np.asarray([focal_len_m], dtype=np.float64)
-        tracer.add_scale_context(
-            pos=aperture_center.astype(np.float64),
-            radius=float(max(aperture_radius_m * 1.2, 1.0e-4)),
-            scale_type=rt_wave,
-            dt_m=float(max(1.0e-4, aperture_radius_m * 0.08)),
-            n_substeps=2,
-            n_real=1.0,
-            n_imag=0.0,
-            context_kind=thin_kind,
-            payload=thin_payload,
-        )
+        if include_surrogate_lenses:
+            tracer.add_scale_context(
+                pos=aperture_center.astype(np.float64),
+                radius=float(max(aperture_radius_m * 1.2, 1.0e-4)),
+                scale_type=rt_wave,
+                dt_m=float(max(1.0e-4, aperture_radius_m * 0.08)),
+                n_substeps=2,
+                n_real=1.0,
+                n_imag=0.0,
+                context_kind=thin_kind,
+                payload=thin_payload,
+            )
 
         wave_payload = np.asarray([focal_len_m], dtype=np.float64)
         tracer.add_scale_context(
@@ -4896,17 +4906,18 @@ class ExposureSession:
         )
 
         thick_payload = np.asarray([focal_len_m, phase_scale], dtype=np.float64)
-        tracer.add_scale_context(
-            pos=aperture_center.astype(np.float64),
-            radius=float(max(aperture_radius_m * 2.0, 1.0e-4)),
-            scale_type=rt_wave,
-            dt_m=float(max(1.0e-4, aperture_radius_m * 0.1)),
-            n_substeps=2,
-            n_real=1.0,
-            n_imag=0.0,
-            context_kind=thick_kind,
-            payload=thick_payload,
-        )
+        if include_surrogate_lenses:
+            tracer.add_scale_context(
+                pos=aperture_center.astype(np.float64),
+                radius=float(max(aperture_radius_m * 2.0, 1.0e-4)),
+                scale_type=rt_wave,
+                dt_m=float(max(1.0e-4, aperture_radius_m * 0.1)),
+                n_substeps=2,
+                n_real=1.0,
+                n_imag=0.0,
+                context_kind=thick_kind,
+                payload=thick_payload,
+            )
 
     # ── Calibration: gain to match measured H to target H ────────────────
     @staticmethod
@@ -6486,18 +6497,26 @@ class ExposureSession:
 
                     # Bind sensor/film SSBO before batch dispatch.
                     self._bind_sensor_film_ssbo(tracer)
-                    if scene.optical_camera is not None:
-                        # Exact conic traversal owns the camera path. A second
-                        # thin/thick-lens scale context would steer the same ray
-                        # again and invalidate its optical geometry.
-                        tracer.clear_scale_contexts()
+                    if self.wave_contexts:
+                        # Exact conic traversal still owns lens steering. Wave
+                        # mode adds only Helmholtz arenas in that case; it must
+                        # not add thin/thick surrogate lenses on top.
+                        self._configure_default_wave_contexts(
+                            tracer, cam, solved,
+                            include_surrogate_lenses=(scene.optical_camera is None),
+                        )
                         print(
-                            "  [camera-build] surrogate scale contexts disabled; "
-                            "exact parametric assembly owns optical transport",
+                            "  [arena] wave contexts ON "
+                            f"(exact_camera={scene.optical_camera is not None})",
                             flush=True,
                         )
                     else:
-                        self._configure_default_wave_contexts(tracer, cam, solved)
+                        tracer.clear_scale_contexts()
+                        print(
+                            "  [arena] wave contexts OFF; geometric/parametric "
+                            "optical transport only",
+                            flush=True,
+                        )
 
                     _bdpt_emitter_centers = (
                         np.asarray(emissive_group_centers, np.float64)
@@ -8422,6 +8441,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--gpu-resident", action="store_true",
                    help="Enable GPU-resident BDPT/T5 mode, matching thick_lens_focus_lab's "
                         "--gpu-resident path. This is required to exercise native GPU T5 scheduling.")
+    p.add_argument(
+        "--wave-contexts", action="store_true",
+        help=("Enable pipeline T4 wave arenas. With an exact parametric camera, "
+              "lens surrogate contexts remain disabled."),
+    )
     p.add_argument("--bdpt-native-packages", type=int, default=1,
                    help="Minimum spatial partitions per native sensor sweep (default: 1; "
                         "automatically raised to satisfy record caps).")
@@ -8653,6 +8677,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.no_convergence = True
                 args.no_convergence_drive_batches = True
                 args.max_bounces = 1
+        if "wave_contexts" in authored_runtime:
+            args.wave_contexts = bool(authored_runtime["wave_contexts"])
         authored_frequencies = order_transport_frequencies(order_package)
         if authored_frequencies is not None:
             DEFAULT_FREQ_HZ = authored_frequencies
@@ -8965,6 +8991,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         vcm_radius_mm   = float(args.vcm_radius_mm),
         vcm_radius_alpha = float(args.vcm_radius_alpha),
         gpu_resident    = bool(args.gpu_resident),
+        wave_contexts   = bool(args.wave_contexts),
         bdpt_native_packages = int(args.bdpt_native_packages),
         bdpt_native_sweeps = int(args.bdpt_native_sweeps),
         save_files       = args.save_files,

@@ -24,6 +24,60 @@ def test_work_preview_tab_routes_without_changing_render_settings(monkeypatch):
     assert toolbar.mode == "work-piece"
 
 
+def test_work_preview_toolbar_adds_gpu_product_tabs():
+    from types import SimpleNamespace
+
+    toolbar = WorkPreviewToolbar()
+    toolbar.set_gpu_products((
+        SimpleNamespace(product_id="camera.surface", tab_label="SURFACE"),
+        SimpleNamespace(product_id="wave.accum", tab_label="WAVE FIELD"),
+    ))
+    assert [knob.name for knob in toolbar.panel.knobs] == [
+        "whole-work", "work-piece", "gpu:camera.surface", "gpu:wave.accum",
+        "capture-frame", "capture-sequence",
+    ]
+    toolbar.mode = "gpu:camera.surface"
+    assert toolbar.selected_product_id == "camera.surface"
+
+
+def test_fast_surface_scan_becomes_default_until_user_selects_a_tab():
+    from types import SimpleNamespace
+
+    toolbar = WorkPreviewToolbar()
+    products = (
+        SimpleNamespace(
+            product_id="camera.surface-scan", tab_label="FAST PREVIEW"
+        ),
+        SimpleNamespace(product_id="wave.field", tab_label="WAVE SLICE"),
+    )
+    toolbar.set_gpu_products(products)
+    assert toolbar.mode == "gpu:camera.surface-scan"
+
+    toolbar._grid.route_event = lambda _event, _rect: ("whole-work", 1)
+    toolbar.handle_event(object(), (0, 0, 200, 24))
+    toolbar.set_gpu_products(products)
+    assert toolbar.mode == "whole-work"
+
+
+def test_capture_sequence_is_a_widget_state_not_a_preview_mode(monkeypatch):
+    from types import SimpleNamespace
+
+    toolbar = WorkPreviewToolbar()
+    toolbar.set_gpu_products((
+        SimpleNamespace(product_id="camera.surface", tab_label="SURFACE"),
+    ))
+    toolbar.mode = "gpu:camera.surface"
+    monkeypatch.setattr(
+        toolbar._grid, "route_event",
+        lambda _event, _rect: ("capture-sequence", 1),
+    )
+    assert toolbar.handle_event(object(), (0, 0, 200, 24)) == (
+        "work-preview:capture-sequence"
+    )
+    assert toolbar.sequence_capture_armed
+    assert toolbar.selected_product_id == "camera.surface"
+
+
 def test_work_piece_crop_uses_render_dimensions_then_fits_ui(monkeypatch):
     class Surface:
         def __init__(self, size):

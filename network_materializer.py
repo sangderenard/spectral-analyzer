@@ -125,9 +125,84 @@ def _archetype_key_for(analytic_obj) -> str:
 
 @dataclass
 class CompiledGraph:
+    """Engine-facing runtime for a compiled complex transport network.
+
+    This is intentionally domain-neutral.  Audio, optical/EM parametric
+    regions, controls, and calibration tools all enter through named complex
+    ports and request named complex products; presentation belongs outside.
+    """
+
     solver: object
     output_node_keys: list[str]
     module_registry: dict[str, nn.Module]
+
+    def _select_products(
+        self,
+        values: Dict[str, torch.Tensor],
+        product_keys: Optional[List[str]],
+    ) -> Dict[str, torch.Tensor]:
+        keys = self.output_node_keys if product_keys is None else list(product_keys)
+        unknown = sorted(set(keys) - set(values))
+        if unknown:
+            raise KeyError(f"Unknown graph products: {unknown}")
+        return {key: values[key] for key in keys}
+
+    def process_window(
+        self,
+        inputs: Optional[Dict[str, torch.Tensor]] = None,
+        *,
+        n_frames: int,
+        product_keys: Optional[List[str]] = None,
+        on_progress=None,
+    ) -> Dict[str, torch.Tensor]:
+        """Process one tensor window without projecting away complex state."""
+
+        values = self.solver.run_schedule(
+            inputs or {},
+            n_frames=max(1, int(n_frames)),
+            on_progress=on_progress,
+        )
+        return self._select_products(values, product_keys)
+
+    def process_sample(
+        self,
+        inputs: Optional[Dict[str, torch.Tensor]] = None,
+        *,
+        product_keys: Optional[List[str]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Advance a stateful context by one causal sample."""
+
+        values = self.solver.step(inputs or {})
+        return self._select_products(values, product_keys)
+
+    def reset(self) -> None:
+        self.solver.reset()
+
+    def transport_contract(self) -> dict:
+        """Return a serializable description suitable for engine/context APIs."""
+
+        delayed = {
+            str(delay): len(edges)
+            for delay, edges in sorted(self.solver.delayed_edges_by_steps.items())
+        }
+        return {
+            "schema": "complex-network-context-v1",
+            "engine": "graph_solver",
+            "representation": "torch.complex128",
+            "sample_rate": float(self.solver.sample_rate),
+            "entry": "named_complex_ports",
+            "exit": "named_complex_products",
+            "node_keys": list(self.solver.node_keys),
+            "output_node_keys": list(self.output_node_keys),
+            "zero_delay_edges": len(self.solver.zero_delay_edges),
+            "delayed_edges_by_samples": delayed,
+            "schedule": (
+                "causal_feedback"
+                if self.solver._schedule_has_delayed_feedback
+                else "vectorized_window"
+            ),
+            "state_lifetime": "persistent_until_reset",
+        }
 
 
 def compile_nodes(
@@ -662,6 +737,9 @@ def routing_edge_to_tensor_edge(e) -> "TensorEdge":
         src_key           = str(e.src_key),
         dst_key           = str(e.dst_key),
         weight            = weight,
+        delay_s           = float(getattr(e, "delay_s", 0.0)),
+        delay_samples     = max(0, int(getattr(e, "delay_samples", 0))),
+        analog_complex_delay = getattr(e, "analog_complex_delay", 1.0 + 0.0j),
         saturation_policy = str(getattr(e, "saturation", "")),
         saturation_knee   = float(getattr(e, "saturation_knee", 1.0)),
         group             = str(getattr(e, "router_key", "")),

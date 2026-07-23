@@ -81,6 +81,10 @@ from camera_software import (
     program_frame_metrics as manifest_program_frame_metrics,
     layout_program_ui,
     OpenGLContextHost,
+    PreviewProductRegistry,
+    OpenGLShareGroup,
+    GLPreviewCompositor,
+    AsyncTextureCapture,
     process_linear_sensor_image,
     save_linear_sensor_image,
     DEFAULT_FILM_FORMAT,
@@ -1494,7 +1498,7 @@ def build_self_rendering_program_scene(
     for object_id in (
         "camera-panel", "work-panel", "asset-browser",
         "camera-toolbar", "lens-toolbar", "light-toolbar", "film-toolbar",
-        "integrator-toolbar", "exposure-toolbar",
+        "arena-toolbar", "integrator-toolbar", "exposure-toolbar",
     ):
         if object_id not in regions:
             continue
@@ -4673,6 +4677,11 @@ def run_window(
     program_manifest_override: Any = None,
     parent_gl_context: Any = None,
     gl_context_factory: Callable[[Any], Any] | None = None,
+    preview_registry: PreviewProductRegistry | None = None,
+    preview_host_ready: Callable[
+        [PreviewProductRegistry, OpenGLShareGroup], Any
+    ] | None = None,
+    capture_output_dir: str = "",
 ) -> int:
     import pygame
 
@@ -4754,13 +4763,24 @@ def run_window(
     initial_presentation = _presentation_rect(
         scene_width, scene_height, available_width, available_height
     )
-    display_window = pygame.display.set_mode(
+    # Production UI and compute textures share one real outer GL namespace.
+    # Existing software composition is uploaded once as the background while
+    # solver products remain GPU-resident and draw directly into viewports.
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 4)
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+    if hasattr(pygame, "GL_CONTEXT_PROFILE_MASK"):
+        pygame.display.gl_set_attribute(
+            pygame.GL_CONTEXT_PROFILE_MASK,
+            pygame.GL_CONTEXT_PROFILE_COMPATIBILITY,
+        )
+    gl_display_window = pygame.display.set_mode(
         (initial_presentation[2], initial_presentation[3]),
-        pygame.RESIZABLE,
+        pygame.RESIZABLE | pygame.OPENGL | pygame.DOUBLEBUF,
         display=display_index,
     )
+    display_window = pygame.Surface(gl_display_window.get_size()).convert_alpha()
     window = pygame.Surface((scene_width, scene_height)).convert()
-    pygame.display.set_caption("Spectral text surface")
+    pygame.display.set_caption("Optical Engine — Text Frontend")
     clock = pygame.time.Clock()
     from camera_loadout_browser import CameraLoadoutBrowser
     from render_work_browser import RenderWorkBrowser
@@ -4797,8 +4817,11 @@ def run_window(
     panel_patch_loader = layout_work_cache.patch_loader(
         layout_work_manifest
     )
+    preview_registry = preview_registry or PreviewProductRegistry()
+    gl_share_group = OpenGLShareGroup.current()
+    effective_parent_context = parent_gl_context or gl_share_group
     context_host = OpenGLContextHost(
-        parent_gl_context, owned_factory=gl_context_factory
+        effective_parent_context, owned_factory=gl_context_factory
     )
     viewport_contexts = {
         key: context_host.acquire(request)
@@ -4820,6 +4843,19 @@ def run_window(
     render_progress_toolbar = RenderProgressToolbar()
     from work_preview_toolbar import WorkPreviewToolbar
     work_preview_toolbar = WorkPreviewToolbar()
+    from opengl_widget import SurfaceBlitter
+    surface_blitter = SurfaceBlitter()
+    preview_compositor = GLPreviewCompositor()
+    preview_capture = AsyncTextureCapture(
+        capture_output_dir or os.path.join(os.path.abspath(output_root), "captures")
+    )
+    preview_pollers: list[Callable[[], Any]] = []
+    if preview_host_ready is not None:
+        attached_preview = preview_host_ready(preview_registry, gl_share_group)
+        if callable(attached_preview):
+            preview_pollers.append(attached_preview)
+        elif callable(getattr(attached_preview, "poll", None)):
+            preview_pollers.append(attached_preview.poll)
     # Startup is intentionally inert. Validation descriptions remain visible,
     # but neither CPU/GPU checks nor camera exposures run without RUN SELECTED.
     work_browser.set_startup_validation(None, ())
@@ -5061,6 +5097,9 @@ def run_window(
             apply_toolbar_render_mode(
                 calibration_order, resolved_trace_settings.transport_mode
             )
+            calibration_order.setdefault("runtime", {})["wave_contexts"] = bool(
+                resolved_trace_settings.wave_mode
+            )
         checkpoint_interrupted_calibration()
         sequence = worker.submit(
             f"CALIBRATION / {mode_key}", calibration_order, None
@@ -5188,10 +5227,23 @@ def run_window(
     ] = []
     published_usd_signature: tuple[Any, ...] = ()
     running = True
+    capture_current_generation = [False]
+    preview_poller_errors: set[str] = set()
 
     try:
         while running:
-            display_window = pygame.display.get_surface()
+            for poll_preview in preview_pollers:
+                try:
+                    poll_preview()
+                except Exception as exc:
+                    signature = f"{type(exc).__name__}: {exc}"
+                    if signature not in preview_poller_errors:
+                        preview_poller_errors.add(signature)
+                        print(f"[gpu-preview] producer poll failed: {signature}", flush=True)
+            display_size = tuple(map(int, pygame.display.get_window_size()))
+            if display_window.get_size() != display_size:
+                display_window = pygame.Surface(display_size).convert_alpha()
+            work_preview_toolbar.set_gpu_products(preview_registry.snapshot())
             presentation = _presentation_rect(
                 scene_width, scene_height,
                 display_window.get_width(), display_window.get_height(),
@@ -5273,6 +5325,8 @@ def run_window(
                     work_preview_action = work_preview_toolbar.handle_event(
                         event, work_preview_tabs_rect
                     )
+                    if work_preview_action == "work-preview:capture-frame":
+                        capture_current_generation[0] = True
                     if progress_toolbar_action == "toggle-render-pause":
                         paused = worker.toggle_foreground_paused()
                         if paused is None:
@@ -6272,10 +6326,43 @@ def run_window(
             work_preview_toolbar.render(
                 display_window, work_preview_tabs_rect
             )
+            surface_blitter.blit(
+                display_window, display_window.get_width(), display_window.get_height()
+            )
+            selected_gpu_product = preview_registry.get(
+                work_preview_toolbar.selected_product_id
+            )
+            gpu_inset = max(1, work_tab_inset)
+            gpu_preview_top = work_preview_tabs_rect[1] + work_preview_tabs_rect[3] + gpu_inset
+            gpu_preview_rect = (
+                work_display_rect[0] + gpu_inset,
+                gpu_preview_top,
+                max(1, work_display_rect[2] - 2 * gpu_inset),
+                max(1, work_display_rect[1] + work_display_rect[3]
+                    - gpu_preview_top - gpu_inset),
+            )
+            ready_gpu_product = preview_compositor.ready_product(selected_gpu_product)
+            if ready_gpu_product is not None:
+                preview_compositor.draw(
+                    ready_gpu_product,
+                    gpu_preview_rect,
+                    display_window.get_height(),
+                )
+                if (
+                    capture_current_generation[0]
+                    or work_preview_toolbar.sequence_capture_armed
+                ):
+                    preview_capture.request(ready_gpu_product)
+            capture_current_generation[0] = False
+            preview_capture.poll()
             pygame.display.flip()
             clock.tick(60)
     finally:
         worker.close()
+        preview_capture.close()
+        preview_capture.destroy_gl()
+        preview_compositor.destroy()
+        surface_blitter.destroy()
         context_host.close()
         pygame.key.stop_text_input()
         pygame.quit()

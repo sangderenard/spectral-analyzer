@@ -34,7 +34,7 @@ def test_partial_manifest_overlays_only_authored_equipment_details():
     ray, exposure = resolve_equipment_settings({
         "equipment": {
             "lens": {"f_number": 8.0},
-            "integrator": {"lane_count": 16},
+            "arena": {"lane_count": 16, "wave_mode": True},
             "exposure": {
                 "allocation_mode": "focus-explore",
                 "final_edge_px": 2048,
@@ -48,6 +48,7 @@ def test_partial_manifest_overlays_only_authored_equipment_details():
     assert exposure.final_edge_px == 2048
     assert exposure.iso == 100
     assert ray.lane_count == 16
+    assert ray.wave_mode is True
     assert ray.transport_mode == "continuous"
     assert ray.total_rays == 204_800
 
@@ -59,6 +60,13 @@ def test_equipment_manifest_rejects_misspelled_groups_and_fields():
         resolve_equipment_settings({
             "equipment": {"lens": {"fstop": 4.0}}
         })
+
+
+def test_legacy_integrator_lane_fields_migrate_to_arena_settings():
+    ray, _ = resolve_equipment_settings({
+        "equipment": {"integrator": {"lane_count": 8}}
+    })
+    assert ray.lane_count == 8
 
 
 def test_equipment_field_partition_has_no_duplicate_ownership():

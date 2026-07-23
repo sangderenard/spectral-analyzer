@@ -90,6 +90,7 @@ static_assert(sizeof(FilmRecord) == 64 * sizeof(float),
 #include <random>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -8168,8 +8169,10 @@ public:
 
     GLuint prog_t1 = 0, prog_t2 = 0, prog_t3 = 0;
     std::array<GLuint, wave_t4::kBandCounts.size()> prog_t4 = {};
+    std::string wave_t4_shader_source;
     GLuint prog_field_accum = 0, prog_field_resolve = 0;
     GLuint prog_surface_scan_resolve = 0;
+    std::string surface_scan_shader_source;
     GLuint prog_dispatch_prep = 0;
     struct { GLint bdpt_count_base = -1; } uloc_prep;
     /* T5 BDPT connection pass (t5_full_connect.comp.glsl) — non-fatal if absent */
@@ -8537,6 +8540,9 @@ public:
      * Combines tri_param_group_of_tri size, kind vector hash, and neural payload
      * size into one uint64.  Matches param_groups_version_uploaded on no-change → skip. */
     uint64_t param_groups_version_uploaded = UINT64_MAX;  /* force upload on first call */
+    /* Capacity by GL object name. IDs may be swapped between pipeline roles;
+     * keying by object preserves the allocation fact across those swaps. */
+    std::unordered_map<GLuint, GLsizeiptr> ssbo_capacity_bytes;
 
     /* Invalidate the dirty cache — call whenever the host modifies tri group
      * registration (clear_tri_groups, register_tri_group, etc.). */
@@ -8551,13 +8557,91 @@ public:
         return "csrc/shaders/" + name;
     }
 
-    /* Allocate or grow an SSBO to at least `bytes`.  Returns false on GL error. */
+    /* Allocate or grow an SSBO to at least `bytes`. Existing storage is kept
+     * when sufficient: an "ensure" must not orphan a hot buffer every call. */
     bool ensure_ssbo(GLuint& id, GLsizeiptr bytes) {
-        if (!id) glc_GenBuffers(1, &id);
+        bytes = std::max<GLsizeiptr>(bytes, 4);
+        if (!id) {
+            glc_GenBuffers(1, &id);
+            if (!id) return false;
+        }
+        const auto found = ssbo_capacity_bytes.find(id);
+        if (found != ssbo_capacity_bytes.end() && found->second >= bytes)
+            return true;
+        /* std430 base/range alignment is implementation-dependent, while
+         * whole-buffer bindings only require ordinary allocation alignment.
+         * A 256-byte rounded capacity avoids tiny repeat growth without
+         * materially inflating the multi-GiB BDPT arenas. */
+        constexpr GLsizeiptr kAllocationAlignment = 256;
+        const GLsizeiptr allocation =
+            ((bytes + kAllocationAlignment - 1) / kAllocationAlignment)
+            * kAllocationAlignment;
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, id);
-        glc_BufferData(GL_SHADER_STORAGE_BUFFER, bytes, nullptr, GL_DYNAMIC_DRAW);
+        glc_BufferData(
+            GL_SHADER_STORAGE_BUFFER, allocation, nullptr, GL_DYNAMIC_DRAW
+        );
+        const GLenum error = glGetError();
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-        return (glGetError() == GL_NO_ERROR);
+        if (error != GL_NO_ERROR) return false;
+        ssbo_capacity_bytes[id] = allocation;
+        return true;
+    }
+
+    bool ensure_t4_program(size_t spec) {
+        if (spec >= wave_t4::kBandCounts.size()) return false;
+        if (prog_t4[spec]) return true;
+        if (wave_t4_shader_source.empty()) return false;
+
+        char error[1024] = {};
+        const int bands = wave_t4::kBandCounts[spec];
+        /* WAVE_BANDS is compile-time constant. Band loops in the shared shader
+         * therefore specialize/unroll without maintaining duplicated sources. */
+        const std::string preamble =
+            "#define WAVE_BANDS " + std::to_string(bands) + "\n";
+        const GLuint program = gl_compute_build_program2(
+            wave_t4_shader_source.c_str(), preamble.c_str(),
+            error, sizeof(error)
+        );
+        if (!program) {
+            fprintf(stderr,
+                    "[T4] ray_wave_bpm compile failed bands=%d: %s\n",
+                    bands, error);
+            fflush(stderr);
+            return false;
+        }
+        prog_t4[spec] = program;
+        auto& u = uloc_t4[spec];
+        u.mode        = glc_GetUniformLocation(program, "mode");
+        u.nx          = glc_GetUniformLocation(program, "nx");
+        u.ny          = glc_GetUniformLocation(program, "ny");
+        u.n_bands     = glc_GetUniformLocation(program, "n_bands");
+        u.dx          = glc_GetUniformLocation(program, "dx");
+        u.dz          = glc_GetUniformLocation(program, "dz");
+        u.wavelengths = glc_GetUniformLocation(program, "wavelengths");
+        u.absorber_cells = glc_GetUniformLocation(program, "absorber_cells");
+        u.absorber_step_strength = glc_GetUniformLocation(
+            program, "absorber_step_strength"
+        );
+        fprintf(stderr, "[T4] compiled exact %d-lane shader on first use\n", bands);
+        fflush(stderr);
+        return true;
+    }
+
+    bool ensure_surface_scan_program() {
+        if (prog_surface_scan_resolve) return true;
+        if (surface_scan_shader_source.empty()) return false;
+        char error[1024] = {};
+        prog_surface_scan_resolve = gl_compute_build_program(
+            surface_scan_shader_source.c_str(), error, sizeof(error)
+        );
+        if (!prog_surface_scan_resolve) {
+            fprintf(stderr, "[surface-scan] shader compile failed: %s\n", error);
+            fflush(stderr);
+            return false;
+        }
+        fprintf(stderr, "[surface-scan] shader compiled on first use\n");
+        fflush(stderr);
+        return true;
     }
 
     bool initialize_sensor_mipmap(const RayPipelineConfig& cfg, int n_bands) {
@@ -11595,9 +11679,8 @@ public:
 
     /* Upload data to an SSBO (auto-grows if needed). */
     void upload_ssbo(GLuint& id, const void* data, GLsizeiptr bytes) {
-        if (!id) glc_GenBuffers(1, &id);
+        if (!ensure_ssbo(id, bytes)) return;
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, id);
-        glc_BufferData(GL_SHADER_STORAGE_BUFFER, bytes, nullptr, GL_DYNAMIC_DRAW);
         if (data && bytes > 0)
             glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, bytes, data);
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
@@ -11741,8 +11824,20 @@ public:
             : 0u;
     }
 
+    bool published_field_display_info(uint64_t& texture, int& nx, int& ny,
+                                      int& nz, uint64_t& generation) const {
+        std::lock_guard<std::mutex> lk(field_display_mu);
+        texture = static_cast<uint64_t>(tex_field_display_rgb);
+        nx = field_display_nx;
+        ny = field_display_ny;
+        nz = field_display_nz;
+        generation = field_display_generation;
+        return texture != 0u && nx > 0 && ny > 0 && nz > 0;
+    }
+
     int begin_surface_scan(RayPipelineState& ps) {
-        if (!display_context_shared || !prog_surface_scan_resolve || ps.sensor_res <= 0)
+        if (!display_context_shared || ps.sensor_res <= 0
+            || !ensure_surface_scan_program())
             return -1;
         std::lock_guard<std::mutex> lk(surface_scan_mu);
         if (surface_scan_build_slot >= 0)
@@ -11823,7 +11918,10 @@ public:
 
     void publish_surface_scan(int slot) {
         if (slot < 0 || slot > 1) return;
-        glFlush();  /* make the completed back texture visible to the shared context */
+        /* Publication is infrequent (one complete edit generation), and runs
+         * on the producer thread.  Finish here so the display thread never
+         * adopts a generation whose shared texture is still being written. */
+        glFinish();
         std::lock_guard<std::mutex> lk(surface_scan_mu);
         surface_scan_pending_slot = slot;
         surface_scan_build_slot = -1;
@@ -11839,6 +11937,21 @@ public:
         return surface_scan_active_slot >= 0
             ? static_cast<uint64_t>(tex_surface_scan[(size_t)surface_scan_active_slot])
             : 0u;
+    }
+
+    bool published_surface_scan_info(uint64_t& texture, int& resolution,
+                                     uint64_t& generation) {
+        std::lock_guard<std::mutex> lk(surface_scan_mu);
+        if (surface_scan_pending_slot >= 0) {
+            surface_scan_active_slot = surface_scan_pending_slot;
+            surface_scan_pending_slot = -1;
+        }
+        texture = surface_scan_active_slot >= 0
+            ? static_cast<uint64_t>(tex_surface_scan[(size_t)surface_scan_active_slot])
+            : 0u;
+        resolution = surface_scan_res;
+        generation = surface_scan_generation;
+        return texture != 0u && resolution > 0;
     }
 
     /* Re-sync parametric SSBOs from current CPU state.
@@ -12065,27 +12178,22 @@ public:
         if (!load("ray_refine.comp.glsl", prog_t2)) { snprintf(ctx.error, sizeof(ctx.error), "ray_refine.comp.glsl: %s", err); return false; }
         if (!load("ray_material.comp.glsl", prog_t3)) { snprintf(ctx.error, sizeof(ctx.error), "ray_material.comp.glsl: %s", err); return false; }
         {
-            std::string wave_src;
-            if (!read_shader_file("ray_wave_bpm.comp.glsl", wave_src)) {
+            if (!read_shader_file(
+                    "ray_wave_bpm.comp.glsl", wave_t4_shader_source)) {
                 snprintf(ctx.error, sizeof(ctx.error), "ray_wave_bpm.comp.glsl: %s", err);
                 return false;
             }
-            for (size_t i = 0; i < wave_t4::kBandCounts.size(); ++i) {
-                const int bands = wave_t4::kBandCounts[i];
-                const std::string preamble =
-                    "#define WAVE_BANDS " + std::to_string(bands) + "\n";
-                prog_t4[i] = gl_compute_build_program2(
-                    wave_src.c_str(), preamble.c_str(), err, sizeof(err));
-                if (!prog_t4[i]) {
-                    snprintf(ctx.error, sizeof(ctx.error),
-                             "ray_wave_bpm.comp.glsl bands=%d: %s", bands, err);
-                    return false;
-                }
-            }
+            /* Exact lane variants compile lazily on the GPU owner thread.
+             * Non-wave renders pay one file read and zero T4 driver compiles. */
         }
         if (!load("field_display_accum.comp.glsl", prog_field_accum)) { snprintf(ctx.error, sizeof(ctx.error), "field_display_accum.comp.glsl: %s", err); return false; }
         if (!load("field_display_resolve.comp.glsl", prog_field_resolve)) { snprintf(ctx.error, sizeof(ctx.error), "field_display_resolve.comp.glsl: %s", err); return false; }
-        if (!load("surface_scan_resolve.comp.glsl", prog_surface_scan_resolve)) { snprintf(ctx.error, sizeof(ctx.error), "surface_scan_resolve.comp.glsl: %s", err); return false; }
+        if (!read_shader_file(
+                "surface_scan_resolve.comp.glsl", surface_scan_shader_source)) {
+            snprintf(ctx.error, sizeof(ctx.error),
+                     "surface_scan_resolve.comp.glsl: %s", err);
+            return false;
+        }
         if (!load("dispatch_prep.comp.glsl",   prog_dispatch_prep)) {
             fprintf(stderr, "[gpu-dispatch] dispatch_prep.comp.glsl failed (%s)%s\n",
                     err, gpu_required ? "" : " — falling back to CPU n_hits readback");
@@ -12388,19 +12496,6 @@ public:
             (int)uloc_t3.bdpt_spectral_base,
             (int)uloc_t3.bdpt_pdf_base);
         fflush(stderr);
-
-        for (size_t i = 0; i < wave_t4::kBandCounts.size(); ++i) {
-            const GLuint p = prog_t4[i];
-            uloc_t4[i].mode        = glc_GetUniformLocation(p, "mode");
-            uloc_t4[i].nx          = glc_GetUniformLocation(p, "nx");
-            uloc_t4[i].ny          = glc_GetUniformLocation(p, "ny");
-            uloc_t4[i].n_bands     = glc_GetUniformLocation(p, "n_bands");
-            uloc_t4[i].dx          = glc_GetUniformLocation(p, "dx");
-            uloc_t4[i].dz          = glc_GetUniformLocation(p, "dz");
-            uloc_t4[i].wavelengths = glc_GetUniformLocation(p, "wavelengths");
-            uloc_t4[i].absorber_cells = glc_GetUniformLocation(p, "absorber_cells");
-            uloc_t4[i].absorber_step_strength = glc_GetUniformLocation(p, "absorber_step_strength");
-        }
 
         ready = true;
         return true;
@@ -12777,7 +12872,12 @@ public:
         /* Record caps: budget-clamped, and — only at a cycle start, when the
          * section layout may legally change — raised by any pending overflow
          * growth scheduled by the previous T5 pass. */
-        apply_bdpt_cap_policy(ps, /*at_cycle_start=*/reset_bdpt_records);
+        /* Surface scan authors no BDPT records and lays out a zero-byte record
+         * section below.  Do not run (or log) the full exposure cap policy for
+         * this utility batch; it was truthful about global capacity but looked
+         * like a 4.1 GiB preview allocation even though no such SSBO was made. */
+        if (!surface_scan_batch)
+            apply_bdpt_cap_policy(ps, /*at_cycle_start=*/reset_bdpt_records);
         const int max_bdpt_v = surface_scan_batch ? 0
             : ((ps.cfg.bdpt_max_vertices > 0) ? ps.cfg.bdpt_max_vertices : 10000000);
         cached_max_bdpt_v = max_bdpt_v;
@@ -13517,14 +13617,16 @@ public:
             }
         }
         if (t3_post_diag) {
-            fprintf(stderr, "[gpu-T3-post] terminal readback done\n");
+            fprintf(stderr, "[gpu-T3-post] terminal CPU readback %s\n",
+                    ps.cfg.gpu_skip_record_readback ? "skipped" : "done");
             fflush(stderr);
         }
 
         /* Direct camera-visible emissive surfaces do not need a T5 vertex pair.
          * The splat accepts lens-only sensor paths; emitter hits after a scene
          * scatter remain exclusively in the paired BDPT/VCM estimators. */
-        if (ps.cfg.gpu_skip_record_readback && ps.sensor_res > 0 && prog_sensor_splat) {
+        if (surface_scan_slot < 0 && ps.cfg.gpu_skip_record_readback
+            && ps.sensor_res > 0 && prog_sensor_splat) {
             ensure_sensor_rgb_ssbo(ps, ps.sensor_res);
             dispatch_terminal_splat(ps, max_children, nb);
         }
@@ -13650,7 +13752,8 @@ public:
             }
         }
         if (t3_post_diag) {
-            fprintf(stderr, "[gpu-T3-post] qout/field readback done\n");
+            fprintf(stderr, "[gpu-T3-post] qout/field CPU readback %s\n",
+                    ps.cfg.gpu_skip_record_readback ? "skipped" : "done");
             fflush(stderr);
         }
 
@@ -13838,7 +13941,8 @@ public:
 
         /* Pass B: rate-limited GPU→CPU shadow readback for get_sensor_image().
          * Capped at ~20 Hz so display stays responsive without thrashing PCIe. */
-        if (ps.cfg.gpu_skip_record_readback && ssbo_sensor_rgb != 0) {
+        if (surface_scan_slot < 0 && ps.cfg.gpu_skip_record_readback
+            && ssbo_sensor_rgb != 0) {
             static auto last_shadow_t = std::chrono::steady_clock::time_point{};
             const auto  now_t = std::chrono::steady_clock::now();
             if (std::chrono::duration<float>(now_t - last_shadow_t).count() >= 0.050f) {
@@ -13933,6 +14037,7 @@ public:
             fflush(stderr);
             return false;
         }
+        if (!ensure_t4_program(static_cast<size_t>(spec))) return false;
         const GLuint t4_program = prog_t4[static_cast<size_t>(spec)];
         const T4Uniforms& t4_u = uloc_t4[static_cast<size_t>(spec)];
 
@@ -18491,6 +18596,17 @@ uint64_t ray_pipeline_get_field_display_tex_id(const RayPipelineState* ps)
     return const_cast<RayPipelineState::GlPipelineDispatch*>(ps->gpu_dispatch)->published_field_display_texture();
 }
 
+int ray_pipeline_get_field_display_info(const RayPipelineState* ps,
+                                        uint64_t* tex_id,
+                                        int* nx, int* ny, int* nz,
+                                        uint64_t* generation)
+{
+    if (!ps || !ps->gpu_dispatch || !tex_id || !nx || !ny || !nz || !generation)
+        return 0;
+    return ps->gpu_dispatch->published_field_display_info(
+        *tex_id, *nx, *ny, *nz, *generation) ? 1 : 0;
+}
+
 void ray_pipeline_request_field_display_clear(RayPipelineState* ps)
 {
     if (!ps || !ps->gpu_dispatch) return;
@@ -18501,6 +18617,17 @@ uint64_t ray_pipeline_get_surface_scan_tex_id(RayPipelineState* ps)
 {
     if (!ps || !ps->gpu_dispatch) return 0;
     return ps->gpu_dispatch->published_surface_scan_texture();
+}
+
+int ray_pipeline_get_surface_scan_info(RayPipelineState* ps,
+                                       uint64_t* tex_id,
+                                       int* resolution,
+                                       uint64_t* generation)
+{
+    if (!ps || !ps->gpu_dispatch || !tex_id || !resolution || !generation)
+        return 0;
+    return ps->gpu_dispatch->published_surface_scan_info(
+        *tex_id, *resolution, *generation) ? 1 : 0;
 }
 
 int ray_pipeline_wave_arena_count(const RayPipelineState* ps)

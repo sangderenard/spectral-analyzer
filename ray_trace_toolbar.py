@@ -52,7 +52,7 @@ class RayTraceToolbar:
         modes = ("continuous", "fixed", "depth")
         current = modes.index(self.settings.transport_mode)
         values["transport_mode"] = modes[(current + delta) % len(modes)]
-        allowed = (1, 3, 8, 16, 32)
+        allowed = (1, 3, 4, 8, 16, 32)
         if values["lane_count"] not in allowed:
             values["lane_count"] = 3
         self.settings = RayTraceSettings(**values).validated()
@@ -60,7 +60,7 @@ class RayTraceToolbar:
 
     def _cycle_lanes(self, delta: int) -> str:
         values = self.settings.mapping()
-        options = (1, 3, 8, 16, 32)
+        options = (1, 3, 4, 8, 16, 32)
         values["lane_count"] = self._cycle(
             self.settings.lane_count, options, delta
         )
@@ -77,7 +77,10 @@ class RayTraceToolbar:
             "transport_mode": self._index(
                 settings.transport_mode, ("continuous", "fixed", "depth")
             ),
-            "lane_count": self._index(settings.lane_count, (1, 3, 8, 16, 32)),
+            "lane_count": self._index(
+                settings.lane_count, (1, 3, 4, 8, 16, 32)
+            ),
+            "wave_mode": int(bool(settings.wave_mode)),
             "total_rays": self._index(settings.total_rays, self._ray_options),
             "max_sensor_epochs": self._index(settings.max_sensor_epochs, self._epoch_options),
             "epoch_bundle_count": self._index(settings.epoch_bundle_count, self._bundle_options),
@@ -98,6 +101,11 @@ class RayTraceToolbar:
             return self._toggle_transport(delta)
         if name == "lane_count":
             return self._cycle_lanes(delta)
+        if name == "wave_mode":
+            values = self.settings.mapping()
+            values["wave_mode"] = not bool(values["wave_mode"])
+            self.settings = RayTraceSettings(**values).validated()
+            return "ray-settings-changed"
         if name == "grid_mode":
             values = self.settings.mapping()
             choices = self._grid_mode_options

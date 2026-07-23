@@ -90,8 +90,8 @@ def perceptual_visible_bins(
     """
 
     count = int(lane_count)
-    if count not in (1, 3, 8, 16, 32):
-        raise ValueError("fixed visible transport requires 1, 3, 8, 16, or 32 lanes")
+    if count not in (1, 3, 4, 8, 16, 32):
+        raise ValueError("fixed visible transport requires 1, 3, 4, 8, 16, or 32 lanes")
     step_nm = 0.25
     sample_count = int(round(
         (VISIBLE_WAVELENGTH_MAX_NM - VISIBLE_WAVELENGTH_MIN_NM) / step_nm
@@ -401,8 +401,8 @@ class TransportWorkContract:
 
     def __post_init__(self) -> None:
         variant = int(self.payload_variant or self.lane_table.active_lane_count)
-        if variant not in (1, 3, 8, 16, 32) or variant < self.lane_table.active_lane_count:
-            raise ValueError("payload_variant must be 1,3,8,16,32 and cannot hold fewer slots than active lanes")
+        if variant not in (1, 3, 4, 8, 16, 32) or variant < self.lane_table.active_lane_count:
+            raise ValueError("payload_variant must be 1,3,4,8,16,32 and cannot hold fewer slots than active lanes")
         object.__setattr__(self, "payload_variant", variant)
 
     def mapping(self) -> dict[str, Any]:

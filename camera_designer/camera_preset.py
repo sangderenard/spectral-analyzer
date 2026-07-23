@@ -129,6 +129,12 @@ class LensElement:
     glass_out:  GlassSpec         = field(default_factory=lambda: GlassSpec())
     z_vertex:   float             = 0.0     # metres
     label:      str               = ""
+    # Rigid surface frame relative to the nominal optical axis.  These are
+    # derived from CameraManifest.lens.surface_adjustments in the optical
+    # engine frontend; both tessellation and exact preview transport consume
+    # them, so alignment is never a display-only annotation.
+    shift_xy_m: Tuple[float, float] = (0.0, 0.0)
+    tilt_xy_deg: Tuple[float, float] = (0.0, 0.0)
 
     def to_dict(self) -> dict:
         return {
@@ -136,6 +142,8 @@ class LensElement:
             "glass_out": self.glass_out.to_dict(),
             "z_vertex":  self.z_vertex,
             "label":     self.label,
+            "shift_xy_m": list(self.shift_xy_m),
+            "tilt_xy_deg": list(self.tilt_xy_deg),
         }
 
     @classmethod
@@ -145,6 +153,8 @@ class LensElement:
             glass_out = GlassSpec.from_dict(d.get("glass_out", {})),
             z_vertex  = float(d.get("z_vertex", 0.)),
             label     = d.get("label", ""),
+            shift_xy_m=tuple(float(v) for v in d.get("shift_xy_m", (0.0, 0.0))),
+            tilt_xy_deg=tuple(float(v) for v in d.get("tilt_xy_deg", (0.0, 0.0))),
         )
 
 
@@ -588,8 +598,15 @@ def simple_doublet_preset() -> CameraPreset:
 
     mount = LensMountRing(z_flange=0.0, r_inner=0.021,
                           r_outer=0.031, back_clearance=0.004)
-    aperture = ApertureStop(z_pos=mount.aperture_plane_z + 0.002,
-                            r_inner=0., r_outer=0.0139)  # f/1.8 at 50mm
+    aperture = ApertureStop(
+        # Physical iris sits immediately behind the 54 mm rear surface.  The
+        # former mount-derived 6 mm station left only 8.4 mm from the sensor;
+        # center-pupil rays from almost the entire 43 mm format consequently
+        # missed the 18 mm doublet before they ever reached the scene.
+        z_pos=0.050,
+        r_inner=0., r_outer=0.0139,
+        n_blades=8,
+    )  # material 8-blade iris, f/1.8 at 50mm
     sensor = SensorSurface(z_pos=-0.0024, r_max=0.0215)
 
     return CameraPreset(

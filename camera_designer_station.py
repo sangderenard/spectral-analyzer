@@ -64,49 +64,25 @@ try:
 except ImportError:
     _HAS_GL = False
 
-try:
-    from demo_pluck_gl import (
-        _build_gpu_bvh          as _gpu_bvh_fn,
-        _gpu_ray_field_prebuilt as _gpu_prebuilt_fn,
-        _gpu_pump_prebuilt      as _gpu_pump_fn,
-        _clear_prebuilt         as _gpu_clear_fn,
-        _destroy_prebuilt       as _gpu_destroy_fn,
-        _gpu_readback_prebuilt  as _gpu_readback_fn,
-        GPU_OPTICAL_FIELD_DIMS  as _GPU_OPT_DIMS,
-        FilmStack               as _FilmStack,
-        FILM_STACKS             as _FILM_STACKS,
-        _MARCH_VS               as _MARCH_VS,
-        _MARCH_FS               as _MARCH_FS,
-        GPU_RAY_FIELD_SCALE     as _GPU_RAY_FIELD_SCALE,
-        GPU_RAY_LOG_SCALE       as _GPU_RAY_LOG_SCALE,
-        GPU_RAY_FIELD_GAMMA     as _GPU_RAY_FIELD_GAMMA,
-    )
-    _HAS_GPU_FIELD = True
-except Exception:
-    _HAS_GPU_FIELD = False
-    _gpu_bvh_fn = _gpu_prebuilt_fn = _gpu_pump_fn = None
-    _gpu_clear_fn = _gpu_destroy_fn = _gpu_readback_fn = None
-    _GPU_OPT_DIMS = (128, 128, 256)
-    _FilmStack = None
-    _FILM_STACKS = {}
-    _MARCH_VS = _MARCH_FS = None
-    _GPU_RAY_FIELD_SCALE = 4.0
-    _GPU_RAY_LOG_SCALE   = True
-    _GPU_RAY_FIELD_GAMMA = 0.62
+# Optical transport is deliberately absent from this module.  The station is
+# an editor/presenter; the optical-engine pillar owns every tracer, compute
+# context, transport mode, allocation and published preview product.
+_HAS_GPU_FIELD = False
+_GPU_RAY_FIELD_SCALE = 4.0
+_GPU_RAY_LOG_SCALE = True
+_GPU_RAY_FIELD_GAMMA = 0.62
 
 try:
     from camera_designer.camera_preset import (
         CameraPreset, simple_doublet_preset, PRESET_REGISTRY, EmitterSpec,
     )
-    from camera_designer.bake_worker import BakeWorker
-    from camera_designer.scene_builder import build_gpu_scene
-    from camera_designer.ray_order import RayOrder
     _HAS_CAMERA_DESIGNER = True
 except ImportError:
     _HAS_CAMERA_DESIGNER = False
     CameraPreset   = None  # type: ignore[assignment,misc]
-    build_gpu_scene = None  # type: ignore[assignment]
-    RayOrder       = None  # type: ignore[assignment,misc]
+
+# Compatibility name for old callers; no station-local transport is imported.
+BakeWorker = None
 
 try:
     from camera_software.auto_computer import CameraComputer as _CameraComputer
@@ -310,6 +286,11 @@ class SensorPlaneConfig:
     }
 
     def __init__(self) -> None:
+        # Canonical camera solve controls.  These are seeded from the active
+        # CameraManifest by CameraDesignerStation and written back to it before
+        # the physical four-group train is solved again.
+        self.zoom: float = 0.5
+        self.focus_distance_m: float = 1.0
         # Sensor focal-plane fine adjustment (metres)
         self.sensor_x: float = 0.0
         self.sensor_y: float = 0.0
@@ -323,6 +304,39 @@ class SensorPlaneConfig:
         # Per-element angular nudge (degrees +/-5):
         # {element_index: {pan_a, pan_b, tilt_a, tilt_b}}
         self.element_angles: dict = {}
+        self.element_geometry: dict = {}
+
+    def sync_elements(self, preset) -> None:
+        self.element_geometry = {}
+        for index, element in enumerate(preset.lens_group.elements):
+            surface = element.surface
+            k = float(getattr(surface, "K", 0.0))
+            conic_type = (
+                "sphere" if abs(k) < 1.0e-9 else
+                "paraboloid" if abs(k + 1.0) < 1.0e-9 else
+                "hyperboloid" if k < -1.0 else
+                "prolate_ellipsoid" if k < 0.0 else
+                "oblate_ellipsoid"
+            )
+            shift = tuple(getattr(element, "shift_xy_m", (0.0, 0.0)))
+            tilt = tuple(getattr(element, "tilt_xy_deg", (0.0, 0.0)))
+            self.element_geometry[index] = {
+                "axial_offset": 0.0,
+                "shift_x": float(shift[0]),
+                "shift_y": float(shift[1]),
+                "tilt_x": float(tilt[0]),
+                "tilt_y": float(tilt[1]),
+                "radius": float(getattr(surface, "R", 0.050)),
+                "clear_radius": float(getattr(surface, "r_max", 0.020)),
+                "conic_k": k,
+                "conic_type": conic_type,
+            }
+
+    def el_geometry_value(self, idx: int, key: str, default=0.0):
+        return self.element_geometry.get(idx, {}).get(key, default)
+
+    def set_el_geometry_value(self, idx: int, key: str, value) -> None:
+        self.element_geometry.setdefault(idx, {})[key] = value
 
     def el_angle(self, idx: int, key: str) -> float:
         return self.element_angles.get(idx, {}).get(key, 0.0)
@@ -355,9 +369,8 @@ class _ComponentTreePanel:
     Sections (top to bottom)
     -------------------------
     PRESET / SPEC / MOUNT   — read-only optics summary
-    LENS ELEMENTS           — element tree; each element has 4 angle knobs:
-                              pan_a, pan_b (two independent pan axes),
-                              tilt_a, tilt_b (two independent tilt axes)
+    LENS ELEMENTS           — physical-surface tree; each surface exposes
+                              alignment, aperture, curvature and conic controls
     APERTURE STOP           — read-only
     SENSOR PLANE            — X/Y/Z offset knobs + mode selector
     PLATE PLANE             — X/Y/Z offset knobs + mode selector
@@ -376,6 +389,8 @@ class _ComponentTreePanel:
     _XY_STEP     = 1e-4      # 0.1 mm
     _Z_STEP      = 1e-4      # 0.1 mm
     _ANGLE_STEP  = 0.05      # 0.05 degrees
+    _FOCUS_MIN_M = 0.25
+    _FOCUS_MAX_M = 20.0
 
     def __init__(self, preset, sensor_cfg=None) -> None:
         pygame.font.init()
@@ -408,7 +423,10 @@ class _ComponentTreePanel:
     # Render
 
     def render(self, w: int, h: int) -> pygame.Surface:
-        VIRT = max(h, 2400)
+        # Eight physical surfaces expose full geometry controls; keep one
+        # scrollable backing surface large enough that no later element is
+        # silently clipped merely because earlier controls are expanded.
+        VIRT = max(h, 4800)
         vs   = pygame.Surface((w, VIRT), pygame.SRCALPHA)
         vs.fill((14, 17, 26, 248))
         self._knob_rects = {}
@@ -431,14 +449,33 @@ class _ComponentTreePanel:
         y = self._lbl(vs, y, f"  f/     {self.preset.f_number:.1f}")
         y = self._lbl(vs, y, f"  fov    {self.preset.fov_deg:.1f} deg")
 
+        y = self._sect(vs, y + 2, "CAMERA SOLVE", w)
+        cfg = self.sensor_cfg
+        y = self._float_knob(
+            vs, y, w, "camera_zoom", "  zoom",
+            cfg.zoom, 0.0, 1.0, "", ".3f",
+        )
+        y = self._float_knob(
+            vs, y, w, "focus_distance_m", "  focus distance",
+            cfg.focus_distance_m,
+            self._FOCUS_MIN_M, self._FOCUS_MAX_M, "m", ".3f",
+        )
+        y = self._lbl(
+            vs, y,
+            "  release knob to re-solve + refresh preview",
+            (105, 145, 115),
+        )
+
         y = self._sect(vs, y + 2, "MOUNT", w)
         mr = self.preset.mount_ring
         y = self._lbl(vs, y, f"  flange {mr.z_flange*1e3:.1f} mm")
         y = self._lbl(vs, y, f"  ap_z   {mr.aperture_plane_z*1e3:.2f} mm")
         y = self._lbl(vs, y, f"  clr    {mr.back_clearance*1e3:.1f} mm")
 
-        # LENS ELEMENTS — each with 2-pan + 2-tilt knobs
+        # LENS ELEMENTS — canonical physical surface controls
         y = self._sect(vs, y + 2, "LENS ELEMENTS", w)
+        y = self._lbl(vs, y, "  edits rebuild exact QR geometry on release",
+                      (105, 145, 115))
         for idx, el in enumerate(self.preset.lens_group.elements):
             sel = (idx == self._selected_idx)
             bg  = (30, 55, 100) if sel else (18, 22, 32)
@@ -452,21 +489,47 @@ class _ComponentTreePanel:
             y += self.ROW_H
             cfg = self.sensor_cfg
             y = self._float_knob(vs, y, w,
-                f"el{idx}_pan_a",  "  pan A",
-                cfg.el_angle(idx, 'pan_a'),
-                -self._ANGLE_RANGE, self._ANGLE_RANGE, "deg", ".2f")
+                f"el{idx}_axial_offset", "  axial offset",
+                cfg.el_geometry_value(idx, 'axial_offset'),
+                -0.050, 0.050, "mm", ".3f", scale=1e3)
             y = self._float_knob(vs, y, w,
-                f"el{idx}_pan_b",  "  pan B",
-                cfg.el_angle(idx, 'pan_b'),
-                -self._ANGLE_RANGE, self._ANGLE_RANGE, "deg", ".2f")
+                f"el{idx}_shift_x", "  shift X",
+                cfg.el_geometry_value(idx, 'shift_x'),
+                -0.025, 0.025, "mm", ".3f", scale=1e3)
             y = self._float_knob(vs, y, w,
-                f"el{idx}_tilt_a", "  tilt A",
-                cfg.el_angle(idx, 'tilt_a'),
-                -self._ANGLE_RANGE, self._ANGLE_RANGE, "deg", ".2f")
+                f"el{idx}_shift_y", "  shift Y",
+                cfg.el_geometry_value(idx, 'shift_y'),
+                -0.025, 0.025, "mm", ".3f", scale=1e3)
             y = self._float_knob(vs, y, w,
-                f"el{idx}_tilt_b", "  tilt B",
-                cfg.el_angle(idx, 'tilt_b'),
-                -self._ANGLE_RANGE, self._ANGLE_RANGE, "deg", ".2f")
+                f"el{idx}_tilt_x", "  tilt X",
+                cfg.el_geometry_value(idx, 'tilt_x'),
+                -15.0, 15.0, "deg", ".3f")
+            y = self._float_knob(vs, y, w,
+                f"el{idx}_tilt_y", "  tilt Y",
+                cfg.el_geometry_value(idx, 'tilt_y'),
+                -15.0, 15.0, "deg", ".3f")
+            y = self._float_knob(vs, y, w,
+                f"el{idx}_radius", "  curvature radius",
+                cfg.el_geometry_value(idx, 'radius', 0.050),
+                -0.500, 0.500, "mm", ".3f", scale=1e3)
+            y = self._float_knob(vs, y, w,
+                f"el{idx}_clear_radius", "  clear radius",
+                cfg.el_geometry_value(idx, 'clear_radius', 0.020),
+                0.001, 0.120, "mm", ".3f", scale=1e3)
+            y = self._choice_knob(vs, y, w,
+                f"el{idx}_conic_type", "  conic type",
+                cfg.el_geometry_value(idx, 'conic_type', 'sphere'),
+                ["sphere", "paraboloid", "hyperboloid",
+                 "prolate_ellipsoid", "oblate_ellipsoid"],
+                {
+                    "sphere": "sphere", "paraboloid": "parabola",
+                    "hyperboloid": "hyperbola", "prolate_ellipsoid": "prolate",
+                    "oblate_ellipsoid": "oblate",
+                })
+            y = self._float_knob(vs, y, w,
+                f"el{idx}_conic_k", "  conic constant K",
+                cfg.el_geometry_value(idx, 'conic_k'),
+                -5.0, 5.0, "", ".4f")
             y += 3
 
         # APERTURE STOP
@@ -676,7 +739,7 @@ class _ComponentTreePanel:
                         step = (hi - lo) / 200.0
                         cur  = self._read_float(self._hover_knob, cfg)
                         self._apply_float(self._hover_knob, cfg, cur + step * ev.y)
-                        return True, ""
+                        return True, self._hover_knob
                 self._scroll = int(np.clip(
                     self._scroll - ev.y * self.ROW_H,
                     0, max(0, self._virtual_h - 400)))
@@ -698,14 +761,15 @@ class _ComponentTreePanel:
                 bar_px  = panel_w - 2 * self.PAD
                 new_val = self._drag_val0 + dx / max(bar_px, 1) * (hi - lo)
                 self._apply_float(self._drag_knob, cfg, new_val)
-                return True, ""
+                return True, self._drag_knob
 
         # End drag
         if ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
             if self._drag_knob:
+                finished = self._drag_knob
                 self._drag_knob  = None
                 self._drag_start = None
-                return True, ""
+                return True, finished
 
         # Click: start drag or activate choice / row
         if ev.type == pygame.MOUSEBUTTONDOWN:
@@ -729,7 +793,7 @@ class _ComponentTreePanel:
                         self._drag_knob  = name
                         self._drag_start = (mx, my)
                         self._drag_val0  = self._read_float(name, cfg)
-                    return True, ""
+                    return True, name
                 if kind == 'choice':
                     choices   = lo   # lo holds choices list for choice knobs
                     direction = -1 if ev.button == 3 else 1
@@ -737,13 +801,15 @@ class _ComponentTreePanel:
                     idx       = choices.index(cur) if cur in choices else 0
                     self._apply_choice(name, cfg,
                                        choices[(idx + direction) % len(choices)])
-                    return True, ""
+                    return True, name
         return False, ""
 
     # -------------------------------------------------------------------------
     # Knob state read / write dispatch
 
     def _read_float(self, name: str, cfg) -> float:
+        if name == "camera_zoom": return cfg.zoom
+        if name == "focus_distance_m": return cfg.focus_distance_m
         if name == "sensor_x":   return cfg.sensor_x
         if name == "sensor_y":   return cfg.sensor_y
         if name == "sensor_z":   return cfg.sensor_z
@@ -754,11 +820,17 @@ class _ComponentTreePanel:
             parts = name.split("_", 1)
             idx = int(parts[0][2:])
             key = parts[1]
-            return cfg.el_angle(idx, key)
+            return float(cfg.el_geometry_value(idx, key, 0.0))
         return 0.0
 
     def _apply_float(self, name: str, cfg, val: float) -> None:
-        if name == "sensor_x":
+        if name == "camera_zoom":
+            cfg.zoom = float(np.clip(val, 0.0, 1.0))
+        elif name == "focus_distance_m":
+            cfg.focus_distance_m = float(np.clip(
+                val, self._FOCUS_MIN_M, self._FOCUS_MAX_M
+            ))
+        elif name == "sensor_x":
             cfg.sensor_x = float(np.clip(val, -self._XY_RANGE, self._XY_RANGE))
         elif name == "sensor_y":
             cfg.sensor_y = float(np.clip(val, -self._XY_RANGE, self._XY_RANGE))
@@ -774,16 +846,44 @@ class _ComponentTreePanel:
             parts = name.split("_", 1)
             idx = int(parts[0][2:])
             key = parts[1]
-            cfg.set_el_angle(idx, key, val)
+            if key == "radius" and abs(float(val)) < 1.0e-3:
+                val = cfg.el_geometry_value(idx, "radius", 0.050)
+            if key == "clear_radius":
+                val = max(
+                    1.0e-3,
+                    float(val) if float(val) > 0.0
+                    else float(cfg.el_geometry_value(idx, "clear_radius", 0.020)),
+                )
+            cfg.set_el_geometry_value(idx, key, float(val))
+            if key == "conic_k":
+                k = float(val)
+                conic_type = (
+                    "sphere" if abs(k) < 1.0e-9 else
+                    "paraboloid" if abs(k + 1.0) < 1.0e-9 else
+                    "hyperboloid" if k < -1.0 else
+                    "prolate_ellipsoid" if k < 0.0 else
+                    "oblate_ellipsoid"
+                )
+                cfg.set_el_geometry_value(idx, "conic_type", conic_type)
 
     def _read_choice(self, name: str, cfg) -> str:
         if name == "sensor_mode": return cfg.sensor_mode
         if name == "plate_mode":  return cfg.plate_mode
+        if name.startswith("el") and name.endswith("_conic_type"):
+            idx = int(name[2:].split("_", 1)[0])
+            return str(cfg.el_geometry_value(idx, "conic_type", "sphere"))
         return ""
 
     def _apply_choice(self, name: str, cfg, val: str) -> None:
         if name == "sensor_mode": cfg.sensor_mode = val
         if name == "plate_mode":  cfg.plate_mode  = val
+        if name.startswith("el") and name.endswith("_conic_type"):
+            idx = int(name[2:].split("_", 1)[0])
+            cfg.set_el_geometry_value(idx, "conic_type", str(val))
+            from camera_software.camera_designer_bridge import CONIC_TYPE_DEFAULT_K
+            cfg.set_el_geometry_value(
+                idx, "conic_k", float(CONIC_TYPE_DEFAULT_K[str(val)])
+            )
 
     # -------------------------------------------------------------------------
     # Helpers
@@ -824,9 +924,14 @@ class _ElementPropsPanel:
     ROW_H  = 20
     MODE_H = 28
 
-    _BR_VIEWS    = ('gpu_field', 'sensor', 'plate', 'manifold_bdpt')
+    _BR_VIEWS    = (
+        'surface_scan', 'complex_transport', 'gpu_field',
+        'sensor', 'plate', 'manifold_bdpt',
+    )
     _BR_LABELS   = {'gpu_field': 'GPU field', 'sensor': 'sensor',
-                    'plate': 'plate', 'manifold_bdpt': 'manifold BDPT'}
+                    'plate': 'plate', 'manifold_bdpt': 'manifold BDPT',
+                    'surface_scan': 'pixel-ray preview',
+                    'complex_transport': 'complex transport'}
     _PLACE_MODES = ('mesh',)
     _PLACE_LABELS = {'mesh': 'mesh'}
 
@@ -841,7 +946,7 @@ class _ElementPropsPanel:
         self.glow_rays_per_s: float = 0.0
         self.glow_segs_total: int  = 0
         # Interactive state
-        self.bottom_right_view: str = 'gpu_field'
+        self.bottom_right_view: str = 'surface_scan'
         self.place_mode: str = 'mesh'
         self._knob_rects: dict = {}
         # Sim parameters (control the GPU ray pipeline)
@@ -854,6 +959,12 @@ class _ElementPropsPanel:
         self.cam_auto_iso:    bool  = True
         self.cam_iso:         float = 4.0
         self.cam_target_ev:   float = math.log2(0.18)   # 18 % grey standard
+        self.surface_scan_generation: int = 0
+        self.diagnostic_state: str = "waiting"
+        self.diagnostic_rays: int = 0
+        self.diagnostic_segments: int = 0
+        self.diagnostic_sensor_hits: int = 0
+        self.diagnostic_wavelengths: int = 0
         # Scroll + drag state for right-panel virtual surface
         self._scroll:     int   = 0
         self._virtual_h:  int   = 1200
@@ -895,14 +1006,38 @@ class _ElementPropsPanel:
         y = self._kv(vs, y, "r/s",
                      f"{self.glow_rays_per_s:.0f}" if self.glow_rays_per_s else "idle")
 
+        y = self._section(vs, y + 4, "NATIVE RAY DIAGNOSTIC", w)
+        y = self._kv(vs, y, "state", self.diagnostic_state)
+        y = self._kv(vs, y, "rays", f"{self.diagnostic_rays:,}")
+        y = self._kv(vs, y, "segments", f"{self.diagnostic_segments:,}")
+        y = self._kv(vs, y, "sensor hits", f"{self.diagnostic_sensor_hits:,}")
+        y = self._kv(vs, y, "spectral lanes", str(self.diagnostic_wavelengths))
+        y = self._kv(vs, y, "source", "native mesh transport")
+        vs.blit(self._font_s.render(
+            "  line colour = wavelength; follows every bounce",
+            True, (95, 125, 155),
+        ), (self.PAD, y + 1))
+        y += 15
+
         # VIEW CONTROLS
         y = self._section(vs, y + 6, "BOTTOM-RIGHT VIEW", w)
         y = self._choice_knob(vs, y, w, "bottom_right_view",
                               "  view mode", self.bottom_right_view,
                               self._BR_VIEWS, self._BR_LABELS)
-        vs.blit(self._font_s.render("  sensor/plate: live accum image", True,
-                (60, 75, 90)), (self.PAD, y + 2))
-        y += 14
+        if self.bottom_right_view == "surface_scan":
+            hints = (
+                "  LIVE: left panel > SENSOR PLANE",
+                "  drag or wheel offset X/Y/Z",
+                f"  published generation {self.surface_scan_generation}",
+            )
+            hint_color = (105, 150, 115)
+        else:
+            hints = ("  sensor/plate require accumulated exposure",)
+            hint_color = (60, 75, 90)
+        for hint in hints:
+            vs.blit(self._font_s.render(hint, True, hint_color),
+                    (self.PAD, y + 2))
+            y += 14
 
         y = self._section(vs, y + 4, "RIGHT-CLICK PLACE", w)
         vs.blit(self._font_s.render("  meshes only (light spawn removed)", True,
@@ -1260,18 +1395,34 @@ class CameraDesignerStation:
         preset: Optional["CameraPreset"] = None,
         win_w: int = 1280,
         win_h: int = 720,
+        preview_registry: Optional[Any] = None,
+        engine_graph: Optional[Any] = None,
     ) -> None:
         if not _HAS_CAMERA_DESIGNER:
             raise ImportError("camera_designer package not found.")
 
-        self.preset: CameraPreset = preset or simple_doublet_preset()
+        self.camera_manifest = None
+        if preset is None:
+            # The station is a frontend for the optical engine.  Its default
+            # camera therefore comes from the same canonical manifest as the
+            # text-render frontend, rather than from its historical doublet.
+            from camera_software.camera_manifest import resolve_camera_manifest
+            from camera_software.camera_designer_bridge import (
+                camera_manifest_to_designer_preset,
+            )
+            self.camera_manifest = resolve_camera_manifest()
+            preset = camera_manifest_to_designer_preset(self.camera_manifest)
+        self.preset: CameraPreset = preset
         self.win_w  = win_w
         self.win_h  = win_h
 
         # ── Scene state (init first so panel can hold reference) ──────────────
         self._scene_lights:  List[dict]  = []
         self._scene_meshes:  List[dict]  = []   # platonic meshes placed by user
-        self._scene_object:  Optional[dict] = None
+        # A machine-readable physical witness exposes focus, mirroring, axis
+        # swaps, vignetting and missing tiles more frankly than a smooth sphere.
+        from camera_software.qr_optical_validator import qr_target_spec
+        self._scene_object: Optional[dict] = qr_target_spec(z=0.30, width=0.15)
         self._ctx_map: Dict[str, int] = {}
 
         # Sensor / plate accumulation backs (software readback display)
@@ -1295,6 +1446,16 @@ class CameraDesignerStation:
         # UI panels
         pygame.font.init()
         self.sensor_cfg   = SensorPlaneConfig()
+        if self.camera_manifest is not None:
+            _camera_mapping = self.camera_manifest.mapping()
+            self.sensor_cfg.zoom = float(
+                dict(_camera_mapping.get("lens", {})).get("zoom", 0.5)
+            )
+            self.sensor_cfg.focus_distance_m = float(
+                dict(_camera_mapping.get("focus", {})).get("distance_m", 1.0)
+            )
+        self.sensor_cfg.sync_elements(self.preset)
+        self._sync_surface_controls_from_manifest()
         self._left_panel  = _ComponentTreePanel(self.preset, self.sensor_cfg)
         self._left_panel.scene_lights = self._scene_lights  # shared reference
         self._right_panel = _ElementPropsPanel()
@@ -1347,19 +1508,22 @@ class CameraDesignerStation:
         self._march_vao:  Optional[int] = None
         self._march_vbo:  Optional[int] = None
 
-        # GPU dispatch state (populated by _build_gpu_dispatch)
-        self._gpu_packed:      Optional[np.ndarray] = None   # (N,32) float32
-        self._gpu_bvh_tris:    Optional[np.ndarray] = None   # (N,3,3) float32
-        self._gpu_context_buf: Optional[np.ndarray] = None   # (M,8) float32
-        self._gpu_ctx_map:     Dict[str, int] = {}
-        self._gpu_bounds:      Optional[tuple] = None        # (bmin, bmax)
-        self._gpu_source_buf:  Optional[np.ndarray] = None   # (S,9) float32
-        self._gpu_scene_ready: bool = False
-        # Active FilmStack driving the GPU layer uniforms
-        self._film_stack = _FILM_STACKS.get('em_rgb') if _FILM_STACKS else None
-        # Prebuilt pipeline state (live GL handles)
-        self._gpu_state:       Optional[dict] = None   # from _gpu_ray_field_prebuilt
-        self._gpu_frame_count: int = 0
+        # Transport state is intentionally not retained here.  The optical
+        # backend publishes immutable texture products through this registry.
+        self._preview_registry = preview_registry
+        self._engine_graph = engine_graph
+        self._preview_request_id = ""
+        self._preview_request_revision = 0
+        self._preview_compositor = None
+        if preview_registry is not None:
+            from camera_software.gpu_preview import GLPreviewCompositor
+            self._preview_compositor = GLPreviewCompositor()
+        self._surface_scan_error: str = ""
+        self._diagnostic_requested = False
+        self._diagnostic_in_flight = False
+        self._diagnostic_xz_lines: list[tuple[list, tuple]] = []
+        self._diagnostic_yz_lines: list[tuple[list, tuple]] = []
+        self._diagnostic_xy_lines: list[tuple[list, tuple]] = []
 
         # ── Auto-ISO (CameraComputer) state ──────────────────────────────────
         # _auto_cam_item: a real CameraItem built from the preset.
@@ -1450,6 +1614,8 @@ class CameraDesignerStation:
             surf = el.surface
             col  = _EL_COLORS[idx % len(_EL_COLORS)]
             r_max = surf.r_max
+            from camera_designer.scene_builder import _element_surface_frame
+            element_rotation, element_translation = _element_surface_frame(el)
 
             # XZ profile: vary r in [-r_max, r_max], trace in XZ plane
             xz_pts = []
@@ -1459,7 +1625,8 @@ class CameraDesignerStation:
                 ro_local = ro.copy(); ro_local[2] -= el.z_vertex
                 t, hit, _ = surf.intersect(ro_local, rd)
                 if math.isfinite(t):
-                    xz_pts.append((hit[2] + el.z_vertex, r))
+                    world = element_rotation @ hit + element_translation
+                    xz_pts.append((float(world[2]), float(world[0])))
             if xz_pts:
                 self._xz_lines.append((xz_pts, col))
 
@@ -1471,14 +1638,23 @@ class CameraDesignerStation:
                 ro_local = ro.copy(); ro_local[2] -= el.z_vertex
                 t, hit, _ = surf.intersect(ro_local, rd)
                 if math.isfinite(t):
-                    yz_pts.append((hit[2] + el.z_vertex, r))
+                    world = element_rotation @ hit + element_translation
+                    yz_pts.append((float(world[2]), float(world[1])))
             if yz_pts:
                 self._yz_lines.append((yz_pts, col))
 
             # XY aperture cross (circle at z=aperture plane)
             if r_max > 0:
                 angs = np.linspace(0., 2*math.pi, 64)
-                xy_pts = [(r_max*math.cos(a), r_max*math.sin(a)) for a in angs]
+                xy_pts = []
+                for angle in angs:
+                    local = np.array([
+                        r_max * math.cos(angle),
+                        r_max * math.sin(angle),
+                        0.0,
+                    ], np.float64)
+                    world = element_rotation @ local + element_translation
+                    xy_pts.append((float(world[0]), float(world[1])))
                 self._xy_lines.append((xy_pts, (col[0]*0.7, col[1]*0.7, col[2]*0.7, 0.6)))
 
         # ── Aperture stop ─────────────────────────────────────────────────
@@ -1571,6 +1747,9 @@ class CameraDesignerStation:
         # section slices of the actual ray-traced scene; lens element curves
         # (above) are drawn on top as physical-element overlays.  The housing
         # was purely an illustrative analogy and is no longer needed.
+        if hasattr(self, "_diagnostic_requested"):
+            self._diagnostic_requested = True
+            self._right_panel.diagnostic_state = "waiting for scan"
 
     # ── GL lifecycle ──────────────────────────────────────────────────────────
 
@@ -1622,10 +1801,14 @@ class CameraDesignerStation:
 
         self._rebuild_lines()
         self._gl_ready = True
+        self._request_optical_preview()
 
     def destroy_gl(self) -> None:
         if not _HAS_GL or not self._gl_ready:
             return
+        if self._preview_compositor is not None:
+            self._preview_compositor.destroy()
+            self._preview_compositor = None
         vaos = [v for v in (self._hud_vao, self._xz_vao, self._yz_vao,
                              self._xy_vao, self._march_vao) if v is not None]
         vbos = [v for v in (self._hud_vbo, self._xz_vbo, self._yz_vbo,
@@ -1684,110 +1867,128 @@ class CameraDesignerStation:
         return bmin, bmax
 
     def _build_gpu_dispatch(self) -> None:
-        """Pack the camera scene into GPU SSBOs and compile the canonical
-        _GPU_RAY_FIELD_CS compute shader against them.
-        Stores all GL handles in self._gpu_state for per-frame pumping.
-        Called automatically after lights or preset change.
+        """Invalidate the optical backend; retained as a UI call-site shim."""
+        self._request_optical_preview()
+
+    def _surface_scan_pose(self):
+        from camera_software.surface_scan_preview import SurfaceScanPose
+
+        sensor = self.preset.sensor
+        aperture = self.preset.aperture_stop
+        cfg = self.sensor_cfg
+        return SurfaceScanPose(
+            sensor_center=(
+                float(cfg.sensor_x), float(cfg.sensor_y),
+                float(sensor.z_pos + cfg.sensor_z),
+            ),
+            aperture_center=(0.0, 0.0, float(aperture.z_pos)),
+            sensor_half_width=float(sensor.r_max),
+            sensor_half_height=float(sensor.r_max),
+            resolution=256,
+        )
+
+    def _request_optical_preview(self) -> bool:
+        """Submit authored state to the optical engine's fast transport mode.
+
+        This method does not build, configure, poll, or retain a tracer.  The
+        render graph and its optical backend own the complete job lifetime.
         """
-        if not _HAS_CAMERA_DESIGNER or build_gpu_scene is None:
-            return
-        # Destroy previous GPU state if any
-        if self._gpu_state is not None and _gpu_destroy_fn is not None:
-            try:
-                _gpu_destroy_fn(self._gpu_state)
-            except Exception:
-                pass
-            self._gpu_state = None
-            self._gpu_scene_ready = False
-
+        if (
+            getattr(self, "_engine_graph", None) is None
+            or getattr(self, "camera_manifest", None) is None
+        ):
+            self._surface_scan_error = "optical backend unavailable"
+            self._right_panel.diagnostic_state = "backend unavailable"
+            return False
         try:
-            cbox = self._compute_confinement_box()
-            packed, bvh_tris, context_buf, ctx_map, bounds, source_buf = build_gpu_scene(
-                self.preset, self._scene_lights, self._scene_object,
-                confinement_box=cbox)
-            self._gpu_packed      = packed
-            self._gpu_bvh_tris    = bvh_tris
-            self._gpu_context_buf = context_buf
-            self._gpu_ctx_map     = ctx_map
-            self._gpu_bounds      = bounds
-            self._gpu_source_buf  = source_buf
-            print(f"[camera_designer] GPU scene packed — "
-                  f"{len(packed)} tris, {len(context_buf)} wave contexts.", flush=True)
-        except Exception as exc:
-            import traceback
-            traceback.print_exc()
-            print(f"[camera_designer] GPU scene build failed: {exc}", flush=True)
-            return
-
-        if not _HAS_GPU_FIELD or _gpu_bvh_fn is None or _gpu_prebuilt_fn is None:
-            print("[camera_designer] GPU field functions not available — CPU trickle only",
-                  flush=True)
-            return
-        # Inform right panel of current context labels, preserving existing toggles
-        if ctx_map:
-            self._right_panel.set_ctx_labels(list(ctx_map.keys()))
-
-        # Apply per-context enable mask: zero out radius of disabled contexts
-        _rp_ctx = self._right_panel.sim_ctx_enabled
-        ctx_buf_send = context_buf.copy()
-        for _lbl, _row in ctx_map.items():
-            if not _rp_ctx.get(_lbl, True):
-                ctx_buf_send[_row, 3] = 0.0
-
-        try:
-            bvh_nodes, bvh_ids = _gpu_bvh_fn(bvh_tris)
-            state = _gpu_prebuilt_fn(
-                packed_geom, packed_shade, mat_buf, bvh_nodes, bvh_ids,
-                ctx_buf_send, source_buf, bounds,
-                dims=_GPU_OPT_DIMS,
-                dispatch_batch=8192,
-                max_bounces=self._right_panel.sim_max_bounces,
-                initial_rays=32768,
-                speed_of_medium=2.998e8,
-                film_stack=self._film_stack,
+            from pluck_render_graph import EngineRequest
+            from camera_software.optical_bench import (
+                OpticalTransportMode,
+                camera_bell_jar_scene_manifest,
             )
-            if state is not None:
-                self._gpu_state       = state
-                self._gpu_scene_ready = True
-                self._gpu_frame_count = 0
-                print("[camera_designer] GPU prebuilt pipeline ready.", flush=True)
-            else:
-                print("[camera_designer] GPU prebuilt compile failed.", flush=True)
+
+            pose = self._surface_scan_pose().validated()
+            self._preview_request_revision += 1
+            payload = {
+                "bench_id": "camera-designer",
+                "scene_manifest": camera_bell_jar_scene_manifest(
+                    self.camera_manifest
+                ),
+                "scene_object": dict(self._scene_object or {}),
+                "lights": [dict(light) for light in self._scene_lights],
+                "transport_mode": OpticalTransportMode.RAY.value,
+                "backend_mode": "fast_preview",
+                "execution_policy": "interactive_preview",
+                "sensor_pose": {
+                    "sensor_center": list(pose.sensor_center),
+                    "aperture_center": list(pose.aperture_center),
+                    "sensor_half_width": float(pose.sensor_half_width),
+                    "sensor_half_height": float(pose.sensor_half_height),
+                    "resolution": int(pose.resolution),
+                },
+                "revision": self._preview_request_revision,
+                "requested_products": [
+                    "surface_scan", "camera_geometry", "light_field",
+                    "transport_diagnostics",
+                ],
+            }
+            request = EngineRequest.create(
+                "optical",
+                payload,
+                scene_revision=self.camera_manifest.hash,
+                requested_products=payload["requested_products"],
+                priority=10,
+            )
+            accepted = bool(self._engine_graph.submit(request))
+            if not accepted:
+                raise RuntimeError("optical render graph rejected preview request")
+            self._preview_request_id = request.request_id
+            self._surface_scan_error = ""
+            self._right_panel.diagnostic_state = "backend queued"
+            return True
         except Exception as exc:
-            import traceback
-            traceback.print_exc()
-            print(f"[camera_designer] GPU prebuilt init error: {exc}", flush=True)
+            self._surface_scan_error = str(exc)
+            self._right_panel.diagnostic_state = "backend error"
+            print(
+                f"[camera_designer] optical preview request failed: {exc}",
+                flush=True,
+            )
+            return False
+
+    def _build_surface_scan(self) -> None:
+        """Request the backend-owned fast transport mode."""
+        self._request_optical_preview()
+
+    def _poll_surface_scan(self) -> dict:
+        if self._preview_registry is None:
+            return {}
+        product = self._preview_registry.get("camera.surface-scan")
+        if product is None:
+            return {}
+        return {
+            "texture_id": int(product.texture_id),
+            "width": int(product.width),
+            "height": int(product.height),
+            "generation": int(product.generation),
+            "producer": str(product.producer),
+            "metadata": dict(product.metadata),
+        }
+
+    def bind_preview_registry(self, registry: Any) -> None:
+        """Bind the host-owned product registry used only for presentation."""
+
+        self._preview_registry = registry
+        if self._preview_compositor is None:
+            from camera_software.gpu_preview import GLPreviewCompositor
+            self._preview_compositor = GLPreviewCompositor()
 
     def _gpu_pump_frame(self) -> None:
-        """Dispatch one batch of forward rays into the live GPU pipeline.
-        Called from draw() every frame when _gpu_state is ready.
-        """
-        if self._gpu_state is None or _gpu_pump_fn is None:
-            return
-        try:
-            _gpu_pump_fn(self._gpu_state, n_rays=self._right_panel.sim_rays_per_frame)
-            # Debug: every 60 frames read back texture energy and print source info
-            self._gpu_frame_count = getattr(self, '_gpu_frame_count', 0) + 1
-            if self._gpu_frame_count % 60 == 1:
-                sb  = self._gpu_state.get('source_buf')
-                n_s = self._gpu_state.get('n_sources', 0)
-                if sb is not None and n_s > 0:
-                    print(f"[dbg pump] n_sources={n_s}  pump_rays={self._right_panel.sim_rays_per_frame}", flush=True)
-                    for _si in range(min(n_s, 4)):
-                        print(f"  src[{_si}] pos={sb[_si,0:3]}  dir={sb[_si,4:7]}  freq={sb[_si,10] if sb.shape[1]>10 else '?'}", flush=True)
-                if _gpu_readback_fn is not None:
-                    try:
-                        _dbg_vol = _gpu_readback_fn(self._gpu_state['tex_bands'], self._gpu_state['dims'])
-                        print(f"[dbg pump] tex energy — max={_dbg_vol.max()}  sum={_dbg_vol.sum():.3e}  shape={_dbg_vol.shape}", flush=True)
-                    except Exception as _e:
-                        print(f"[dbg pump] readback failed: {_e}", flush=True)
-        except Exception as exc:
-            print(f"[camera_designer] GPU pump error: {exc}", flush=True)
+        """Transport execution belongs to the optical backend."""
+        return None
 
     def _clear_glow(self) -> None:
-        """Clear GPU ray-field accumulation textures."""
-        if _gpu_clear_fn is not None and self._gpu_state is not None:
-            _gpu_clear_fn(self._gpu_state)
+        """Invalidate backend products after an authoring change."""
+        self._request_optical_preview()
 
     # ── Per-frame render ──────────────────────────────────────────────────────
 
@@ -1891,8 +2092,8 @@ class CameraDesignerStation:
             ("Slice thick",   f"{self._slice_thickness * 1e3:.2f} mm"),
             ("Scene lights",  len(self._scene_lights)),
             ("Scene meshes",  len(self._scene_meshes)),
-            ("GPU ready",     "yes" if self._gpu_scene_ready else "no"),
-            ("Frame count",   self._gpu_frame_count),
+            ("Backend request", self._preview_request_id[:12] or "unavailable"),
+            ("Preview generation", self._right_panel.surface_scan_generation),
         ]
         for label, value in rows:
             if y + fh > vp_h:
@@ -1921,11 +2122,10 @@ class CameraDesignerStation:
         vp_x = lw
         vp_w = win_w - lw - rw
         vp_h = win_h
-
-        # ── GPU pump ──────────────────────────────────────────────────────
-        if self._gpu_scene_ready and self._gpu_state is not None:
-            self._gpu_pump_frame()
-            self._gpu_frame_count += 1
+        surface_scan_info = self._poll_surface_scan()
+        self._right_panel.surface_scan_generation = int(
+            surface_scan_info.get("generation", 0)
+        )
 
         # ── Auto-ISO tick — CameraComputer owns all auto logic ───────────────────────
         if self._auto_computer is not None:
@@ -2006,8 +2206,64 @@ class CameraDesignerStation:
             _br_view = self._right_panel.bottom_right_view
             _br_title = {'gpu_field': 'Sensor plane (GPU)',
                          'sensor':    'Sensor accumulation',
-                         'plate':     'Plate accumulation'}.get(_br_view, _br_view)
-            if _br_view == 'gpu_field':
+                         'plate':     'Plate accumulation',
+                         'complex_transport': 'Complex ray transport',
+                         'surface_scan': 'Pixel-ray camera preview'}.get(_br_view, _br_view)
+            if _br_view == 'surface_scan':
+                self._draw_cross_section(
+                    vp_x + half_vp_w, 0,
+                    half_vp_w, half_vp_h,
+                    self._xy_lines, self._view_xy,
+                    win_w, win_h,
+                    title=_br_title,
+                    border_rgba=_sb,
+                )
+                scan_tex = int(surface_scan_info.get("texture_id", 0))
+                if scan_tex > 0:
+                    screen_y = win_h - half_vp_h
+                    product = (
+                        None if self._preview_registry is None
+                        else self._preview_registry.get("camera.surface-scan")
+                    )
+                    if self._preview_compositor is not None and product is not None:
+                        self._preview_compositor.draw(
+                            product,
+                            (vp_x + half_vp_w, screen_y, half_vp_w, half_vp_h),
+                            win_h,
+                        )
+                    else:
+                        self._blit_panel(
+                            vp_x + half_vp_w, screen_y,
+                            half_vp_w, half_vp_h,
+                            scan_tex, win_w, win_h,
+                        )
+            elif _br_view == 'complex_transport':
+                self._draw_cross_section(
+                    vp_x + half_vp_w, 0,
+                    half_vp_w, half_vp_h,
+                    self._xy_lines, self._view_xy,
+                    win_w, win_h,
+                    title=_br_title,
+                    border_rgba=_sb,
+                )
+                product = (
+                    None if self._preview_registry is None
+                    else self._preview_registry.get(
+                        "transport.complex-accumulation"
+                    )
+                )
+                if self._preview_compositor is not None and product is not None:
+                    self._preview_compositor.draw(
+                        product,
+                        (
+                            vp_x + half_vp_w,
+                            win_h - half_vp_h,
+                            half_vp_w,
+                            half_vp_h,
+                        ),
+                        win_h,
+                    )
+            elif _br_view == 'gpu_field':
                 self._draw_view_layers(
                     vp_x + half_vp_w, 0,
                     half_vp_w,        half_vp_h,
@@ -2092,6 +2348,18 @@ class CameraDesignerStation:
 
     # ── Internal draw helpers ─────────────────────────────────────────────────
 
+    def render(self) -> None:
+        """Pluck full-screen station contract.
+
+        The designer's native drawing API accepts explicit dimensions because
+        it is also usable as an embedded viewport.  Pluck owns the full window
+        and invokes stations through a no-argument ``render()`` method, so keep
+        that host adapter here rather than making either side know the other's
+        implementation detail.
+        """
+
+        self.draw(self.win_w, self.win_h)
+
     def _draw_view_layers(
         self,
         vp_x: int, vp_y: int, vp_w: int, vp_h: int,
@@ -2106,9 +2374,14 @@ class CameraDesignerStation:
         if self._view_layers.get("texture", True):
             self._draw_march_volume(vp_x, vp_y, vp_w, vp_h, axis)
         if self._view_layers.get("pictographic", True):
+            diagnostic = {
+                "xz": self._diagnostic_xz_lines,
+                "yz": self._diagnostic_yz_lines,
+                "xy": self._diagnostic_xy_lines,
+            }.get(axis, ())
             self._draw_cross_section(
                 vp_x, vp_y, vp_w, vp_h,
-                lines, view, win_w, win_h,
+                [*lines, *diagnostic], view, win_w, win_h,
                 title=title,
                 border_rgba=border_rgba,
             )
@@ -2123,7 +2396,9 @@ class CameraDesignerStation:
         axis: 'xz' | 'yz' | 'xy' | 'sensor'
         Additive blend (GL_ONE, GL_ONE) — same as demo_pluck_gl.
         """
-        if self._gpu_state is None or self._prog_march is None:
+        # Volumetric products are composed from the backend registry in their
+        # own tabs; the station has no local field texture or dispatch state.
+        if getattr(self, "_gpu_state", None) is None or self._prog_march is None:
             return
         state      = self._gpu_state
         bmin       = np.asarray(state['bmin'], np.float32)
@@ -2404,6 +2679,36 @@ class CameraDesignerStation:
             return True
         if consumed:
             self._panels_dirty = True
+            if action in {"sensor_x", "sensor_y", "sensor_z"}:
+                self._rebuild_lines()
+                self._request_optical_preview()
+            elif action in {"camera_zoom", "focus_distance_m"} and (
+                ev.type == pygame.MOUSEWHEEL
+                or (
+                    ev.type == pygame.MOUSEBUTTONUP
+                    and getattr(ev, "button", 0) == 1
+                )
+                or (
+                    ev.type == pygame.MOUSEBUTTONDOWN
+                    and getattr(ev, "button", 0) == 3
+                )
+            ):
+                self._apply_canonical_camera_controls()
+            elif action.startswith("el") and "_" in action and (
+                ev.type == pygame.MOUSEWHEEL
+                or (
+                    ev.type == pygame.MOUSEBUTTONUP
+                    and getattr(ev, "button", 0) == 1
+                )
+                or (
+                    ev.type == pygame.MOUSEBUTTONDOWN
+                    and (
+                        getattr(ev, "button", 0) == 3
+                        or action.endswith("_conic_type")
+                    )
+                )
+            ):
+                self._apply_canonical_surface_control(action)
             return True
 
         # Right panel
@@ -2571,93 +2876,28 @@ class CameraDesignerStation:
 
         return False
 
-    # ── Bake logic (threaded) ─────────────────────────────────────────────────
+    # ── Backend transport requests ────────────────────────────────────────────
 
     def _start_bake(self) -> None:
-        if self._left_panel.bake_state == "baking":
-            return
-        import threading
-        self._left_panel.bake_state = "baking"
-        self._left_panel.bake_msg   = "tracing rays…"
+        """Retired local bake button; invalidate the engine-owned preview."""
+        self._left_panel.bake_state = "queued"
+        self._left_panel.bake_msg = "submitted to optical backend"
+        self._request_optical_preview()
         self._panels_dirty = True
-
-        def _worker():
-            try:
-                worker = BakeWorker(self.preset, n_rays=16_384, verbose=False)
-                self._manifold = worker.bake()
-                n = getattr(self._manifold, "n_noodles",
-                            len(getattr(self._manifold, "_data", [])))
-                self._left_panel.bake_state = "done"
-                self._left_panel.bake_msg   = f"{n} noodles baked"
-                self._right_panel.lut_info  = {
-                    "noodles": str(n),
-                    "kdim":    "5D  (u,v,dx,dy,dz)",
-                }
-            except Exception as exc:
-                self._left_panel.bake_state = "error"
-                self._left_panel.bake_msg   = str(exc)[:60]
-            self._panels_dirty = True
-
-        self._bake_thread = threading.Thread(target=_worker, daemon=True)
-        self._bake_thread.start()
-
-    # ── Manifold BDPT render (threaded) ──────────────────────────────────────
 
     def _start_manifold_bdpt(self) -> None:
-        if self._left_panel.manifold_bdpt_state == "rendering":
-            return
-        import threading
-        from camera_designer import ManifoldEndpoint
-        self._left_panel.manifold_bdpt_state = "rendering"
+        """Do not instantiate a station-local BDPT solver."""
+        self._left_panel.manifold_bdpt_state = "backend"
+        self._request_optical_preview()
         self._panels_dirty = True
-        preset = self.preset
-
-        def _worker():
-            try:
-                ep = ManifoldEndpoint(preset, n_bands=1)
-                fwd = ep.sample_forward_records(512, seed=0)
-                bwd = ep.sample_sensor_records(32, 32, n_per_pixel=4, seed=1)
-                corr = ep.make_correlator(grid_n=16, match_radius_bins=2)
-                cands = corr.correlate(fwd, bwd, n_bands=1)
-
-                import numpy as np
-                accum = np.zeros(32 * 32, np.float64)
-                for c in cands:
-                    if not c.accepted:
-                        continue
-                    if c.backward_record is None:
-                        continue
-                    pid = int(c.backward_record["subpath_id"].flat[0]) % (32 * 32)
-                    cv  = complex(np.ravel(c.contribution)[0])
-                    w   = c.middle.mis_weight if c.middle is not None else 1.0
-                    accum[pid] += (cv.real ** 2 + cv.imag ** 2) * w
-
-                img = np.zeros((32, 32, 3), np.float32)
-                peak = accum.max()
-                if peak > 0.0:
-                    bright = (accum / peak).reshape(32, 32).astype(np.float32)
-                    img[:, :, 0] = bright
-                    img[:, :, 1] = bright * 0.85
-                    img[:, :, 2] = bright * 0.65
-                # Store on the station so the plate viewer can display it.
-                self._bdpt_manifold_img = img
-                n_hits = sum(1 for c in cands if c.accepted)
-                print(f"[manifold-bdpt] {n_hits} hits, "
-                      f"fwd={len(fwd)}, bwd={len(bwd)}", flush=True)
-                self._left_panel.manifold_bdpt_state = "done"
-            except Exception as exc:
-                import traceback
-                traceback.print_exc()
-                self._left_panel.manifold_bdpt_state = "error"
-            self._panels_dirty = True
-
-        threading.Thread(target=_worker, daemon=True).start()
 
     # ── Preset switching ──────────────────────────────────────────────────────
 
     def load_preset(self, preset: "CameraPreset") -> None:
         """Hot-swap the active preset and rebuild geometry."""
         self.preset = preset
+        self.sensor_cfg.sync_elements(preset)
+        self._sync_surface_controls_from_manifest()
         self._left_panel.preset     = preset
         self._left_panel.sensor_cfg = self.sensor_cfg   # keep live config
         self._left_panel._selected_idx = -1
@@ -2666,29 +2906,142 @@ class CameraDesignerStation:
         self._right_panel.element_info = {}
         self._right_panel.lut_info     = {}
         self._manifold = None
-        self._tracer   = None
         self._ctx_map  = {}
-        self._gpu_scene_ready  = False
-        self._gpu_packed       = None
-        self._gpu_bvh_tris     = None
-        self._gpu_context_buf  = None
-        self._gpu_ctx_map      = {}
-        self._gpu_bounds       = None
-        self._gpu_source_buf   = None
-        if self._gpu_state is not None and _gpu_destroy_fn is not None:
-            try:
-                _gpu_destroy_fn(self._gpu_state)
-            except Exception:
-                pass
-        self._gpu_state        = None
-        self._gpu_frame_count  = 0
         # Propagate sensor log-scale flag from the preset (set in sensor YAML /
         # camera preset YAML via CameraPreset.sensor_log_scale)
         self._glow_log_scale = bool(getattr(preset, 'sensor_log_scale', False))
         self._setup_auto_computer()
-        self._clear_glow()
         self._rebuild_lines()
+        if self._gl_ready:
+            self._request_optical_preview()
+
+    def load_camera_manifest(self, camera) -> None:
+        """Load the optical engine's canonical camera into this frontend.
+
+        ``CameraPreset`` remains only the designer/GPU-view projection.  The
+        manifest is retained so saving, cache identity and subsequent engine
+        requests continue to refer to the production camera rather than to the
+        derived drawing object.
+        """
+        from camera_software.camera_designer_bridge import (
+            camera_manifest_to_designer_preset,
+        )
+        from camera_software.optical_bench import resolve_bench_camera_manifest
+
+        resolved = resolve_bench_camera_manifest(camera)
+        self.camera_manifest = resolved
+        mapping = resolved.mapping()
+        if hasattr(self, "sensor_cfg"):
+            self.sensor_cfg.zoom = float(
+                dict(mapping.get("lens", {})).get("zoom", 0.5)
+            )
+            self.sensor_cfg.focus_distance_m = float(
+                dict(mapping.get("focus", {})).get("distance_m", 1.0)
+            )
+        self.load_preset(camera_manifest_to_designer_preset(resolved))
         self._panels_dirty = True
+
+    def _sync_surface_controls_from_manifest(self) -> None:
+        if self.camera_manifest is None or not hasattr(self, "sensor_cfg"):
+            return
+        lens = dict(self.camera_manifest.mapping().get("lens", {}))
+        adjustments = dict(lens.get("surface_adjustments", {}))
+        by_label = {
+            str(element.label): index
+            for index, element in enumerate(self.preset.lens_group.elements)
+        }
+        field_map = {
+            "axial_offset_mm": ("axial_offset", 1.0e-3),
+            "shift_x_mm": ("shift_x", 1.0e-3),
+            "shift_y_mm": ("shift_y", 1.0e-3),
+            "tilt_x_deg": ("tilt_x", 1.0),
+            "tilt_y_deg": ("tilt_y", 1.0),
+            "radius_mm": ("radius", 1.0e-3),
+            "clear_radius_mm": ("clear_radius", 1.0e-3),
+            "conic_k": ("conic_k", 1.0),
+            "conic_type": ("conic_type", 1.0),
+        }
+        for label, edit in adjustments.items():
+            index = by_label.get(str(label))
+            if index is None:
+                continue
+            for source, (target, scale) in field_map.items():
+                if source not in edit:
+                    continue
+                value = edit[source]
+                self.sensor_cfg.set_el_geometry_value(
+                    index, target,
+                    str(value) if source == "conic_type" else float(value) * scale,
+                )
+
+    def _apply_canonical_camera_controls(self) -> None:
+        """Resolve zoom/focus edits through the production camera manifest."""
+
+        zoom = float(self.sensor_cfg.zoom)
+        from camera_software.camera_designer_bridge import (
+            camera_manifest_to_designer_preset,
+            camera_manifest_with_controls,
+        )
+        resolved = camera_manifest_with_controls(
+            self.camera_manifest,
+            zoom=zoom,
+            focus_distance_m=self.sensor_cfg.focus_distance_m,
+        )
+        # Avoid feeding values back through load_camera_manifest: the controls
+        # are already authoritative for this edit and should not jump while the
+        # user releases the knob.
+        self.camera_manifest = resolved
+        self.load_preset(camera_manifest_to_designer_preset(resolved))
+        print(
+            "[camera_designer] canonical camera re-solved "
+            f"zoom={zoom:.3f} focal={self.preset.focal_mm:.2f}mm "
+            f"focus={self.sensor_cfg.focus_distance_m:.3f}m",
+            flush=True,
+        )
+
+    def _apply_canonical_surface_control(self, action: str) -> None:
+        """Commit one visible surface control through CameraManifest."""
+
+        head, field = str(action).split("_", 1)
+        index = int(head[2:])
+        if not 0 <= index < len(self.preset.lens_group.elements):
+            return
+        element = self.preset.lens_group.elements[index]
+        value = self.sensor_cfg.el_geometry_value(index, field)
+        manifest_field = {
+            "axial_offset": "axial_offset_mm",
+            "shift_x": "shift_x_mm",
+            "shift_y": "shift_y_mm",
+            "tilt_x": "tilt_x_deg",
+            "tilt_y": "tilt_y_deg",
+            "radius": "radius_mm",
+            "clear_radius": "clear_radius_mm",
+            "conic_type": "conic_type",
+            "conic_k": "conic_k",
+        }.get(field)
+        if manifest_field is None:
+            return
+        if manifest_field.endswith("_mm"):
+            value = float(value) * 1.0e3
+        from camera_software.camera_designer_bridge import (
+            camera_manifest_to_designer_preset,
+            camera_manifest_with_surface_adjustment,
+        )
+        update = {manifest_field: value}
+        if field == "conic_k":
+            update["conic_type"] = str(
+                self.sensor_cfg.el_geometry_value(index, "conic_type", "sphere")
+            )
+        resolved = camera_manifest_with_surface_adjustment(
+            self.camera_manifest, element.label, **update,
+        )
+        self.camera_manifest = resolved
+        self.load_preset(camera_manifest_to_designer_preset(resolved))
+        edit = dict(resolved.mapping()["lens"]["surface_adjustments"])[element.label]
+        print(
+            f"[camera_designer] surface {element.label} updated {edit}",
+            flush=True,
+        )
 
     def _setup_auto_computer(self) -> None:
         """Create (or replace) the CameraComputer that drives auto-ISO.

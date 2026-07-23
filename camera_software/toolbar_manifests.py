@@ -73,8 +73,6 @@ def integrator_toolbar_panel() -> Panel:
         "integrator-toolbar",
         "INTEGRATOR",
         knobs=[
-            choice_knob("transport_mode", "MODE", ("continuous", "fixed", "depth"), widget="stepper"),
-            choice_knob("lane_count", "LANES", ("1", "3", "8", "16", "32"), widget="stepper"),
             choice_knob("total_rays", "RAYS", tuple(f"{value:,}" for value in RAY_OPTIONS), widget="stepper"),
             choice_knob("max_sensor_epochs", "EPOCHS", EPOCH_OPTIONS, widget="stepper"),
             choice_knob("epoch_bundle_count", "BUNDLES", BUNDLE_OPTIONS, widget="stepper"),
@@ -82,7 +80,30 @@ def integrator_toolbar_panel() -> Panel:
             choice_knob("max_bounces", "BOUNCES", BOUNCE_OPTIONS, widget="stepper"),
             choice_knob("sensor_t5_pair_budget", "T5 PAIRS", tuple(f"{value:.1e}" for value in T5_OPTIONS), widget="stepper"),
         ],
-        payload=_grid_payload(8, "blue"),
+        payload=_grid_payload(6, "blue"),
+    )
+
+
+def arena_toolbar_panel() -> Panel:
+    """Spectral/wave execution context, separate from integrator budgets."""
+
+    return Panel(
+        "arena-toolbar",
+        "ARENA",
+        knobs=[
+            choice_knob(
+                "transport_mode", "RAY MODE",
+                ("continuous", "fixed", "depth"), widget="stepper",
+            ),
+            choice_knob(
+                "lane_count", "LANES",
+                ("1", "3", "4", "8", "16", "32"), widget="stepper",
+            ),
+            choice_knob(
+                "wave_mode", "WAVE", ("OFF", "ON"), widget="stepper",
+            ),
+        ],
+        payload=_grid_payload(3, "blue"),
     )
 
 
@@ -220,6 +241,7 @@ __all__ = [
     "F_NUMBER_OPTIONS", "CAMERA_ANGLE_OPTIONS", "CAMERA_OFFSET_OPTIONS",
     "camera_toolbar_panel", "lens_toolbar_panel",
     "light_toolbar_panel", "film_toolbar_panel", "integrator_toolbar_panel",
+    "arena_toolbar_panel",
     "ray_trace_toolbar_panel", "exposure_toolbar_panel",
     "render_progress_panel", "work_preview_tabs_panel",
 ]

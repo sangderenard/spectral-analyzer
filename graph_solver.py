@@ -630,6 +630,10 @@ def _tarjan_sccs(node_keys: list[str], edges: Iterable["TensorEdge"], sample_rat
     ki = {k: i for i, k in enumerate(node_keys)}
     adj: list[list[int]] = [[] for _ in range(n)]
     for edge in edges:
+        # A delayed edge is causal state, not an algebraic dependency.  Folding
+        # it into an SCC would incorrectly demand an instantaneous solve.
+        if edge.delay_steps(sample_rate) != 0:
+            continue
         si = ki.get(edge.src_key)
         di = ki.get(edge.dst_key)
         if si is None or di is None:
@@ -1295,6 +1299,11 @@ class TensorEdge:
     src_key: str
     dst_key: str
     weight: Tensor | complex | float | int
+    # Zero is the optimized algebraic path.  Positive delays remain explicit
+    # causal channels and are never folded into the instantaneous SCC solve.
+    delay_s: float = 0.0
+    delay_samples: int = 0
+    analog_complex_delay: Tensor | complex | float | int = 1.0 + 0.0j
     coefficient_set: str = ""
     coefficient_names: tuple[str, ...] = ()
     crosstalk_weight: Tensor | complex | float | int = 0.0 + 0.0j
@@ -1330,8 +1339,14 @@ class TensorEdge:
     # supply the bank it draws from.
     fifo_bank: Optional[Any] = field(default=None, hash=False, compare=False, repr=False)
 
+    def delay_steps(self, sample_rate: float) -> int:
+        if int(self.delay_samples) > 0:
+            return int(self.delay_samples)
+        return max(0, int(round(float(self.delay_s) * float(sample_rate))))
+
     def apply(self, payload: Tensor) -> Tensor:
         out = _canonical_complex(self.weight).to(payload.device) * payload
+        out = out * _canonical_complex(self.analog_complex_delay).to(payload.device)
         out = out * _canonical_complex(self.src_mask).to(payload.device)
         out = out * _canonical_complex(self.dst_mask).to(payload.device)
         out = out * _canonical_complex(self.activity_mask).to(payload.device)
@@ -2021,31 +2036,35 @@ class GraphSolver(nn.Module):
         self.nodes = list(nodes)
         self.edges = [
             TensorEdge(
-                e.src_key,
-                e.dst_key,
-                _canonical_complex(e.weight).to(device),
-                e.coefficient_set,
-                e.coefficient_names,
-                _canonical_complex(e.crosstalk_weight).to(device),
-                e.saturation_policy,
-                e.saturation_knee,
-                e.saturation_fn,
-                e.group,
-                e.semantic_role,
-                e.src_port_set,
-                e.dst_port_set,
-                e.src_port,
-                e.dst_port,
-                e.counts_for_occupancy,
-                e.contract_key,
-                e.contract_semantic_role,
-                _canonical_complex(e.src_mask).to(device),
-                _canonical_complex(e.dst_mask).to(device),
-                _canonical_complex(e.activity_mask).to(device),
-                e.activity_contract,
-                e.src_addresses,
-                e.dst_addresses,
-                e.consumption_policy,
+                src_key=e.src_key,
+                dst_key=e.dst_key,
+                weight=_canonical_complex(e.weight).to(device),
+                delay_s=float(e.delay_s),
+                delay_samples=int(e.delay_samples),
+                analog_complex_delay=_canonical_complex(e.analog_complex_delay).to(device),
+                coefficient_set=e.coefficient_set,
+                coefficient_names=e.coefficient_names,
+                crosstalk_weight=_canonical_complex(e.crosstalk_weight).to(device),
+                saturation_policy=e.saturation_policy,
+                saturation_knee=e.saturation_knee,
+                saturation_fn=e.saturation_fn,
+                group=e.group,
+                semantic_role=e.semantic_role,
+                src_port_set=e.src_port_set,
+                dst_port_set=e.dst_port_set,
+                src_port=e.src_port,
+                dst_port=e.dst_port,
+                counts_for_occupancy=e.counts_for_occupancy,
+                contract_key=e.contract_key,
+                contract_semantic_role=e.contract_semantic_role,
+                src_mask=_canonical_complex(e.src_mask).to(device),
+                dst_mask=_canonical_complex(e.dst_mask).to(device),
+                activity_mask=_canonical_complex(e.activity_mask).to(device),
+                activity_contract=e.activity_contract,
+                src_addresses=e.src_addresses,
+                dst_addresses=e.dst_addresses,
+                consumption_policy=e.consumption_policy,
+                fifo_bank=e.fifo_bank,
             )
             for e in edges
         ]
@@ -2078,7 +2097,15 @@ class GraphSolver(nn.Module):
         self._auto_form_contract_edges()
         self.solve_edges = [edge for edge in self.edges if not self._is_subscription_contract_edge(edge)]
         raw_sccs = _tarjan_sccs(self.node_keys, self.solve_edges, self.sample_rate)
-        zero_delay_edges = list(self.solve_edges)
+        zero_delay_edges = [
+            edge for edge in self.solve_edges
+            if edge.delay_steps(self.sample_rate) == 0
+        ]
+        self.delayed_edges_by_steps: dict[int, list[TensorEdge]] = {}
+        for edge in self.solve_edges:
+            delay = edge.delay_steps(self.sample_rate)
+            if delay > 0:
+                self.delayed_edges_by_steps.setdefault(delay, []).append(edge)
         node_to_scc: dict[int, int] = {}
         sccs: list[SCCSpec] = []
         for scc_id, raw in enumerate(reversed(raw_sccs)):
@@ -2142,6 +2169,16 @@ class GraphSolver(nn.Module):
                 self._scc_direct_picard[str(_scc.scc_id)] = _p
 
         self._last_outputs: dict[str, Tensor] = {}
+        # One ring per distinct delay.  A snapshot is shared by all edges with
+        # that delay, keeping the state compact while preserving arbitrary
+        # tensor payload shapes.
+        self._delay_buffers: dict[int, list[dict[str, Tensor]]] = {
+            delay: [{} for _ in range(delay)]
+            for delay in self.delayed_edges_by_steps
+        }
+        self._delay_pos: dict[int, int] = {
+            delay: 0 for delay in self.delayed_edges_by_steps
+        }
 
         # Pre-index edges by destination key to avoid O(S×E) scan in _build_local_src.
         self._zd_edges_by_dst: dict[str, list[TensorEdge]] = {}
@@ -2428,6 +2465,18 @@ class GraphSolver(nn.Module):
         handle causality.
         """
         sccs = list(self.condensed.sccs)
+        self._schedule_has_delayed_feedback = False
+        for edge in self.solve_edges:
+            if edge.delay_steps(self.sample_rate) <= 0:
+                continue
+            si = self.node_index.get(edge.src_key)
+            di = self.node_index.get(edge.dst_key)
+            if si is None or di is None:
+                continue
+            if self.condensed.node_to_scc.get(si) == self.condensed.node_to_scc.get(di):
+                # Since zero-delay SCCs were already condensed, a delayed edge
+                # inside one condensed component is a causal self-feedback.
+                self._schedule_has_delayed_feedback = True
         if len(sccs) < 2:
             return sccs
         sid_to_scc = {s.scc_id: s for s in sccs}
@@ -2455,6 +2504,9 @@ class GraphSolver(nn.Module):
                 if indeg[dst] == 0:
                     ready.append(dst)
         if len(ordered_ids) != len(sccs):
+            # The zero-delay condensation is a DAG by construction.  A cycle
+            # here therefore crosses at least one delayed channel.
+            self._schedule_has_delayed_feedback = True
             return sccs
         return [sid_to_scc[sid] for sid in ordered_ids]
 
@@ -2589,6 +2641,91 @@ class GraphSolver(nn.Module):
             return self._zero_scalar
         return torch.zeros(payload_shape, dtype=_CDTYPE, device=self.device)
 
+    def _delayed_stream(
+        self,
+        value: Tensor,
+        delay: int,
+        payload_shape: tuple[int, ...],
+    ) -> Tensor:
+        """Shift an already available KPN tensor stream without scalarizing it."""
+        stream = _broadcast_to(
+            _canonical_complex(value).to(self.device),
+            payload_shape,
+            self.device,
+        )
+        d = max(0, int(delay))
+        if d <= 0 or not payload_shape:
+            return stream
+        axis = _time_dim(payload_shape)
+        n = int(payload_shape[axis])
+        if d >= n:
+            return torch.zeros_like(stream)
+        out = torch.zeros_like(stream)
+        dst = [slice(None)] * stream.dim()
+        src = [slice(None)] * stream.dim()
+        dst[axis] = slice(d, None)
+        src[axis] = slice(None, -d)
+        out[tuple(dst)] = stream[tuple(src)]
+        return out
+
+    def _propagate_delayed_streams(
+        self,
+        new_outputs: Dict[str, Tensor],
+        base_src: Dict[str, Optional[Tensor]],
+        payload_shape: tuple[int, ...],
+    ) -> None:
+        """Route acyclic delayed channels as vectorized shifted streams."""
+        if not new_outputs:
+            return
+        for delay, edges in self.delayed_edges_by_steps.items():
+            for edge in edges:
+                src_val = new_outputs.get(edge.src_key)
+                if src_val is None:
+                    continue
+                shifted = self._delayed_stream(src_val, delay, payload_shape)
+                base_src[edge.dst_key] = _add_broadcast(
+                    base_src.get(edge.dst_key),
+                    edge.apply(shifted),
+                )
+
+    def _run_causal_schedule(
+        self,
+        ext_series: Dict[str, Tensor],
+        *,
+        payload_shape: tuple[int, ...],
+        n_frames: int,
+        on_progress: Optional[Any],
+    ) -> Dict[str, Tensor]:
+        """Evaluate a delayed graph exactly in causal sample order.
+
+        Delays are optional, so this deliberately sits outside the ordinary
+        whole-window path.  Graphs containing only zero-delay edges retain the
+        vectorized/SCC solve; a graph that declares causal state pays for it.
+        """
+        axis = _time_dim(payload_shape)
+        frame_shape = payload_shape[:axis] + payload_shape[axis + 1:]
+        gathered: dict[str, list[Tensor]] = {key: [] for key in self.node_keys}
+        n = max(1, int(n_frames))
+        for frame_index in range(n):
+            frame_ext = {
+                key: value.select(axis, frame_index)
+                for key, value in ext_series.items()
+            }
+            frame_out = self.step(frame_ext)
+            for key in self.node_keys:
+                value = frame_out.get(key, self._zero_scalar)
+                gathered[key].append(_broadcast_to(value, frame_shape, self.device))
+            if callable(on_progress):
+                on_progress(frame_index + 1, n, "causal-delay")
+        outputs = {
+            key: torch.stack(frames, dim=axis)
+            for key, frames in gathered.items()
+        }
+        self._last_outputs = {
+            key: value.detach().clone() for key, value in outputs.items()
+        }
+        return outputs
+
     def run_schedule(
         self,
         ext: Optional[Dict[str, Tensor]] = None,
@@ -2629,6 +2766,14 @@ class GraphSolver(nn.Module):
 
             self._dispatch_at_solve_start()
 
+            if self.delayed_edges_by_steps and self._schedule_has_delayed_feedback:
+                return self._run_causal_schedule(
+                    ext_series,
+                    payload_shape=payload_shape,
+                    n_frames=n,
+                    on_progress=on_progress,
+                )
+
             with _T.span("solver.schedule.inject"):
                 base_src: dict[str, Optional[Tensor]] = {
                     key: self._zero_payload(payload_shape) for key in self.node_keys
@@ -2646,7 +2791,7 @@ class GraphSolver(nn.Module):
                     )
 
             outputs: dict[str, Tensor] = {}
-            if self.condensed.tier == 1:
+            if self.condensed.tier == 1 and not self.delayed_edges_by_steps:
                 with _T.span("solver.schedule.solve.linear_tier1"):
                     src_map = {key: value for key, value in base_src.items() if value is not None}
                     outputs = self._solve_linear_region(self.node_keys, src_map)
@@ -2657,12 +2802,21 @@ class GraphSolver(nn.Module):
                     _plan = self._execution_plan
                     _total = len(_plan)
                     for _i, _item in enumerate(_plan):
+                        before_keys = set(outputs)
                         if _item[0] == "lateral":
                             self._solve_lateral_group(_item[1], _item[2], base_src, outputs)
                             _label = f"lateral:{_item[1]}"
                         else:
                             self._solve_scc(_item[1], base_src, outputs)
                             _label = f"scc:{','.join(_item[1].node_keys)}"
+                        self._propagate_delayed_streams(
+                            {
+                                key: outputs[key]
+                                for key in set(outputs) - before_keys
+                            },
+                            base_src,
+                            payload_shape,
+                        )
                         if callable(on_progress):
                             on_progress(_i + 1, _total, _label)
 
@@ -2691,6 +2845,18 @@ class GraphSolver(nn.Module):
                 for key, value in ext.items():
                     base_src[key] = _add_broadcast(base_src[key], _canonical_complex(value).to(self.device))
 
+            with _T.span("solver.step.delay_read"):
+                for delay, edges in self.delayed_edges_by_steps.items():
+                    snapshot = self._delay_buffers[delay][self._delay_pos[delay]]
+                    for edge in edges:
+                        src_val = snapshot.get(edge.src_key)
+                        if src_val is None:
+                            continue
+                        base_src[edge.dst_key] = _add_broadcast(
+                            base_src[edge.dst_key],
+                            edge.apply(src_val),
+                        )
+
             src_map = {key: value for key, value in base_src.items() if value is not None}
             if self.condensed.tier == 1:
                 with _T.span("solver.step.solve"):
@@ -2705,11 +2871,28 @@ class GraphSolver(nn.Module):
                         else:
                             self._solve_scc(_item[1], base_src, outputs)
 
+            with _T.span("solver.step.delay_write"):
+                for delay, edges in self.delayed_edges_by_steps.items():
+                    pos = self._delay_pos[delay]
+                    source_keys = {edge.src_key for edge in edges}
+                    self._delay_buffers[delay][pos] = {
+                        key: outputs[key].detach().clone()
+                        for key in source_keys
+                        if key in outputs
+                    }
+                    self._delay_pos[delay] = (pos + 1) % delay
+
             self._last_outputs = {key: value.detach().clone() for key, value in outputs.items()}
             return outputs
 
+    def _reset_delay_state(self) -> None:
+        for delay in self.delayed_edges_by_steps:
+            self._delay_buffers[delay] = [{} for _ in range(delay)]
+            self._delay_pos[delay] = 0
+
     def reset(self) -> None:
         self._first_tick = True
+        self._reset_delay_state()
         if self.fifo_bank is not None:
             self.fifo_bank.reset()
         for block in self.cyclic_blocks.values():
@@ -2727,6 +2910,7 @@ class GraphSolver(nn.Module):
         a Recompose).  The FIFO bank retains its slots and contents.
         """
         self._first_tick = True
+        self._reset_delay_state()
         for block in self.cyclic_blocks.values():
             block.reset()
         self._last_outputs = {}

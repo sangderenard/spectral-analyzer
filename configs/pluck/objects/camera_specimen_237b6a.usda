@@ -1,0 +1,17 @@
+#usda 1.0
+(
+    defaultPrim = "PlacedObject"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "PlacedObject"
+{
+    custom string pluck:componentData = '{"focal_max_mm":110.0,"focal_min_mm":55.0,"focal_mm":82.5,"id":"camera_specimen_237b6a","interaction_radius":0.0,"label":"Canonical 6x6 Camera (display proxy)","lens_name":"portrait_85mm","material_bindings":{"body":"basic_paneling"},"mesh_id":"camera_box","pan_deg":0.0,"sensor_name":"medium_format_645","tilt_deg":0.0,"tilt_max_deg":80.0,"tilt_min_deg":-80.0,"type":"camera"}'
+    custom string pluck:label = "Canonical 6x6 Camera (display proxy)"
+    custom string pluck:materialBindings = '{"body":"basic_paneling"}'
+    custom string pluck:objectId = "camera_specimen_237b6a"
+    custom token pluck:objectType = "camera"
+    custom int pluck:schemaVersion = 1
+}
+

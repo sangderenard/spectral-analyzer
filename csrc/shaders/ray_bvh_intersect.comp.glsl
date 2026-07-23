@@ -78,11 +78,9 @@
  *    [nb..2nb-1]   atmo_abs[b]
  *    [2nb..]        arena center xyz + radius
  *
- *  WaveArenaBuf  (ARENA_STRIDE = 4 floats):
- *    [0..2] center xyz   [3] radius
- *
- *  TriSensorGroupBuf  (int per triangle): sensor_group_id (-1 = not sensor)
- *  CounterBuf  (uint):  [0]=hit_count  [1]=miss_count  [2]=wave_count
+ *  CounterBuf (24 uint words; shared pipeline control):
+ *    [0]=hit_count  [1]=miss_count  [2]=wave_count
+ *    [8]=live intent count  [22]=wave-tail overflow count
  *
  *  WaveIntent tail (starts at wave_base_floats in HitBuf):
  *    [0] arena_id, [1..3] entry position, [4..6] direction,
@@ -104,7 +102,6 @@ layout(local_size_x = 64) in;
 #define TRI_FULL_STRIDE   16
 #define MAT_BAND_STRIDE   12
 #define MAT_FULL_BANDS    32      /* MAX_SPECTRAL_BANDS in C++ */
-#define ARENA_STRIDE       4
 
 #define T_SELF            1e-4    /* self-intersection guard                   */
 #define BVH_STACK_SIZE    64      /* max BVH depth                             */

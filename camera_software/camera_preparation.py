@@ -86,6 +86,32 @@ def apply_camera_manifest_to_lab_scene(
     scene.image_plate.sensor_half_h = 0.5e-3 * height_mm
     scene.image_plate.radius = 0.5e-3 * image_circle_diameter_mm
     scene.screen_radius = float(scene.image_plate.radius)
+    surface_adjustments = {
+        str(key): dict(value)
+        for key, value in dict(lens.get("surface_adjustments", {})).items()
+    }
+    group_count = int(lens.get("group_count", 4))
+
+    def _surface_values(side: str, field: str, *, scale: float = 1.0, negate=False):
+        values = []
+        any_value = False
+        for index in range(group_count):
+            edit = surface_adjustments.get(f"G{index + 1}_{side}", {})
+            value = edit.get(field)
+            if value is None:
+                values.append(None)
+            else:
+                numeric = float(value) * scale
+                values.append(-numeric if negate else numeric)
+                any_value = True
+        return tuple(values) if any_value else None
+
+    front_radii = _surface_values("front", "radius_mm", scale=1.0e-3)
+    # LensConfig radius_back uses the opposite sign convention from the
+    # physical back surface radius stored in surface_adjustments.
+    back_radii = _surface_values("back", "radius_mm", scale=1.0e-3, negate=True)
+    front_conics = _surface_values("front", "conic_k")
+    back_conics = _surface_values("back", "conic_k")
     prior = getattr(scene, "optical_design", None)
     prior = getattr(prior, "spec", prior)
     scene.optical_design = OpticalDesignSpec(
@@ -100,11 +126,15 @@ def apply_camera_manifest_to_lab_scene(
         sensor_x_m=float(getattr(prior, "sensor_x_m", 1.25)),
         sensor_clearance_m=float(getattr(prior, "sensor_clearance_m", 0.030)),
         image_radius_m=float(scene.image_plate.radius),
-        group_count=int(lens.get("group_count", 4)),
+        group_count=group_count,
         default_ior=float(lens.get("default_ior", 1.55)),
         min_air_gap_m=float(lens.get("minimum_air_gap_mm", 8.0)) * 1.0e-3,
         group_thickness_m=float(lens.get("group_thickness_mm", 18.0)) * 1.0e-3,
         max_group_radius_m=float(lens.get("maximum_group_radius_mm", 120.0)) * 1.0e-3,
+        group_radius_front_m=front_radii,
+        group_radius_back_m=back_radii,
+        group_conic_front=front_conics,
+        group_conic_back=back_conics,
     )
     emitters = {
         str(item.get("key", "")): dict(item)

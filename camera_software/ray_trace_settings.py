@@ -14,6 +14,7 @@ from typing import Any, Mapping
 class RayTraceSettings:
     transport_mode: str = "continuous"
     lane_count: int = 1
+    wave_mode: bool = False
     # Keep the requested impactful-ray target near 200k. The default 256-wide
     # work tile and 1,024 sample/node floor may schedule 262,144 physical
     # camera samples when every tile column is selected in one epoch.
@@ -33,7 +34,7 @@ class RayTraceSettings:
         if mode not in {"fixed", "continuous", "depth"}:
             raise ValueError(f"unsupported transport mode {mode!r}")
         lanes = int(self.lane_count)
-        allowed = (1, 3, 8, 16, 32)
+        allowed = (1, 3, 4, 8, 16, 32)
         if lanes not in allowed:
             raise ValueError(f"{mode} transport does not support {lanes} lanes")
         grid_mode = str(self.grid_mode).strip().lower()
@@ -57,6 +58,7 @@ class RayTraceSettings:
             self,
             transport_mode=mode,
             lane_count=lanes,
+            wave_mode=bool(self.wave_mode),
             grid_mode=grid_mode,
         )
 

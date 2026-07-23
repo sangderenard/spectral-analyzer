@@ -96,6 +96,13 @@ class RoomWorkspace:
             except Exception as exc:
                 print(f"[RoomWorkspace] skip bad object: {exc}", flush=True)
 
+        self.room_authority_id: Optional[str] = (
+            str(scene_cfg.get("room_authority_id", "")) or None
+        )
+        self.movement_policy = str(scene_cfg.get("movement_policy", "unbounded"))
+        self.movement_enforced = bool(scene_cfg.get("movement_enforced", False))
+        self.usd_stage_path = ""
+
         # ── selection state ───────────────────────────────────────────────────
         self.selected_id: Optional[str] = None
 
@@ -119,6 +126,10 @@ class RoomWorkspace:
         ws._objects    = {}
         ws.selected_id = None
         ws._dirty      = False
+        ws.room_authority_id = None
+        ws.movement_policy = "unbounded"
+        ws.movement_enforced = False
+        ws.usd_stage_path = ""
         return ws
 
     @classmethod
@@ -133,6 +144,18 @@ class RoomWorkspace:
                 ws._objects[obj.obj_id] = obj
             except Exception as exc:
                 print(f"[RoomWorkspace] skip bad object in {path}: {exc}", flush=True)
+        authority_id = str(scene_data.get("room_authority_id", ""))
+        if authority_id:
+            ws.declare_room_authority(
+                authority_id,
+                movement_policy=str(
+                    scene_data.get("movement_policy", "room-authority-bounded")
+                ),
+                movement_enforced=bool(
+                    scene_data.get("movement_enforced", False)
+                ),
+            )
+        ws._dirty = False
         return ws
 
     # ── Object registry ───────────────────────────────────────────────────────
@@ -199,6 +222,66 @@ class RoomWorkspace:
 
     def portals(self) -> List[PlacedPortalFrame]:
         return [o for o in self._objects.values() if isinstance(o, PlacedPortalFrame)]
+
+    def material_binding_issues(self) -> tuple[str, ...]:
+        """Return physical scene roles that bypass canonical material keys."""
+
+        issues: list[str] = []
+        room_bindings = dict(self.room_cfg.get("material_bindings", {}))
+        for role in ("floor", "ceiling", "walls"):
+            if not str(room_bindings.get(role, "")).strip():
+                issues.append(f"room:{role}")
+        for obj in self._objects.values():
+            if isinstance(obj, PlacedDutyStation):
+                required = ("body", "screen")
+            elif isinstance(obj, PlacedCamera):
+                required = ("body",)
+            elif isinstance(obj, PlacedEnclosure):
+                required = ("glass",)
+            elif isinstance(obj, PlacedLight):
+                required = ("emitter",)
+            elif isinstance(obj, PlacedPortalFrame):
+                required = ("body",)
+            else:
+                required = ()
+            for role in required:
+                if not str(obj.material_bindings.get(role, "")).strip():
+                    issues.append(f"{obj.obj_id}:{role}")
+        return tuple(issues)
+
+    def require_material_bindings(self) -> None:
+        issues = self.material_binding_issues()
+        if issues:
+            raise ValueError(
+                "physical scene bodies require canonical material bindings: "
+                + ", ".join(issues)
+            )
+
+    # ── Meta-environment authority ──────────────────────────────────────────
+
+    @property
+    def room_authority(self) -> Optional[PlacedDutyStation]:
+        """The self-describing Room Station that owns this map's envelope."""
+
+        obj = self._objects.get(self.room_authority_id or "")
+        return obj if isinstance(obj, PlacedDutyStation) else None
+
+    def declare_room_authority(
+        self,
+        obj_id: str,
+        *,
+        movement_policy: str = "room-authority-bounded",
+        movement_enforced: bool = False,
+    ) -> PlacedDutyStation:
+        obj = self._objects.get(str(obj_id))
+        if not isinstance(obj, PlacedDutyStation):
+            raise ValueError("room authority must name a placed duty station")
+        if obj.station_type not in {"room", "room_control"}:
+            raise ValueError("room authority must use the room station runtime")
+        self.room_authority_id = obj.obj_id
+        self.movement_policy = str(movement_policy)
+        self.movement_enforced = bool(movement_enforced)
+        return obj
 
     # ── Physics ───────────────────────────────────────────────────────────────
 
@@ -283,6 +366,10 @@ class RoomWorkspace:
             st_cfg["position"] = np.asarray(obj.pos, np.float64).tolist()
             st_cfg["yaw_deg"] = float(obj.yaw_deg)
             st_cfg["interaction_radius"] = float(obj.interaction_radius)
+            # Scene-authored bindings name canonical material records. Station
+            # dictionaries are compatibility fallbacks, never stronger local
+            # definitions when a binding is present.
+            st_cfg["material_bindings"] = dict(obj.material_bindings)
             if "module_type" not in st_cfg:
                 st_cfg["module_type"] = str(obj.station_type)
 
@@ -336,9 +423,14 @@ class RoomWorkspace:
                 menu = SimulatorStation(pal_cfg, coevo_cfg, glass_cfg,
                                        wb_min, wb_max, win_w, win_h)
                 menu.init_gl()
+            elif obj.station_type == "camera_designer":
+                from camera_station import CameraStationMenu
+                menu = CameraStationMenu()
 
             if menu is not None:
                 st.menu = menu
+                if hasattr(menu, "bind_host_station"):
+                    menu.bind_host_station(st)
                 if hasattr(menu, "bind_scene_workspace"):
                     menu.bind_scene_workspace(self)
 
@@ -386,9 +478,14 @@ class RoomWorkspace:
     # ── Serialisation ─────────────────────────────────────────────────────────
 
     def to_dict(self) -> dict:
-        return {
-            "objects": [obj.to_dict() for obj in self._objects.values()]
-        }
+        result = {"objects": [obj.to_dict() for obj in self._objects.values()]}
+        if self.room_authority_id:
+            result.update(
+                room_authority_id=self.room_authority_id,
+                movement_policy=self.movement_policy,
+                movement_enforced=self.movement_enforced,
+            )
+        return result
 
     def save_scene(self, path: str = None) -> bool:
         if path is None:

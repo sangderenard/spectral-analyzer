@@ -144,6 +144,11 @@ def default_camera_manifest() -> dict[str, Any]:
             "surface_model": "spherical_conic_k0",
             "representation": "exact_parametric_conic",
             "design_fidelity": "first_order_surrogate_exact_surface_transport",
+            # Sparse, label-keyed edits to the solved prescription. Supported
+            # fields are axial_offset_mm, shift_x_mm, shift_y_mm, tilt_x_deg,
+            # tilt_y_deg, radius_mm, clear_radius_mm, conic_type, conic_k and
+            # ior_after. Omitted surfaces retain solver output exactly.
+            "surface_adjustments": {},
         },
         "focus": {
             "distance_m": 1.0,
@@ -250,6 +255,7 @@ def _compatibility_payloads(data: Mapping[str, Any]) -> dict[str, Any]:
         "f_number": lens.get("f_number"),
         "group_thickness_mm": lens.get("group_thickness_mm"),
         "minimum_air_gap_mm": lens.get("minimum_air_gap_mm"),
+        "surface_adjustments": lens.get("surface_adjustments", {}),
         "solved_groups": data.get("resolved", {}).get("groups"),
     }
     return {

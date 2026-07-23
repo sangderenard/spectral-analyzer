@@ -772,14 +772,6 @@ void main() {
         }
     }
 
-    /* Deterministic preview shunt: T2 lens/neural teleports returned above,
-     * so this is the first ordinary authored surface after lens transport. */
-    if ((cflag & 32u) != 0u) {
-        uint tslot = atomicAdd(meta[1], 1u);
-        write_terminal(tslot, hbase, (flags & MAT_FLAG_EMISSIVE) != 0);
-        return;
-    }
-
     /* ── Terminal: aperture stop ── */
     if ((flags & MAT_FLAG_APERTURE_STOP) != 0) {
         uint tslot = atomicAdd(meta[1], 1u);
@@ -843,6 +835,15 @@ void main() {
 
     /* ── Epsilon fast-path: fully absorptive opaque material ── */
     bool is_transmissive = mat_is_transmissive(mat_id);
+    /* Deterministic preview shunt. Exact parametric lens groups return from T2
+     * before this shader, while tessellated camera-designer glass reaches T3.
+     * Let explicitly transmissive material boundaries execute normal physical
+     * Snell/Fresnel transport and stop at the first ordinary authored surface. */
+    if ((cflag & 32u) != 0u && !is_transmissive) {
+        uint tslot = atomicAdd(meta[1], 1u);
+        write_terminal(tslot, hbase, false);
+        return;
+    }
     if (!is_transmissive && mat_id >= 0 && mat_id < n_mats) {
         if (meta[2u + uint(mat_id)] != 0u) {
             uint tslot = atomicAdd(meta[1], 1u);
@@ -862,6 +863,45 @@ void main() {
     const uint CAMERA_PATH_SCATTERED_BIT = 16u;
     if ((cflag & 1u) != 0u)
         cflag |= CAMERA_PATH_SCATTERED_BIT;
+
+    /* Surface-scan glass traversal is intentionally one geometric ray per
+     * pixel. Use the central active wavelength for the lens direction, retain
+     * the complete spectral amplitude vector for final material colour, and
+     * do not spawn reflection/dispersion trees. Full exposures take the normal
+     * branch below and preserve the complete Fresnel lane behavior. */
+    if ((cflag & 32u) != 0u && is_transmissive) {
+        int med_pos = tri_med_pos(tri_idx);
+        int med_neg = tri_med_neg(tri_idx);
+        bool has_pair = (med_pos != med_neg);
+        int medium_from = -1;
+        int medium_to = -1;
+        if (has_pair) {
+            medium_from = front_face ? med_pos : med_neg;
+            medium_to = front_face ? med_neg : med_pos;
+        }
+        int center_band = clamp(nb / 2, 0, max(nb - 1, 0));
+        float n1 = medium_n_real_b(has_pair ? medium_from : medium, center_band);
+        float n2 = has_pair ? medium_n_real_b(medium_to, center_band)
+                            : (front_face ? medium_n_real_b(mat_id, center_band) : 1.0);
+        vec3 refracted;
+        if (!snell_refract(in_dir, nrm, n1, n2, refracted)) {
+            uint tslot = atomicAdd(meta[1], 1u);
+            write_terminal(tslot, hbase, false);
+            return;
+        }
+        int new_med = has_pair ? medium_to : (front_face ? mat_id : -1);
+        float scan_re[MAX_BANDS], scan_im[MAX_BANDS];
+        for (int b = 0; b < MAX_BANDS; ++b) {
+            scan_re[b] = amp_re[b];
+            scan_im[b] = amp_im[b];
+        }
+        uint islot = atomicAdd(meta[0], 1u);
+        write_intent(islot, pos, refracted, path_len, new_med, iflags,
+                     src_id, new_bounce, new_bleft, min_amp,
+                     tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid,
+                     scan_re, scan_im);
+        return;
+    }
 
     if (is_transmissive) {
         int med_pos = tri_med_pos(tri_idx);

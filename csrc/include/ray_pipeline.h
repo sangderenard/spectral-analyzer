@@ -1075,11 +1075,19 @@ uint64_t ray_pipeline_get_uv_pages_tex_id(const RayPipelineState* ps);
 
 /* Return the latest shared GPU field-display volume texture (GL_TEXTURE_3D), or 0. */
 uint64_t ray_pipeline_get_field_display_tex_id(const RayPipelineState* ps);
+int ray_pipeline_get_field_display_info(const RayPipelineState* ps,
+                                        uint64_t* tex_id,
+                                        int* nx, int* ny, int* nz,
+                                        uint64_t* generation);
 
 /* Latest completed deterministic center-site surface scan texture (RGBA32F).
  * The getter adopts a pending back buffer; the worker never writes the active
  * texture until a later generation has been adopted. */
 uint64_t ray_pipeline_get_surface_scan_tex_id(RayPipelineState* ps);
+int ray_pipeline_get_surface_scan_info(RayPipelineState* ps,
+                                       uint64_t* tex_id,
+                                       int* resolution,
+                                       uint64_t* generation);
 
 /* Ask the GPU dispatch thread to clear the field-display accumulator. */
 void ray_pipeline_request_field_display_clear(RayPipelineState* ps);

@@ -1,0 +1,19 @@
+#usda 1.0
+(
+    defaultPrim = "PlacedObject"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "PlacedObject"
+{
+    custom string pluck:componentData = '{"build_state":{"delivered_materials":{"basic_led_display":0,"basic_paneling":0},"job_order_id":"job::room_control_bootstrap","required_materials":{"basic_led_display":1,"basic_paneling":6},"unfinished":true},"config_dir":"configs/duty_stations/room_control","id":"room_station_492f28","interaction_radius":2.0,"label":"Room Control","material_bindings":{"body":"basic_paneling","screen":"basic_led_display"},"station_type":"room_control","type":"duty_station"}'
+    custom string pluck:configurationRoot = "configs/duty_stations/room_control"
+    custom string pluck:label = "Room Control"
+    custom string pluck:materialBindings = '{"body":"basic_paneling","screen":"basic_led_display"}'
+    custom string pluck:objectId = "room_station_492f28"
+    custom token pluck:objectType = "duty_station"
+    custom token pluck:runtimeHandler = "room_control"
+    custom int pluck:schemaVersion = 1
+}
+

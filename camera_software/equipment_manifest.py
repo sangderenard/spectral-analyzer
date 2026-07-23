@@ -15,9 +15,10 @@ EQUIPMENT_FIELDS: dict[str, tuple[str, ...]] = {
     "lens": ("focal_length_mm", "f_number"),
     "light": ("flash_mode", "lighting_ev"),
     "film": ("film_id", "iso"),
+    "arena": ("transport_mode", "lane_count", "wave_mode"),
     "integrator": (
-        "transport_mode", "lane_count", "total_rays", "max_sensor_epochs",
-        "epoch_bundle_count", "sensor_samples_per_node",
+        "total_rays", "max_sensor_epochs", "epoch_bundle_count",
+        "sensor_samples_per_node",
         "sensor_t5_pair_budget", "max_bounces",
     ),
     "exposure": (
@@ -83,12 +84,25 @@ def authored_equipment(manifest: Any) -> dict[str, dict[str, Any]]:
             continue
         if not isinstance(values, Mapping):
             raise ValueError(f"equipment.{group} must be a mapping")
-        unknown = sorted(set(values) - set(fields))
+        # Schema-v1 manifests historically owned these two fields under the
+        # integrator. Accept and normalize them so saved equipment remains
+        # loadable while all newly authored manifests place them in ARENA.
+        legacy_arena_fields = (
+            {"transport_mode", "lane_count"} if group == "integrator" else set()
+        )
+        unknown = sorted(set(values) - set(fields) - legacy_arena_fields)
         if unknown:
             raise ValueError(
                 f"unknown equipment.{group} settings: {unknown}"
             )
-        result[group] = dict(values)
+        result[group] = {
+            key: value for key, value in values.items() if key in fields
+        }
+        if legacy_arena_fields.intersection(values):
+            arena = result.setdefault("arena", {})
+            for key in legacy_arena_fields:
+                if key in values and key not in arena:
+                    arena[key] = values[key]
     return result
 
 
@@ -110,6 +124,7 @@ def resolve_equipment_settings(
     exposure_values = asdict(exposure)
     for group in ("camera", "lens", "light", "film"):
         exposure_values.update(authored.get(group, {}))
+    ray_values.update(authored.get("arena", {}))
     integrator = authored.get("integrator", {})
     ray_values.update(integrator)
     exposure_group = authored.get("exposure", {})

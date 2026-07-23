@@ -1,0 +1,238 @@
+#usda 1.0
+(
+    defaultPrim = "PluckWorld"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "PluckWorld"
+{
+    custom bool pluck:movementEnforced = 0
+    custom token pluck:movementPolicy = "room-authority-bounded"
+    custom rel pluck:roomAuthority = </PluckWorld/Objects/room_station_492f28>
+    custom string pluck:roomMaterialBindings = '{"ceiling":"acoustic_plaster_ceiling","floor":"stage_floor","floor_fill":"stage_floor","floor_tile":"pearl_white_tile","walls":"painted_plaster_wall"}'
+    custom token pluck:sceneRole = "general-initial-map"
+    custom int pluck:schemaVersion = 1
+
+    def Scope "Objects"
+    {
+        def Xform "room_station_492f28" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+            prepend references = @objects/room_station_492f28.usda@</PlacedObject>
+        )
+        {
+            rel material:binding = </PluckMaterials/Materials/basic_paneling>
+            custom string pluck:materialBindings = '{"body":"basic_paneling","screen":"basic_led_display"}'
+            custom double pluck:worldYawDegrees = 0
+            float xformOp:rotateZ = 0
+            double3 xformOp:translate = (0, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateZ"]
+        }
+
+        def Xform "fabricator_e0b76e" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+            prepend references = @objects/fabricator_e0b76e.usda@</PlacedObject>
+        )
+        {
+            rel material:binding = </PluckMaterials/Materials/basic_paneling>
+            custom string pluck:materialBindings = '{"body":"basic_paneling","screen":"basic_led_display"}'
+            custom double pluck:worldYawDegrees = 0
+            float xformOp:rotateZ = 0
+            double3 xformOp:translate = (2, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateZ"]
+        }
+
+        def Xform "camera_station_475468" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+            prepend references = @objects/camera_station_475468.usda@</PlacedObject>
+        )
+        {
+            rel material:binding = </PluckMaterials/Materials/basic_paneling>
+            custom string pluck:materialBindings = '{"body":"basic_paneling","screen":"basic_led_display"}'
+            custom double pluck:worldYawDegrees = 0
+            float xformOp:rotateZ = 0
+            double3 xformOp:translate = (-2, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateZ"]
+        }
+
+        def Xform "camera_display_jar_2bebcd" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+            prepend references = @objects/camera_display_jar_2bebcd.usda@</PlacedObject>
+        )
+        {
+            rel material:binding = </PluckMaterials/Materials/borosilicate_glass>
+            custom string pluck:materialBindings = '{"glass":"borosilicate_glass","skirt":"stage_floor"}'
+            custom double pluck:worldYawDegrees = 0
+            float xformOp:rotateZ = 0
+            double3 xformOp:translate = (-2, 1.35, 0.72)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateZ"]
+        }
+
+        def Xform "camera_specimen_237b6a" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+            prepend references = @objects/camera_specimen_237b6a.usda@</PlacedObject>
+        )
+        {
+            rel material:binding = </PluckMaterials/Materials/basic_paneling>
+            custom string pluck:materialBindings = '{"body":"basic_paneling"}'
+            custom double pluck:worldYawDegrees = 0
+            float xformOp:rotateZ = 0
+            double3 xformOp:translate = (-2, 1.35, 0.82)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateZ"]
+        }
+    }
+}
+
+def Scope "PluckMaterials"
+{
+    def Scope "Materials"
+    {
+        def Material "basic_paneling"
+        {
+            token outputs:surface.connect = </PluckMaterials/Materials/basic_paneling/PreviewSurface.outputs:surface>
+            custom token pluck:authority = "canonical-project-material"
+            custom asset pluck:definitionAsset = @../materials/basic_paneling.yaml@
+            custom token[] pluck:engineRequirements = []
+            custom string pluck:materialKey = "basic_paneling"
+            custom string pluck:materialRevision = "af5914832882069debc9dfffd1e25fdcf7455707bbf4dbbe0f1cc46afc13f752"
+            custom token pluck:projectionKind = "portable-preview"
+
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.5, 0.5, 0.5)
+                float inputs:metallic = 0
+                float inputs:opacity = 1
+                float inputs:roughness = 0.5
+                token outputs:surface
+            }
+        }
+
+        def Material "basic_led_display"
+        {
+            token outputs:surface.connect = </PluckMaterials/Materials/basic_led_display/PreviewSurface.outputs:surface>
+            custom token pluck:authority = "canonical-project-material"
+            custom asset pluck:definitionAsset = @../materials/basic_led_display.yaml@
+            custom token[] pluck:engineRequirements = []
+            custom string pluck:materialKey = "basic_led_display"
+            custom string pluck:materialRevision = "1a20c30f23c98ba14881929afa12daf723c47c210848e151881881ceb276e388"
+            custom token pluck:projectionKind = "portable-preview"
+
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.5, 0.5, 0.5)
+                float inputs:metallic = 0
+                float inputs:opacity = 1
+                float inputs:roughness = 0.5
+                token outputs:surface
+            }
+        }
+
+        def Material "borosilicate_glass"
+        {
+            token outputs:surface.connect = </PluckMaterials/Materials/borosilicate_glass/PreviewSurface.outputs:surface>
+            custom token pluck:authority = "canonical-project-material"
+            custom asset pluck:definitionAsset = @../materials/borosilicate_glass.yaml@
+            custom token[] pluck:engineRequirements = []
+            custom string pluck:materialKey = "borosilicate_glass"
+            custom string pluck:materialRevision = "bdc798eb26a40c35bf56c70358fc848a1b52bbc778fdc27e28bfb61c57630bb2"
+            custom token pluck:projectionKind = "portable-preview"
+
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.5, 0.5, 0.5)
+                float inputs:metallic = 0
+                float inputs:opacity = 0
+                float inputs:roughness = 0.5
+                token outputs:surface
+            }
+        }
+
+        def Material "stage_floor"
+        {
+            token outputs:surface.connect = </PluckMaterials/Materials/stage_floor/PreviewSurface.outputs:surface>
+            custom token pluck:authority = "canonical-project-material"
+            custom asset pluck:definitionAsset = @../materials/stage_floor.yaml@
+            custom token[] pluck:engineRequirements = []
+            custom string pluck:materialKey = "stage_floor"
+            custom string pluck:materialRevision = "3a62f12194f1aeff58cab72d59005b4bd8d963d4d5a064a2757c06b3e045e839"
+            custom token pluck:projectionKind = "portable-preview"
+
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.5, 0.5, 0.5)
+                float inputs:metallic = 0
+                float inputs:opacity = 1
+                float inputs:roughness = 0.5
+                token outputs:surface
+            }
+        }
+
+        def Material "acoustic_plaster_ceiling"
+        {
+            token outputs:surface.connect = </PluckMaterials/Materials/acoustic_plaster_ceiling/PreviewSurface.outputs:surface>
+            custom token pluck:authority = "canonical-project-material"
+            custom asset pluck:definitionAsset = @../materials/acoustic_plaster_ceiling.yaml@
+            custom token[] pluck:engineRequirements = []
+            custom string pluck:materialKey = "acoustic_plaster_ceiling"
+            custom string pluck:materialRevision = "77ed218281dafda38010d3c572dda2cd5afa993a65afa16320d03dda536b7f2d"
+            custom token pluck:projectionKind = "portable-preview"
+
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.92, 0.91, 0.89)
+                float inputs:metallic = 0
+                float inputs:opacity = 1
+                float inputs:roughness = 0.65
+                token outputs:surface
+            }
+        }
+
+        def Material "pearl_white_tile"
+        {
+            token outputs:surface.connect = </PluckMaterials/Materials/pearl_white_tile/PreviewSurface.outputs:surface>
+            custom token pluck:authority = "canonical-project-material"
+            custom asset pluck:definitionAsset = @../materials/pearl_white_tile.yaml@
+            custom token[] pluck:engineRequirements = []
+            custom string pluck:materialKey = "pearl_white_tile"
+            custom string pluck:materialRevision = "7002dfcde105a6a54fcf3286d8460be990de4da61e66c2988d7b2d44b402f4bb"
+            custom token pluck:projectionKind = "portable-preview"
+
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.96, 0.93, 0.86)
+                float inputs:metallic = 0
+                float inputs:opacity = 1
+                float inputs:roughness = 0.11
+                token outputs:surface
+            }
+        }
+
+        def Material "painted_plaster_wall"
+        {
+            token outputs:surface.connect = </PluckMaterials/Materials/painted_plaster_wall/PreviewSurface.outputs:surface>
+            custom token pluck:authority = "canonical-project-material"
+            custom asset pluck:definitionAsset = @../materials/painted_plaster_wall.yaml@
+            custom token[] pluck:engineRequirements = []
+            custom string pluck:materialKey = "painted_plaster_wall"
+            custom string pluck:materialRevision = "94da326fa77f87a9ebacd5f18598fbff8b91fe283c4caddbc570b97674bba95d"
+            custom token pluck:projectionKind = "portable-preview"
+
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.88, 0.85, 0.8)
+                float inputs:metallic = 0
+                float inputs:opacity = 1
+                float inputs:roughness = 0.55
+                token outputs:surface
+            }
+        }
+    }
+}
+

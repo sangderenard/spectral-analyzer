@@ -1,10 +1,11 @@
-"""Six manifest-owned toolbar rows sharing the camera and trace settings."""
+"""Seven manifest-owned toolbar rows sharing camera and trace settings."""
 from __future__ import annotations
 
 from typing import Any
 
 from camera_software.grid_knob_toolbar import GridKnobToolbar
 from camera_software.toolbar_manifests import (
+    arena_toolbar_panel,
     camera_toolbar_panel,
     exposure_toolbar_panel,
     film_toolbar_panel,
@@ -20,6 +21,7 @@ class TopToolbarRows:
         "lens-toolbar",
         "light-toolbar",
         "film-toolbar",
+        "arena-toolbar",
         "integrator-toolbar",
         "exposure-toolbar",
     )
@@ -32,6 +34,7 @@ class TopToolbarRows:
             lens_toolbar_panel(),
             light_toolbar_panel(),
             film_toolbar_panel(),
+            arena_toolbar_panel(),
             integrator_toolbar_panel(),
             exposure_toolbar_panel(),
         )
@@ -39,7 +42,11 @@ class TopToolbarRows:
         self._grids = {
             panel.name: GridKnobToolbar(
                 panel,
-                palette=("blue" if panel.name == "integrator-toolbar" else "amber"),
+                palette=(
+                    "blue"
+                    if panel.name in {"arena-toolbar", "integrator-toolbar"}
+                    else "amber"
+                ),
             )
             for panel in panels
         }

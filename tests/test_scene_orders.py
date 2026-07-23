@@ -18,6 +18,18 @@ def test_example_order_resolves_and_consumes_runtime_settings():
     assert runtime["aperture_mm"] == 25.0
 
 
+def test_runtime_accepts_boolean_wave_context_selection():
+    payload = {
+        "schema_version": 1,
+        "runtime": {"wave_contexts": True},
+        "jobs": [{"id": "wave_scene", "token": "A"}],
+    }
+    orders.validate_order(payload)
+    payload["runtime"]["wave_contexts"] = "yes"
+    with pytest.raises(ValueError, match="wave_contexts must be boolean"):
+        orders.validate_order(payload)
+
+
 def test_circular_glyph_is_solid_non_degenerate_and_half_embedded():
     job = orders.resolved_jobs(orders.load_order(ORDER), "glyph_A")[0]
     plane = job["planes"][0]

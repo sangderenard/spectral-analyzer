@@ -659,6 +659,8 @@ class CompoundLens:
         preset,
         x_offset: float = 0.0,
         wavelength_um: float = 0.587,
+        wavelengths_um: Optional[Sequence[float]] = None,
+        axial_scale: float = 1.0,
     ) -> "CompoundLens":
         """Build an exact algebraic CompoundLens from a CameraPreset.
 
@@ -686,29 +688,39 @@ class CompoundLens:
 
         lens = cls()
 
+        axial_scale = float(axial_scale)
+        if axial_scale not in (-1.0, 1.0):
+            raise ValueError("axial_scale must be +1 or -1")
         elements = sorted(
             list(preset.lens_group.elements) if hasattr(preset, "lens_group") else [],
             key=lambda e: float(e.z_vertex),
+            reverse=axial_scale < 0.0,
         )
 
         ap     = getattr(preset, "aperture_stop", None)
         ap_z   = float(ap.z_pos) if ap is not None else None
 
-        # Build a merged list: (z, kind, data) sorted by z
-        merged: list = []
-        stop_done = False
-        for el in elements:
-            z = float(el.z_vertex)
-            if not stop_done and ap_z is not None and ap_z <= z:
-                merged.append((ap_z, "stop", ap))
-                stop_done = True
-            merged.append((z, "lens", el))
-        if not stop_done and ap_z is not None:
+        # Build in canonical transport order (increasing scene X).
+        merged: list = [
+            (float(el.z_vertex), "lens", el) for el in elements
+        ]
+        if ap_z is not None:
             merged.append((ap_z, "stop", ap))
+        merged.sort(key=lambda item: axial_scale * float(item[0]))
 
+        spectral_wavelengths = (
+            None
+            if wavelengths_um is None
+            else tuple(float(value) for value in wavelengths_um)
+        )
         n_prev = 1.0
+        n_prev_spectral = (
+            None
+            if spectral_wavelengths is None
+            else [1.0] * len(spectral_wavelengths)
+        )
         for z, kind, data in merged:
-            x = x_offset + z
+            x = x_offset + axial_scale * z
             if kind == "stop":
                 lens.add(ApertureStop(
                     x_pos    = x,
@@ -719,25 +731,34 @@ class CompoundLens:
                 el     = data
                 surf   = el.surface
                 n_out  = el.glass_out.n_at(wavelength_um)
+                n_out_spectral = (
+                    None
+                    if spectral_wavelengths is None
+                    else [el.glass_out.n_at(wl) for wl in spectral_wavelengths]
+                )
                 r_ap   = float(getattr(surf, "r_max", 0.020))
 
                 if isinstance(surf, _PSConic):
                     lens.add(ConicSurface(
                         x_pos       = x,
-                        R_curvature = float(surf.R),
+                        R_curvature = axial_scale * float(surf.R),
                         n_before    = n_prev,
                         n_after     = n_out,
                         aperture_r  = r_ap,
                         conic_k     = float(surf.K),
+                        n_before_spectral=n_prev_spectral,
+                        n_after_spectral=n_out_spectral,
                     ))
                 elif _PSSphere is not None and isinstance(surf, _PSSphere):
                     lens.add(ConicSurface(
                         x_pos       = x,
-                        R_curvature = float(surf.R),
+                        R_curvature = axial_scale * float(surf.R),
                         n_before    = n_prev,
                         n_after     = n_out,
                         aperture_r  = r_ap,
                         conic_k     = 0.0,
+                        n_before_spectral=n_prev_spectral,
+                        n_after_spectral=n_out_spectral,
                     ))
                 elif isinstance(surf, _PSFlat):
                     lens.add(FlatSurface(
@@ -745,6 +766,8 @@ class CompoundLens:
                         n_before   = n_prev,
                         n_after    = n_out,
                         aperture_r = r_ap,
+                        n_before_spectral=n_prev_spectral,
+                        n_after_spectral=n_out_spectral,
                     ))
                 else:
                     lens.add(FlatSurface(
@@ -752,9 +775,12 @@ class CompoundLens:
                         n_before   = n_prev,
                         n_after    = n_out,
                         aperture_r = r_ap,
+                        n_before_spectral=n_prev_spectral,
+                        n_after_spectral=n_out_spectral,
                     ))
 
                 n_prev = n_out
+                n_prev_spectral = n_out_spectral
 
         return lens
 

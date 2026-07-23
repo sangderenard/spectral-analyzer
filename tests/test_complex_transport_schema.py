@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,3 +21,17 @@ def test_hot_schema_does_not_declare_an_ssbo_binding():
     gpu = (ROOT / "csrc/shaders/complex_transport.glsl.inc").read_text(encoding="utf-8")
     assert "layout(std430" not in gpu
     assert "binding =" not in gpu
+
+
+def test_gpu_t1_wave_routing_stays_within_existing_eight_ssbo_channels():
+    shader = (
+        ROOT / "csrc/shaders/ray_bvh_intersect.comp.glsl"
+    ).read_text(encoding="utf-8")
+    bindings = {
+        int(value) for value in re.findall(r"binding\s*=\s*(\d+)", shader)
+    }
+
+    assert bindings == set(range(8))
+    assert "WaveIntent tail" in shader
+    assert "4 × n_arenas" in shader
+    assert "WaveArenaBuf" not in shader

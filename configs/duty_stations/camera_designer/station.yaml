@@ -1,0 +1,35 @@
+name: camera_designer
+module_type: camera_designer
+
+position: [-2.0, 0.0, 0.0]
+yaw_deg: 0.0
+
+console:
+  width: 1.50
+  depth: 0.70
+  height: 0.90
+  top_tilt_deg: 12.0
+  bevel: 0.08
+
+screen:
+  width: 1.30
+  height: 0.80
+  tilt_back_deg: 6.0
+
+side_wings:
+  enabled: true
+  width: 0.16
+  height: 0.58
+
+interaction_radius: 2.0
+
+interact_camera:
+  eye: [-2.0, -1.60, 1.35]
+  target: [-2.0, 0.00, 1.30]
+
+# Keys are resolved through the process-global scientific material authority.
+# Portable USD shaders are projections of these records, not local definitions.
+material_bindings:
+  body: basic_paneling
+  trim: basic_paneling
+  screen: basic_led_display

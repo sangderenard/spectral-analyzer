@@ -1,0 +1,17 @@
+#usda 1.0
+(
+    defaultPrim = "PlacedObject"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "PlacedObject"
+{
+    custom string pluck:componentData = '{"dims":{"depth_m":0.62,"glass_thickness_m":0.012,"height_m":0.72,"width_m":0.72},"glass_color":[0.055,0.075,0.11,0.42],"id":"camera_display_jar_2bebcd","label":"Camera Optical Display Jar","material_bindings":{"glass":"borosilicate_glass","skirt":"stage_floor"},"shape":"rect","skirt_color":[0.025,0.028,0.038,0.94],"type":"enclosure","wireframe_color":[0.28,0.42,0.66,0.72]}'
+    custom string pluck:label = "Camera Optical Display Jar"
+    custom string pluck:materialBindings = '{"glass":"borosilicate_glass","skirt":"stage_floor"}'
+    custom string pluck:objectId = "camera_display_jar_2bebcd"
+    custom token pluck:objectType = "enclosure"
+    custom int pluck:schemaVersion = 1
+}
+

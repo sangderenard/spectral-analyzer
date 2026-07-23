@@ -13,6 +13,7 @@ def test_toolbar_defaults_are_balanced_single_band_continuous() -> None:
     settings = RayTraceSettings()
     assert settings.transport_mode == "continuous"
     assert settings.lane_count == 1
+    assert settings.wave_mode is False
     assert settings.total_rays == 204_800
     assert settings.max_sensor_epochs == 1
     assert settings.epoch_bundle_count == 16
@@ -40,6 +41,14 @@ def test_depth_is_a_toolbar_mode_with_continuous_transport() -> None:
     toolbar = RayTraceToolbar(settings)
     assert toolbar._toggle_transport() == "ray-settings-changed"
     assert toolbar.settings.transport_mode == "continuous"
+
+
+def test_arena_toolbar_supports_four_lanes_and_explicit_wave_toggle() -> None:
+    toolbar = RayTraceToolbar(RayTraceSettings(lane_count=3))
+    assert toolbar.handle_routed("lane_count", 1) == "ray-settings-changed"
+    assert toolbar.settings.lane_count == 4
+    assert toolbar.handle_routed("wave_mode", 1) == "ray-settings-changed"
+    assert toolbar.settings.wave_mode is True
 
 
 def test_user_toolbar_overrides_defaults() -> None:

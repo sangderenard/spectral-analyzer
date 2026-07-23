@@ -48,16 +48,23 @@ class PlacedObject:
     label:   str
     pos:     np.ndarray = field(default_factory=lambda: np.zeros(3, np.float64))
     yaw_deg: float = 0.0
+    # Semantic surface role -> canonical MaterialDatabase key.  Renderer
+    # representations are derived from these keys; this mapping is not a local
+    # material definition.
+    material_bindings: Dict[str, str] = field(default_factory=dict)
 
     # ── serialisation ─────────────────────────────────────────────────────────
 
     def _base_dict(self) -> dict:
-        return {
+        result = {
             "id":      self.obj_id,
             "label":   self.label,
             "pos":     self.pos.tolist(),
             "yaw_deg": float(self.yaw_deg),
         }
+        if self.material_bindings:
+            result["material_bindings"] = dict(self.material_bindings)
+        return result
 
     def to_dict(self) -> dict:
         return self._base_dict()
@@ -69,6 +76,10 @@ class PlacedObject:
             label   = d.get("label",   ""),
             pos     = _arr3(d.get("pos", [0, 0, 0])),
             yaw_deg = float(d.get("yaw_deg", 0.0)),
+            material_bindings = {
+                str(role): str(key) for role, key in
+                dict(d.get("material_bindings", {})).items()
+            },
         )
 
 
@@ -256,7 +267,8 @@ class PlacedEnclosure(PlacedObject):
 class PlacedDutyStation(PlacedObject):
     """Reference to an external duty-station type to be instantiated.
 
-    ``station_type`` is one of "fabricator" | "simulator" | "room".
+    ``station_type`` identifies the station runtime handler, including
+    "fabricator", "simulator", "room", and "camera_designer".
     ``config_dir`` is the directory (relative to project root) from which
     the station's YAML files are loaded.
     ``interaction_radius`` is the proximity threshold (metres) at which the

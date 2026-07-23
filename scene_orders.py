@@ -74,6 +74,7 @@ def validate_order(payload: dict[str, Any]) -> None:
         "sensor_flash_total_rays", "sensor_t5_pair_budget", "focus_distance_m",
         "transport_option", "max_bounces", "sensor_work_tile_width",
         "sensor_work_tile_height", "sensor_allocation_mode", "capacity_test",
+        "wave_contexts",
     }
     runtime_extra = sorted(set(runtime) - runtime_allowed)
     if runtime_extra:
@@ -89,6 +90,8 @@ def validate_order(payload: dict[str, Any]) -> None:
             raise ValueError(f"runtime.{key} must be positive")
     if "max_sensor_epochs" in runtime and int(runtime["max_sensor_epochs"]) < 0:
         raise ValueError("runtime.max_sensor_epochs must be non-negative")
+    if "wave_contexts" in runtime and not isinstance(runtime["wave_contexts"], bool):
+        raise ValueError("runtime.wave_contexts must be boolean")
     transport = payload.get("transport")
     if transport is not None:
         if not isinstance(transport, dict):

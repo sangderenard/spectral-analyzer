@@ -251,7 +251,12 @@ void gl_compute_release_current(void) {
 
 void gl_compute_destroy_context(GlComputeContext* ctx) {
     if (!ctx) return;
-    wglMakeCurrent(nullptr, nullptr);
+    /* Do not detach an unrelated host/display context from the caller.
+     * Pipeline teardown commonly runs on the UI thread after the compute
+     * worker has joined; an unconditional detach made the following display
+     * GL call fail with GL_INVALID_OPERATION. */
+    if (ctx->hglrc && wglGetCurrentContext() == ctx->hglrc)
+        wglMakeCurrent(nullptr, nullptr);
     if (ctx->hglrc) { wglDeleteContext(ctx->hglrc); ctx->hglrc = nullptr; }
     if (ctx->hdc && ctx->hwnd) { ReleaseDC(ctx->hwnd, ctx->hdc); ctx->hdc = nullptr; }
     if (ctx->hwnd)  { DestroyWindow(ctx->hwnd);  ctx->hwnd   = nullptr; }

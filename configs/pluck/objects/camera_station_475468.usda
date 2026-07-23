@@ -1,0 +1,19 @@
+#usda 1.0
+(
+    defaultPrim = "PlacedObject"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "PlacedObject"
+{
+    custom string pluck:componentData = '{"build_state":{"unfinished":false},"config_dir":"configs/duty_stations/camera_designer","id":"camera_station_475468","interaction_radius":2.0,"label":"Camera / Optics Station","material_bindings":{"body":"basic_paneling","screen":"basic_led_display"},"station_type":"camera_designer","type":"duty_station"}'
+    custom string pluck:configurationRoot = "configs/duty_stations/camera_designer"
+    custom string pluck:label = "Camera / Optics Station"
+    custom string pluck:materialBindings = '{"body":"basic_paneling","screen":"basic_led_display"}'
+    custom string pluck:objectId = "camera_station_475468"
+    custom token pluck:objectType = "duty_station"
+    custom token pluck:runtimeHandler = "camera_designer"
+    custom int pluck:schemaVersion = 1
+}
+

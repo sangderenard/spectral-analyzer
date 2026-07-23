@@ -3242,7 +3242,12 @@ struct PyRayTracer
                     RayIntent& ray = _surface_scan_rays[index];
                     ray.pos = center + right*y + up*z;
                     ray.dir = (aperture - ray.pos).normalized();
-                    ray.pos += ray.dir * 2.56e-8;
+                    /* Leave the sensor triangle before T1.  The previous
+                     * 25.6 nm nudge was below the robust float/BVH scale and
+                     * made nearly every preview ray immediately re-hit its
+                     * own camera back.  This matches T3's established child
+                     * origin epsilon and does not alter the center-site ray. */
+                    ray.pos += ray.dir * 2.0e-4;
                     ray.amp_scalar = 1.0f;
                     ray.amp_n_bands = static_cast<int8_t>(_n_bands);
                     ray.src_id = static_cast<int>(index);
@@ -3265,6 +3270,24 @@ struct PyRayTracer
     uint64_t surface_scan_texture_id()
     {
         return _pipeline ? ray_pipeline_get_surface_scan_tex_id(_pipeline) : 0u;
+    }
+
+    py::dict surface_scan_texture_info()
+    {
+        py::dict out;
+        uint64_t texture = 0, generation = 0;
+        int resolution = 0;
+        if (_pipeline && ray_pipeline_get_surface_scan_info(
+                _pipeline, &texture, &resolution, &generation)) {
+            out["texture_id"] = texture;
+            out["width"] = resolution;
+            out["height"] = resolution;
+            out["depth"] = 1;
+            out["generation"] = generation;
+            out["texture_target"] = 0x0DE1;
+            out["internal_format"] = 0x8814;
+        }
+        return out;
     }
 
     /* Snapshot of pipeline throughput / batch-size / queue-depth for all stages. */
@@ -6346,6 +6369,8 @@ Rays use normal pipeline lens transport and stop at the first scene surface.
 The GPU resolver writes a transparent-background RGBA32F back texture.)doc")
         .def("surface_scan_texture_id", &PyRayTracer::surface_scan_texture_id,
 R"doc(Adopt and return the latest completed double-buffered surface-scan texture.)doc")
+        .def("surface_scan_texture_info", &PyRayTracer::surface_scan_texture_info,
+R"doc(Atomically adopt and describe the latest shared surface-scan texture.)doc")
         .def("pipeline_stats", &PyRayTracer::pipeline_stats,
 R"doc(Snapshot of pipeline throughput/batch-size/queue-depth for all four stages.
 Returns dict with keys t1, t2, t3, t4, t5 (each a dict with throughput, processed,
@@ -7632,6 +7657,25 @@ for zero-copy UV visualisation.)doc")
              },
              R"doc(Return the OpenGL texture object ID of the shared field-display
 GL_TEXTURE_3D (RGBA32F). Returns 0 if GPU field display is unavailable.)doc")
+        .def("get_field_display_texture_info",
+             [](PyRayTracer& self) -> py::dict {
+                 std::lock_guard<std::mutex> lk(self._pipeline_mu);
+                 py::dict out;
+                 uint64_t texture = 0, generation = 0;
+                 int nx = 0, ny = 0, nz = 0;
+                 if (ray_pipeline_get_field_display_info(
+                         self._pipeline, &texture, &nx, &ny, &nz, &generation)) {
+                     out["texture_id"] = texture;
+                     out["width"] = nx;
+                     out["height"] = ny;
+                     out["depth"] = nz;
+                     out["generation"] = generation;
+                     out["texture_target"] = 0x806F;
+                     out["internal_format"] = 0x8814;
+                 }
+                 return out;
+             },
+R"doc(Describe the shared live field/complex accumulation volume without readback.)doc")
         .def("request_field_display_clear",
              [](PyRayTracer& self) {
                  std::lock_guard<std::mutex> lk(self._pipeline_mu);

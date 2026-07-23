@@ -66,6 +66,29 @@ from placed_object   import (
 )
 
 
+def _canonical_material_view(key: str, fallback_rgba) -> tuple[list[float], dict]:
+    """Return a GL view derived from the canonical material tensor cache."""
+
+    fallback = [float(value) for value in list(fallback_rgba)[:4]]
+    while len(fallback) < 4:
+        fallback.append(1.0)
+    material_key = str(key or "")
+    if not material_key:
+        return fallback, {}
+    try:
+        from material_db import MaterialDatabase
+        database = MaterialDatabase.instance()
+        if material_key not in database:
+            return fallback, {}
+        tensors = database.build_tensors()
+        index = int(tensors["index"][material_key])
+        pbr = tensors["pbr"][index]
+        phong = database.as_compat_phong(material_key)
+        return [float(pbr[0]), float(pbr[1]), float(pbr[2]), float(pbr[7])], phong
+    except Exception:
+        return fallback, {}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # GLSL shaders
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1078,15 +1101,31 @@ class RoomStation:
 
         # Material colours from room.yaml
         rcfg = ws.room_cfg
+        surface_bindings = dict(rcfg.get("material_bindings", {}))
         def _rgba(key, default):
             v = rcfg.get(key, default)
             return [float(x) for x in (v + [1.0])[:4]]
-        self._floor_col   = _rgba("floor_color",   [0.18, 0.18, 0.22, 1.0])
-        self._floor_tile_col = _rgba("floor_tile_color", [0.96, 0.93, 0.86, 1.0])
-        self._floor_fill_col = _rgba("floor_fill_color", [0.18, 0.18, 0.20, 1.0])
+        self._floor_col, self._floor_material_view = _canonical_material_view(
+            surface_bindings.get("floor", ""),
+            _rgba("floor_color", [0.18, 0.18, 0.22, 1.0]),
+        )
+        self._floor_tile_col, self._floor_tile_material_view = _canonical_material_view(
+            surface_bindings.get("floor_tile", ""),
+            _rgba("floor_tile_color", [0.96, 0.93, 0.86, 1.0]),
+        )
+        self._floor_fill_col, self._floor_fill_material_view = _canonical_material_view(
+            surface_bindings.get("floor_fill", ""),
+            _rgba("floor_fill_color", [0.18, 0.18, 0.20, 1.0]),
+        )
         self._floor_border_col = _rgba("floor_border_color", [0.98, 0.95, 0.82, 0.95])
-        self._ceiling_col = _rgba("ceiling_color", [0.12, 0.12, 0.15, 1.0])
-        self._wall_col    = _rgba("wall_color",     [0.15, 0.16, 0.20, 1.0])
+        self._ceiling_col, self._ceiling_material_view = _canonical_material_view(
+            surface_bindings.get("ceiling", ""),
+            _rgba("ceiling_color", [0.12, 0.12, 0.15, 1.0]),
+        )
+        self._wall_col, self._wall_material_view = _canonical_material_view(
+            surface_bindings.get("walls", ""),
+            _rgba("wall_color", [0.15, 0.16, 0.20, 1.0]),
+        )
         self._grid_col    = rcfg.get("floor_grid", {}).get(
                                 "color", [0.30, 0.30, 0.40, 0.45])
         self._ambient     = float(rcfg.get("ambient",      0.18))
@@ -1318,7 +1357,9 @@ class RoomStation:
                 obj = enclosures.get(obj_id)
                 if obj is None:
                     continue
-                gc = obj.glass_color
+                gc, _glass_view = _canonical_material_view(
+                    obj.material_bindings.get("glass", ""), obj.glass_color
+                )
                 if mv and mn:
                     glUniform4f(glGetUniformLocation(gp, "uColor"), *gc)
                     glBindVertexArray(mv)

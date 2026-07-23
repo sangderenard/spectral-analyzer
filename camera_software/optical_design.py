@@ -56,6 +56,8 @@ class OpticalDesignSpec:
     group_thicknesses_m: Optional[Tuple[float, ...]] = None
     group_radius_front_m: Optional[Tuple[float, ...]] = None
     group_radius_back_m: Optional[Tuple[float, ...]] = None
+    group_conic_front: Optional[Tuple[float, ...]] = None
+    group_conic_back: Optional[Tuple[float, ...]] = None
     group_iors: Optional[Tuple[float, ...]] = None
     lock_group_positions: bool = False
     lock_group_powers: bool = False
@@ -176,8 +178,10 @@ class SolvedOpticalTrain:
                 radius_front=float(g.radius_front_m),
                 radius_back=float(g.radius_back_m),
                 ior=float(g.ior),
+                conic_front=_seq_value(self.spec.group_conic_front, index, 0.0),
+                conic_back=_seq_value(self.spec.group_conic_back, index, 0.0),
             )
-            for g in self.groups
+            for index, g in enumerate(self.groups)
         ]
 
     def apply_to_scene(self, scene):
@@ -297,6 +301,8 @@ def _hardware_power_override(spec: OpticalDesignSpec, index: int) -> Optional[fl
     if (
         spec.group_radius_front_m is not None and index < len(spec.group_radius_front_m)
         and spec.group_radius_back_m is not None and index < len(spec.group_radius_back_m)
+        and spec.group_radius_front_m[index] is not None
+        and spec.group_radius_back_m[index] is not None
     ):
         ior = _seq_value(spec.group_iors, index, spec.default_ior)
         return _power_from_curvature(
@@ -342,6 +348,16 @@ def _candidate_groups(spec: OpticalDesignSpec, xs: Sequence[float], powers: Sequ
             max(spec.aperture_radius_m, ap * (1.0 - 0.18 * frac)),
         )
         rf, rb = _group_curvature_from_power(power, ior, local_ap * 1.25)
+        authored_rf = (
+            spec.group_radius_front_m is not None
+            and i < len(spec.group_radius_front_m)
+            and spec.group_radius_front_m[i] is not None
+        )
+        authored_rb = (
+            spec.group_radius_back_m is not None
+            and i < len(spec.group_radius_back_m)
+            and spec.group_radius_back_m[i] is not None
+        )
         rf = _seq_value(spec.group_radius_front_m, i, rf)
         rb = _seq_value(spec.group_radius_back_m, i, rb)
         # Keep curvature safely larger than aperture so demo mesh remains valid.
@@ -349,8 +365,13 @@ def _candidate_groups(spec: OpticalDesignSpec, xs: Sequence[float], powers: Sequ
             local_ap * 1.18,
             _min_curvature_radius_for_aperture(local_ap, thickness),
         )
-        rf = math.copysign(max(abs(rf), min_r), rf)
-        rb = math.copysign(max(abs(rb), min_r), rb)
+        # Generated surfaces are kept inside a mesh-safe envelope. Authored
+        # hardware is never silently rewritten: invalid prescriptions must be
+        # reported by the geometry validator instead of becoming another lens.
+        if not authored_rf:
+            rf = math.copysign(max(abs(rf), min_r), rf)
+        if not authored_rb:
+            rb = math.copysign(max(abs(rb), min_r), rb)
         groups.append(ParaxialGroup(
             name=f"G{i + 1}",
             x_m=float(x),

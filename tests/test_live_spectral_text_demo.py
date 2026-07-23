@@ -902,13 +902,13 @@ def test_active_calibration_bundle_exposure_owns_the_center_work_panel():
     ) is atlas
 
 
-def test_program_layout_owns_six_tool_rows_above_preview_panels():
+def test_program_layout_owns_seven_tool_rows_above_preview_panels():
     layout = demo.resolved_program_ui_layout(
         800, 600, work_width=200, work_height=200
     )
     row_keys = (
         "camera-toolbar", "lens-toolbar", "light-toolbar", "film-toolbar",
-        "integrator-toolbar", "exposure-toolbar",
+        "arena-toolbar", "integrator-toolbar", "exposure-toolbar",
     )
     rows = [layout.region(key) for key in row_keys]
     first_panel_y = min(
@@ -1195,6 +1195,7 @@ def test_work_sized_scene_has_exact_camera_and_work_sensor_products():
         "lens-toolbar",
         "light-toolbar",
         "film-toolbar",
+        "arena-toolbar",
         "integrator-toolbar",
         "exposure-toolbar",
         "camera-label",
@@ -1607,7 +1608,7 @@ def test_calibration_modes_build_valid_image_producing_scene_orders(mode_key):
         assert job["emitter"]["mode"] == "collimated"
 
 
-@pytest.mark.parametrize("lane_count", (1, 3, 8, 16, 32))
+@pytest.mark.parametrize("lane_count", (1, 3, 4, 8, 16, 32))
 def test_same_camera_scene_accepts_continuous_lane_table_at_any_lane_count(lane_count):
     from camera_software.transport_contract import continuous_lut_lane_table
 

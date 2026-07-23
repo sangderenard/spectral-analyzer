@@ -520,6 +520,7 @@ def program_ui_manifest() -> Panel:
 
     from .equipment_manifest import default_equipment_manifest
     from .toolbar_manifests import (
+        arena_toolbar_panel,
         camera_toolbar_panel,
         exposure_toolbar_panel,
         film_toolbar_panel,
@@ -536,6 +537,7 @@ def program_ui_manifest() -> Panel:
             lens_toolbar_panel(),
             light_toolbar_panel(),
             film_toolbar_panel(),
+            arena_toolbar_panel(),
             integrator_toolbar_panel(),
             exposure_toolbar_panel(),
             Panel(
@@ -718,7 +720,7 @@ def program_frame_metrics(
         len(tool_rows) * tool_row_h
         + max(0, len(tool_rows) - 1) * tool_gap
     )
-    # The action row, six physical tool rows, and viewport labels each own
+    # The action row, seven physical tool rows, and viewport labels each own
     # actual vertical space; none overlap the photographed work panels.
     control_h = max(13, int(round(26.0 * scale)))
     label_h = max(13, int(round(26.0 * scale)))

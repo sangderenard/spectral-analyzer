@@ -138,49 +138,11 @@ except ImportError:
 
 
 def _build_default_scene(config_dir: str = "configs/room_station"):
-    """Build the canonical default entry-point scene programmatically.
-
-    Returns a blank RoomWorkspace containing exactly two stations:
-      - a room control duty station (origin, yaw 0)
-      - a fabricator duty station (2 m to the right in X)
-
-    Does NOT read or write scene.yaml.  scene.yaml is a dev reference only.
-    """
+    """Compose the general map's authored initial state from OpenUSD."""
     if _RoomWorkspace is None:
         return None
-    from placed_object import PlacedDutyStation, _make_id  # local import: not a top-level dep
-    ws = _RoomWorkspace.blank(config_dir)
-    room_ctrl = PlacedDutyStation(
-        obj_id=_make_id("room_station"),
-        label="Room Control",
-        pos=np.array([0.0, 0.0, 0.0], np.float64),
-        yaw_deg=0.0,
-        station_type="room_control",
-        config_dir="configs/duty_stations/room_control",
-        build_state={
-            "unfinished": True,
-            "job_order_id": "job::room_control_bootstrap",
-            "required_materials": {"basic_paneling": 6, "basic_led_display": 1},
-            "delivered_materials": {"basic_paneling": 0, "basic_led_display": 0},
-        },
-    )
-    ws.add_object(room_ctrl)
-    fabricator = PlacedDutyStation(
-        obj_id=_make_id("fabricator"),
-        label="Fabricator",
-        pos=np.array([2.0, 0.0, 0.0], np.float64),
-        yaw_deg=0.0,
-        station_type="fabricator",
-        config_dir="configs/duty_stations/fabricator",
-        build_state={
-            "unfinished": True,
-            "job_order_id": "job::fabricator_bootstrap",
-            "required_materials": {"basic_paneling": 5, "basic_led_display": 1},
-            "delivered_materials": {"basic_paneling": 0, "basic_led_display": 0},
-        },
-    )
-    ws.add_object(fabricator)
-    return ws
+    from pluck_scene_usd import workspace_from_usd
+    return workspace_from_usd(config_dir=config_dir)
 
 
 class _MaterialPile:
@@ -7257,7 +7219,7 @@ def _gpu_ray_field_prebuilt(
 
     bmin = np.asarray(bounds[0], np.float32)
     bmax = np.asarray(bounds[1], np.float32)
-    n_tris = len(packed)
+    n_tris = len(packed_geom)
 
     # ── Resolve film layers ───────────────────────────────────────────────
     if film_stack is not None and hasattr(film_stack, 'layer_specs'):
@@ -7329,9 +7291,9 @@ def _gpu_ray_field_prebuilt(
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[7])
     glBufferData(GL_SHADER_STORAGE_BUFFER, _ep_tensor.nbytes, _ep_tensor, GL_STATIC_DRAW)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, ssbo[7])
-    _ctx = np.ascontiguousarray(context_buf, np.float32) if len(context_buf) > 0 \
+    _n_ctx = len(context_buf)
+    _ctx = np.ascontiguousarray(context_buf, np.float32) if _n_ctx > 0 \
            else np.zeros((1, 8), np.float32)
-    n_ctx = len(_ctx)
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[8])
     glBufferData(GL_SHADER_STORAGE_BUFFER, _ctx.nbytes, _ctx, GL_STATIC_DRAW)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, ssbo[8])
@@ -7381,7 +7343,7 @@ def _gpu_ray_field_prebuilt(
     glUniform1f(glGetUniformLocation(prog, b'uAirSpecularScatter'), 0.65)
     glUniform1f(glGetUniformLocation(prog, b'uAirAnisotropy'),      12.0)
     glUniform1i(glGetUniformLocation(prog, b'uScaleContextCount'),
-                int(n_ctx) if n_ctx > 1 else 0)
+                int(_n_ctx))
     glUniform1f(glGetUniformLocation(prog, b'uSpeedOfMedium'),   float(speed_of_medium))
     # Film layer spectral uniforms — driven by FilmStack.layer_specs()
     glUniform1i(glGetUniformLocation(prog, b'uLayerCount'), n_layers)
@@ -7422,7 +7384,7 @@ def _gpu_ray_field_prebuilt(
 
     print(f"  [gpu_ray_field_prebuilt] {n_tris} tris  {n_src} src  "
           f"dims={dims}  initial={_n_init} rays  "
-          f"n_ctx={n_ctx if n_ctx > 1 else 0}", flush=True)
+          f"n_ctx={_n_ctx}", flush=True)
     return {
         'tex_bands':      tex_bands,
         'ssbo':           ssbo,
@@ -14232,6 +14194,62 @@ def main():
         print(f"[globals] dispatcher init failed: {_exc}", flush=True)
         R._global_dispatcher = None
 
+    # ── Coordinator-owned multi-engine graph ────────────────────────────────
+    # Existing engines keep their established execution points.  The graph
+    # makes their capabilities/products discoverable and schedules engines
+    # (such as the optical pillar) that accept explicit work requests.
+    _render_graph = None
+    _optical_pillar = None
+    _preview_products = None
+    try:
+        from camera_software.gpu_preview import (
+            OpenGLShareGroup,
+            PreviewProductRegistry,
+        )
+        from camera_software.optical_engine_backend import OpticalEngineBackend
+        from pluck_render_graph import (
+            ExternalEnginePillar,
+            MultiEngineRenderGraph,
+            OpticalEnginePillar,
+        )
+        _preview_products = PreviewProductRegistry()
+        _render_graph = MultiEngineRenderGraph(_preview_products)
+        if R._global_dispatcher is not None:
+            _render_graph.register(ExternalEnginePillar(
+                "presentation",
+                R._global_dispatcher,
+                capabilities=("document-2d", "raster-3d", "progressive-ray"),
+                products=("display-rgba", "depth", "material-ids"),
+            ))
+        _render_graph.register(ExternalEnginePillar(
+            "acoustic-field",
+            R,
+            capabilities=("pressure-field", "fdtd", "ray-field"),
+            products=("pressure", "ray-segments", "sensor-field"),
+        ))
+        _optical_pillar = OpticalEnginePillar(_preview_products)
+        _optical_backend = OpticalEngineBackend(
+            _preview_products,
+            OpenGLShareGroup.current(),
+        )
+        _optical_pillar.attach_backend(
+            _optical_backend.submit,
+            _optical_backend.poll,
+            shutdown=_optical_backend.shutdown,
+            describe=_optical_backend.describe,
+        )
+        _render_graph.register(_optical_pillar)
+        R._render_graph = _render_graph
+        R._preview_products = _preview_products
+        print(
+            "[render-graph] pillars=presentation,acoustic-field,optical; "
+            "optical backend=attached owner=optical-engine",
+            flush=True,
+        )
+    except Exception as _exc:
+        print(f"[render-graph] init failed: {_exc}", flush=True)
+        R._render_graph = None
+
     # ── Camera optics schematic (three-view line diagram) ────────────────────
     _cam_optics_view = _CameraOpticsView()
     _cam_optics_view.init_gl()
@@ -14360,9 +14378,15 @@ def main():
 
     # ── Camera designer station ──────────────────────────────────────────────
     _cam_designer_station = None
+    _cam_designer_from_world = False
     if _HAS_CAMERA_DESIGNER_STATION and getattr(args, "station", None) == "camera_designer":
         try:
-            _cam_designer_station = _CameraDesignerStation(win_w=WIN_W, win_h=WIN_H)
+            _cam_designer_station = _CameraDesignerStation(
+                win_w=WIN_W,
+                win_h=WIN_H,
+                preview_registry=_preview_products,
+                engine_graph=_render_graph,
+            )
             _cam_designer_station.init_gl()
             print("[camera_designer_station] ready", flush=True)
         except Exception as _e:
@@ -14806,13 +14830,15 @@ def main():
               _wp = np.asarray(getattr(_ds, 'world_position', np.zeros(3, np.float64)), np.float64).reshape(3)
               _yaw = float(getattr(_ds, '_yaw_deg', 0.0))
               _unfinished = bool(getattr(_ds, "is_unfinished", False))
+              _bindings = dict(getattr(_pref, "material_bindings", {}) or {})
               _sig = (
                   float(_wp[0]), float(_wp[1]), float(_wp[2]),
                   _yaw,
                   int(_unfinished),
+                  tuple(sorted(_bindings.items())),
                   int(_tris.shape[0]) if hasattr(_tris, 'shape') else 0,
               )
-              _mat_name = getattr(_ds, "material_slot", None)
+              _mat_name = _bindings.get('body', getattr(_ds, "material_slot", None))
               _ntri = int(_tris.shape[0]) if hasattr(_tris, 'shape') else 0
 
               # Cache per-object default material id once.
@@ -14841,11 +14867,17 @@ def main():
                       _c_wall = int(max(0, len(getattr(_ds, '_wall_data', [])) // 3))
                       _exp = _c_body + _c_scr + _c_wing + _c_wall
                       if _exp > 0 and _ntri > 0:
-                          _ids = np.full((_ntri,), _MAT_ID_BASIC_PANELING, dtype=np.int32)
+                          _body_id = _resolve_material_id(
+                              _bindings.get('body', 'basic_paneling')
+                          )
+                          _screen_id = _resolve_material_id(
+                              _bindings.get('screen', 'basic_led_display')
+                          )
+                          _ids = np.full((_ntri,), _body_id, dtype=np.int32)
                           _a = min(_ntri, _c_body)
                           _b = min(_ntri, _a + _c_scr)
                           if _b > _a:
-                              _ids[_a:_b] = _MAT_ID_BASIC_LED_DISPLAY
+                              _ids[_a:_b] = _screen_id
                           _mat_ids = _ids
 
               _shader_walker.publish_owner_target(
@@ -14872,6 +14904,9 @@ def main():
               except Exception:
                   continue
               _placed = getattr(_ci, 'placed', None)
+              _cam_bindings = dict(
+                  getattr(_placed, 'material_bindings', {}) or {}
+              )
               _owner = str(getattr(_placed, 'obj_id', f'camera_{_i}'))
               _pos = np.asarray(getattr(_placed, 'pos', np.zeros(3, np.float64)), np.float64).reshape(3)
               _sig = (
@@ -14881,9 +14916,12 @@ def main():
                   float(getattr(_placed, 'tilt_deg', 0.0)),
                   float(getattr(_placed, 'focal_mm', 0.0)),
                   str(getattr(_placed, 'mesh_id', 'camera_35mm')),
+                  tuple(sorted(_cam_bindings.items())),
                   int(_tris.shape[0]) if hasattr(_tris, 'shape') else 0,
               )
-              _cam_mat_name = getattr(_ci, "material_slot", None)
+              _cam_mat_name = _cam_bindings.get(
+                  'body', getattr(_ci, "material_slot", None)
+              )
               if _cam_mat_name is None:
                   _cam_mat_name = getattr(_ci, "material_name", None)
               _cam_mat_id = getattr(_ci, "_material_slot_id", None)
@@ -14949,6 +14987,11 @@ def main():
                 # Never let routing kill the render loop.
                 print(f"[naive] tick error: {_ng_exc}", flush=True)
         _dt = clock.tick(60) / 1000.0
+        if _render_graph is not None:
+            try:
+                _render_graph.tick(fi, _dt)
+            except Exception as _graph_exc:
+                print(f"[render-graph] tick failed: {_graph_exc}", flush=True)
         _keys_held = pygame.key.get_pressed()
         # Camera designer station owns the mouse — always keep it free.
         if _cam_designer_station is not None:
@@ -14968,6 +15011,73 @@ def main():
                 _m = getattr(_ds, 'menu', None)
                 if _m is not None and hasattr(_m, 'show_hud'):
                     _m.show_hud(_in_interact and _active_st is _ds)
+
+        # Station menus publish navigation requests; the Pluck host owns the
+        # actual full-screen tool lifetime and GL context transition.
+        if _cam_designer_station is None:
+            for _ds in duty_stations:
+                _menu = getattr(_ds, "menu", None)
+                _consume = getattr(_menu, "consume_open_optics_request", None)
+                if not callable(_consume) or not _consume():
+                    continue
+                if not _HAS_CAMERA_DESIGNER_STATION:
+                    _menu.status = "Camera designer is unavailable"
+                    break
+                try:
+                    _cam_designer_station = _CameraDesignerStation(
+                        win_w=WIN_W,
+                        win_h=WIN_H,
+                        preview_registry=_preview_products,
+                        engine_graph=_render_graph,
+                    )
+                    _cam_designer_station.init_gl()
+                    _cam_designer_from_world = True
+                    _menu.status = "Optics bench open; Esc returns to room"
+                    print("[camera_station] optics bench opened", flush=True)
+                except Exception as _exc:
+                    _cam_designer_station = None
+                    _cam_designer_from_world = False
+                    _menu.status = f"Optics bench failed: {_exc}"
+                    print(f"[camera_station] optics bench failed: {_exc}", flush=True)
+                break
+        for _ds in duty_stations:
+            _menu = getattr(_ds, "menu", None)
+            _consume_engine = getattr(_menu, "consume_open_engine_request", None)
+            if callable(_consume_engine) and _consume_engine():
+                try:
+                    from camera_software.optical_bench import BellJarWorkspace
+                    from pluck_render_graph import EngineRequest
+                    _bench = BellJarWorkspace.for_camera()
+                    _request = EngineRequest.create(
+                        "optical",
+                        _bench.job.mapping(),
+                        scene_revision=str(
+                            getattr(_room_ws, "usd_stage_path", "")
+                        ),
+                        requested_products=_bench.job.requested_products,
+                        priority=20,
+                    )
+                    _accepted = bool(
+                        _render_graph is not None
+                        and _render_graph.submit(_request)
+                    )
+                    if not _accepted:
+                        _menu.status = "Optical render graph is unavailable"
+                    else:
+                        _desc = dict(_optical_pillar.describe())
+                        _menu.status = (
+                            "Optical request retained; engine frontend may attach"
+                            if _desc.get("state") == "unavailable"
+                            else "Optical request queued"
+                        )
+                    print(
+                        f"[camera_station] optical request={_request.request_id} "
+                        f"accepted={int(_accepted)}",
+                        flush=True,
+                    )
+                except Exception as _exc:
+                    _menu.status = f"Optical request failed: {_exc}"
+                    print(f"[camera_station] optical request failed: {_exc}", flush=True)
 
         # Close player cam panel if player has left walk/in_camera states
         if (_player_cam_panel.open
@@ -14996,6 +15106,17 @@ def main():
                         continue
                 elif ev.type == QUIT:
                     continue
+                continue
+            if (ev.type == KEYDOWN and ev.key == pygame.K_ESCAPE
+                    and _cam_designer_station is not None
+                    and _cam_designer_from_world):
+                try:
+                    _cam_designer_station.destroy_gl()
+                except Exception:
+                    pass
+                _cam_designer_station = None
+                _cam_designer_from_world = False
+                print("[camera_station] returned to room", flush=True)
                 continue
             if ev.type == KEYDOWN and ev.key == pygame.K_ESCAPE:
                 _open_exit_confirm("Esc")
@@ -15331,6 +15452,15 @@ def main():
             R._sensor_acc._air_an = float(panel.values['air_aniso'])
 
         try:
+            if _cam_designer_station is not None:
+                _arm_hang_watchdog("render:camera_designer", frame_index=int(fi))
+                glClearColor(0.01, 0.012, 0.02, 1.0)
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+                glViewport(0, 0, WIN_W, WIN_H)
+                _cam_designer_station.render()
+                pygame.display.flip()
+                _disarm_hang_watchdog()
+                continue
             # Per-frame framebuffer clear. R.render() (GL 3D path) used
             # to do this; with 3D=C it's never called, so do it here
             # unconditionally so leftover GL state can't bleed through.
@@ -15696,6 +15826,16 @@ def main():
             _report_exception(f"render frame {fi}", exc)
             raise
     finally:
+        if _render_graph is not None:
+            try:
+                _render_graph.shutdown()
+            except Exception:
+                pass
+        if _cam_designer_station is not None:
+            try:
+                _cam_designer_station.destroy_gl()
+            except Exception:
+                pass
         try:
             _stop_action_dispatcher()
         except Exception:

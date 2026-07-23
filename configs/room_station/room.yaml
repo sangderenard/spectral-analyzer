@@ -7,7 +7,17 @@ dimensions:
   depth_m:  10.0    # y-axis (entrance at y=0, back wall at y=10)
   wall_thickness_m: 0.25
 
-# Surface materials (RGBA — alpha used for roughness hints in shaders)
+# Canonical scientific material bindings. Renderer colours and compatibility
+# uniforms are derived from the shared MaterialDatabase records.
+material_bindings:
+  floor: stage_floor
+  floor_tile: pearl_white_tile
+  floor_fill: stage_floor
+  ceiling: acoustic_plaster_ceiling
+  walls: painted_plaster_wall
+
+# Compatibility display colours used only when the material authority has not
+# yet loaded a referenced material (for example in a minimal editor process).
 floor_color:   [0.18, 0.18, 0.22, 1.0]
 ceiling_color: [0.12, 0.12, 0.15, 1.0]
 wall_color:    [0.15, 0.16, 0.20, 1.0]

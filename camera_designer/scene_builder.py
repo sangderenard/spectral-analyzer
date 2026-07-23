@@ -33,8 +33,9 @@ import numpy as np
 
 from .camera_preset import CameraPreset, EmitterSpec, ProjectorBackSpec
 from .optical_material import OpticalMaterial, MATERIAL_CATALOG
-from .optical_volume import OpticalVolume
+from .optical_volume import OpticalVolume, _glass_spec_to_material
 from .parametric_surfaces import (
+    ConicSurface,
     FlatSurface,
     ParametricSurface,
     SphericalSurface,
@@ -157,6 +158,20 @@ def _triangulate_surface(
             z_func, z_vertex, r_inner, r_outer, n_rings, n_sectors,
             outward_normal_z=1.0 if R > 0 else -1.0)
         return verts, normals, z_vertex, r_outer
+
+    elif isinstance(surf, ConicSurface):
+        r_outer = float(surf.r_max)
+        r_inner = float(surf.r_min)
+
+        def z_func(r):
+            sag = float(surf._sag(r * r))
+            return sag if math.isfinite(sag) else 0.0
+
+        verts, normals = _triangulate_disk(
+            z_func, 0.0, r_inner, r_outer, n_rings, n_sectors,
+            outward_normal_z=1.0,
+        )
+        return verts, normals, 0.0, r_outer
 
     else:
         # Generic fallback: sample with the surface's own intersect() on a grid
@@ -490,6 +505,46 @@ _GEO_FLAG_PROJECTOR_BACK    = "projector_back"
 _GEO_FLAG_CONFINEMENT_WALL  = "confinement_wall"
 
 
+def _element_surface_frame(element) -> tuple[np.ndarray, np.ndarray]:
+    """Return (rotation, translation) for one authored optical surface."""
+
+    shift = tuple(getattr(element, "shift_xy_m", (0.0, 0.0)))
+    tilt = tuple(getattr(element, "tilt_xy_deg", (0.0, 0.0)))
+    tx = math.radians(float(tilt[0]))
+    ty = math.radians(float(tilt[1]))
+    cx, sx = math.cos(tx), math.sin(tx)
+    cy, sy = math.cos(ty), math.sin(ty)
+    rx = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, cx, -sx],
+        [0.0, sx, cx],
+    ], np.float64)
+    ry = np.array([
+        [cy, 0.0, sy],
+        [0.0, 1.0, 0.0],
+        [-sy, 0.0, cy],
+    ], np.float64)
+    rotation = ry @ rx
+    translation = np.array([
+        float(shift[0]), float(shift[1]), float(getattr(element, "z_vertex", 0.0))
+    ], np.float64)
+    return rotation, translation
+
+
+def _apply_element_surface_frame(
+    verts: np.ndarray, normals: np.ndarray, element,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Transform local tessellation and normals into camera coordinates."""
+
+    rotation, translation = _element_surface_frame(element)
+    points = np.asarray(verts, np.float64).reshape(-1, 3)
+    transformed = points @ rotation.T + translation
+    transformed_normals = np.asarray(normals, np.float64) @ rotation.T
+    lengths = np.linalg.norm(transformed_normals, axis=1, keepdims=True)
+    transformed_normals /= np.maximum(lengths, 1.0e-15)
+    return transformed.reshape(-1, 9), transformed_normals
+
+
 def _collect_optical_geometry(
     preset: CameraPreset,
     scene_object: Optional[dict],
@@ -525,6 +580,7 @@ def _collect_optical_geometry(
     context_specs: List[Tuple[str, np.ndarray, float, float, float, float]] = []
     ior_specs:     List[tuple] = []
     mat_groups:    List[tuple] = []
+    lens_material_specs: List[tuple] = []
     _tri_cursor: int = 0
 
     # ── Lens elements ─────────────────────────────────────────────────────
@@ -533,18 +589,39 @@ def _collect_optical_geometry(
         key=lambda e: getattr(e, "z_vertex", getattr(e, "z_pos", 0.0)),
         reverse=True,
     )
+    medium_before = air
     for el in elements:
         surf = el.surface
         label = getattr(el, "label", None) or "lens"
-        verts, normals, z_vertex, r_outer = _triangulate_surface(surf, n_rings=32, n_sectors=128)
+        verts, normals, z_local, r_outer = _triangulate_surface(
+            surf, n_rings=32, n_sectors=128,
+        )
         if len(verts) == 0:
             continue
+        # ParametricSurface coordinates are local to their LensElement.  The
+        # element's z_vertex is the authoritative camera-space placement (and
+        # is what the analytic/bake path already uses).  Losing this transform
+        # piled every tessellated lens surface around z=0 on top of the sensor.
+        verts, normals = _apply_element_surface_frame(verts, normals, el)
+        rotation, translation = _element_surface_frame(el)
+        local_vertex = np.array([0.0, 0.0, float(z_local)], np.float64)
+        world_vertex = rotation @ local_vertex + translation
+        z_vertex = float(world_vertex[2])
 
         glass_name = None
         if hasattr(el, "glass_out") and el.glass_out is not None:
             glass_name = getattr(el.glass_out, "name", None)
-        mat_out = MATERIAL_CATALOG.get(glass_name, OpticalMaterial()) if glass_name else air
-        mat_in  = air
+        # Catalog names take the fast path.  Custom/edited GlassSpec instances
+        # must retain their authored Sellmeier data instead of silently turning
+        # into air when their name is not in the small built-in catalog.
+        mat_out = (MATERIAL_CATALOG.get(glass_name)
+                   if glass_name else None)
+        if mat_out is None:
+            mat_out = _glass_spec_to_material(getattr(el, "glass_out", None))
+        # ``glass_out`` is the medium after this boundary when traversing the
+        # authored lens front-to-back.  The incident medium is therefore the
+        # previous element's glass, not air at every surface.
+        mat_in = medium_before
 
         refl_re, refl_im = _surface_reflectances(mat_in, mat_out, wavelengths_um)
         diffusion = np.full(len(verts), mat_out.scatter_albedo or 0.05, np.float64)
@@ -557,10 +634,17 @@ def _collect_optical_geometry(
         all_diff.append(diffusion)
 
         lam_mean = float(np.mean(wavelengths_um))
-        n_glass  = mat_out.n_at(lam_mean) if mat_out is not air else 1.0
-        flag_str = _GEO_FLAG_TRANSMISSIVE if n_glass > 1.0 + 1e-6 else ""
+        n_in = float(mat_in.n_at(lam_mean))
+        n_out = float(mat_out.n_at(lam_mean))
+        is_interface = abs(n_out - n_in) > 1.0e-8
+        flag_str = _GEO_FLAG_TRANSMISSIVE if is_interface else ""
         if flag_str:
-            ior_specs.append((_tri_cursor, n_new, 1.0, n_glass, flag_str))
+            ior_specs.append((_tri_cursor, n_new, n_in, n_out, flag_str))
+
+        # MatBuf needs a transmissive material row even at a glass->air exit.
+        # Use the non-air side as the boundary record; explicit boundary media
+        # installed below determine the actual Snell n1/n2 pair.
+        boundary_mat = mat_out if n_out > 1.0 + 1.0e-8 else mat_in
 
         # Glass tint RGB (wavelength-independent approximation: flat 0.9 white glass)
         glass_rgb  = (0.9, 0.9, 0.9)
@@ -569,19 +653,23 @@ def _collect_optical_geometry(
             (1.0, 1.0, 1.0),   # mat_in: air
             glass_rgb,          # mat_out: glass
             glass_rgb,          # albedo
-            float(n_glass),
+            float(boundary_mat.n_at(lam_mean)),
             0.0 if flag_str else 1.0,  # opacity: 0 = fully transparent glass
             flag_str,
+        ))
+        lens_material_specs.append((
+            _tri_cursor, n_new, label, boundary_mat, mat_in, mat_out,
         ))
 
         lam_avg_m = np.mean(wavelengths_um) * 1e-6
         dt_m = lam_avg_m / 20.0
-        n_re = mat_out.n_at(lam_mean)
-        n_im = mat_out.k
+        n_re = boundary_mat.n_at(lam_mean)
+        n_im = boundary_mat.k
         context_specs.append((label,
-                               np.array([0.0, 0.0, z_vertex], np.float64),
+                               np.asarray(world_vertex, np.float64),
                                r_outer * 2.0, n_re, n_im, dt_m))
         _tri_cursor += n_new
+        medium_before = mat_out
 
     # ── Aperture stop — per-blade physical geometry ───────────────────────
     from .parametric_surfaces import ApertureStop as _ApertureStop
@@ -606,39 +694,42 @@ def _collect_optical_geometry(
                                        n_rings=12, n_sectors=256)
             blade_verts_list.append(bv); blade_normals_list.append(bn)
         else:
-            sector           = 2.0 * math.pi / n_bl
-            blade_half_angle = sector * 0.75
-            n_tang = 80; n_rad = 24
+            # Each opaque blade occupies the region OUTSIDE one edge of the
+            # clear N-gon.  The old center-out wedges inverted the aperture and
+            # left only a pinhole.  These material quads meet at the inscribed
+            # opening and extend into the surrounding barrel, so rays interact
+            # with real blade geometry rather than a perfect aperture mask.
+            clear_poly = ap.blade_polygon_xy()
+            blade_outer = r_out * 2.0
             all_blade_verts: List[np.ndarray] = []
             all_blade_normals: List[np.ndarray] = []
             for bi in range(n_bl):
-                pivot_angle = a_rot + bi * sector
-                th_min = pivot_angle - blade_half_angle
-                th_max = pivot_angle + blade_half_angle
-                thetas = np.linspace(th_min, th_max, n_tang + 1)
-                radii  = np.linspace(r_in if r_in > 1e-9 else r_out * 0.05,
-                                     r_out, n_rad + 1)
-                pts = np.zeros((n_rad + 1, n_tang + 1, 3), np.float64)
-                for ri, r in enumerate(radii):
-                    for ti, th in enumerate(thetas):
-                        pts[ri, ti] = [r * math.cos(th), r * math.sin(th), z_ap]
-                for ri in range(n_rad):
-                    for ti in range(n_tang):
-                        p00 = pts[ri,   ti  ]; p10 = pts[ri+1, ti  ]
-                        p11 = pts[ri+1, ti+1]; p01 = pts[ri,   ti+1]
-                        for a, b_pt, c in [(p00, p10, p11), (p00, p11, p01)]:
-                            e1 = b_pt - a; e2 = c - a
-                            nv = np.cross(e1, e2); nl = np.linalg.norm(nv)
-                            if nl < 1e-30: continue
-                            nv /= nl
-                            all_blade_verts.append(np.concatenate([a, b_pt, c]))
-                            all_blade_normals.append(nv)
+                q0 = clear_poly[bi]
+                q1 = clear_poly[(bi + 1) % n_bl]
+                a0 = math.atan2(float(q0[1]), float(q0[0]))
+                a1 = math.atan2(float(q1[1]), float(q1[0]))
+                p0 = np.array([q0[0], q0[1], z_ap], np.float64)
+                p1 = np.array([q1[0], q1[1], z_ap], np.float64)
+                o0 = np.array([blade_outer * math.cos(a0),
+                               blade_outer * math.sin(a0), z_ap], np.float64)
+                o1 = np.array([blade_outer * math.cos(a1),
+                               blade_outer * math.sin(a1), z_ap], np.float64)
+                for a, b_pt, c in ((p0, o0, o1), (p0, o1, p1)):
+                    nv = np.cross(b_pt - a, c - a)
+                    nl = np.linalg.norm(nv)
+                    if nl < 1e-30:
+                        continue
+                    all_blade_verts.append(np.concatenate([a, b_pt, c]))
+                    all_blade_normals.append(nv / nl)
             if all_blade_verts:
                 blade_verts_list.append(np.array(all_blade_verts,   np.float64))
                 blade_normals_list.append(np.array(all_blade_normals, np.float64))
-            bv, bn = _triangulate_disk(lambda r: 0.0, z_ap, r_out, r_out * 2.0,
-                                       n_rings=12, n_sectors=256)
-            blade_verts_list.append(bv); blade_normals_list.append(bn)
+            if r_in > 1e-9:
+                bv, bn = _triangulate_disk(
+                    lambda r: 0.0, z_ap, 0.0, r_in,
+                    n_rings=12, n_sectors=128,
+                )
+                blade_verts_list.append(bv); blade_normals_list.append(bn)
 
         for bv, bn in zip(blade_verts_list, blade_normals_list):
             if len(bv) == 0: continue
@@ -902,7 +993,27 @@ def _collect_optical_geometry(
     # ── Scene object ──────────────────────────────────────────────────────
     if scene_object is not None:
         obj_type = scene_object.get("type", "sphere")
-        if obj_type == "sphere":
+        if obj_type == "qr_target":
+            from camera_software.qr_optical_validator import triangulate_qr_target
+
+            for is_black, qv, qn in triangulate_qr_target(scene_object):
+                if len(qv) == 0:
+                    continue
+                n_new = len(qv)
+                level = 0.006 if is_black else 0.92
+                spectral_r = np.full(n_bands, level, np.float64)
+                rgb = (level, level, level)
+                all_verts.append(qv); all_normals.append(qn)
+                all_refl_re.append(np.tile(spectral_r, (n_new, 1)))
+                all_refl_im.append(np.zeros((n_new, n_bands), np.float64))
+                all_diff.append(np.full(n_new, 0.96, np.float64))
+                mat_groups.append((
+                    _tri_cursor, n_new, rgb, rgb, rgb, 1.0, 1.0, "",
+                ))
+                _tri_cursor += n_new
+            sv = np.empty((0, 9), np.float64)
+            sn = np.empty((0, 3), np.float64)
+        elif obj_type == "sphere":
             obj_pos = np.asarray(scene_object.get("pos", [0., 0., 1.0]), np.float64)
             obj_r   = float(scene_object.get("radius", 0.05))
             sv, sn  = _triangulate_sphere_scene_object(obj_pos, obj_r)
@@ -983,7 +1094,7 @@ def _collect_optical_geometry(
     diff_all    = np.concatenate(all_diff,    axis=0)
 
     return (verts_all, normals_all, refl_re_all, refl_im_all, diff_all,
-            ior_specs, context_specs, mat_groups)
+            ior_specs, context_specs, mat_groups, lens_material_specs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -996,6 +1107,9 @@ def build_tracer(
     scene_object: Optional[dict] = None,
     wavelengths_um: Sequence[float] = (0.450, 0.550, 0.650),
     confinement_box: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    *,
+    exact_lens_transport: bool = True,
+    allow_mesh_lens_transport_for_diagnostics: bool = False,
 ) -> Tuple[object, Dict[str, int]]:
     """Build a _spectral_kernels.RayTracer from a CameraPreset and scene.
 
@@ -1004,16 +1118,21 @@ def build_tracer(
     tracer  : _spectral_kernels.RayTracer instance
     ctx_map : dict label -> context_id
     """
-    try:
-        from _spectral_kernels import (
-            RayTracer as _CRayTracer,
-            RT_TRI_FLAG_TRANSMISSIVE,
-            RT_TRI_FLAG_APERTURE_STOP,
+    if not exact_lens_transport and not allow_mesh_lens_transport_for_diagnostics:
+        raise RuntimeError(
+            "mesh-only camera optics are diagnostic-only; pass "
+            "allow_mesh_lens_transport_for_diagnostics=True explicitly"
         )
+    try:
+        from _spectral_kernels import RayTracer as _CRayTracer
     except ImportError as exc:
         raise RuntimeError(
             "_spectral_kernels extension not found — rebuild the C extension first."
         ) from exc
+    # Material flags have one Python/C++/GLSL source of truth.  The retired
+    # RT_TRI_FLAG_* extension constants were a stale parallel ABI and are no
+    # longer exported by the native module.
+    from mat_flags import MAT_FLAG_TRANSMISSIVE, MAT_FLAG_APERTURE_STOP
 
     wavelengths_um = list(wavelengths_um)
     n_bands   = len(wavelengths_um)
@@ -1021,8 +1140,30 @@ def build_tracer(
     speed_m_s = _C_LIGHT
 
     (verts_all, normals_all, refl_re_all, refl_im_all, diff_all,
-     ior_specs, context_specs, _mat_groups) = _collect_optical_geometry(
+     ior_specs, context_specs, _mat_groups, lens_material_specs) = _collect_optical_geometry(
          preset, scene_object, wavelengths_um, confinement_box)
+
+    # Native compound-lens transport is canonical along scene X.  Designer
+    # authoring uses optical Z, so rotate the complete authored scene once at
+    # the backend boundary: (x,y,z)_designer -> (-z,x,y)_transport.  The sign
+    # makes ordinary world->sensor travel +X, matching the production payload.
+    points = verts_all.reshape(-1, 3).copy()
+    points = points[:, [2, 0, 1]]
+    points[:, 0] *= -1.0
+    verts_all = np.ascontiguousarray(points.reshape(-1, 9), np.float64)
+    normals_all = np.ascontiguousarray(normals_all[:, [2, 0, 1]], np.float64)
+    normals_all[:, 0] *= -1.0
+    context_specs = [
+        (
+            label,
+            np.asarray(
+                [-float(center[2]), float(center[0]), float(center[1])],
+                np.float64,
+            ),
+            radius, n_re, n_im, dt_m,
+        )
+        for label, center, radius, n_re, n_im, dt_m in context_specs
+    ]
 
     n_tri    = len(verts_all)
     atmo_abs = np.zeros(n_bands, np.float64)
@@ -1033,9 +1174,26 @@ def build_tracer(
     # the material data here before packing.
     ior_real_bands = np.ones((n_tri, n_bands), np.float64)
     ior_imag_bands = np.zeros((n_tri, n_bands), np.float64)
+    transmittance_bands = np.zeros((n_tri, n_bands), np.float64)
     for tri_start, n_tris_seg, _n_in, n_out, _flag_str in ior_specs:
         if n_tris_seg > 0:
-            ior_real_bands[tri_start:tri_start + n_tris_seg, :] = float(n_out)
+            sl = slice(tri_start, tri_start + n_tris_seg)
+            ior_real_bands[sl, :] = float(n_out)
+            if _flag_str == _GEO_FLAG_TRANSMISSIVE:
+                # The current transport ABI enters Snell/Fresnel handling only
+                # for explicitly transmissive MatBuf rows.  IOR alone describes
+                # a boundary; it must not silently turn an opaque material into
+                # glass.  These authored camera surfaces are glass by contract.
+                transmittance_bands[sl, :] = np.clip(
+                    1.0 - np.hypot(refl_re_all[sl], refl_im_all[sl]),
+                    0.0, 1.0,
+                )
+    for (tri_start, n_tris_seg, _label, optical_mat,
+         _medium_before, _medium_after) in lens_material_specs:
+        sl = slice(tri_start, tri_start + n_tris_seg)
+        ior_real_bands[sl, :] = np.asarray(
+            [optical_mat.n_at(wl) for wl in wavelengths_um], np.float64)
+        ior_imag_bands[sl, :] = float(optical_mat.k)
 
     from ray_tracer_bridge import per_tri_spectral_to_mat_buf as _per_tri_to_mat_buf
     mat_idx_arr, mat_buf_arr, mat_n_mats_int = _per_tri_to_mat_buf(
@@ -1043,6 +1201,7 @@ def build_tracer(
         refl_im_all.astype(np.float64, copy=False),
         np.tile(diff_all.astype(np.float64, copy=False)[:, None], (1, n_bands)),
         freq_hz,
+        transmittance_bands=transmittance_bands,
         ior_real_bands=ior_real_bands,
         ior_imag_bands=ior_imag_bands,
     )
@@ -1059,14 +1218,115 @@ def build_tracer(
         atmo_abs,
     )
 
+    # Install exact compound-medium adjacency.  Triangle normals point toward
+    # +Z, so the positive side is the medium before the boundary in the
+    # front-to-back prescription and the negative side is the medium after it.
+    # Mat indices are fixed-stride material records and are therefore valid as
+    # persistent medium identifiers in both CPU and GPU transport.
+    medium_indices: dict[tuple, int] = {}
+
+    def _medium_key(material: OpticalMaterial) -> tuple:
+        return (
+            material.name, material.n_d, tuple(material.B), tuple(material.C),
+            material.k, material.scatter_albedo,
+        )
+
+    for (tri_start, n_tris_seg, _label, boundary_mat,
+         medium_pos, medium_neg) in lens_material_specs:
+        boundary_idx = int(mat_idx_arr[tri_start])
+        boundary_n = float(boundary_mat.n_at(float(np.mean(wavelengths_um))))
+        if boundary_n > 1.0 + 1.0e-8:
+            medium_indices[_medium_key(boundary_mat)] = boundary_idx
+
+        def _resolved_medium_index(material: OpticalMaterial) -> int:
+            if float(material.n_at(float(np.mean(wavelengths_um)))) <= 1.0 + 1.0e-8:
+                return -1
+            return medium_indices.get(_medium_key(material), boundary_idx)
+
+        tracer.set_tri_boundary_media(
+            tri_start, n_tris_seg,
+            _resolved_medium_index(medium_pos),
+            _resolved_medium_index(medium_neg),
+        )
+
     # Map abstract flag tokens to C extension constants
     _flag_map = {
-        _GEO_FLAG_TRANSMISSIVE:  RT_TRI_FLAG_TRANSMISSIVE,
-        _GEO_FLAG_APERTURE_STOP: RT_TRI_FLAG_APERTURE_STOP,
+        _GEO_FLAG_TRANSMISSIVE:  MAT_FLAG_TRANSMISSIVE,
+        _GEO_FLAG_APERTURE_STOP: MAT_FLAG_APERTURE_STOP,
     }
     for tri_start, n_tris, _n_in, _n_out, flag_str in ior_specs:
         if n_tris > 0 and flag_str in _flag_map:
             tracer.set_tri_ior(tri_start, n_tris, _flag_map[flag_str])
+
+    if exact_lens_transport:
+        from .compound_optics import CompoundLens
+        from .lens_assembly import LensAssemblySpec
+        from camera_software.camera_build import RebuiltCameraArtifact
+
+        surface_ids = {
+            str(label): np.arange(
+                int(tri_start), int(tri_start) + int(n_tris), dtype=np.int32
+            )
+            for (
+                tri_start, n_tris, label, _material,
+                _medium_before, _medium_after,
+            ) in lens_material_specs
+        }
+        surface_radius = {
+            str(element.label): float(getattr(element.surface, "R", 0.0))
+            for element in preset.lens_group.elements
+        }
+        group_names = sorted({
+            label.rsplit("_", 1)[0]
+            for label in surface_ids
+            if label.endswith("_front") or label.endswith("_back")
+        })
+        lens_surface_groups = []
+        for group in group_names:
+            front_label = f"{group}_front"
+            back_label = f"{group}_back"
+            if front_label not in surface_ids or back_label not in surface_ids:
+                continue
+            lens_surface_groups.append((
+                surface_ids[front_label],
+                surface_ids[back_label],
+                surface_radius.get(front_label, 0.0),
+                surface_radius.get(back_label, 0.0),
+            ))
+        if not lens_surface_groups:
+            if not allow_mesh_lens_transport_for_diagnostics:
+                raise RuntimeError(
+                    "camera transport refused mesh-only lens geometry; "
+                    "exact parametric front/back proxy groups were not found"
+                )
+        else:
+            optics = CompoundLens.from_preset(
+                preset,
+                wavelengths_um=wavelengths_um,
+                axial_scale=-1.0,
+            )
+            assembly = LensAssemblySpec()
+            assembly.set_optics(optics, mode=LensAssemblySpec.MODE_PARAMETRIC)
+            artifact = RebuiltCameraArtifact.create(
+                scene_config={"coordinate_system": "canonical-optical-x"},
+                lens_assembly=assembly,
+                lens_surface_groups=lens_surface_groups,
+                scene_lenses=(),
+                wavelengths_nm=np.asarray(wavelengths_um, np.float64) * 1000.0,
+                sensor_center=(
+                    -float(preset.sensor.z_pos), 0.0, 0.0,
+                ),
+                diffraction_model="disabled_for_geometric_fast_preview",
+            )
+            artifact.register_exact_transport(tracer, verts_all.reshape(-1, 3, 3))
+            if int(getattr(assembly, "_entrance_gid", -1)) < 0:
+                raise RuntimeError(
+                    "camera transport refused zero exact parametric groups"
+                )
+            print(
+                f"[camera-transport] exact required; {artifact.describe()}",
+                flush=True,
+            )
 
     ctx_map: Dict[str, int] = {}
     for label, center, radius, n_re, n_im, dt_m in context_specs:
@@ -1111,7 +1371,7 @@ def build_gpu_scene(
     wavelengths_um = list(wavelengths_um)
 
     (verts_all, normals_all, _refl_re, _refl_im, _diff,
-     ior_specs, context_specs, mat_groups) = _collect_optical_geometry(
+     ior_specs, context_specs, mat_groups, lens_material_specs) = _collect_optical_geometry(
          preset, scene_object, wavelengths_um, confinement_box)
 
     # ── Build per-triangle material arrays ────────────────────────────────
@@ -1146,59 +1406,134 @@ def build_gpu_scene(
     # Reinterpret uint32 flags as float32 bits (same bit pattern the GLSL reads)
     flags_f32 = np.frombuffer(flags_u32.tobytes(), np.float32)
 
-    # ── Pack into 32-float-per-tri SSBO layout ────────────────────────────
-    # Matches demo_pluck_gl.py _gpu_ray_field() exactly:
-    #  [0-2]  v0        [3]    –
-    #  [4-6]  e1=v1-v0  [7]    –
-    #  [8-10] e2=v2-v0  [11]   –
-    #  [12-14] normal   [15]   mat_flags (uint bits as float)
-    #  [16-18] mat_in   [19]   IOR
-    #  [20-22] mat_out  [23]   opacity
-    #  [24-26] albedo   [27]   emit_has_profile (0 for optical scene)
-    #  [28]   emit_profile_idx (-1)  [29] remit_profile_idx (-1)
-    #  [30]   0          [31]  reactive_shift_hz (0)
+    # ── Pack the shared split GPU contract ───────────────────────────────
+    # TriGeom is the hot BVH row; TriShade is fetched only after a hit.  MatBuf
+    # is the same fixed-stride spectral material block used by the production
+    # ray pipeline.  Keep these three blocks separate: recombining the old
+    # 32-float triangle row would undo the cache-line migration.
     tris = verts_all.reshape(-1, 3, 3).astype(np.float32)
     nrm  = normals_all.astype(np.float32)
 
-    packed = np.zeros((n_tri, 32), np.float32)
-    packed[:, 0:3]   = tris[:, 0, :]
-    packed[:, 4:7]   = tris[:, 1, :] - tris[:, 0, :]
-    packed[:, 8:11]  = tris[:, 2, :] - tris[:, 0, :]
-    packed[:, 12:15] = nrm
-    packed[:, 15]    = flags_f32
-    packed[:, 16:19] = mat_in_rgb
-    packed[:, 19]    = ior_col
-    packed[:, 20:23] = mat_out_rgb
-    packed[:, 23]    = opac_col
-    packed[:, 24:27] = albedo_rgb
-    packed[:, 27]    = 0.0         # albedo.w = has_emission_profile (default: none)
-    packed[:, 28]    = -1.0        # emit_profile_idx  = none
-    packed[:, 29]    = -1.0        # remit_profile_idx = none
-    packed[:, 30]    = 0.0         # emissive.z
-    packed[:, 31]    = 0.0         # reactive_shift_hz = none
+    packed_geom = np.zeros((n_tri, 16), np.float32)
+    packed_geom[:, 0:3]   = tris[:, 0, :]
+    packed_geom[:, 4:7]   = tris[:, 1, :] - tris[:, 0, :]
+    packed_geom[:, 8:11]  = tris[:, 2, :] - tris[:, 0, :]
+    packed_geom[:, 12:15] = nrm
+    packed_geom[:, 15]    = flags_f32
+
+    raw16 = np.zeros((n_tri, 16), np.float32)
+    raw16[:, 0:3] = mat_in_rgb
+    raw16[:, 3:6] = mat_out_rgb
+    raw16[:, 6:9] = albedo_rgb
+    raw16[:, 9]   = ior_col
+    raw16[:, 10]  = opac_col
+    raw16[:, 11]  = flags_f32
+    raw16[:, 12:15] = -1.0
+
+    from material_db import MaterialDatabase
+    mat_db = MaterialDatabase.instance()
+    freq_hz = np.asarray([_C_LIGHT / (wl * 1e-6) for wl in wavelengths_um],
+                         dtype=np.float64)
+
+    # Resolve only unique authored rows.  A camera shell contains tens of
+    # thousands of triangles but normally fewer than a dozen materials; doing
+    # content registration per triangle made every small bench edit needlessly
+    # Python-bound.
+    unique_rows, inverse = np.unique(raw16, axis=0, return_inverse=True)
+    unique_indices = np.fromiter(
+        (mat_db.ensure_mat16(row) for row in unique_rows),
+        dtype=np.int32,
+        count=len(unique_rows),
+    )
+    mat_idx = unique_indices[inverse]
+
+    # Lens glass gets a named spectral row sampled directly from its Sellmeier
+    # model.  Geometry remains compact (one uint material index per triangle),
+    # while the shared fixed-stride MatBuf retains wavelength-specific n + ik
+    # for the current transport grid and future complex-field consumption.
+    if freq_hz.size == 1:
+        bandwidths = np.asarray([max(float(freq_hz[0]) * 0.01, 1.0)], np.float64)
+    else:
+        bandwidths = np.asarray([
+            max(float(np.min(np.abs(np.delete(freq_hz, i) - f))) * 0.10, 1.0)
+            for i, f in enumerate(freq_hz)
+        ], np.float64)
+    for (tri_start, n_tris_seg, _label, optical_mat,
+         _medium_before, _medium_after) in lens_material_specs:
+        signature = (
+            optical_mat.name, optical_mat.n_d, tuple(optical_mat.B),
+            tuple(optical_mat.C), optical_mat.k, optical_mat.scatter_albedo,
+            tuple(float(wl) for wl in wavelengths_um),
+        )
+        material_key = "camera_optical:" + repr(signature)
+        if material_key not in mat_db:
+            bands = []
+            for wl, f, bw in zip(wavelengths_um, freq_hz, bandwidths):
+                n_real = float(optical_mat.n_at(float(wl)))
+                fresnel = float(_fresnel_reflectance(1.0, n_real))
+                diffuse = float(np.clip(optical_mat.scatter_albedo, 0.0, 1.0))
+                bands.append({
+                    "center_hz": float(f),
+                    "bandwidth_hz": float(bw),
+                    "reflectance": fresnel,
+                    "transmittance": float(np.clip(1.0 - fresnel - diffuse, 0.0, 1.0)),
+                    "diffuse_frac": diffuse,
+                    "emission": 0.0,
+                    "reemission": 0.0,
+                    "ior_real": n_real,
+                    "ior_imag": float(optical_mat.k),
+                })
+            mat_db.register(material_key, {
+                "name": optical_mat.name,
+                "domain": "em_optical",
+                "albedo": [0.9, 0.9, 0.9],
+                "roughness": float(np.clip(optical_mat.roughness, 0.0, 1.0)),
+                "metallic": 1.0 if optical_mat.is_mirror else 0.0,
+                "transmission": 0.0 if optical_mat.is_opaque else 1.0,
+                "ior": float(optical_mat.n_d),
+                "opacity": 1.0 if optical_mat.is_opaque else 0.0,
+                "spectral_bands": bands,
+            })
+        sl = slice(tri_start, tri_start + n_tris_seg)
+        mat_idx[sl] = mat_db.index_of(material_key)
+
+    mat_buf = np.ascontiguousarray(mat_db.build_mat_buf(freq_hz=freq_hz),
+                                   dtype=np.float32)
+    mat_idx_bits = np.frombuffer(mat_idx.astype(np.uint32).tobytes(), np.float32)
+
+    packed_shade = np.zeros((n_tri, 16), np.float32)
+    packed_shade[:, 0:3]   = mat_in_rgb
+    packed_shade[:, 3]     = ior_col
+    packed_shade[:, 4:7]   = mat_out_rgb
+    packed_shade[:, 7]     = opac_col
+    packed_shade[:, 8:11]  = albedo_rgb
+    packed_shade[:, 12:14] = -1.0
+    packed_shade[:, 14]    = mat_idx_bits
 
     # Confinement walls: enable the GLSL emissive splat so every surface arrival
     # is deposited into the 3D volume texture.
-    #   albedo.w (packed[:,27]) = 1.0  → emissive gate open
-    #   emissive.z (packed[:,30]) = 1.0 → max(emissive.xyz) > 0, giving cos_i weight
+    # Preserve the legacy surface-arrival splat gate.  Source launch itself is
+    # handled by source_buf; this strength is only used when a traced ray hits
+    # one of the specially tagged surfaces.
     for _ts, _nt, *_, _fs in mat_groups:
         if _fs == _GEO_FLAG_CONFINEMENT_WALL:
             _sl = slice(_ts, _ts + _nt)
-            packed[_sl, 27] = 1.0
-            packed[_sl, 30] = 1.0
+            packed_shade[_sl, 11] = 1.0
+            packed_shade[_sl, 12] = 1.0
         elif _fs == _GEO_FLAG_EMITTER:
             _sl = slice(_ts, _ts + _nt)
-            packed[_sl, 27] = 1.0    # has_emission_profile gate
-            packed[_sl, 30] = 1.0    # emissive.z = brightness weight
+            packed_shade[_sl, 11] = 1.0
+            packed_shade[_sl, 12] = 1.0
         elif _fs == _GEO_FLAG_PROJECTOR_BACK:
             # diff_all already carries band-averaged power × mean_weight.
             # Enable the emissive splat gate identically to regular emitters;
             # per-band spectral curve modulation is future GPU shader work.
             _sl = slice(_ts, _ts + _nt)
-            packed[_sl, 27] = 1.0   # has_emission_profile gate
-            packed[_sl, 30] = 1.0   # emissive.z = brightness weight
+            packed_shade[_sl, 11] = 1.0
+            packed_shade[_sl, 12] = 1.0
 
-    packed = np.ascontiguousarray(packed)
+    packed_geom = np.ascontiguousarray(packed_geom)
+    packed_shade = np.ascontiguousarray(packed_shade)
 
     bvh_tris = tris  # (N_tri, 3, 3) float32 — ready for _build_gpu_bvh()
 
@@ -1216,7 +1551,7 @@ def build_gpu_scene(
             context_buf[i, 7]   = 1.0   # RT_SCALE_WAVE
             ctx_map[label] = i
     else:
-        context_buf = np.zeros((1, 8), np.float32)
+        context_buf = np.zeros((0, 8), np.float32)
 
     # ── Scene bounds ──────────────────────────────────────────────────────
     all_pts = tris.reshape(-1, 3)
@@ -1229,7 +1564,7 @@ def build_gpu_scene(
     # Direction and phase are baked CPU-side from each source's directional
     # model and PhaseState — the GPU PASS_FORWARD just reads and traces them.
     _PREBAKE_N = 4096
-    _WL_UM = np.array([0.450, 0.525, 0.600], np.float64)
+    _WL_UM = np.asarray(wavelengths_um, np.float64)
     from .ray_order import RayOrder as _RayOrder
     from .emitter_profile import DirectionalModel as _DM, PhaseState as _PS, \
         CoherenceModel as _CM, AngularDistribution as _AD

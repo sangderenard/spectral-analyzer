@@ -499,12 +499,33 @@ class DutyStation:
 
         # Material dicts — support both old-style 'materials' and new 'gl_materials' key
         gl_mats  = cfg.get('gl_materials', cfg.get('materials', {}))
-        self._mat_body    = _pbr_to_phong(gl_mats.get('body',           {}))
-        self._mat_screen  = _pbr_to_phong(gl_mats.get('screen_active',  {}))
-        self._mat_scr_off = _pbr_to_phong(gl_mats.get('screen_inactive',{}))
-        self._mat_wall    = _pbr_to_phong(gl_mats.get('back_wall', gl_mats.get('wall', {
+        self._canonical_material_bindings = {
+            str(role): str(key) for role, key in
+            dict(cfg.get('material_bindings', {})).items()
+        }
+
+        def _canonical_phong(role: str, fallback: dict, *aliases: str) -> dict:
+            if _HAS_MAT_DB:
+                _db = _MaterialDatabase.instance()
+                for _role in (role, *aliases):
+                    _key = self._canonical_material_bindings.get(_role, '')
+                    if _key and _key in _db:
+                        try:
+                            return _db.as_compat_phong(_key)
+                        except Exception:
+                            pass
+            return _pbr_to_phong(fallback)
+
+        self._mat_body    = _canonical_phong('body', gl_mats.get('body', {}))
+        self._mat_screen  = _canonical_phong(
+            'screen_active', gl_mats.get('screen_active', {}), 'screen'
+        )
+        self._mat_scr_off = _canonical_phong(
+            'screen_inactive', gl_mats.get('screen_inactive', {}), 'screen'
+        )
+        self._mat_wall    = _canonical_phong('back_wall', gl_mats.get('back_wall', gl_mats.get('wall', {
             'albedo_rgb': [0.12, 0.12, 0.16],
-            'ambient': 0.2, 'spec_strength': 0.1, 'shininess': 8.0})))
+            'ambient': 0.2, 'spec_strength': 0.1, 'shininess': 8.0})), 'wall')
 
         # Per-piece PBR materials (for ray tracing / future deferred pass)
         self._piece_materials: dict = cfg.get('piece_materials', {})
@@ -584,6 +605,9 @@ class DutyStation:
             _prefix = f"duty_station.{id(self)}"
             # Per-piece spectral materials (richest path)
             for _pname, _mat in self._spectral_materials.items():
+                if (_pname in self._canonical_material_bindings
+                        or (_pname.startswith('screen') and 'screen' in self._canonical_material_bindings)):
+                    continue
                 _db.register(f"{_prefix}.{_pname}", _mat)
             # Phong-derived materials for pieces without spectral objects
             for _pname, _phong in [
@@ -594,6 +618,9 @@ class DutyStation:
                 ('cornerstone',     self._mat_cornerstone),
                 ('floor_tile',      self._mat_floor_tile),
             ]:
+                if (_pname in self._canonical_material_bindings
+                        or (_pname.startswith('screen') and 'screen' in self._canonical_material_bindings)):
+                    continue
                 _full = f"{_prefix}.{_pname}"
                 if _full not in _db:
                     _db.register(_full, _phong)

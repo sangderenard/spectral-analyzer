@@ -80,6 +80,7 @@ static_assert(sizeof(FilmRecord) == 64 * sizeof(float),
 #include <atomic>
 #include <cmath>
 #include <complex>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -7692,6 +7693,46 @@ static inline uint32_t dispatch_scale_context_entry(
  * Forward and backward paths are identical — BDPT delivers RayIntents only.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+struct ComplexSourceStateBlock {
+    /* One allocation, separated into aligned fixed-stride tables. This state
+     * is built cold and never resized after atomic publication. */
+    std::vector<std::max_align_t> storage;
+    size_t bindings_offset = 0u;
+    size_t modes_offset = 0u;
+    size_t bases_offset = 0u;
+    size_t operators_offset = 0u;
+    size_t binding_count = 0u;
+    size_t mode_count = 0u;
+    size_t basis_count = 0u;
+    size_t operator_count = 0u;
+
+    const unsigned char* bytes() const {
+        return reinterpret_cast<const unsigned char*>(storage.data());
+    }
+    unsigned char* bytes() {
+        return reinterpret_cast<unsigned char*>(storage.data());
+    }
+    const ComplexSourceModeBinding* bindings() const {
+        return reinterpret_cast<const ComplexSourceModeBinding*>(
+            bytes() + bindings_offset);
+    }
+    const complex_optical_operators::PackedSourceModeGpu* modes() const {
+        return reinterpret_cast<
+            const complex_optical_operators::PackedSourceModeGpu*>(
+                bytes() + modes_offset);
+    }
+    const complex_optical_operators::PackedTransverseBasisGpu* bases() const {
+        return reinterpret_cast<
+            const complex_optical_operators::PackedTransverseBasisGpu*>(
+                bytes() + bases_offset);
+    }
+    const complex_optical_operators::PackedOperatorGpu* operators() const {
+        return reinterpret_cast<
+            const complex_optical_operators::PackedOperatorGpu*>(
+                bytes() + operators_offset);
+    }
+};
+
 struct RayPipelineState {
     RayTracerState*      st  = nullptr;
     RayPipelineConfig    cfg;
@@ -7701,6 +7742,12 @@ struct RayPipelineState {
     PipelineQueue<RefinedHit> Q_refined;
     PipelineQueue<WaveIntent> Q_wave;
     PipelineQueue<RayRecord>  Q_out;    /* output records drained by the caller */
+
+    /* Cold-built, solid contiguous Jones source state. Ray tags are the
+     * stable handles, so ordinary CPU/GPU ray records do not grow. The block
+     * is immutable while work is in flight and sorted for binary lookup. */
+    std::shared_ptr<const ComplexSourceStateBlock> complex_source_state =
+        std::make_shared<const ComplexSourceStateBlock>();
 
     /* ── BDPT side-data queues — never mixed into Q_out ──────────────────────
      * Each queue is drained separately via a dedicated pybind function.
@@ -8013,9 +8060,87 @@ static void band_to_display_rgb(int b, int n_bands,
 /* T4 lifecycle is shared by the CPU worker and the GL dispatch thread.  Keep
  * these declarations at the backend boundary so both implementations perform
  * the same seed -> complete march -> extract -> requeue contract. */
-static void wave_arena_seed(WaveArena& arena, const RayIntent& ray);
+struct ResolvedSourceJones {
+    cd s{1.0, 0.0};
+    cd p{0.0, 0.0};
+    uint64_t coherence_id = 0u;
+    bool configured = false;
+};
+
+static ResolvedSourceJones pipeline_source_jones(
+    const ComplexSourceStateBlock& source_state,
+    const WaveArena& arena,
+    wave_t4::Direction direction,
+    const RayIntent& ray)
+{
+    ResolvedSourceJones result;
+    result.coherence_id = ray.tag;
+    if (source_state.binding_count == 0u)
+        return result;
+    const auto* binding_begin = source_state.bindings();
+    const auto* binding_end =
+        binding_begin + source_state.binding_count;
+    const auto it = std::lower_bound(
+        binding_begin,
+        binding_end,
+        ray.tag,
+        [](const ComplexSourceModeBinding& binding, uint64_t tag) {
+            return binding.ray_tag < tag;
+        });
+    if (it == binding_end || it->ray_tag != ray.tag
+        || it->source_mode_id >= source_state.mode_count)
+        return result;
+    const auto& packed = source_state.modes()[it->source_mode_id];
+    const double weight = std::max(0.0, static_cast<double>(
+        packed.power_weight));
+    const double scale = std::sqrt(weight);
+    result.s = scale * cd(packed.amplitude_s_re, packed.amplitude_s_im);
+    result.p = scale * cd(packed.amplitude_p_re, packed.amplitude_p_im);
+
+    if (packed.operator_id < source_state.operator_count) {
+        const auto& op = source_state.operators()[packed.operator_id];
+        const cd m00(op.jones_row0[0], op.jones_row0[1]);
+        const cd m01(op.jones_row0[2], op.jones_row0[3]);
+        const cd m10(op.jones_row1[0], op.jones_row1[1]);
+        const cd m11(op.jones_row1[2], op.jones_row1[3]);
+        const cd transformed_s = m00*result.s + m01*result.p;
+        const cd transformed_p = m10*result.s + m11*result.p;
+        result.s = transformed_s;
+        result.p = transformed_p;
+    }
+    if (packed.basis_id < source_state.basis_count) {
+        const auto& basis = source_state.bases()[packed.basis_id];
+        const V3d source_s(
+            basis.s[0], basis.s[1], basis.s[2]);
+        const V3d source_p(
+            basis.p[0], basis.p[1], basis.p[2]);
+        const V3d destination_s = arena.axis_x;
+        const V3d destination_p =
+            direction == wave_t4::Direction::Forward
+                ? arena.axis_y : -arena.axis_y;
+        const cd rotated_s =
+            destination_s.dot(source_s)*result.s
+          + destination_s.dot(source_p)*result.p;
+        const cd rotated_p =
+            destination_p.dot(source_s)*result.s
+          + destination_p.dot(source_p)*result.p;
+        result.s = rotated_s;
+        result.p = rotated_p;
+    }
+    result.coherence_id =
+        static_cast<uint64_t>(packed.coherence_lo)
+        | (static_cast<uint64_t>(packed.coherence_hi) << 32u);
+    result.configured = true;
+    return result;
+}
+
+static void wave_arena_seed(
+    const RayPipelineState& ps, WaveArena& arena, const RayIntent& ray);
 static void wave_arena_seed_continuous_cohort(
-    WaveArena& arena, const std::array<WaveIntent*, 32>& cohort, int count);
+    const RayPipelineState& ps,
+    WaveArena& arena,
+    const std::array<WaveIntent*, 32>& cohort,
+    int count);
 static void wave_arena_measure_all(WaveArena& arena);
 static bool wave_arena_march(WaveArena& arena);
 static bool wave_arena_ports_compatible(
@@ -13991,7 +14116,7 @@ public:
                            bool state_preseeded = false) {
         using Clock = std::chrono::high_resolution_clock;
         if (!state_preseeded)
-            wave_arena_seed(arena, source);
+            wave_arena_seed(ps, arena, source);
         auto t4_start = Clock::now();
         const bool marched = wave_arena_march(arena);
         if (marched
@@ -14110,7 +14235,8 @@ public:
                         wave_handled[j] = 1u;
                         cohort[static_cast<size_t>(cohort_count++)] = &candidate;
                     }
-                    wave_arena_seed_continuous_cohort(arena, cohort, cohort_count);
+                    wave_arena_seed_continuous_cohort(
+                        ps, arena, cohort, cohort_count);
                     const bool marched = dispatch_t4_march(
                         ps, arena, wi.ray, /*state_preseeded=*/true);
                     for (int lane = 0; lane < cohort_count; ++lane) {
@@ -14763,7 +14889,8 @@ static void wave_arena_build(
         arena.spectral_lanes[static_cast<size_t>(b)].frequency_hz = freq;
         arena.spectral_lanes[static_cast<size_t>(b)].wavelength_m = arena.wavelengths_m[b];
         arena.spectral_lanes[static_cast<size_t>(b)].pdf = 1.0f;
-        arena.spectral_lanes[static_cast<size_t>(b)].coherence_id = static_cast<unsigned int>(b);
+        arena.spectral_lanes[static_cast<size_t>(b)].coherence_id =
+            static_cast<uint64_t>(b);
         arena.spectral_lanes[static_cast<size_t>(b)].active = 1u;
     }
     auto next_power_of_two = [](int value) {
@@ -14992,10 +15119,17 @@ static void wave_arena_deposit_lane(WaveArena& arena,
 }
 
 /* Seed the entry plane from a ray using the declared boundary adapter. */
-static void wave_arena_seed(WaveArena& arena, const RayIntent& ray)
+static void wave_arena_seed(
+    const RayPipelineState& ps, WaveArena& arena, const RayIntent& ray)
 {
     std::fill(arena.state_block.begin(), arena.state_block.end(), 0.0f);
     arena.field_active.fill(0u);
+    const auto direction = wave_arena_direction(arena, ray);
+    const auto source_state =
+        std::atomic_load_explicit(
+            &ps.complex_source_state, std::memory_order_acquire);
+    const ResolvedSourceJones source_jones =
+        pipeline_source_jones(*source_state, arena, direction, ray);
 
     if (ray.spectral_resolved && ray.spectral_frequency_hz > 0.0) {
         arena.spectral_mode = wave_t4::SpectralMode::ContinuousCohort;
@@ -15009,7 +15143,7 @@ static void wave_arena_seed(WaveArena& arena, const RayIntent& ray)
                 lane.wavelength_m = (arena.speed_m_s / ray.spectral_frequency_hz)
                                   / arena.n_real;
                 lane.pdf = std::max(ray.spectral_pdf, 1.0e-30f);
-                lane.coherence_id = static_cast<unsigned int>(ray.tag & 0xffffffffu);
+                lane.coherence_id = source_jones.coherence_id;
                 arena.wavelengths_m[b] = lane.wavelength_m;
             }
         }
@@ -15022,27 +15156,47 @@ static void wave_arena_seed(WaveArena& arena, const RayIntent& ray)
             lane.frequency_hz = arena.speed_m_s
                               / (arena.wavelengths_m[b] * arena.n_real);
             lane.pdf = 1.0f;
-            lane.coherence_id = static_cast<unsigned int>(b);
+            lane.coherence_id = source_jones.configured
+                ? source_jones.coherence_id
+                : static_cast<uint64_t>(b);
             lane.active = 1u;
         }
     }
 
     const V3d lpos = wave_arena_to_local(arena, ray.pos);
-    const auto direction = wave_arena_direction(arena, ray);
-    const auto component = wave_t4::TransverseComponent::S;
     arena.field_active[static_cast<size_t>(
-        wave_t4::field_index(direction, component))] = 1u;
-    float* field_re = arena.field_re(direction, component);
-    float* field_im = arena.field_im(direction, component);
+        wave_t4::field_index(
+            direction, wave_t4::TransverseComponent::S))] =
+        std::norm(source_jones.s) > 0.0 ? 1u : 0u;
+    arena.field_active[static_cast<size_t>(
+        wave_t4::field_index(
+            direction, wave_t4::TransverseComponent::P))] =
+        std::norm(source_jones.p) > 0.0 ? 1u : 0u;
+    float* field_s_re =
+        arena.field_re(direction, wave_t4::TransverseComponent::S);
+    float* field_s_im =
+        arena.field_im(direction, wave_t4::TransverseComponent::S);
+    float* field_p_re =
+        arena.field_re(direction, wave_t4::TransverseComponent::P);
+    float* field_p_im =
+        arena.field_im(direction, wave_t4::TransverseComponent::P);
     const size_t fft_plane =
         static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
     double input_power = 0.0;
     for (int b = 0; b < arena.n_bands && b < (int)ray.amp.size(); ++b) {
-        input_power += std::norm(ray.amp[b]);
-        wave_arena_deposit_lane(
-            arena, ray, lpos, arena.wavelengths_m[b], ray.amp[b],
-            field_re + static_cast<size_t>(b)*fft_plane,
-            field_im + static_cast<size_t>(b)*fft_plane);
+        const cd amplitude_s = ray.amp[b] * source_jones.s;
+        const cd amplitude_p = ray.amp[b] * source_jones.p;
+        input_power += std::norm(amplitude_s) + std::norm(amplitude_p);
+        if (std::norm(amplitude_s) > 0.0)
+            wave_arena_deposit_lane(
+                arena, ray, lpos, arena.wavelengths_m[b], amplitude_s,
+                field_s_re + static_cast<size_t>(b)*fft_plane,
+                field_s_im + static_cast<size_t>(b)*fft_plane);
+        if (std::norm(amplitude_p) > 0.0)
+            wave_arena_deposit_lane(
+                arena, ray, lpos, arena.wavelengths_m[b], amplitude_p,
+                field_p_re + static_cast<size_t>(b)*fft_plane,
+                field_p_im + static_cast<size_t>(b)*fft_plane);
     }
     arena.progress = {};
     wave_arena_measure_all(arena);
@@ -15062,7 +15216,10 @@ static void wave_arena_seed(WaveArena& arena, const RayIntent& ray)
  * state lane carries its own frequency/PDF/coherence identity; it is not a
  * fixed spectral bin. The pipeline RayIntent remains the lineage authority. */
 static void wave_arena_seed_continuous_cohort(
-    WaveArena& arena, const std::array<WaveIntent*, 32>& cohort, int count)
+    const RayPipelineState& ps,
+    WaveArena& arena,
+    const std::array<WaveIntent*, 32>& cohort,
+    int count)
 {
     std::fill(arena.state_block.begin(), arena.state_block.end(), 0.0f);
     arena.field_active.fill(0u);
@@ -15074,32 +15231,59 @@ static void wave_arena_seed_continuous_cohort(
     const size_t npix = static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
     const auto direction =
         wave_arena_direction(arena, cohort[0]->ray);
-    const auto component = wave_t4::TransverseComponent::S;
-    arena.field_active[static_cast<size_t>(
-        wave_t4::field_index(direction, component))] = 1u;
-    float* state_re = arena.field_re(direction, component);
-    float* state_im = arena.field_im(direction, component);
+    const auto source_state =
+        std::atomic_load_explicit(
+            &ps.complex_source_state, std::memory_order_acquire);
+    float* state_s_re =
+        arena.field_re(direction, wave_t4::TransverseComponent::S);
+    float* state_s_im =
+        arena.field_im(direction, wave_t4::TransverseComponent::S);
+    float* state_p_re =
+        arena.field_re(direction, wave_t4::TransverseComponent::P);
+    float* state_p_im =
+        arena.field_im(direction, wave_t4::TransverseComponent::P);
+    double input_power = 0.0;
     for (int state_lane = 0; state_lane < used; ++state_lane) {
         const RayIntent& ray = cohort[static_cast<size_t>(state_lane)]->ray;
+        const ResolvedSourceJones source_jones =
+            pipeline_source_jones(*source_state, arena, direction, ray);
         auto& lane = arena.spectral_lanes[static_cast<size_t>(state_lane)];
         const auto& sidecar = cohort[static_cast<size_t>(state_lane)]->complex;
         lane.frequency_hz = sidecar.frequency_hz > 0.0
             ? sidecar.frequency_hz : ray.spectral_frequency_hz;
-        lane.wavelength_m = (arena.speed_m_s / ray.spectral_frequency_hz)
+        lane.wavelength_m = (arena.speed_m_s / lane.frequency_hz)
                           / arena.n_real;
         lane.pdf = static_cast<float>(std::max(sidecar.spectral_pdf, 1.0e-30));
-        lane.coherence_id = static_cast<unsigned int>(sidecar.coherence_id & 0xffffffffu);
+        lane.coherence_id = source_jones.configured
+            ? source_jones.coherence_id : sidecar.coherence_id;
         lane.active = 1u;
         arena.wavelengths_m[state_lane] = lane.wavelength_m;
 
         const int source_lane = ray.amp.size() > 0
             ? std::min<int>(ray.spectral_lane_id, static_cast<int>(ray.amp.size()) - 1) : 0;
         const cd source_amp = ray.amp.size() > 0 ? ray.amp[source_lane] : cd(0.0, 0.0);
+        const cd amplitude_s = source_amp * source_jones.s;
+        const cd amplitude_p = source_amp * source_jones.p;
         const V3d local = wave_arena_to_local(arena, ray.pos);
-        float* re = state_re + static_cast<size_t>(state_lane) * npix;
-        float* im = state_im + static_cast<size_t>(state_lane) * npix;
-        wave_arena_deposit_lane(
-            arena, ray, local, lane.wavelength_m, source_amp, re, im);
+        if (std::norm(amplitude_s) > 0.0) {
+            arena.field_active[static_cast<size_t>(
+                wave_t4::field_index(
+                    direction, wave_t4::TransverseComponent::S))] = 1u;
+            wave_arena_deposit_lane(
+                arena, ray, local, lane.wavelength_m, amplitude_s,
+                state_s_re + static_cast<size_t>(state_lane) * npix,
+                state_s_im + static_cast<size_t>(state_lane) * npix);
+        }
+        if (std::norm(amplitude_p) > 0.0) {
+            arena.field_active[static_cast<size_t>(
+                wave_t4::field_index(
+                    direction, wave_t4::TransverseComponent::P))] = 1u;
+            wave_arena_deposit_lane(
+                arena, ray, local, lane.wavelength_m, amplitude_p,
+                state_p_re + static_cast<size_t>(state_lane) * npix,
+                state_p_im + static_cast<size_t>(state_lane) * npix);
+        }
+        input_power += std::norm(amplitude_s) + std::norm(amplitude_p);
     }
     arena.progress = {};
     wave_arena_measure_all(arena);
@@ -15111,15 +15295,6 @@ static void wave_arena_seed_continuous_cohort(
     arena.boundary_telemetry.entry_local =
         wave_arena_to_local(arena, cohort[0]->ray.pos);
     arena.boundary_telemetry.entry_direction = cohort[0]->ray.dir;
-    double input_power = 0.0;
-    for (int lane = 0; lane < used; ++lane) {
-        const RayIntent& source = cohort[static_cast<size_t>(lane)]->ray;
-        const int source_lane = source.amp.size() > 0
-            ? std::min<int>(source.spectral_lane_id,
-                            static_cast<int>(source.amp.size()) - 1) : 0;
-        if (source.amp.size() > 0)
-            input_power += std::norm(source.amp[source_lane]);
-    }
     arena.boundary_telemetry.input_ray_power = input_power;
     arena.boundary_telemetry.seeded_field_power =
         arena.progress.field_power;
@@ -16718,7 +16893,8 @@ static void pipeline_wave_solver(RayPipelineState& ps)
                         handled[static_cast<size_t>(j)] = 1u;
                         cohort[static_cast<size_t>(cohort_count++)] = &candidate;
                     }
-                    wave_arena_seed_continuous_cohort(arena, cohort, cohort_count);
+                    wave_arena_seed_continuous_cohort(
+                        ps, arena, cohort, cohort_count);
                     const bool marched = wave_arena_march(arena);
                     for (int lane = 0; lane < cohort_count; ++lane) {
                         WaveIntent& completed = *cohort[static_cast<size_t>(lane)];
@@ -16729,7 +16905,7 @@ static void pipeline_wave_solver(RayPipelineState& ps)
                     }
                 } else {
                     handled[static_cast<size_t>(wi_index)] = 1u;
-                    wave_arena_seed(arena, wi.ray);
+                    wave_arena_seed(ps, arena, wi.ray);
                     if (wave_arena_march(arena))
                         wave_arena_complete(ps, wi, arena);
                     else
@@ -16976,6 +17152,124 @@ void ray_pipeline_destroy(RayPipelineState* ps)
         ps->gpu_dispatch = nullptr;
     }
     delete ps;
+}
+
+int ray_pipeline_set_complex_source_modes(
+    RayPipelineState*               ps,
+    const ComplexSourceModeBinding* bindings,
+    int                             n_bindings,
+    const complex_optical_operators::PackedSourceModeGpu* modes,
+    int                             n_modes,
+    const complex_optical_operators::PackedTransverseBasisGpu* bases,
+    int                             n_bases,
+    const complex_optical_operators::PackedOperatorGpu* operators,
+    int                             n_operators)
+{
+    if (!ps) return SK_ERR_NULL_STATE;
+    if (n_bindings < 0 || (n_bindings > 0 && !bindings))
+        return SK_ERR_DIM_MISMATCH;
+    if (n_modes < 0 || (n_modes > 0 && !modes))
+        return SK_ERR_DIM_MISMATCH;
+    if (n_bases < 0 || (n_bases > 0 && !bases)
+        || n_operators < 0 || (n_operators > 0 && !operators))
+        return SK_ERR_DIM_MISMATCH;
+    if (n_bindings > 0
+        && (n_modes <= 0 || n_bases <= 0 || n_operators <= 0))
+        return SK_ERR_DIM_MISMATCH;
+    if (ps->in_flight.load(std::memory_order_acquire) != 0)
+        return SK_ERR_DIM_MISMATCH;
+
+    std::vector<ComplexSourceModeBinding> next;
+    next.reserve(static_cast<size_t>(n_bindings));
+    for (int i = 0; i < n_bindings; ++i) {
+        const ComplexSourceModeBinding& binding = bindings[i];
+        if (binding.source_mode_id >= static_cast<uint32_t>(n_modes))
+            return SK_ERR_DIM_MISMATCH;
+        next.push_back(binding);
+    }
+    for (int i = 0; i < n_modes; ++i) {
+        const auto& mode = modes[i];
+        const double norm =
+            static_cast<double>(mode.amplitude_s_re) * mode.amplitude_s_re
+          + static_cast<double>(mode.amplitude_s_im) * mode.amplitude_s_im
+          + static_cast<double>(mode.amplitude_p_re) * mode.amplitude_p_re
+          + static_cast<double>(mode.amplitude_p_im) * mode.amplitude_p_im;
+        if (!std::isfinite(norm) || std::abs(norm - 1.0) > 2.0e-4
+            || !std::isfinite(mode.power_weight)
+            || mode.power_weight < 0.0f
+            || mode.basis_id >= static_cast<uint32_t>(n_bases)
+            || mode.operator_id >= static_cast<uint32_t>(n_operators))
+            return SK_ERR_DIM_MISMATCH;
+    }
+    std::sort(
+        next.begin(), next.end(),
+        [](const ComplexSourceModeBinding& a,
+           const ComplexSourceModeBinding& b) {
+            return a.ray_tag < b.ray_tag;
+        });
+    for (size_t i = 1; i < next.size(); ++i)
+        if (next[i - 1].ray_tag == next[i].ray_tag)
+            return SK_ERR_DIM_MISMATCH;
+
+    auto next_state = std::make_shared<ComplexSourceStateBlock>();
+    const auto align_offset = [](size_t offset, size_t alignment) {
+        return (offset + alignment - 1u) & ~(alignment - 1u);
+    };
+    size_t byte_count = 0u;
+    next_state->bindings_offset = align_offset(
+        byte_count, alignof(ComplexSourceModeBinding));
+    byte_count = next_state->bindings_offset
+        + next.size() * sizeof(ComplexSourceModeBinding);
+    next_state->modes_offset = align_offset(
+        byte_count,
+        alignof(complex_optical_operators::PackedSourceModeGpu));
+    byte_count = next_state->modes_offset
+        + static_cast<size_t>(n_modes)
+            * sizeof(complex_optical_operators::PackedSourceModeGpu);
+    next_state->bases_offset = align_offset(
+        byte_count,
+        alignof(complex_optical_operators::PackedTransverseBasisGpu));
+    byte_count = next_state->bases_offset
+        + static_cast<size_t>(n_bases)
+            * sizeof(
+                complex_optical_operators::PackedTransverseBasisGpu);
+    next_state->operators_offset = align_offset(
+        byte_count,
+        alignof(complex_optical_operators::PackedOperatorGpu));
+    byte_count = next_state->operators_offset
+        + static_cast<size_t>(n_operators)
+            * sizeof(complex_optical_operators::PackedOperatorGpu);
+    next_state->storage.resize(
+        (byte_count + sizeof(std::max_align_t) - 1u)
+        / sizeof(std::max_align_t));
+    next_state->binding_count = next.size();
+    next_state->mode_count = static_cast<size_t>(n_modes);
+    next_state->basis_count = static_cast<size_t>(n_bases);
+    next_state->operator_count = static_cast<size_t>(n_operators);
+    if (!next.empty())
+        std::memcpy(
+            next_state->bytes() + next_state->bindings_offset,
+            next.data(), next.size() * sizeof(next[0]));
+    if (n_modes > 0)
+        std::memcpy(
+            next_state->bytes() + next_state->modes_offset,
+            modes, static_cast<size_t>(n_modes) * sizeof(modes[0]));
+    if (n_bases > 0)
+        std::memcpy(
+            next_state->bytes() + next_state->bases_offset,
+            bases, static_cast<size_t>(n_bases) * sizeof(bases[0]));
+    if (n_operators > 0)
+        std::memcpy(
+            next_state->bytes() + next_state->operators_offset,
+            operators,
+            static_cast<size_t>(n_operators) * sizeof(operators[0]));
+    std::shared_ptr<const ComplexSourceStateBlock> immutable =
+        std::move(next_state);
+    std::atomic_store_explicit(
+        &ps->complex_source_state,
+        std::move(immutable),
+        std::memory_order_release);
+    return SK_OK;
 }
 
 void ray_pipeline_submit(

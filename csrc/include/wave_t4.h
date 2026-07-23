@@ -78,7 +78,7 @@ struct SpectralLane {
     double frequency_hz = 0.0;
     double wavelength_m = 0.0;
     float pdf = 1.0f;
-    unsigned int coherence_id = 0;
+    std::uint64_t coherence_id = 0u;
     unsigned int active = 0;
 };
 

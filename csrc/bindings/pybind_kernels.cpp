@@ -626,6 +626,15 @@ struct PyRayTracer
     std::array<float, 3> _aperture_right = {0.0f, 1.0f, 0.0f};
     std::array<float, 3> _aperture_up = {0.0f, 0.0f, 1.0f};
     std::atomic<uint32_t> _bdpt_subpath_counter{1u};
+    /* Cold source-mode bindings are retained across lazy pipeline creation.
+     * The native pipeline copies them into its own contiguous immutable block. */
+    std::vector<ComplexSourceModeBinding> _complex_source_modes;
+    std::vector<complex_optical_operators::PackedSourceModeGpu>
+        _complex_source_mode_values;
+    std::vector<complex_optical_operators::PackedTransverseBasisGpu>
+        _complex_source_bases;
+    std::vector<complex_optical_operators::PackedOperatorGpu>
+        _complex_source_operators;
 
     /* T5 connection config */
     float    _t5_min_geom          = 1e-8f;
@@ -725,6 +734,24 @@ struct PyRayTracer
             _pipeline = ray_pipeline_create(handle, &cfg);
             if (!_pipeline)
                 throw std::runtime_error("ray_pipeline_create failed");
+            if (!_complex_source_modes.empty()) {
+                const int rc = ray_pipeline_set_complex_source_modes(
+                    _pipeline,
+                    _complex_source_modes.data(),
+                    static_cast<int>(_complex_source_modes.size()),
+                    _complex_source_mode_values.empty()
+                        ? nullptr : _complex_source_mode_values.data(),
+                    static_cast<int>(_complex_source_mode_values.size()),
+                    _complex_source_bases.empty()
+                        ? nullptr : _complex_source_bases.data(),
+                    static_cast<int>(_complex_source_bases.size()),
+                    _complex_source_operators.empty()
+                        ? nullptr : _complex_source_operators.data(),
+                    static_cast<int>(_complex_source_operators.size()));
+                if (rc != SK_OK)
+                    throw std::runtime_error(
+                        "failed to install complex source-mode block");
+            }
             /* Apply sensor image config that may have been set before pipeline existed. */
             if (_sensor_res > 0)
                 ray_pipeline_configure_sensor_image(
@@ -1749,6 +1776,123 @@ struct PyRayTracer
             }
         }
         (void)_get_pipeline(max_children, seed);
+    }
+
+    void configure_complex_source_modes(
+        py::array_t<uint64_t, py::array::c_style | py::array::forcecast>
+            ray_tags,
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast>
+            source_mode_indices,
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast>
+            source_mode_words,
+        py::array_t<float, py::array::c_style | py::array::forcecast>
+            basis_values,
+        py::array_t<float, py::array::c_style | py::array::forcecast>
+            operator_values)
+    {
+        auto tags = ray_tags.request();
+        auto indices = source_mode_indices.request();
+        auto words = source_mode_words.request();
+        auto bases = basis_values.request();
+        auto operators = operator_values.request();
+        if (tags.ndim != 1 || indices.ndim != 1
+            || indices.shape[0] != tags.shape[0]
+            || words.ndim != 2 || words.shape[1] != 12)
+            throw std::invalid_argument(
+                "source modes require tags[N], indices[N], and words[M,12]");
+        if (bases.ndim != 2 || bases.shape[1] != 8
+            || operators.ndim != 2 || operators.shape[1] != 24)
+            throw std::invalid_argument(
+                "source bases/operators require float32[B,8] and float32[O,24]");
+        const int count = static_cast<int>(tags.shape[0]);
+        const int mode_count = static_cast<int>(words.shape[0]);
+        const int basis_count = static_cast<int>(bases.shape[0]);
+        const int operator_count = static_cast<int>(operators.shape[0]);
+        if (count > 0
+            && (mode_count <= 0 || basis_count <= 0 || operator_count <= 0))
+            throw std::invalid_argument(
+                "source modes require non-empty basis and operator tables");
+        const auto* tag_data = static_cast<const uint64_t*>(tags.ptr);
+        const auto* index_data = static_cast<const uint32_t*>(indices.ptr);
+        const auto* word_data = static_cast<const uint32_t*>(words.ptr);
+        std::vector<ComplexSourceModeBinding> next(
+            static_cast<size_t>(count));
+        for (int i = 0; i < count; ++i) {
+            auto& binding = next[static_cast<size_t>(i)];
+            binding.ray_tag = tag_data[i];
+            binding.source_mode_id = index_data[i];
+            if (binding.source_mode_id >= static_cast<uint32_t>(mode_count))
+                throw std::invalid_argument(
+                    "source mode index is outside words[M,12]");
+        }
+        std::vector<complex_optical_operators::PackedSourceModeGpu>
+            next_modes(static_cast<size_t>(mode_count));
+        static_assert(
+            sizeof(next_modes[0]) == 12u * sizeof(uint32_t),
+            "source-mode Python ABI must remain 12 words");
+        if (mode_count > 0)
+            std::memcpy(
+                next_modes.data(), word_data,
+                next_modes.size() * sizeof(next_modes[0]));
+        for (const auto& mode : next_modes) {
+            const double norm =
+                static_cast<double>(mode.amplitude_s_re) * mode.amplitude_s_re
+              + static_cast<double>(mode.amplitude_s_im) * mode.amplitude_s_im
+              + static_cast<double>(mode.amplitude_p_re) * mode.amplitude_p_re
+              + static_cast<double>(mode.amplitude_p_im) * mode.amplitude_p_im;
+            if (!std::isfinite(norm) || std::abs(norm - 1.0) > 2.0e-4
+                || !std::isfinite(mode.power_weight)
+                || mode.power_weight < 0.0f
+                || mode.basis_id >= static_cast<uint32_t>(basis_count)
+                || mode.operator_id
+                    >= static_cast<uint32_t>(operator_count))
+                throw std::invalid_argument(
+                    "source Jones vectors must be normalized and power finite");
+        }
+        std::sort(
+            next.begin(), next.end(),
+            [](const ComplexSourceModeBinding& a,
+               const ComplexSourceModeBinding& b) {
+                return a.ray_tag < b.ray_tag;
+            });
+        for (size_t i = 1; i < next.size(); ++i)
+            if (next[i - 1].ray_tag == next[i].ray_tag)
+                throw std::invalid_argument(
+                    "source mode ray tags must be unique");
+
+        std::vector<complex_optical_operators::PackedTransverseBasisGpu>
+            next_bases(static_cast<size_t>(basis_count));
+        std::vector<complex_optical_operators::PackedOperatorGpu>
+            next_operators(static_cast<size_t>(operator_count));
+        if (basis_count > 0)
+            std::memcpy(
+                next_bases.data(), bases.ptr,
+                next_bases.size() * sizeof(next_bases[0]));
+        if (operator_count > 0)
+            std::memcpy(
+                next_operators.data(), operators.ptr,
+                next_operators.size() * sizeof(next_operators[0]));
+        std::lock_guard<std::mutex> lock(_pipeline_mu);
+        if (_pipeline) {
+            const int rc = ray_pipeline_set_complex_source_modes(
+                _pipeline,
+                next.empty() ? nullptr : next.data(),
+                count,
+                next_modes.empty() ? nullptr : next_modes.data(),
+                mode_count,
+                next_bases.empty() ? nullptr : next_bases.data(),
+                basis_count,
+                next_operators.empty() ? nullptr : next_operators.data(),
+                operator_count);
+            if (rc != SK_OK)
+                throw std::runtime_error(
+                    "source modes can change only while no rays are in flight "
+                    "and tags must be unique");
+        }
+        _complex_source_modes.swap(next);
+        _complex_source_mode_values.swap(next_modes);
+        _complex_source_bases.swap(next_bases);
+        _complex_source_operators.swap(next_operators);
     }
 
     /*
@@ -6691,6 +6835,22 @@ intersect it are not launched.)doc")
 R"doc(Force creation of the persistent ray pipeline without submitting rays.
 Use this on the display thread when the pipeline needs to share with the
 currently-bound OpenGL display context.)doc")
+        .def("configure_complex_source_modes",
+             &PyRayTracer::configure_complex_source_modes,
+             py::arg("ray_tags"),
+             py::arg("source_mode_indices"),
+             py::arg("source_mode_words"),
+             py::arg("basis_values"),
+             py::arg("operator_values"),
+R"doc(Install the pipeline-owned Jones/coherence source block.
+
+ray_tags is uint64[N] and source_mode_indices is uint32[N].
+source_mode_words is the canonical, deduplicated uint32[M,12]
+ComplexSourceMode ABI. basis_values and operator_values are the canonical
+float32[B,8] and float32[O,24] cold tables. Multiple tags may share one source
+mode. Tags act as stable handles through unchanged ordinary CPU/GPU ray
+records. Configuration must occur while no rays are in flight; passing empty
+arrays clears the block.)doc")
         .def("drain_records", &PyRayTracer::drain_records,
              py::arg("max_n") = 50000,
 R"doc(Non-blocking drain: pop up to max_n completed records from the output queue.

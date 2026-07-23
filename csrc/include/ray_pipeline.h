@@ -131,6 +131,17 @@ struct WaveIntent {
     complex_transport::RaySidecar complex{};
 };
 
+/* Cold-installed association between a stable ray correlation tag and an
+ * index in the deduplicated Jones/coherence source-mode table. Bindings and
+ * modes live in one immutable pipeline-owned state; ordinary RayIntent and GPU
+ * intent ABIs stay unchanged.
+ */
+struct ComplexSourceModeBinding {
+    uint64_t ray_tag = 0u;
+    uint32_t source_mode_id = 0u;
+    uint32_t reserved = 0u;
+};
+
 /* ─── Per-stage profiling with adaptive batch control ───────────────────── */
 
 /* Lockfree stats kept by each pipeline stage.
@@ -1184,7 +1195,7 @@ struct WaveArenaSnapshot {
     double absorbed_power;
     double frequency_hz[32];
     float spectral_pdf[32];
-    uint32_t coherence_id[32];
+    uint64_t coherence_id[32];
     uint32_t lane_active[32];
     uint32_t field_active[wave_t4::kFieldCount];
     uint64_t boundary_generation;
@@ -1447,6 +1458,21 @@ void ray_pipeline_submit(
     RayPipelineState*  ps,
     const RayIntent*   intents,
     int                n_intents);
+
+/* Replace the immutable complex source-mode state used at T4 entry.
+ * Configuration is accepted only while no rays are in flight. An empty range
+ * clears the block. Bindings are sorted by ray_tag for allocation-free lookup
+ * and may share records in the deduplicated modes table. */
+int ray_pipeline_set_complex_source_modes(
+    RayPipelineState*                 ps,
+    const ComplexSourceModeBinding*   bindings,
+    int                               n_bindings,
+    const complex_optical_operators::PackedSourceModeGpu* modes,
+    int                               n_modes,
+    const complex_optical_operators::PackedTransverseBasisGpu* bases,
+    int                               n_bases,
+    const complex_optical_operators::PackedOperatorGpu* operators,
+    int                               n_operators);
 
 /* Native forward-light launcher: samples authored emissive triangles inside C++
  * and submits RayIntents directly to the persistent T1 queue.  This avoids the

@@ -147,27 +147,31 @@ per-ray reference is not allowed.
 - optical graph contracts
   - advertise the operator schema and persistent indexed storage expected by
     exact T2 and ray/field boundary modules.
+- native `RayPipelineState`
+  - owns one cold-installed, aligned allocation containing 16-byte
+    tag-to-mode bindings plus deduplicated 48-byte source modes, transverse
+    bases, and operators. Stable uint64 ray tags resolve records at T4 entry
+    without widening ordinary CPU or GPU ray records. The same lookup seeds
+    both s/p fields for fixed bands and continuous-frequency cohorts.
 
 ## Deliberately not claimed complete
 
-The current native T4 arena already owns forward/backward s/p field planes.
-The reusable reference adapter now seeds and propagates both components, so
-the material and propagation kernels can be qualified without a demo-private
-solver. The production ray-pipeline boundary still seeds only s and reduces
-the exit field to one scalar ray amplitude. The reference adapter does not
-disguise that old hot-path adapter as Jones-complete.
+The current native T4 arena owns forward/backward s/p field planes. Both the
+reference adapter and production ray-pipeline entry now seed and propagate both
+components when a source-mode handle is installed. Fixed bands and continuous
+cohorts use the same entry contract; continuous lanes retain arbitrary
+frequency, PDF, and full 64-bit coherence identity. Unconfigured legacy rays
+remain an explicit s-only scalar specialization. T4 exit still reduces the
+field to one scalar ray amplitude.
 
 The next implementation gate is:
 
-1. install the implemented fixed-stride source-mode block in
-   `RayPipelineState`;
-2. carry only its stable handle through ordinary ray stages;
-3. apply interface Jones operators at physical material boundaries;
-4. seed both T4 transverse components in the declared entry basis;
-5. extract a Jones complex ray or retain the full field when reduction is
+1. apply interface Jones operators at physical material boundaries;
+2. compose indexed basis/operator state through exact T2;
+3. extract a Jones complex ray or retain the full field when reduction is
    scientifically invalid;
-6. propagate and compose the canonical 4x4 map and OPL through exact T2;
-7. qualify CPU/GLSL parity, Fresnel power, reciprocity, and caustic behavior.
+4. propagate and compose the canonical 4x4 map and OPL through exact T2;
+5. qualify CPU/GLSL parity, Fresnel power, reciprocity, and caustic behavior.
 
 No new per-ray N-lane payload and no shader-hot object construction are
 authorized by this contract.
@@ -190,6 +194,14 @@ source states; `K` cycles solve quality; `[` and `]` rotate the source
 orientation; Left/Right rotate the analyzer; `V` switches between Stokes and
 coherent-component phase pages; `P` switches relative and absolute phase;
 Space pauses.
+
+`F` switches between perceptually partitioned fixed bands and stratified
+continuous-frequency samples; `L` cycles exact widths `1,3,4,8,16,32`; `R`
+resamples the continuous cohort without changing the aperture. The fixed and
+continuous paths share the material, vector propagation, open boundary, and
+Stokes calculations. Continuous samples are drawn uniformly in frequency and
+carry normalized Monte Carlo field weights; lane width remains concurrency,
+not spectral quantization.
 
 The Stokes page shows the material aperture, total intensity, spatial
 polarization, normalized Q and V, and a rotatable analyzer. The coherent page

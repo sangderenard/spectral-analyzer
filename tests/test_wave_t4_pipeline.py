@@ -83,6 +83,59 @@ def test_empty_space_crossing_routes_through_t4():
     assert np.count_nonzero(p_field["im"]) == 0
 
 
+def test_fixed_band_source_mode_seeds_both_components_and_full_coherence():
+    from camera_software.complex_optical_operators import (
+        ComplexOpticalOperator,
+        ComplexOperatorStateBlock,
+        ComplexSourceMode,
+        JonesOperator,
+        TransverseBasis,
+        install_source_mode_block,
+    )
+
+    tracer = _tracer(np.array([550e-9]))
+    _add_arena(tracer)
+    tag = 0x12345678ABCDEF01
+    coherence = 0xFFEEDDCC87654321
+    block = ComplexOperatorStateBlock()
+    block.add_basis(TransverseBasis.from_direction((0.0, 0.0, 1.0)))
+    block.add_operator(ComplexOpticalOperator(jones=JonesOperator(
+        np.asarray([[1.0, 0.0], [0.0, 1.0j]], np.complex128)
+    )))
+    block.add_source_mode(ComplexSourceMode(
+        jones=np.asarray([1.0, 1.0]),
+        power_weight=1.0,
+        coherence_id=coherence,
+        basis_id=0,
+    ))
+    install_source_mode_block(
+        tracer,
+        np.asarray([tag, tag + 1], np.uint64),
+        block,
+        mode_indices=np.zeros(2, np.uint32),
+    )
+    tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+    tracer.submit_rays(
+        np.array([[0.0, 0.0, -0.05]]),
+        np.array([[0.0, 0.0, 1.0]]),
+        np.array([[1.0 + 0.0j]]),
+        tags=np.asarray([tag], np.uint64),
+        max_bounces=1,
+        min_amplitude=1e-12,
+    )
+    _wait(tracer)
+
+    s_field = tracer.wave_arena_field_snapshot(0, 0, 0, 0)
+    p_field = tracer.wave_arena_field_snapshot(0, 0, 1, 0)
+    s = np.asarray(s_field["re"]) + 1j*np.asarray(s_field["im"])
+    p = np.asarray(p_field["re"]) + 1j*np.asarray(p_field["im"])
+    illuminated = np.abs(s) > float(np.max(np.abs(s))) * 1.0e-6
+    np.testing.assert_allclose(p[illuminated], 1j*s[illuminated], rtol=3e-5)
+    arena = tracer.wave_arena_stats()[0]
+    assert arena["lanes"][0]["coherence_id"] == coherence
+    assert arena["field_active"][:2] == [1, 1]
+
+
 def test_compiled_optical_graph_installs_and_drives_native_t4():
     from camera_software.optical_transport_graph import (
         OpticalTransportGraphSpec,
@@ -347,6 +400,65 @@ def test_continuous_paths_share_one_exact_width_complex_dispatch():
     assert np.asarray(tracer.drain_records(16)["kind"]).tolist() == [3, 3, 3, 3]
 
 
+def test_continuous_cohort_uses_same_jones_source_block():
+    from camera_software.complex_optical_operators import (
+        ComplexOpticalOperator,
+        ComplexOperatorStateBlock,
+        ComplexSourceMode,
+        TransverseBasis,
+        install_source_mode_block,
+    )
+
+    tracer = _tracer(np.array([450e-9, 500e-9, 600e-9, 700e-9]))
+    tracer.configure_spectral_luts(
+        np.zeros(4, np.int32),
+        np.array([0, 2], np.int32),
+        np.array([4.0e14, 7.5e14]),
+        np.ones(2),
+    )
+    _add_arena(tracer)
+    tags = np.asarray([
+        0x100000001, 0x200000002, 0x300000003, 0x400000004,
+    ], np.uint64)
+    coherences = [
+        0xA000000010, 0xB000000020, 0xC000000030, 0xD000000040,
+    ]
+    block = ComplexOperatorStateBlock()
+    block.add_basis(TransverseBasis.from_direction((0.0, 0.0, 1.0)))
+    block.add_operator(ComplexOpticalOperator())
+    for coherence in coherences:
+        block.add_source_mode(ComplexSourceMode(
+            jones=np.asarray([1.0, 1.0]),
+            power_weight=1.0,
+            coherence_id=coherence,
+            basis_id=0,
+        ))
+    install_source_mode_block(tracer, tags, block)
+    tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+    tracer.submit_rays(
+        np.array([
+            [x, 0.0, -0.05] for x in (-0.003, -0.001, 0.001, 0.003)
+        ]),
+        np.tile([0.0, 0.0, 1.0], (4, 1)),
+        np.ones((4, 4), np.complex128),
+        tags=tags,
+        max_bounces=1,
+        min_amplitude=1e-12,
+    )
+    _wait(tracer)
+
+    arena = tracer.wave_arena_stats()[0]
+    assert arena["spectral_mode"] == 1
+    active = [lane for lane in arena["lanes"] if lane["active"]]
+    assert [lane["coherence_id"] for lane in active] == coherences
+    for lane in range(4):
+        s_field = tracer.wave_arena_field_snapshot(0, 0, 0, lane)
+        p_field = tracer.wave_arena_field_snapshot(0, 0, 1, lane)
+        s = np.asarray(s_field["re"]) + 1j*np.asarray(s_field["im"])
+        p = np.asarray(p_field["re"]) + 1j*np.asarray(p_field["im"])
+        np.testing.assert_allclose(p, s, rtol=4e-5, atol=2e-7)
+
+
 def test_continuous_cohort_marches_linked_field_chain_only_once():
     tracer = _tracer(np.array([450e-9, 500e-9, 600e-9, 700e-9]))
     tracer.configure_spectral_luts(
@@ -400,6 +512,14 @@ def test_continuous_cohort_marches_linked_field_chain_only_once():
 
 def test_gpu_t1_routes_empty_space_continuous_cohort_to_t4():
     """Exercise GPU T1 itself: gpu_all_stages leaves no CPU T1 worker alive."""
+    from camera_software.complex_optical_operators import (
+        ComplexOpticalOperator,
+        ComplexOperatorStateBlock,
+        ComplexSourceMode,
+        TransverseBasis,
+        install_source_mode_block,
+    )
+
     tracer = _tracer(np.array([450e-9, 500e-9, 600e-9, 700e-9]))
     tracer.configure_spectral_luts(
         np.zeros(4, np.int32),
@@ -408,6 +528,22 @@ def test_gpu_t1_routes_empty_space_continuous_cohort_to_t4():
         np.ones(2),
     )
     _add_arena(tracer)
+    tags = np.array([11, 22, 33, 44], np.uint64)
+    coherences = [
+        0x1000000000B, 0x20000000016, 0x30000000021, 0x4000000002C,
+    ]
+    block = ComplexOperatorStateBlock()
+    block.add_basis(TransverseBasis.from_direction((0.0, 0.0, 1.0)))
+    block.add_operator(ComplexOpticalOperator())
+    for coherence in coherences:
+        block.add_source_mode(ComplexSourceMode(
+            jones=np.asarray([1.0, 1.0j]),
+            power_weight=1.0,
+            coherence_id=coherence,
+            basis_id=0,
+            operator_id=0,
+        ))
+    install_source_mode_block(tracer, tags, block)
     tracer.ensure_pipeline(
         max_children=1,
         min_amplitude=1e-12,
@@ -416,7 +552,6 @@ def test_gpu_t1_routes_empty_space_continuous_cohort_to_t4():
         shader_dir="csrc/shaders",
     )
     origins = np.array([[x, 0.0, -0.05] for x in (-0.003, -0.001, 0.001, 0.003)])
-    tags = np.array([11, 22, 33, 44], np.uint64)
     tracer.submit_rays(
         origins,
         np.tile([0.0, 0.0, 1.0], (4, 1)),
@@ -432,7 +567,16 @@ def test_gpu_t1_routes_empty_space_continuous_cohort_to_t4():
     assert arena["generation"] == 1
     assert arena["spectral_mode"] == 1
     assert len(active) == 4
-    assert [lane["coherence_id"] for lane in active] == tags.tolist()
+    assert [lane["coherence_id"] for lane in active] == coherences
+    for lane in range(4):
+        s_field = tracer.wave_arena_field_snapshot(0, 0, 0, lane)
+        p_field = tracer.wave_arena_field_snapshot(0, 0, 1, lane)
+        s = np.asarray(s_field["re"]) + 1j*np.asarray(s_field["im"])
+        p = np.asarray(p_field["re"]) + 1j*np.asarray(p_field["im"])
+        illuminated = np.abs(s) > float(np.max(np.abs(s))) * 1.0e-6
+        np.testing.assert_allclose(
+            p[illuminated], 1j*s[illuminated], rtol=5e-5
+        )
     assert arena["boundary"]["output_ray_power"] == pytest.approx(
         arena["boundary"]["propagated_field_power"], rel=3.0e-5
     )

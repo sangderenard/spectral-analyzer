@@ -67,8 +67,10 @@ backward p
 ```
 
 It marches every active component. The missing vector behavior is localized
-at the adapters: current entry seeds only s, and current exit reduces combined
-s/p power to one scalar ray amplitude.
+at the remaining exit adapter: source-tagged production entry now resolves
+the persistent source/basis/operator block and seeds s/p, while current exit
+still reduces combined s/p power to one scalar ray amplitude. Untagged legacy
+rays deliberately retain the s-only specialization.
 
 A reusable `JonesFieldState` reference adapter now drives both components
 through the production native aperture-material and angular-spectrum kernels.
@@ -92,6 +94,8 @@ leaving the production ray-pipeline boundary honestly unfinished.
   - bake: 8x width, 64x samples, 16 propagation substeps;
 - the production exact-lane absorbing exterior after every substep, with only
   the central requested field published to the OpenGL panels.
+- live switching between perceptual fixed bands and stratified
+  continuous-frequency cohorts at exact widths `1,3,4,8,16,32`.
 
 The blade material is isotropic, so it does not invent polarization conversion.
 The demo is a qualification and visualization client of shared production T4
@@ -135,17 +139,20 @@ Do not weaken these while continuing:
 
 ## Honest incompleteness
 
-- The fixed-stride source-mode ABI and contiguous graph block exist, but are
-  not yet installed as a native `RayPipelineState` side block.
+- Source modes, transverse bases, and Jones/differential operators are
+  installed in one cold, aligned native `RayPipelineState` allocation. Compact
+  16-byte tag bindings index deduplicated 48-byte source modes, so many rays
+  can share a mode without widening ordinary CPU/GPU intent records.
 - Ordinary T3 material boundaries do not yet apply the canonical Jones
   interface operators.
 - Exact T2 computes full tangent maps through the native helper, but the hot
   transport path does not yet compose those maps into an indexed operator
   record.
-- T4 entry still seeds only s.
+- T4 entry is Jones-complete for configured source records in fixed and
+  continuous modes; the legacy no-record specialization remains s-only.
 - T4 exit still collapses vector field state to scalar complex ray amplitude.
-- Full Jones projector textures and continuous-frequency Jones launch remain
-  unwired.
+- Full Jones projector textures remain unwired. Programmatic fixed and
+  continuous Jones launches are wired through the shared source-mode API.
 - Finite projector pupil-fill and condenser/relay source optics remain after
   the vector boundary is correct.
 
@@ -153,8 +160,8 @@ Do not weaken these while continuing:
 
 ### 1. Pipeline-owned complex source state
 
-- Install the implemented persistent contiguous source-mode block in
-  `RayPipelineState`/the installed optical graph.
+- Completed: one persistent allocation containing source bindings, deduplicated
+  source modes, bases, and operators is owned by `RayPipelineState`.
 - Lower each emitter's coherent-mode decomposition into this block once per
   immutable source revision.
 - Store spectral/coherence identity, local transverse basis, Jones amplitudes,
@@ -164,6 +171,10 @@ Do not weaken these while continuing:
   vectors.
 - Define explicit lifetime, generation, invalid-handle, and child-copy rules.
 
+Ray tags are the stable handles. Configuration is accepted only with no work
+in flight; replacement atomically publishes a new immutable block. Tags and
+continuous-frequency state are copied unchanged by child CPU/GPU intents.
+
 Acceptance:
 
 - linear/circular/elliptical source reaches a wave port with both components;
@@ -171,6 +182,9 @@ Acceptance:
 - ordinary scalar rays have no additional dynamic allocation.
 
 ### 2. Jones-complete ray-to-T4 entry
+
+Completed for configured source records in both fixed-band and continuous
+cohort modes.
 
 - Construct the incidence/arena basis from ray direction and port frame.
 - Apply the indexed basis-change/Jones operator.

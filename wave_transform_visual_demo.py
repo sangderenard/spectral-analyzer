@@ -240,6 +240,8 @@ _APERTURE_POLARIZATION_MODES = (
     "partial", "unpolarized",
 )
 _APERTURE_QUALITY_MODES = ("balanced", "high", "bake")
+_APERTURE_SPECTRAL_MODES = ("fixed", "continuous")
+_APERTURE_LANE_COUNTS = (1, 3, 4, 8, 16, 32)
 
 
 def _aperture_polarization_state(name: str, angle_deg: float = 0.0):
@@ -273,6 +275,63 @@ def _aperture_polarization_state(name: str, angle_deg: float = 0.0):
     raise ValueError(
         f"unknown aperture polarization {name!r}; "
         f"expected {_APERTURE_POLARIZATION_MODES}"
+    )
+
+
+def _aperture_spectral_samples(
+    mode: str,
+    lane_count: int,
+    *,
+    wavelength_m: float,
+    sample_epoch: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return wavelengths and normalized field amplitudes for an experiment."""
+
+    key = str(mode).strip().lower()
+    count = int(lane_count)
+    if key not in _APERTURE_SPECTRAL_MODES:
+        raise ValueError(
+            f"spectral mode must be one of {_APERTURE_SPECTRAL_MODES}"
+        )
+    if count not in _APERTURE_LANE_COUNTS:
+        raise ValueError(
+            f"spectral lane count must be one of {_APERTURE_LANE_COUNTS}"
+        )
+    if key == "fixed":
+        if count == 1:
+            wavelengths = np.asarray([float(wavelength_m)], np.float64)
+            weights = np.ones(1, np.float64)
+        else:
+            from camera_software.transport_contract import (
+                perceptual_visible_bins,
+            )
+
+            bins = perceptual_visible_bins(count)
+            wavelengths = np.asarray(
+                [center*1.0e-9 for _lower, center, _upper in bins],
+                np.float64,
+            )
+            weights = np.asarray(
+                [upper-lower for lower, _center, upper in bins],
+                np.float64,
+            )
+            weights /= float(np.sum(weights))
+    else:
+        # A deterministic shifted stratification in frequency, not wavelength:
+        # lanes are arbitrary continuous samples and never become fixed bins.
+        speed = 299_792_458.0
+        frequency_min = speed / 700.0e-9
+        frequency_max = speed / 400.0e-9
+        shift = (int(sample_epoch) * 0.6180339887498949) % 1.0
+        u = (
+            (np.arange(count, dtype=np.float64) + 0.5) / count + shift
+        ) % 1.0
+        frequencies = frequency_min + u*(frequency_max-frequency_min)
+        wavelengths = speed/frequencies
+        weights = np.full(count, 1.0/count, np.float64)
+    return (
+        np.ascontiguousarray(wavelengths),
+        np.ascontiguousarray(np.sqrt(weights), np.float32),
     )
 
 
@@ -765,6 +824,8 @@ def run_aperture_live(
     fps: int = 30,
     polarization_mode: str = "radial",
     quality: str = "balanced",
+    spectral_mode: str = "fixed",
+    lane_count: int = 1,
     _max_display_frames: int | None = None,
 ) -> None:
     """Animate Jones-resolved interaction with physical material iris blades."""
@@ -781,6 +842,15 @@ def run_aperture_live(
     quality_key = str(quality).strip().lower()
     if quality_key not in _APERTURE_QUALITY_MODES:
         raise ValueError(f"quality must be one of {_APERTURE_QUALITY_MODES}")
+    spectral_key = str(spectral_mode).strip().lower()
+    if spectral_key not in _APERTURE_SPECTRAL_MODES:
+        raise ValueError(
+            f"spectral_mode must be one of {_APERTURE_SPECTRAL_MODES}"
+        )
+    if int(lane_count) not in _APERTURE_LANE_COUNTS:
+        raise ValueError(
+            f"lane_count must be one of {_APERTURE_LANE_COUNTS}"
+        )
     import pygame
     from OpenGL import GL as gl
     from camera_software.gpu_preview import (
@@ -802,7 +872,6 @@ def run_aperture_live(
         (1500, 820), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
     )
     tracer = _calibration_tracer(wavelength_m)
-    wavelengths = np.asarray([wavelength_m], np.float64)
     textures = [int(value) for value in gl.glGenTextures(6)]
     compositor = GLPreviewCompositor()
     compositor.init_gl()
@@ -829,6 +898,9 @@ def run_aperture_live(
     analyzer_angle_deg = 0.0
     polarization_index = _APERTURE_POLARIZATION_MODES.index(polarization_key)
     quality_index = _APERTURE_QUALITY_MODES.index(quality_key)
+    spectral_index = _APERTURE_SPECTRAL_MODES.index(spectral_key)
+    lane_index = _APERTURE_LANE_COUNTS.index(int(lane_count))
+    spectral_epoch = 0
     generation = 0
     displayed_frames = 0
     try:
@@ -853,6 +925,16 @@ def run_aperture_live(
                         quality_index = (
                             quality_index + 1
                         ) % len(_APERTURE_QUALITY_MODES)
+                    elif event.key == pygame.K_f:
+                        spectral_index = (
+                            spectral_index + 1
+                        ) % len(_APERTURE_SPECTRAL_MODES)
+                    elif event.key == pygame.K_l:
+                        lane_index = (
+                            lane_index + 1
+                        ) % len(_APERTURE_LANE_COUNTS)
+                    elif event.key == pygame.K_r:
+                        spectral_epoch += 1
                     elif event.key == pygame.K_LEFT:
                         analyzer_angle_deg -= 5.0
                     elif event.key == pygame.K_RIGHT:
@@ -868,6 +950,14 @@ def run_aperture_live(
                 phase, size, pitch_m,
             )
             active_quality = _APERTURE_QUALITY_MODES[quality_index]
+            active_spectral = _APERTURE_SPECTRAL_MODES[spectral_index]
+            active_lanes = _APERTURE_LANE_COUNTS[lane_index]
+            wavelengths, spectral_amplitudes = _aperture_spectral_samples(
+                active_spectral,
+                active_lanes,
+                wavelength_m=wavelength_m,
+                sample_epoch=spectral_epoch,
+            )
             domain = PaddedWaveDomain.for_quality(
                 (size, size), active_quality
             )
@@ -894,8 +984,10 @@ def run_aperture_live(
             active_polarization = _APERTURE_POLARIZATION_MODES[
                 polarization_index
             ]
+            scalar_field = domain.uniform_scalar_field(bands=active_lanes)
+            scalar_field *= spectral_amplitudes[:, None, None]
             initial = JonesFieldState.from_scalar_field(
-                domain.uniform_scalar_field(),
+                scalar_field,
                 _aperture_polarization_state(
                     active_polarization, source_angle_deg
                 ),
@@ -997,10 +1089,10 @@ def run_aperture_live(
                 )
                 labels = (
                     "PHYSICAL BLADES",
-                    "MODE 0 MATERIAL S",
-                    "MODE 0 MATERIAL P",
-                    "MODE 0 FORWARD S",
-                    "MODE 0 FORWARD P",
+                    f"MODE 0 {wavelengths[0]*1e9:.1f}NM MATERIAL S",
+                    f"MODE 0 {wavelengths[0]*1e9:.1f}NM MATERIAL P",
+                    f"MODE 0 {wavelengths[0]*1e9:.1f}NM FORWARD S",
+                    f"MODE 0 {wavelengths[0]*1e9:.1f}NM FORWARD P",
                     "REVERSE POLARIZATION",
                 )
             for texture, rgba in zip(textures, panels):
@@ -1050,6 +1142,7 @@ def run_aperture_live(
                 f"angle={source_angle_deg%180.0:.0f}deg "
                 f"modes={forward.mode_count} "
                 f"quality={active_quality} "
+                f"spectrum={active_spectral}:{active_lanes} "
                 f"solve={solve_width}x{solve_height}/{size}x{size} "
                 f"steps={domain.propagation_steps} "
                 f"diameter={2.0*opening*1e6:.2f} um "
@@ -1058,7 +1151,8 @@ def run_aperture_live(
                 f"edge={boundary['border_fraction']:.2e} "
                 f"phase={'RELATIVE' if piston_removed else 'ABSOLUTE'} "
                 f"{'PAUSED ' if paused else ''}"
-                "[J source, K quality, [/] source angle, arrows analyzer, V page, "
+                "[J source, K quality, F fixed/continuous, L lanes, "
+                "R resample, [/] source angle, arrows analyzer, V page, "
                 "P phase gauge, Space pause, Esc close]"
             )
             clock.tick(fps)
@@ -1314,6 +1408,19 @@ def main() -> int:
         default="balanced",
         help="hidden padded solve investment for --aperture-live",
     )
+    parser.add_argument(
+        "--aperture-spectrum",
+        choices=_APERTURE_SPECTRAL_MODES,
+        default="fixed",
+        help="fixed perceptual bands or continuous-frequency cohort",
+    )
+    parser.add_argument(
+        "--aperture-lanes",
+        type=int,
+        choices=_APERTURE_LANE_COUNTS,
+        default=1,
+        help="exact compiled lane width for --aperture-live",
+    )
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument(
         "--cycle-steps", type=int, default=120,
@@ -1328,6 +1435,8 @@ def main() -> int:
             fps=args.fps,
             polarization_mode=args.aperture_polarization,
             quality=args.aperture_quality,
+            spectral_mode=args.aperture_spectrum,
+            lane_count=args.aperture_lanes,
         )
         return 0
     if args.transport_live:

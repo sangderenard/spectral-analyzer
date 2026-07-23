@@ -251,9 +251,12 @@ The reference and shader ABIs now agree on basis rotation, Jones application,
 power-normalized dielectric Fresnel scattering, canonical phase-space
 coordinates, reference-OPL carrier phase, and caustic-safe ray/field gain. The
 native exact-lens helper returns full spectral-lane-specific 4x4 maps plus
-determinant and symplectic residual. T4 still seeds only its s field and reduces
-s/p output to a scalar ray; replacing those two boundary adapters is an
-explicit remaining gate, not an implied capability.
+determinant and symplectic residual. Production T4 entry now resolves a stable
+ray tag through a compact binding into the single-allocation, deduplicated
+source/basis/operator state and seeds both s and p for fixed bands and
+continuous cohorts. Legacy rays with no source record remain explicitly
+s-only. T4 still reduces s/p output to a scalar ray; replacing that exit
+adapter is an explicit remaining gate.
 
 A shared `JonesFieldState` reference adapter now keeps coherent source modes
 separate, drives both s and p components through the production native T4
@@ -261,7 +264,7 @@ aperture-material and angular-spectrum kernels, and accumulates only
 intensities into Stokes/analyzer views. The physical-aperture live demo uses
 that adapter to qualify vector transport. This demonstrates that the existing
 T4 kernels can carry the state; it does not claim that the scalar production
-ray-to-arena or arena-to-ray adapters have been replaced.
+arena-to-ray adapter has been replaced.
 
 The aperture qualification client now surrounds its visible crop with a
 power-of-two hidden solve domain and applies the production numerical exterior

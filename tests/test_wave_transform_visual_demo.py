@@ -6,6 +6,7 @@ import pytest
 
 from wave_transform_visual_demo import (
     _aperture_sweep_radius,
+    _aperture_spectral_samples,
     _remove_piston_phase,
     render_sequence,
     run_aperture_live,
@@ -41,6 +42,10 @@ def test_live_mode_validates_before_opening_a_context():
         run_aperture_live(size=16, polarization_mode="invented")
     with pytest.raises(ValueError, match="quality"):
         run_aperture_live(size=16, quality="reckless")
+    with pytest.raises(ValueError, match="spectral_mode"):
+        run_aperture_live(size=16, spectral_mode="quantized")
+    with pytest.raises(ValueError, match="lane_count"):
+        run_aperture_live(size=16, lane_count=2)
 
 
 def test_relative_phase_gauge_removes_only_global_piston():
@@ -68,3 +73,23 @@ def test_aperture_sweep_reaches_pinhole_and_clear_field_extremes():
     assert maximum < assembly
     assert sweep_min == pytest.approx(0.0)
     assert sweep_max == pytest.approx(1.0)
+
+
+def test_aperture_fixed_and_continuous_spectra_share_exact_lane_widths():
+    fixed_wavelengths, fixed_amplitudes = _aperture_spectral_samples(
+        "fixed", 4, wavelength_m=532.0e-9,
+    )
+    continuous_a, continuous_amplitudes = _aperture_spectral_samples(
+        "continuous", 4, wavelength_m=532.0e-9, sample_epoch=0,
+    )
+    continuous_b, _ = _aperture_spectral_samples(
+        "continuous", 4, wavelength_m=532.0e-9, sample_epoch=1,
+    )
+
+    assert fixed_wavelengths.shape == (4,)
+    assert continuous_a.shape == (4,)
+    assert np.sum(fixed_amplitudes**2) == pytest.approx(1.0)
+    assert np.sum(continuous_amplitudes**2) == pytest.approx(1.0)
+    assert not np.allclose(
+        continuous_a, continuous_b, rtol=1.0e-6, atol=1.0e-12
+    )

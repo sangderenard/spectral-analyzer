@@ -483,6 +483,65 @@ class ComplexOperatorStateBlock:
         }
 
 
+def install_source_mode_block(
+    tracer: Any,
+    ray_tags: np.ndarray,
+    state: ComplexOperatorStateBlock | dict[str, Any],
+    mode_indices: np.ndarray | None = None,
+) -> dict[str, int]:
+    """Install cold Jones/coherence modes using ray tags as stable handles.
+
+    ``mode_indices`` maps each tag onto a deduplicated source-mode record.  If
+    omitted, the block retains the convenient one-tag-per-mode convention.
+    """
+
+    frozen = state.freeze() if isinstance(
+        state, ComplexOperatorStateBlock
+    ) else dict(state)
+    tags = np.ascontiguousarray(ray_tags, np.uint64).reshape(-1)
+    modes = np.ascontiguousarray(frozen["source_modes"], np.uint32)
+    bases = np.ascontiguousarray(frozen["bases"], np.float32)
+    operators = np.ascontiguousarray(frozen["operators"], np.float32)
+    if modes.ndim != 2 or modes.shape[1] != 12:
+        raise ValueError("source mode block must have shape [N,12]")
+    if len(modes) and (len(bases) == 0 or len(operators) == 0):
+        raise ValueError(
+            "source modes require declared basis and operator tables"
+        )
+    if mode_indices is None:
+        if len(tags) != len(modes):
+            raise ValueError(
+                "one stable ray tag is required per source mode unless "
+                "mode_indices is supplied"
+            )
+        indices = np.arange(len(tags), dtype=np.uint32)
+    else:
+        raw_indices = np.asarray(mode_indices)
+        if raw_indices.ndim != 1 or len(raw_indices) != len(tags):
+            raise ValueError("mode_indices must have one entry per ray tag")
+        if not np.issubdtype(raw_indices.dtype, np.integer):
+            raise ValueError("mode_indices must contain integers")
+        if np.any(raw_indices < 0) or np.any(raw_indices >= len(modes)):
+            raise ValueError("mode_indices contains an invalid source mode")
+        indices = np.ascontiguousarray(raw_indices, np.uint32)
+    if len(np.unique(tags)) != len(tags):
+        raise ValueError("source mode ray tags must be unique")
+    configure = getattr(tracer, "configure_complex_source_modes", None)
+    if not callable(configure):
+        raise TypeError(
+            "optical tracer does not expose complex source-mode installation"
+        )
+    configure(tags, indices, modes, bases, operators)
+    return {
+        "source_binding_count": int(len(tags)),
+        "source_binding_stride_bytes": 16,
+        "source_mode_count": int(len(modes)),
+        "source_mode_stride_bytes": int(
+            frozen.get("source_mode_stride_bytes", 48)
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class LensPhaseSpaceBatch:
     matrices: np.ndarray
@@ -627,6 +686,7 @@ __all__ = [
     "ComplexOpticalOperator",
     "ComplexSourceMode",
     "ComplexOperatorStateBlock",
+    "install_source_mode_block",
     "LensPhaseSpaceBatch",
     "estimate_compound_lens_phase_space",
     "canonical_operator_contract",

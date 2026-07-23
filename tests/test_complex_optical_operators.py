@@ -214,6 +214,85 @@ def test_source_modes_are_fixed_stride_and_keep_coherence_outside_rays():
     assert first[8] == operator_id
 
 
+def test_source_mode_block_installer_uses_tags_without_repacking():
+    from camera_software.complex_optical_operators import (
+        ComplexSourceMode,
+        install_source_mode_block,
+    )
+
+    class Tracer:
+        def configure_complex_source_modes(
+            self, tags, indices, words, bases, operators,
+        ):
+            self.tags = tags.copy()
+            self.indices = indices.copy()
+            self.words = words.copy()
+            self.bases = bases.copy()
+            self.operators = operators.copy()
+
+    block = ComplexOperatorStateBlock()
+    block.add_basis(TransverseBasis.from_direction((0.0, 0.0, 1.0)))
+    block.add_operator(ComplexOpticalOperator())
+    block.add_source_mode(ComplexSourceMode(
+        jones=np.asarray([1.0, 1.0j]),
+        power_weight=0.5,
+        coherence_id=0x12345678ABCDEF01,
+        basis_id=3,
+        operator_id=7,
+    ))
+    tracer = Tracer()
+    receipt = install_source_mode_block(
+        tracer, np.asarray([0xFFEEDDCCBBAA0099], np.uint64), block,
+    )
+
+    assert receipt == {
+        "source_binding_count": 1,
+        "source_binding_stride_bytes": 16,
+        "source_mode_count": 1,
+        "source_mode_stride_bytes": 48,
+    }
+    assert tracer.tags.tolist() == [0xFFEEDDCCBBAA0099]
+    assert tracer.indices.tolist() == [0]
+    assert tracer.words.shape == (1, 12)
+
+
+def test_source_mode_block_installer_deduplicates_shared_modes():
+    from camera_software.complex_optical_operators import (
+        ComplexSourceMode,
+        install_source_mode_block,
+    )
+
+    class Tracer:
+        def configure_complex_source_modes(
+            self, tags, indices, words, bases, operators,
+        ):
+            self.tags = tags.copy()
+            self.indices = indices.copy()
+            self.words = words.copy()
+
+    block = ComplexOperatorStateBlock()
+    block.add_basis(TransverseBasis.from_direction((0.0, 0.0, 1.0)))
+    block.add_operator(ComplexOpticalOperator())
+    block.add_source_mode(ComplexSourceMode(
+        jones=np.asarray([1.0, 0.0]),
+        power_weight=1.0,
+        coherence_id=9,
+        basis_id=0,
+    ))
+    tracer = Tracer()
+    receipt = install_source_mode_block(
+        tracer,
+        np.asarray([11, 22, 33, 44], np.uint64),
+        block,
+        mode_indices=np.zeros(4, np.uint32),
+    )
+
+    assert receipt["source_binding_count"] == 4
+    assert receipt["source_mode_count"] == 1
+    assert tracer.indices.tolist() == [0, 0, 0, 0]
+    assert tracer.words.shape == (1, 12)
+
+
 def test_cpu_gpu_operator_abi_matches_and_declares_no_binding():
     cpu = (
         ROOT / "csrc/include/complex_optical_operators.h"

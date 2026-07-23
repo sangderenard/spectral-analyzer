@@ -30,6 +30,23 @@ struct alignas(16) PackedOperatorGpu {
     std::array<float, 16> phase_space{};
 };
 
+/* Three std430 vec4 slots. The Jones vector is normalized; power_weight is a
+ * power fraction. Distinct coherence ids are accumulated incoherently. */
+struct alignas(16) PackedSourceModeGpu {
+    float amplitude_s_re;
+    float amplitude_s_im;
+    float amplitude_p_re;
+    float amplitude_p_im;
+    float power_weight;
+    std::uint32_t coherence_lo;
+    std::uint32_t coherence_hi;
+    std::uint32_t basis_id;
+    std::uint32_t operator_id;
+    std::uint32_t flags;
+    std::uint32_t reserved0;
+    std::uint32_t reserved1;
+};
+
 static_assert(std::is_standard_layout<PackedTransverseBasisGpu>::value,
               "basis record must be standard layout");
 static_assert(std::is_standard_layout<PackedOperatorGpu>::value,
@@ -38,5 +55,7 @@ static_assert(sizeof(PackedTransverseBasisGpu) == 32,
               "basis record must be two vec4 slots");
 static_assert(sizeof(PackedOperatorGpu) == 96,
               "operator record must be six vec4 slots");
+static_assert(sizeof(PackedSourceModeGpu) == 48,
+              "source mode must be three vec4 slots");
 
 } // namespace complex_optical_operators

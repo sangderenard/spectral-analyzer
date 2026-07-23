@@ -123,11 +123,23 @@ per-ray reference is not allowed.
   - deterministic CPU/reference bases, Jones algebra, Fresnel scattering,
     coherent-mode decomposition support, carrier phase, canonical tangent
     maps, composition/inversion, symplectic diagnostics, caustic-safe
-    ray-to-field gain, and contiguous state-block packing.
+    ray-to-field gain, and contiguous state-block packing, including fixed
+    48-byte coherent source-mode records.
 - `csrc/include/complex_optical_operators.h`
-  - binding-independent 32-byte basis and 96-byte combined operator records.
+  - binding-independent 32-byte basis, 96-byte combined operator, and 48-byte
+    source-mode records.
 - `csrc/shaders/complex_optical_operators.glsl.inc`
-  - binding-independent GLSL records and Jones/basis/determinant operations.
+  - matching binding-independent GLSL records and Jones/basis/determinant
+    operations.
+- `camera_software/vector_wave_adapter.py`
+  - a reusable reference boundary adapter that keeps coherent modes separate,
+    drives both native T4 transverse components through the production
+    aperture-material and angular-spectrum kernels, and combines modes only
+    into Stokes/analyzer intensity.
+- `wave_transform_visual_demo.py --aperture-live`
+  - qualifies linear, circular, radial, azimuthal, partial, and unpolarized
+    source states through finite material blades with vector/Stokes and
+    coherent-component diagnostic pages.
 - `lens_optics_estimate_phase_space_jacobians`
   - threaded native exact-lens central finite differences returning the full
     signed 4x4 matrix, determinant, symplectic residual, and validity per ray.
@@ -138,14 +150,17 @@ per-ray reference is not allowed.
 
 ## Deliberately not claimed complete
 
-The current native T4 arena already owns forward/backward s/p field planes,
-but the production boundary still seeds only s and reduces the exit field to
-one scalar ray amplitude. The new operator ABI makes the correct replacement
-possible; it does not disguise the old adapter as Jones-complete.
+The current native T4 arena already owns forward/backward s/p field planes.
+The reusable reference adapter now seeds and propagates both components, so
+the material and propagation kernels can be qualified without a demo-private
+solver. The production ray-pipeline boundary still seeds only s and reduces
+the exit field to one scalar ray amplitude. The reference adapter does not
+disguise that old hot-path adapter as Jones-complete.
 
 The next implementation gate is:
 
-1. lower source coherent-mode/Jones data into a pipeline-owned side block;
+1. install the implemented fixed-stride source-mode block in
+   `RayPipelineState`;
 2. carry only its stable handle through ordinary ray stages;
 3. apply interface Jones operators at physical material boundaries;
 4. seed both T4 transverse components in the declared entry basis;
@@ -156,3 +171,25 @@ The next implementation gate is:
 
 No new per-ray N-lane payload and no shader-hot object construction are
 authorized by this contract.
+
+## Physical-aperture vector qualification
+
+Run:
+
+```powershell
+python wave_transform_visual_demo.py --aperture-live --aperture-polarization radial
+```
+
+The live view uses the real finite-thickness blade material and production
+native T4 kernels. `J` cycles source states; `[` and `]` rotate the source
+orientation; Left/Right rotate the analyzer; `V` switches between Stokes and
+coherent-component phase pages; `P` switches relative and absolute phase;
+Space pauses.
+
+The Stokes page shows the material aperture, total intensity, spatial
+polarization, normalized Q and V, and a rotatable analyzer. The coherent page
+shows s/p phase before and after propagation for one explicitly selected
+coherence mode. Partial and unpolarized sources are never summed as complex
+amplitudes. Because the current blade material is isotropic, it correctly
+does not manufacture polarization conversion; radial and azimuthal inputs
+still expose spatially varying vector diffraction.

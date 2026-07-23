@@ -37,6 +37,8 @@ def test_live_mode_validates_before_opening_a_context():
         run_transport_live(panel_size=32)
     with pytest.raises(ValueError, match="power of two"):
         run_aperture_live(size=15)
+    with pytest.raises(ValueError, match="polarization"):
+        run_aperture_live(size=16, polarization_mode="invented")
 
 
 def test_relative_phase_gauge_removes_only_global_piston():

@@ -364,12 +364,65 @@ class ComplexOpticalOperator:
         return np.concatenate((self.jones.packed(), self.phase_space.packed()))
 
 
+@dataclass(frozen=True)
+class ComplexSourceMode:
+    """One coherent Jones source mode stored outside ordinary ray records."""
+
+    jones: np.ndarray
+    power_weight: float
+    coherence_id: int
+    basis_id: int
+    operator_id: int = 0
+    flags: int = 0
+
+    def __post_init__(self) -> None:
+        field = np.asarray(self.jones, np.complex128).reshape(2)
+        norm = float(np.linalg.norm(field))
+        if not np.all(np.isfinite(field)) or norm <= _EPS:
+            raise ValueError("source Jones mode must be finite and non-zero")
+        weight = float(self.power_weight)
+        if not math.isfinite(weight) or weight < 0.0:
+            raise ValueError("source-mode power weight must be finite and non-negative")
+        if not 0 <= int(self.coherence_id) <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("coherence_id must fit uint64")
+        for name, value in (
+            ("basis_id", self.basis_id),
+            ("operator_id", self.operator_id),
+            ("flags", self.flags),
+        ):
+            if not 0 <= int(value) <= 0xFFFFFFFF:
+                raise ValueError(f"{name} must fit uint32")
+        object.__setattr__(self, "jones", field / norm)
+        object.__setattr__(self, "power_weight", weight)
+
+    def packed_words(self) -> np.ndarray:
+        """Three std430 vec4 slots represented as exact uint32 words."""
+
+        words = np.zeros(12, np.uint32)
+        floats = words.view(np.float32)
+        floats[:5] = (
+            self.jones[0].real,
+            self.jones[0].imag,
+            self.jones[1].real,
+            self.jones[1].imag,
+            self.power_weight,
+        )
+        coherence = int(self.coherence_id)
+        words[5] = np.uint32(coherence & 0xFFFFFFFF)
+        words[6] = np.uint32((coherence >> 32) & 0xFFFFFFFF)
+        words[7] = np.uint32(self.basis_id)
+        words[8] = np.uint32(self.operator_id)
+        words[9] = np.uint32(self.flags)
+        return words
+
+
 class ComplexOperatorStateBlock:
     """Contiguous cold-built basis/operator tables with stable integer handles."""
 
     def __init__(self) -> None:
         self._bases: list[TransverseBasis] = []
         self._operators: list[ComplexOpticalOperator] = []
+        self._source_modes: list[ComplexSourceMode] = []
 
     def add_basis(self, basis: TransverseBasis) -> int:
         self._bases.append(basis)
@@ -378,6 +431,31 @@ class ComplexOperatorStateBlock:
     def add_operator(self, operator: ComplexOpticalOperator) -> int:
         self._operators.append(operator)
         return len(self._operators) - 1
+
+    def add_source_mode(self, mode: ComplexSourceMode) -> int:
+        self._source_modes.append(mode)
+        return len(self._source_modes) - 1
+
+    def add_polarization_modes(
+        self,
+        polarization: Any,
+        *,
+        basis_id: int,
+        operator_id: int = 0,
+        coherence_seed: int = 0,
+    ) -> tuple[int, ...]:
+        handles = []
+        for mode_index, (weight, jones) in enumerate(
+            polarization.coherent_mode_decomposition()
+        ):
+            handles.append(self.add_source_mode(ComplexSourceMode(
+                jones=jones,
+                power_weight=float(weight),
+                coherence_id=int(coherence_seed) + mode_index,
+                basis_id=int(basis_id),
+                operator_id=int(operator_id),
+            )))
+        return tuple(handles)
 
     def freeze(self) -> dict[str, Any]:
         bases = np.ascontiguousarray(
@@ -388,12 +466,20 @@ class ComplexOperatorStateBlock:
             np.stack([value.packed() for value in self._operators], axis=0)
             if self._operators else np.empty((0, 24), np.float32)
         )
+        source_modes = np.ascontiguousarray(
+            np.stack(
+                [value.packed_words() for value in self._source_modes], axis=0
+            )
+            if self._source_modes else np.empty((0, 12), np.uint32)
+        )
         return {
             "schema": COMPLEX_OPTICAL_OPERATOR_SCHEMA,
             "bases": bases,
             "operators": operators,
+            "source_modes": source_modes,
             "basis_stride_bytes": 32,
             "operator_stride_bytes": 96,
+            "source_mode_stride_bytes": 48,
         }
 
 
@@ -539,6 +625,7 @@ __all__ = [
     "PhaseSpaceJacobian",
     "optical_phase",
     "ComplexOpticalOperator",
+    "ComplexSourceMode",
     "ComplexOperatorStateBlock",
     "LensPhaseSpaceBatch",
     "estimate_compound_lens_phase_space",

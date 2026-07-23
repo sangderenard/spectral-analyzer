@@ -5,6 +5,7 @@
 #define COMPLEX_OPTICAL_OPERATOR_SCHEMA_VERSION 1u
 #define COMPLEX_BASIS_WORDS 8u
 #define COMPLEX_OPERATOR_WORDS 24u
+#define COMPLEX_SOURCE_MODE_WORDS 12u
 
 struct ComplexTransverseBasis {
     vec4 s;
@@ -15,6 +16,18 @@ struct ComplexOpticalOperator {
     vec4 jones_row0;
     vec4 jones_row1;
     mat4 phase_space;
+};
+
+struct ComplexSourceMode {
+    vec4 amplitudes;
+    float power_weight;
+    uint coherence_lo;
+    uint coherence_hi;
+    uint basis_id;
+    uint operator_id;
+    uint flags;
+    uint reserved0;
+    uint reserved1;
 };
 
 vec2 complex_mul(vec2 a, vec2 b) {

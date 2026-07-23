@@ -36,6 +36,9 @@ The repository was clean before this handoff document was added.
 - Full state lives in graph-owned contiguous tables:
   - 32-byte right-handed transverse-basis records;
   - 96-byte combined Jones/canonical differential operator records.
+  - 48-byte coherent source-mode records containing normalized Jones
+    amplitudes, power, 64-bit coherence identity, and stable basis/operator
+    handles.
 - CPU reference, C++ ABI, and GLSL ABI agree on:
   - `s x p = k`;
   - Jones column order `[E_s, E_p]`;
@@ -66,6 +69,27 @@ backward p
 It marches every active component. The missing vector behavior is localized
 at the adapters: current entry seeds only s, and current exit reduces combined
 s/p power to one scalar ray amplitude.
+
+A reusable `JonesFieldState` reference adapter now drives both components
+through the production native aperture-material and angular-spectrum kernels.
+It preserves independent coherent modes and produces Stokes/analyzer
+intensity only after propagation. This qualifies the vector kernel path while
+leaving the production ray-pipeline boundary honestly unfinished.
+
+### Physical-aperture vector demo
+
+`wave_transform_visual_demo.py --aperture-live` now provides:
+
+- linear, circular, radial, azimuthal, partial, and unpolarized sources;
+- independent coherent-mode propagation for partial/unpolarized light;
+- Stokes I/Q/U/V, spatial polarization, and rotatable analyzer views;
+- coherent s/p material and propagated phase views;
+- forward and reverse vector propagation through real finite material blades;
+- relative-phase display with piston removed, or absolute phase on demand.
+
+The blade material is isotropic, so it does not invent polarization conversion.
+The demo is a qualification and visualization client of shared production T4
+kernels, not a station-owned or demo-owned solver.
 
 ## Verified numerical properties
 
@@ -105,8 +129,8 @@ Do not weaken these while continuing:
 
 ## Honest incompleteness
 
-- Source Jones/coherent-mode state is not yet lowered into a pipeline-owned
-  native side block.
+- The fixed-stride source-mode ABI and contiguous graph block exist, but are
+  not yet installed as a native `RayPipelineState` side block.
 - Ordinary T3 material boundaries do not yet apply the canonical Jones
   interface operators.
 - Exact T2 computes full tangent maps through the native helper, but the hot
@@ -123,7 +147,7 @@ Do not weaken these while continuing:
 
 ### 1. Pipeline-owned complex source state
 
-- Add a persistent contiguous source-mode block owned by
+- Install the implemented persistent contiguous source-mode block in
   `RayPipelineState`/the installed optical graph.
 - Lower each emitter's coherent-mode decomposition into this block once per
   immutable source revision.

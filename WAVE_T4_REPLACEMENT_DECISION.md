@@ -255,6 +255,14 @@ determinant and symplectic residual. T4 still seeds only its s field and reduces
 s/p output to a scalar ray; replacing those two boundary adapters is an
 explicit remaining gate, not an implied capability.
 
+A shared `JonesFieldState` reference adapter now keeps coherent source modes
+separate, drives both s and p components through the production native T4
+aperture-material and angular-spectrum kernels, and accumulates only
+intensities into Stokes/analyzer views. The physical-aperture live demo uses
+that adapter to qualify vector transport. This demonstrates that the existing
+T4 kernels can carry the state; it does not claim that the scalar production
+ray-to-arena or arena-to-ray adapters have been replaced.
+
 ## Removal gates
 
 Legacy production paths are deleted only after the replacement passes:

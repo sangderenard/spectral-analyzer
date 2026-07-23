@@ -172,6 +172,108 @@ def _scalar_rgba(values: np.ndarray, *, relative_peak: float | None = None) -> n
     ).astype(np.uint8)
 
 
+def _signed_scalar_rgba(values: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """Diverging blue/black/red display for signed Stokes components."""
+
+    signed = np.asarray(values, np.float64)
+    denominator = np.maximum(np.asarray(scale, np.float64), 1.0e-30)
+    normalized = np.clip(signed / denominator, -1.0, 1.0)
+    magnitude = np.sqrt(np.abs(normalized))
+    rgb = np.zeros((*signed.shape, 3), np.float64)
+    positive = normalized >= 0.0
+    rgb[..., 0] = np.where(positive, magnitude, 0.12 * magnitude)
+    rgb[..., 1] = 0.16 * magnitude
+    rgb[..., 2] = np.where(positive, 0.12 * magnitude, magnitude)
+    alpha = (denominator > float(np.max(denominator)) * 1.0e-10).astype(
+        np.float64
+    )
+    return np.clip(
+        np.concatenate((rgb, alpha[..., None]), axis=2) * 255.0,
+        0.0, 255.0,
+    ).astype(np.uint8)
+
+
+def _polarization_rgba(stokes: tuple[np.ndarray, ...]) -> np.ndarray:
+    """Map polarization orientation to hue and degree to saturation."""
+
+    intensity, q, u, v = (np.asarray(value, np.float64) for value in stokes)
+    peak = float(np.max(intensity))
+    value = np.zeros_like(intensity) if peak <= 0.0 else np.sqrt(
+        np.clip(intensity / peak, 0.0, 1.0)
+    )
+    degree = np.clip(
+        np.sqrt(q*q + u*u + v*v) / np.maximum(intensity, 1.0e-30),
+        0.0, 1.0,
+    )
+    orientation = 0.5 * np.arctan2(u, q)
+    hue = (orientation / np.pi + 0.5) % 1.0
+    # Circular handedness brightens red/blue around the orientation hue while
+    # retaining a continuous orientation map for linear states.
+    handed = np.clip(v / np.maximum(intensity, 1.0e-30), -1.0, 1.0)
+    hue = (hue + 0.14 * handed) % 1.0
+    saturation = 0.18 + 0.82 * degree
+    scaled = hue * 6.0
+    sector = np.floor(scaled).astype(np.int32) % 6
+    fraction = scaled - np.floor(scaled)
+    p = value * (1.0 - saturation)
+    qv = value * (1.0 - fraction * saturation)
+    t = value * (1.0 - (1.0 - fraction) * saturation)
+    rgb = np.zeros((*intensity.shape, 3), np.float64)
+    choices = (
+        (value, t, p), (qv, value, p), (p, value, t),
+        (p, qv, value), (t, p, value), (value, p, qv),
+    )
+    for index, channels in enumerate(choices):
+        mask = sector == index
+        for channel, channel_values in enumerate(channels):
+            rgb[..., channel][mask] = channel_values[mask]
+    alpha = (intensity > peak * 1.0e-10).astype(np.float64)
+    return np.clip(
+        np.concatenate((rgb, alpha[..., None]), axis=2) * 255.0,
+        0.0, 255.0,
+    ).astype(np.uint8)
+
+
+_APERTURE_POLARIZATION_MODES = (
+    "linear", "circular+", "circular-", "radial", "azimuthal",
+    "partial", "unpolarized",
+)
+
+
+def _aperture_polarization_state(name: str, angle_deg: float = 0.0):
+    from camera_designer.emitter_profile import (
+        PolarizationMode,
+        PolarizationState,
+    )
+
+    key = str(name).strip().lower()
+    if key == "linear":
+        return PolarizationState(
+            mode=PolarizationMode.LINEAR, angle_deg=float(angle_deg)
+        )
+    if key in {"circular+", "circular-"}:
+        return PolarizationState(
+            mode=PolarizationMode.CIRCULAR,
+            handedness=1 if key.endswith("+") else -1,
+        )
+    if key == "radial":
+        return PolarizationState(mode=PolarizationMode.RADIAL)
+    if key == "azimuthal":
+        return PolarizationState(mode=PolarizationMode.AZIMUTHAL)
+    if key == "partial":
+        return PolarizationState(
+            mode=PolarizationMode.LINEAR,
+            angle_deg=float(angle_deg),
+            degree_of_polarization=0.45,
+        )
+    if key == "unpolarized":
+        return PolarizationState(mode=PolarizationMode.UNPOLARIZED)
+    raise ValueError(
+        f"unknown aperture polarization {name!r}; "
+        f"expected {_APERTURE_POLARIZATION_MODES}"
+    )
+
+
 def _labelled_panel(rgba: np.ndarray, label: str, scale: int) -> Image.Image:
     panel = Image.fromarray(rgba, "RGBA")
     if scale != 1:
@@ -654,18 +756,27 @@ def run_aperture_live(
     pitch_m: float = 0.75e-6,
     wavelength_m: float = 532.0e-9,
     fps: int = 30,
+    polarization_mode: str = "radial",
     _max_display_frames: int | None = None,
 ) -> None:
-    """Animate reciprocal constant-field interaction with physical iris blades."""
+    """Animate Jones-resolved interaction with physical material iris blades."""
 
     if size < 8 or size & (size-1):
         raise ValueError("size must be a power of two and at least 8")
+    if fps < 1:
+        raise ValueError("fps must be positive")
+    polarization_key = str(polarization_mode).strip().lower()
+    if polarization_key not in _APERTURE_POLARIZATION_MODES:
+        raise ValueError(
+            f"polarization_mode must be one of {_APERTURE_POLARIZATION_MODES}"
+        )
     import pygame
     from OpenGL import GL as gl
     from camera_software.gpu_preview import (
         GLPreviewCompositor, PreviewProductKind, PreviewTextureProduct,
     )
     from camera_software.physical_aperture import LivePhysicalAperture
+    from camera_software.vector_wave_adapter import JonesFieldState
 
     pygame.init()
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
@@ -674,11 +785,11 @@ def run_aperture_live(
         pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE
     )
     pygame.display.set_mode(
-        (1440, 420), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
+        (1500, 820), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
     )
     tracer = _calibration_tracer(wavelength_m)
     wavelengths = np.asarray([wavelength_m], np.float64)
-    textures = [int(value) for value in gl.glGenTextures(4)]
+    textures = [int(value) for value in gl.glGenTextures(6)]
     compositor = GLPreviewCompositor()
     compositor.init_gl()
     for texture in textures:
@@ -699,6 +810,10 @@ def run_aperture_live(
     running = True
     paused = False
     piston_removed = True
+    vector_page = True
+    source_angle_deg = 0.0
+    analyzer_angle_deg = 0.0
+    polarization_index = _APERTURE_POLARIZATION_MODES.index(polarization_key)
     generation = 0
     displayed_frames = 0
     try:
@@ -713,6 +828,20 @@ def run_aperture_live(
                         paused = not paused
                     elif event.key == pygame.K_p:
                         piston_removed = not piston_removed
+                    elif event.key == pygame.K_v:
+                        vector_page = not vector_page
+                    elif event.key == pygame.K_j:
+                        polarization_index = (
+                            polarization_index + 1
+                        ) % len(_APERTURE_POLARIZATION_MODES)
+                    elif event.key == pygame.K_LEFT:
+                        analyzer_angle_deg -= 5.0
+                    elif event.key == pygame.K_RIGHT:
+                        analyzer_angle_deg += 5.0
+                    elif event.key == pygame.K_LEFTBRACKET:
+                        source_angle_deg -= 5.0
+                    elif event.key == pygame.K_RIGHTBRACKET:
+                        source_angle_deg += 5.0
             if not paused:
                 generation += 1
             phase = generation*0.018
@@ -731,46 +860,97 @@ def run_aperture_live(
                 material_n_imag=3.0,
             )
             payload = aperture.wave_payload()
-            forward_re = np.ones((1, size, size), np.float32)
-            forward_im = np.zeros_like(forward_re)
-            reverse_re, reverse_im = forward_re.copy(), forward_im.copy()
-            tracer.t4_apply_aperture_material(
-                1, size, size, pitch_m, aperture.thickness_m, 1,
-                wavelengths, payload, forward_re, forward_im,
+            active_polarization = _APERTURE_POLARIZATION_MODES[
+                polarization_index
+            ]
+            initial = JonesFieldState.from_scalar_field(
+                np.ones((size, size), np.complex64),
+                _aperture_polarization_state(
+                    active_polarization, source_angle_deg
+                ),
+                coherence_seed=generation << 8,
             )
-            material_field = (
-                forward_re[0].astype(np.float64)
-                + 1j*forward_im[0].astype(np.float64)
+            material, accounting = initial.apply_isotropic_material_native(
+                tracer,
+                pitch_m=pitch_m,
+                distance_m=aperture.thickness_m,
+                direction_sign=1,
+                wavelengths_m=wavelengths,
+                payload=payload,
             )
-            tracer.t4_apply_aperture_material(
-                1, size, size, pitch_m, aperture.thickness_m, -1,
-                wavelengths, payload, reverse_re, reverse_im,
+            reverse_material, _reverse_accounting = (
+                initial.apply_isotropic_material_native(
+                    tracer,
+                    pitch_m=pitch_m,
+                    distance_m=aperture.thickness_m,
+                    direction_sign=-1,
+                    wavelengths_m=wavelengths,
+                    payload=payload,
+                )
             )
             distance = 90.0e-6
-            tracer.t4_angular_spectrum_step(
-                1, size, size, pitch_m, distance, 1,
-                wavelengths, forward_re, forward_im,
+            forward = material.propagate_native(
+                tracer,
+                pitch_m=pitch_m,
+                distance_m=distance,
+                direction_sign=1,
+                wavelengths_m=wavelengths,
             )
-            tracer.t4_angular_spectrum_step(
-                1, size, size, pitch_m, distance, -1,
-                wavelengths, reverse_re, reverse_im,
+            reverse = reverse_material.propagate_native(
+                tracer,
+                pitch_m=pitch_m,
+                distance_m=distance,
+                direction_sign=-1,
+                wavelengths_m=wavelengths,
             )
-            forward = (
-                forward_re[0].astype(np.float64)
-                + 1j*forward_im[0].astype(np.float64)
-            )
-            reverse = (
-                reverse_re[0].astype(np.float64)
-                + 1j*reverse_im[0].astype(np.float64)
-            )
-            panels = (
-                _aperture_geometry_rgba(aperture, size),
-                _phase_rgba(
-                    material_field, remove_piston=piston_removed,
-                ),
-                _phase_rgba(forward, remove_piston=piston_removed),
-                _phase_rgba(reverse, remove_piston=piston_removed),
-            )
+            forward_stokes = forward.stokes()
+            reverse_stokes = reverse.stokes()
+            if vector_page:
+                panels = (
+                    _aperture_geometry_rgba(aperture, size),
+                    _scalar_rgba(forward_stokes[0]),
+                    _polarization_rgba(forward_stokes),
+                    _signed_scalar_rgba(
+                        forward_stokes[1], forward_stokes[0]
+                    ),
+                    _signed_scalar_rgba(
+                        forward_stokes[3], forward_stokes[0]
+                    ),
+                    _scalar_rgba(
+                        forward.analyzer_intensity(analyzer_angle_deg)
+                    ),
+                )
+                labels = (
+                    "PHYSICAL BLADES",
+                    "STOKES I / POWER",
+                    "POLARIZATION",
+                    "STOKES Q / I",
+                    "STOKES V / I",
+                    f"ANALYZER {analyzer_angle_deg%180.0:.0f} DEG",
+                )
+            else:
+                # Phase is meaningful per coherent mode. Mode zero is shown
+                # explicitly; incoherent modes are never summed in amplitude.
+                material_s = material.fields[0, 0, 0]
+                material_p = material.fields[0, 1, 0]
+                forward_s = forward.fields[0, 0, 0]
+                forward_p = forward.fields[0, 1, 0]
+                panels = (
+                    _aperture_geometry_rgba(aperture, size),
+                    _phase_rgba(material_s, remove_piston=piston_removed),
+                    _phase_rgba(material_p, remove_piston=piston_removed),
+                    _phase_rgba(forward_s, remove_piston=piston_removed),
+                    _phase_rgba(forward_p, remove_piston=piston_removed),
+                    _polarization_rgba(reverse_stokes),
+                )
+                labels = (
+                    "PHYSICAL BLADES",
+                    "MODE 0 MATERIAL S",
+                    "MODE 0 MATERIAL P",
+                    "MODE 0 FORWARD S",
+                    "MODE 0 FORWARD P",
+                    "REVERSE POLARIZATION",
+                )
             for texture, rgba in zip(textures, panels):
                 gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
                 gl.glTexSubImage2D(
@@ -783,10 +963,10 @@ def run_aperture_live(
             gl.glClearColor(0.018, 0.025, 0.04, 1.0)
             gl.glClear(gl.GL_COLOR_BUFFER_BIT)
             gap = max(4, width//288)
-            pane_width = max(1, (width-gap*5)//4)
-            pane_height = max(1, height-gap*2)
-            labels = ("PHYSICAL BLADES", "MATERIAL EXIT", "FORWARD", "REVERSE")
+            pane_width = max(1, (width-gap*4)//3)
+            pane_height = max(1, (height-gap*3)//2)
             for index, texture in enumerate(textures):
+                row, column = divmod(index, 3)
                 compositor.draw(
                     PreviewTextureProduct(
                         product_id=f"t4.aperture.{index}",
@@ -802,7 +982,8 @@ def run_aperture_live(
                         alpha_mode="straight",
                     ),
                     (
-                        gap+index*(pane_width+gap), gap,
+                        gap+column*(pane_width+gap),
+                        gap+row*(pane_height+gap),
                         pane_width, pane_height,
                     ),
                     height,
@@ -811,12 +992,18 @@ def run_aperture_live(
             pygame.display.flip()
             displayed_frames += 1
             pygame.display.set_caption(
-                "Physical aperture — GEOMETRY | MATERIAL | FORWARD | REVERSE  "
+                "Vector physical aperture — "
+                f"{'STOKES' if vector_page else 'COHERENT PHASE'}  "
+                f"source={active_polarization} "
+                f"angle={source_angle_deg%180.0:.0f}deg "
+                f"modes={forward.mode_count} "
                 f"diameter={2.0*opening*1e6:.2f} um "
                 f"range={sweep*100.0:.1f}% "
+                f"retention={accounting['output_power']/max(accounting['input_power'],1e-30):.5f} "
                 f"phase={'RELATIVE' if piston_removed else 'ABSOLUTE'} "
                 f"{'PAUSED ' if paused else ''}"
-                "[Space pause, P phase gauge, Esc close]"
+                "[J source, [/] source angle, arrows analyzer, V page, "
+                "P phase gauge, Space pause, Esc close]"
             )
             clock.tick(fps)
             if (
@@ -1057,7 +1244,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--aperture-live", action="store_true",
-        help="animate finite material iris interaction in OpenGL",
+        help="animate Jones-resolved finite material iris interaction in OpenGL",
+    )
+    parser.add_argument(
+        "--aperture-polarization",
+        choices=_APERTURE_POLARIZATION_MODES,
+        default="radial",
+        help="initial Jones/coherence source for --aperture-live",
     )
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument(
@@ -1068,7 +1261,11 @@ def main() -> int:
     if sum((args.live, args.transport_live, args.aperture_live)) > 1:
         parser.error("choose one live mode")
     if args.aperture_live:
-        run_aperture_live(size=args.aperture_size, fps=args.fps)
+        run_aperture_live(
+            size=args.aperture_size,
+            fps=args.fps,
+            polarization_mode=args.aperture_polarization,
+        )
         return 0
     if args.transport_live:
         run_transport_live(fps=args.fps)

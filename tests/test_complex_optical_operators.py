@@ -7,6 +7,7 @@ from camera_software.complex_optical_operators import (
     COMPLEX_OPTICAL_OPERATOR_SCHEMA,
     ComplexOperatorStateBlock,
     ComplexOpticalOperator,
+    ComplexSourceMode,
     JonesOperator,
     PhaseSpaceJacobian,
     TransverseBasis,
@@ -182,6 +183,35 @@ def test_operator_state_block_is_contiguous_fixed_stride_and_indexed():
     assert frozen["operators"].flags.c_contiguous
     assert frozen["basis_stride_bytes"] == 32
     assert frozen["operator_stride_bytes"] == 96
+    assert frozen["source_modes"].shape == (0, 12)
+    assert frozen["source_mode_stride_bytes"] == 48
+
+
+def test_source_modes_are_fixed_stride_and_keep_coherence_outside_rays():
+    state = ComplexOperatorStateBlock()
+    basis_id = state.add_basis(TransverseBasis.from_direction((1.0, 0.0, 0.0)))
+    operator_id = state.add_operator(ComplexOpticalOperator())
+    handles = state.add_polarization_modes(
+        PolarizationState(
+            mode=PolarizationMode.LINEAR,
+            angle_deg=30.0,
+            degree_of_polarization=0.25,
+        ),
+        basis_id=basis_id,
+        operator_id=operator_id,
+        coherence_seed=0x1_0000_0000,
+    )
+    frozen = state.freeze()
+    assert handles == (0, 1)
+    assert frozen["source_modes"].shape == (2, 12)
+    assert frozen["source_modes"].dtype == np.uint32
+    assert frozen["source_modes"].flags.c_contiguous
+    assert frozen["source_mode_stride_bytes"] == 48
+    first = frozen["source_modes"][0]
+    assert first[5] == 0
+    assert first[6] == 1
+    assert first[7] == basis_id
+    assert first[8] == operator_id
 
 
 def test_cpu_gpu_operator_abi_matches_and_declares_no_binding():
@@ -193,8 +223,10 @@ def test_cpu_gpu_operator_abi_matches_and_declares_no_binding():
     ).read_text(encoding="utf-8")
     assert "sizeof(PackedTransverseBasisGpu) == 32" in cpu
     assert "sizeof(PackedOperatorGpu) == 96" in cpu
+    assert "sizeof(PackedSourceModeGpu) == 48" in cpu
     assert "COMPLEX_BASIS_WORDS 8u" in gpu
     assert "COMPLEX_OPERATOR_WORDS 24u" in gpu
+    assert "COMPLEX_SOURCE_MODE_WORDS 12u" in gpu
     assert "layout(std430" not in gpu
     assert "binding =" not in gpu
 
@@ -212,8 +244,10 @@ def test_optical_graph_publishes_the_canonical_operator_contract():
         "schema": COMPLEX_OPTICAL_OPERATOR_SCHEMA,
         "basis_count": 1,
         "operator_count": 1,
+        "source_mode_count": 0,
         "basis_stride_bytes": 32,
         "operator_stride_bytes": 96,
+        "source_mode_stride_bytes": 48,
         "ownership": "compiled-graph-persistent",
     }
     exact = next(

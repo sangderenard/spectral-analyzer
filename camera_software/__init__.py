@@ -366,11 +366,13 @@ from .complex_optical_operators import (
     PhaseSpaceJacobian,
     optical_phase,
     ComplexOpticalOperator,
+    ComplexSourceMode,
     ComplexOperatorStateBlock,
     LensPhaseSpaceBatch,
     estimate_compound_lens_phase_space,
     canonical_operator_contract,
 )
+from .vector_wave_adapter import JonesFieldState
 from .physical_aperture import (
     APERTURE_PAYLOAD_MAGIC,
     APERTURE_PAYLOAD_VERSION,
@@ -739,10 +741,12 @@ __all__ = [
     "PhaseSpaceJacobian",
     "optical_phase",
     "ComplexOpticalOperator",
+    "ComplexSourceMode",
     "ComplexOperatorStateBlock",
     "LensPhaseSpaceBatch",
     "estimate_compound_lens_phase_space",
     "canonical_operator_contract",
+    "JonesFieldState",
     "APERTURE_PAYLOAD_MAGIC",
     "APERTURE_PAYLOAD_VERSION",
     "APERTURE_PAYLOAD_VALUES",

@@ -163,11 +163,17 @@ class CompiledOpticalTransportGraph:
                 "operator_count": int(
                     self.operator_state_block["operators"].shape[0]
                 ),
+                "source_mode_count": int(
+                    self.operator_state_block["source_modes"].shape[0]
+                ),
                 "basis_stride_bytes": int(
                     self.operator_state_block["basis_stride_bytes"]
                 ),
                 "operator_stride_bytes": int(
                     self.operator_state_block["operator_stride_bytes"]
+                ),
+                "source_mode_stride_bytes": int(
+                    self.operator_state_block["source_mode_stride_bytes"]
                 ),
                 "ownership": "compiled-graph-persistent",
             },

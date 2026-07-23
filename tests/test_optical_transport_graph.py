@@ -67,6 +67,27 @@ def test_projector_back_uses_reciprocal_exact_lens_graph():
     ]
 
 
+def test_projector_back_graph_carries_authored_source_contract_at_entry():
+    source = {
+        "schema": "physical-emissive-back-v1",
+        "asset_key": "bench.home-baked",
+    }
+    compiled = compile_projector_back_graph(
+        _lens(4),
+        lane_count=4,
+        source_contract=source,
+    )
+    entry = next(
+        node for node in compiled.spec.nodes
+        if node.key == "camera.projector-back-port"
+    )
+
+    assert entry.parameters["emissive_source"] == source
+    assert entry.parameters["source_state"] == (
+        "pipeline-owned-contiguous-block"
+    )
+
+
 def test_wave_context_defaults_to_vector_fft_and_absorbing_padding():
     compiled = compile_compound_lens_graph(
         _lens(8),

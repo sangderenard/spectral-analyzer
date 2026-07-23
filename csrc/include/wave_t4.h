@@ -50,6 +50,7 @@ enum class AperturePattern : int {
     ShadowMask = 2,
     SlotMask = 3,
     ApertureGrille = 4,
+    CircularHole = 5,
 };
 
 enum class Direction : int {

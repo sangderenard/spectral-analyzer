@@ -14855,7 +14855,7 @@ static void wave_arena_build(
             const int pattern = static_cast<int>(p[8]);
             if (pattern >= static_cast<int>(wave_t4::AperturePattern::IrisPolygon)
                 && pattern <= static_cast<int>(
-                    wave_t4::AperturePattern::ApertureGrille)) {
+                    wave_t4::AperturePattern::CircularHole)) {
                 arena.has_aperture_material = true;
                 arena.aperture_material.pattern =
                     static_cast<wave_t4::AperturePattern>(pattern);

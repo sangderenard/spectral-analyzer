@@ -354,9 +354,92 @@ class ProjectorBackSpec:
     spatial_samples:  int                          = 64
     scrim_transmission: List[float]                 = field(default_factory=list)
     scrim_diffusion:  float                         = 0.02
+    asset_key:        str                          = ""
+    source_role:      str                          = "projector"
     label:            str                         = "projector_back"
 
     # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def validate(self) -> None:
+        values = (
+            self.power, self.z_offset, self.radius_scale,
+            self.scrim_diffusion, *self.color,
+        )
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("projector-back parameters must be finite")
+        if self.power < 0.0:
+            raise ValueError("projector-back power must be non-negative")
+        if self.z_offset < 0.0:
+            raise ValueError("projector-back z offset must be non-negative")
+        if self.radius_scale <= 0.0:
+            raise ValueError("projector-back radius scale must be positive")
+        if self.spatial_samples < 1:
+            raise ValueError("projector-back spatial samples must be positive")
+        if not 0.0 <= self.scrim_diffusion <= 1.0:
+            raise ValueError("projector-back scrim diffusion must be in [0,1]")
+
+    @classmethod
+    def from_emissive_texture(
+        cls,
+        texture,
+        *,
+        base_profile_name: str = "laser_532nm_green",
+        enabled: bool = True,
+        power: float = 1.0,
+        spatial_samples: int | None = None,
+        asset_key: str = "",
+        source_role: str = "projector",
+        label: str = "baked_emissive_back",
+        **kwargs,
+    ) -> "ProjectorBackSpec":
+        """Create an authored source back from an intensity/Jones texture."""
+
+        from .emitter_profile import EMITTER_CATALOG, EmitterProfile
+
+        profile = EMITTER_CATALOG.get(str(base_profile_name))
+        if profile is None:
+            raise ValueError(
+                f"unknown baked-source base profile {base_profile_name!r}"
+            )
+        isolated = EmitterProfile.from_dict(profile.to_dict())
+        isolated.texture = texture
+        result = cls(
+            enabled=bool(enabled),
+            power=float(power),
+            profile_name="",
+            profile_inline=isolated.to_dict(),
+            spatial_samples=(
+                max(1, int(spatial_samples))
+                if spatial_samples is not None else
+                max(1, int(texture.width)*int(texture.height))
+            ),
+            asset_key=str(asset_key),
+            source_role=str(source_role),
+            label=str(label),
+            **kwargs,
+        )
+        result.validate()
+        return result
+
+    @classmethod
+    def from_jones_field(
+        cls,
+        jones_field,
+        *,
+        texture_label: str = "home_baked_jones_field",
+        **kwargs,
+    ) -> "ProjectorBackSpec":
+        """Create a source back from a sampled complex transverse field."""
+
+        from .emitter_profile import EmissiveTexture
+
+        return cls.from_emissive_texture(
+            EmissiveTexture.from_jones_field(
+                np.asarray(jones_field, np.complex128),
+                label=str(texture_label),
+            ),
+            **kwargs,
+        )
 
     def resolved_weights(self, n_bands: int) -> List[float]:
         """Return a list of length ``n_bands``, padding/truncating as needed.
@@ -401,6 +484,7 @@ class ProjectorBackSpec:
             SpectralModel,
         )
 
+        self.validate()
         profile = None
         if self.profile_name:
             catalog_profile = EMITTER_CATALOG.get(self.profile_name)
@@ -453,17 +537,81 @@ class ProjectorBackSpec:
         wavelengths_um: Sequence[float],
     ) -> EmitterSpec:
         """Lower this panel into the common physical source-placement ABI."""
+        return self.as_optical_source_spec(
+            pos=(0.0, 0.0, float(sensor_z_pos)-float(self.z_offset)),
+            normal=(0.0, 0.0, 1.0),
+            radius=float(sensor_radius)*float(self.radius_scale),
+            wavelengths_um=wavelengths_um,
+        )
+
+    def as_optical_source_spec(
+        self,
+        *,
+        pos: Sequence[float],
+        normal: Sequence[float],
+        radius: float,
+        wavelengths_um: Sequence[float],
+        label: str | None = None,
+    ) -> EmitterSpec:
+        """Lower the authored back into a reusable physical luminaire source."""
+
         profile = self.resolve_profile(wavelengths_um)
         return EmitterSpec(
-            pos=(0.0, 0.0, float(sensor_z_pos) - float(self.z_offset)),
-            normal=(0.0, 0.0, 1.0),
-            radius=float(sensor_radius) * float(self.radius_scale),
+            pos=tuple(float(v) for v in pos),
+            normal=tuple(float(v) for v in normal),
+            radius=float(radius),
             spatial_samples=max(1, int(self.spatial_samples)),
             enabled=bool(self.enabled),
             profile_name="",
             profile_inline=profile.to_dict(),
-            label=str(self.label),
+            label=str(self.label if label is None else label),
         )
+
+    def source_contract(
+        self,
+        wavelengths_um: Sequence[float],
+        *,
+        plane_radius_m: float | None = None,
+        include_profile: bool = True,
+    ) -> dict:
+        """Return the cacheable, renderer-neutral emissive-back contract."""
+
+        profile = self.resolve_profile(wavelengths_um)
+        texture = profile.texture
+        contract = {
+            "schema": "physical-emissive-back-v1",
+            "asset_key": str(self.asset_key),
+            "source_role": str(self.source_role),
+            "label": str(self.label),
+            "enabled": bool(self.enabled),
+            "power_scale": float(self.power),
+            "spatial_samples": int(self.spatial_samples),
+            "plane_radius_m": (
+                None if plane_radius_m is None else float(plane_radius_m)
+            ),
+            "profile_ref": {
+                "name": str(profile.name),
+                "label": str(profile.label),
+                "inline": bool(self.profile_inline is not None),
+            },
+            "texture_shape": (
+                None if texture is None else list(texture.data.shape)
+            ),
+            "scrim": {
+                "transmission": self.resolved_scrim_transmission(
+                    len(wavelengths_um)
+                ),
+                "diffusion": float(self.scrim_diffusion),
+            },
+            "transport": {
+                "spectral": "fixed-lane-complex",
+                "polarization": "jones-source-mode-block",
+                "spatial_sampling": "distributed-emissive-plane",
+            },
+        }
+        if include_profile:
+            contract["profile"] = profile.to_dict()
+        return contract
 
     # ── Serialisation ───────────────────────────────────────────────────────
 
@@ -479,6 +627,8 @@ class ProjectorBackSpec:
             "spatial_samples":  self.spatial_samples,
             "scrim_transmission": list(self.scrim_transmission),
             "scrim_diffusion":  self.scrim_diffusion,
+            "asset_key":        self.asset_key,
+            "source_role":      self.source_role,
             "label":            self.label,
         }
         if self.profile_inline is not None:
@@ -503,6 +653,8 @@ class ProjectorBackSpec:
             scrim_diffusion  = min(
                 1.0, max(0.0, float(d.get("scrim_diffusion", 0.02)))
             ),
+            asset_key        = str(d.get("asset_key", "")),
+            source_role      = str(d.get("source_role", "projector")),
             label            = str(d.get("label", "projector_back")),
         )
 

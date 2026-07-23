@@ -631,6 +631,7 @@ def compile_compound_lens_graph(
     propagation: WavePropagationStyle = WavePropagationStyle.ANGULAR_SPECTRUM_FFT,
     boundary: WaveBoundaryStyle = WaveBoundaryStyle.PADDED_ABSORBING,
     transport_direction: str = "forward",
+    source_contract: Mapping[str, Any] | None = None,
 ) -> CompiledOpticalTransportGraph:
     """Compile the existing exact lens payload as the first fused T2 module.
 
@@ -645,6 +646,8 @@ def compile_compound_lens_graph(
     if transport_direction not in {"forward", "backward"}:
         raise ValueError("transport_direction must be 'forward' or 'backward'")
     is_projection = transport_direction == "backward"
+    if source_contract is not None and not is_projection:
+        raise ValueError("source_contract is only valid for backward projection")
     entry_key = (
         "camera.projector-back-port" if is_projection else "scene.complex-rays"
     )
@@ -659,6 +662,13 @@ def compile_compound_lens_graph(
         OpticalRepresentation.COMPLEX_RAY,
         lane_count,
         directionality=transport_direction,
+        parameters=(
+            {
+                "emissive_source": dict(source_contract),
+                "source_state": "pipeline-owned-contiguous-block",
+            }
+            if source_contract is not None else {}
+        ),
     )
     fused = OpticalNodeSpec(
         "camera.exact-compound-lens",
@@ -747,6 +757,7 @@ def compile_projector_back_graph(
     wave_regions: Sequence[tuple[str, Mapping[str, Any]]] = (),
     propagation: WavePropagationStyle = WavePropagationStyle.ANGULAR_SPECTRUM_FFT,
     boundary: WaveBoundaryStyle = WaveBoundaryStyle.PADDED_ABSORBING,
+    source_contract: Mapping[str, Any] | None = None,
 ) -> CompiledOpticalTransportGraph:
     """Compile sensor-plane-to-scene projection through reciprocal optics."""
     return compile_compound_lens_graph(
@@ -757,6 +768,7 @@ def compile_projector_back_graph(
         propagation=propagation,
         boundary=boundary,
         transport_direction="backward",
+        source_contract=source_contract,
     )
 
 

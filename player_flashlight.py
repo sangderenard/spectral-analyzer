@@ -289,6 +289,7 @@ class PlayerFlashlight:
         bulb_radius:     float = 0.0025,
         n_sides:         int   = 24,
         n_rings:         int   = 12,
+        emissive_back=None,
     ):
         self.cup_radius      = float(cup_radius)
         self.cup_depth       = float(cup_depth)
@@ -296,6 +297,7 @@ class PlayerFlashlight:
         self.bulb_radius     = float(bulb_radius)
         self.n_sides         = int(n_sides)
         self.n_rings         = int(n_rings)
+        self.emissive_back   = emissive_back
 
         # r² = 4·f·z  →  f = R²/(4·D)
         self._focal_length = self.cup_radius ** 2 / (4.0 * self.cup_depth)
@@ -388,6 +390,66 @@ class PlayerFlashlight:
     def bulb_local_pos(self) -> np.ndarray:
         """Bulb centre in flashlight-local space (+Z = forward)."""
         return np.array([0.0, 0.0, self.bulb_z], dtype=np.float32)
+
+    def optical_emitter_spec(self, wavelengths_um):
+        """Return the canonical textured emitter inside this reflector.
+
+        The returned placement is flashlight-local. Pass the held/world
+        transform to ``RayOrder.from_emitter_specs`` so the source and the
+        physical reflector geometry stay registered.
+        """
+
+        authored = self._resolved_emissive_back()
+        return authored.as_optical_source_spec(
+            pos=self.bulb_local_pos,
+            normal=(0.0, 0.0, 1.0),
+            radius=self.bulb_radius,
+            wavelengths_um=wavelengths_um,
+            label="flashlight_bulb_source",
+        )
+
+    def _resolved_emissive_back(self):
+        """Return an isolated source back synchronized to flashlight state."""
+
+        from camera_designer.camera_preset import ProjectorBackSpec
+
+        if self.emissive_back is None:
+            return ProjectorBackSpec(
+                enabled=self.enabled,
+                power=18.0,
+                profile_name="thermal_2856K",
+                spatial_samples=64,
+                asset_key="flashlight.default.tungsten",
+                source_role="flashlight",
+                label="flashlight_bulb_source",
+            )
+        authored = ProjectorBackSpec.from_dict(self.emissive_back.to_dict())
+        authored.enabled = self.enabled
+        authored.source_role = "flashlight"
+        return authored
+
+    def optical_source_contract(self, wavelengths_um) -> dict:
+        """Self-description for scene manifests and render-graph requests."""
+
+        spec = self.optical_emitter_spec(wavelengths_um)
+        authored = self._resolved_emissive_back()
+        return {
+            "schema": "physical-luminaire-source-v1",
+            "role": "flashlight",
+            "geometry": "emissive-bulb-in-parabolic-reflector",
+            "enabled": bool(self.enabled),
+            "bulb_z_m": float(self.bulb_z),
+            "bulb_radius_m": float(self.bulb_radius),
+            "reflector_radius_m": float(self.cup_radius),
+            "reflector_depth_m": float(self.cup_depth),
+            "focal_length_m": float(self.focal_length),
+            "emitter": spec.to_dict(),
+            "emissive_back": authored.source_contract(
+                wavelengths_um,
+                plane_radius_m=float(self.bulb_radius),
+                include_profile=False,
+            ),
+        }
 
     # ── World-space geometry ───────────────────────────────────────────────────
 

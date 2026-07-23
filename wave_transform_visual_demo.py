@@ -277,6 +277,9 @@ _APERTURE_POLARIZATION_MODES = (
 _APERTURE_QUALITY_MODES = ("balanced", "high", "bake")
 _APERTURE_SPECTRAL_MODES = ("fixed", "continuous")
 _APERTURE_LANE_COUNTS = (1, 3, 4, 8, 16, 32)
+_APERTURE_PATTERNS = (
+    "iris", "circular", "hole-array", "slot-array", "grating",
+)
 
 
 def _aperture_polarization_state(name: str, angle_deg: float = 0.0):
@@ -540,13 +543,34 @@ def _aperture_geometry_rgba(
 ) -> np.ndarray:
     """Orthographic projection of the actual finite blade triangle mesh."""
 
-    vertices, _ = aperture.triangle_mesh()
     image = Image.new("RGBA", (size, size), (7, 11, 18, 255))
     draw = ImageDraw.Draw(image)
     radius = (
         aperture.assembly_radius_m
         if view_radius_m is None else float(view_radius_m)
     )
+    from camera_software.physical_aperture import AperturePattern
+
+    if aperture.pattern not in (
+        AperturePattern.IRIS_POLYGON,
+        AperturePattern.CIRCULAR_HOLE,
+    ):
+        coordinate = np.linspace(-radius, radius, size, dtype=np.float64)
+        x, y = np.meshgrid(coordinate, coordinate)
+        inside = x*x+y*y <= aperture.assembly_radius_m**2
+        material = inside & ~aperture.open_mask(x, y)
+        pixels = np.zeros((size, size, 4), np.uint8)
+        pixels[..., :3] = (7, 11, 18)
+        pixels[..., 3] = 255
+        pixels[material, :3] = (88, 96, 110)
+        edge = material ^ (
+            np.roll(material, 1, axis=0)
+            & np.roll(material, 1, axis=1)
+        )
+        pixels[edge, :3] = (170, 190, 215)
+        return pixels
+
+    vertices, _ = aperture.triangle_mesh()
 
     def point(value):
         return (
@@ -583,6 +607,73 @@ def _aperture_sweep_radius(
     return float(opening), float(assembly_radius), float(sweep)
 
 
+def _build_aperture_pattern(
+    pattern: str,
+    *,
+    opening_radius_m: float,
+    sweep: float,
+    assembly_radius_m: float,
+    pitch_m: float,
+    rotation_rad: float,
+):
+    """Author one finite material aperture using comparable scale controls."""
+
+    from camera_software.physical_aperture import LivePhysicalAperture
+
+    key = str(pattern).strip().lower()
+    if key not in _APERTURE_PATTERNS:
+        raise ValueError(f"aperture pattern must be one of {_APERTURE_PATTERNS}")
+    common = dict(
+        assembly_radius_m=float(assembly_radius_m),
+        thickness_m=0.10e-6,
+        material_name="blackened_steel",
+        material_n_real=2.9,
+        material_n_imag=3.0,
+    )
+    if key == "iris":
+        return LivePhysicalAperture.iris(
+            "demo.live-iris",
+            blade_count=9,
+            opening_radius_m=float(opening_radius_m),
+            rotation_rad=float(rotation_rad),
+            **common,
+        )
+    if key == "circular":
+        return LivePhysicalAperture.circular_hole(
+            "demo.circular-bore",
+            opening_radius_m=float(opening_radius_m),
+            **common,
+        )
+    cell_pitch = 8.0*float(pitch_m)
+    duty = 0.10+0.72*float(sweep)
+    if key == "hole-array":
+        return LivePhysicalAperture.circular_hole_array(
+            "demo.circular-hole-array",
+            hole_radius_m=0.5*cell_pitch*duty,
+            pitch_x_m=cell_pitch,
+            pitch_y_m=cell_pitch,
+            rotation_rad=float(rotation_rad),
+            **common,
+        )
+    if key == "slot-array":
+        return LivePhysicalAperture.slot_array(
+            "demo.rectangular-slot-array",
+            slot_width_m=cell_pitch*duty,
+            slot_height_m=cell_pitch*min(0.92, 1.35*duty),
+            pitch_x_m=cell_pitch,
+            pitch_y_m=cell_pitch,
+            rotation_rad=float(rotation_rad),
+            **common,
+        )
+    return LivePhysicalAperture.grating(
+        "demo.transmission-grating",
+        slit_width_m=cell_pitch*duty,
+        pitch_m=cell_pitch,
+        rotation_rad=float(rotation_rad),
+        **common,
+    )
+
+
 def _solve_aperture_visual(
     tracer,
     *,
@@ -590,6 +681,7 @@ def _solve_aperture_visual(
     pitch_m: float,
     wavelength_m: float,
     cycle_phase: float,
+    aperture_pattern: str,
     polarization_mode: str,
     quality: str,
     spectral_mode: str,
@@ -604,7 +696,6 @@ def _solve_aperture_visual(
 ) -> dict[str, object]:
     """Solve one physical-aperture frame through shared production kernels."""
 
-    from camera_software.physical_aperture import LivePhysicalAperture
     from camera_software.vector_wave_adapter import (
         JonesFieldState,
         PaddedWaveDomain,
@@ -625,16 +716,13 @@ def _solve_aperture_visual(
         (solve_width-1)*pitch_m,
         (solve_height-1)*pitch_m,
     )
-    aperture = LivePhysicalAperture.iris(
-        "demo.physical-iris",
-        blade_count=9,
+    aperture = _build_aperture_pattern(
+        aperture_pattern,
         opening_radius_m=float(opening),
+        sweep=float(sweep),
         assembly_radius_m=aperture_extent,
-        thickness_m=0.10e-6,
+        pitch_m=pitch_m,
         rotation_rad=cycle_phase*0.2,
-        material_name="blackened_steel",
-        material_n_real=2.9,
-        material_n_imag=3.0,
     )
     payload = aperture.wave_payload()
     scalar_field = domain.uniform_scalar_field(bands=lane_count)
@@ -759,6 +847,7 @@ def _solve_aperture_visual(
         "panels": panels,
         "labels": labels,
         "opening_radius_m": float(opening),
+        "aperture_pattern": str(aperture_pattern),
         "sweep": float(sweep),
         "wavelengths_m": wavelengths.copy(),
         "solve_shape": (int(solve_height), int(solve_width)),
@@ -906,6 +995,7 @@ _ULTRA_BAKE_PRESETS: dict[str, dict[str, object]] = {
         "quality": "bake",
         "spectral_mode": "fixed",
         "lane_count": 32,
+        "aperture_pattern": "iris",
         "polarizations": ("radial",),
         "vector_page": True,
         "spectral_panel": True,
@@ -919,6 +1009,7 @@ _ULTRA_BAKE_PRESETS: dict[str, dict[str, object]] = {
         "quality": "bake",
         "spectral_mode": "continuous",
         "lane_count": 32,
+        "aperture_pattern": "iris",
         "polarizations": ("azimuthal",),
         "vector_page": True,
         "spectral_panel": True,
@@ -932,6 +1023,7 @@ _ULTRA_BAKE_PRESETS: dict[str, dict[str, object]] = {
         "quality": "bake",
         "spectral_mode": "fixed",
         "lane_count": 16,
+        "aperture_pattern": "iris",
         "polarizations": _APERTURE_POLARIZATION_MODES,
         "vector_page": True,
         "spectral_panel": True,
@@ -945,6 +1037,7 @@ _ULTRA_BAKE_PRESETS: dict[str, dict[str, object]] = {
         "quality": "bake",
         "spectral_mode": "fixed",
         "lane_count": 16,
+        "aperture_pattern": "iris",
         "polarizations": ("circular+",),
         "vector_page": False,
         "spectral_panel": False,
@@ -974,6 +1067,7 @@ def render_aperture_bake(
     scale: int | None = None,
     quality: str | None = None,
     lane_count: int | None = None,
+    aperture_pattern: str | None = None,
     pitch_m: float = 0.75e-6,
     wavelength_m: float = 532.0e-9,
 ) -> dict[str, object]:
@@ -992,6 +1086,10 @@ def render_aperture_bake(
     active_lanes = int(
         recipe["lane_count"] if lane_count is None else lane_count
     )
+    active_pattern = str(
+        recipe["aperture_pattern"]
+        if aperture_pattern is None else aperture_pattern
+    )
     if active_size < 8 or active_size & (active_size-1):
         raise ValueError("ultra bake size must be a power of two and at least 8")
     if active_frames < 1:
@@ -1005,6 +1103,10 @@ def render_aperture_bake(
     if active_lanes not in _APERTURE_LANE_COUNTS:
         raise ValueError(
             f"ultra bake lane count must be one of {_APERTURE_LANE_COUNTS}"
+        )
+    if active_pattern not in _APERTURE_PATTERNS:
+        raise ValueError(
+            f"ultra bake aperture pattern must be one of {_APERTURE_PATTERNS}"
         )
 
     destination = Path(output_dir)
@@ -1042,6 +1144,7 @@ def render_aperture_bake(
             pitch_m=pitch_m,
             wavelength_m=wavelength_m,
             cycle_phase=float(cycle_phase),
+            aperture_pattern=active_pattern,
             polarization_mode=polarization,
             quality=active_quality,
             spectral_mode=str(recipe["spectral_mode"]),
@@ -1055,7 +1158,8 @@ def render_aperture_bake(
         solve_seconds = time.perf_counter() - solve_started
         solve_height, solve_width = visual["solve_shape"]
         footer = (
-            f"{polarization} | {recipe['spectral_mode']}:{active_lanes} | "
+            f"{active_pattern} | {polarization} | "
+            f"{recipe['spectral_mode']}:{active_lanes} | "
             f"{solve_width}x{solve_height} solve | "
             f"D={2.0*visual['opening_radius_m']*1e6:.2f}um | "
             f"edge={visual['border_fraction']:.1e}"
@@ -1075,6 +1179,7 @@ def render_aperture_bake(
             "index": frame_index,
             "path": str(frame_path),
             "polarization": polarization,
+            "aperture_pattern": active_pattern,
             "cycle_phase_rad": float(cycle_phase),
             "opening_radius_m": visual["opening_radius_m"],
             "sweep": visual["sweep"],
@@ -1103,6 +1208,7 @@ def render_aperture_bake(
         "quality": active_quality,
         "spectral_mode": recipe["spectral_mode"],
         "lane_count": active_lanes,
+        "aperture_pattern": active_pattern,
         "aperture": {
             "blade_count": 9,
             "thickness_m": 0.10e-6,
@@ -1343,6 +1449,7 @@ def run_aperture_live(
     quality: str = "balanced",
     spectral_mode: str = "fixed",
     lane_count: int = 1,
+    aperture_pattern: str = "iris",
     _max_display_frames: int | None = None,
 ) -> None:
     """Animate Jones-resolved interaction with physical material iris blades."""
@@ -1367,6 +1474,11 @@ def run_aperture_live(
     if int(lane_count) not in _APERTURE_LANE_COUNTS:
         raise ValueError(
             f"lane_count must be one of {_APERTURE_LANE_COUNTS}"
+        )
+    aperture_key = str(aperture_pattern).strip().lower()
+    if aperture_key not in _APERTURE_PATTERNS:
+        raise ValueError(
+            f"aperture_pattern must be one of {_APERTURE_PATTERNS}"
         )
     import pygame
     from OpenGL import GL as gl
@@ -1411,6 +1523,7 @@ def run_aperture_live(
     quality_index = _APERTURE_QUALITY_MODES.index(quality_key)
     spectral_index = _APERTURE_SPECTRAL_MODES.index(spectral_key)
     lane_index = _APERTURE_LANE_COUNTS.index(int(lane_count))
+    aperture_index = _APERTURE_PATTERNS.index(aperture_key)
     spectral_epoch = 0
     generation = 0
     displayed_frames = 0
@@ -1446,6 +1559,10 @@ def run_aperture_live(
                         ) % len(_APERTURE_LANE_COUNTS)
                     elif event.key == pygame.K_r:
                         spectral_epoch += 1
+                    elif event.key == pygame.K_m:
+                        aperture_index = (
+                            aperture_index + 1
+                        ) % len(_APERTURE_PATTERNS)
                     elif event.key == pygame.K_LEFT:
                         analyzer_angle_deg -= 5.0
                     elif event.key == pygame.K_RIGHT:
@@ -1460,6 +1577,7 @@ def run_aperture_live(
             active_quality = _APERTURE_QUALITY_MODES[quality_index]
             active_spectral = _APERTURE_SPECTRAL_MODES[spectral_index]
             active_lanes = _APERTURE_LANE_COUNTS[lane_index]
+            active_aperture = _APERTURE_PATTERNS[aperture_index]
             active_polarization = _APERTURE_POLARIZATION_MODES[
                 polarization_index
             ]
@@ -1469,6 +1587,7 @@ def run_aperture_live(
                 pitch_m=pitch_m,
                 wavelength_m=wavelength_m,
                 cycle_phase=phase,
+                aperture_pattern=active_aperture,
                 polarization_mode=active_polarization,
                 quality=active_quality,
                 spectral_mode=active_spectral,
@@ -1530,6 +1649,7 @@ def run_aperture_live(
                 f"angle={source_angle_deg%180.0:.0f}deg "
                 f"modes={visual['mode_count']} "
                 f"quality={active_quality} "
+                f"aperture={active_aperture} "
                 f"spectrum={active_spectral}:{active_lanes} "
                 f"solve={solve_width}x{solve_height}/{size}x{size} "
                 f"steps={visual['propagation_steps']} "
@@ -1539,7 +1659,7 @@ def run_aperture_live(
                 f"edge={visual['border_fraction']:.2e} "
                 f"phase={'RELATIVE' if piston_removed else 'ABSOLUTE'} "
                 f"{'PAUSED ' if paused else ''}"
-                "[J source, K quality, F fixed/continuous, L lanes, "
+                "[J source, K quality, M aperture, F fixed/continuous, L lanes, "
                 "R resample, [/] source angle, arrows analyzer, V page, "
                 "P phase gauge, Space pause, Esc close]"
             )
@@ -1814,6 +1934,10 @@ def main() -> int:
         help="override preset exact spectral lane width",
     )
     parser.add_argument(
+        "--ultra-pattern", choices=_APERTURE_PATTERNS,
+        help="override preset physical aperture or scrim geometry",
+    )
+    parser.add_argument(
         "--aperture-polarization",
         choices=_APERTURE_POLARIZATION_MODES,
         default="radial",
@@ -1837,6 +1961,12 @@ def main() -> int:
         choices=_APERTURE_LANE_COUNTS,
         default=1,
         help="exact compiled lane width for --aperture-live",
+    )
+    parser.add_argument(
+        "--aperture-pattern",
+        choices=_APERTURE_PATTERNS,
+        default="iris",
+        help="finite material aperture/scrim geometry",
     )
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument(
@@ -1863,6 +1993,7 @@ def main() -> int:
             scale=args.ultra_scale,
             quality=args.ultra_quality,
             lane_count=args.ultra_lanes,
+            aperture_pattern=args.ultra_pattern,
         )
         print(f"[ultra-bake] index={result['index']}")
         return 0
@@ -1874,6 +2005,7 @@ def main() -> int:
             quality=args.aperture_quality,
             spectral_mode=args.aperture_spectrum,
             lane_count=args.aperture_lanes,
+            aperture_pattern=args.aperture_pattern,
         )
         return 0
     if args.transport_live:

@@ -84,6 +84,35 @@ def test_projector_back_lowers_to_common_coherent_emitter_without_catalog_mutati
     assert EMITTER_CATALOG["laser_532nm_green"].spectral.radiant_exitance == before
 
 
+def test_home_baked_projector_back_is_enabled_serializable_and_self_describing():
+    field = np.zeros((2, 3, 2), np.complex128)
+    field[..., 0] = 1.0
+    field[:, 1:, 1] = 0.5j
+    back = ProjectorBackSpec.from_jones_field(
+        field,
+        asset_key="bench.baked.test",
+        power=2.0,
+    )
+
+    restored = ProjectorBackSpec.from_dict(back.to_dict())
+    contract = restored.source_contract([0.532], plane_radius_m=0.028)
+    compact = restored.source_contract(
+        [0.532], plane_radius_m=0.028, include_profile=False,
+    )
+
+    assert restored.enabled is True
+    assert restored.spatial_samples == 6
+    assert contract["schema"] == "physical-emissive-back-v1"
+    assert contract["asset_key"] == "bench.baked.test"
+    assert contract["texture_shape"] == [2, 3, 10]
+    assert contract["transport"]["polarization"] == (
+        "jones-source-mode-block"
+    )
+    assert "profile" in contract
+    assert "profile" not in compact
+    assert compact["texture_shape"] == [2, 3, 10]
+
+
 def test_projector_back_gpu_launch_covers_large_source_plane_with_fixed_phase():
     preset = simple_doublet_preset()
     preset.projector_back = ProjectorBackSpec(
@@ -172,6 +201,13 @@ def test_projector_launch_enters_native_exact_camera_frame_as_complex_lanes():
     assert launch.profile_contract["source"] == "camera.projector-back-port"
 
     class RecordingTracer:
+        def configure_complex_source_modes(
+            self, tags, indices, words, bases, operators,
+        ):
+            self.source_block = (
+                tags, indices, words, bases, operators,
+            )
+
         def submit_rays(self, *args, **kwargs):
             self.args = args
             self.kwargs = kwargs
@@ -183,6 +219,35 @@ def test_projector_launch_enters_native_exact_camera_frame_as_complex_lanes():
     assert np.all(tracer.kwargs["color_flags"] == 64)
     assert tracer.kwargs["use_gpu_compute"] is True
     assert tracer.kwargs["gpu_all_stages"] is True
+    assert tracer.kwargs["tags"] is launch.ray_tags
+    assert np.array_equal(tracer.source_block[0], launch.ray_tags)
+    assert launch.profile_contract["emissive_back"]["schema"] == (
+        "physical-emissive-back-v1"
+    )
+
+
+def test_baked_jones_projector_field_reaches_pipeline_source_modes():
+    preset = simple_doublet_preset()
+    preset.wavelengths = [0.532]
+    field = np.zeros((2, 2, 2), np.complex128)
+    field[0, 0] = (1.0 + 0.0j, 0.0 + 0.0j)
+    field[0, 1] = (0.0 + 0.0j, 1.0j)
+    field[1, 0] = (0.25 + 0.25j, 0.5 + 0.0j)
+    field[1, 1] = (1.0j, 0.5 + 0.5j)
+    preset.projector_back = ProjectorBackSpec.from_jones_field(
+        field,
+        spatial_samples=4,
+        asset_key="bench.jones.quadrants",
+    )
+
+    launch = prepare_projector_back_launch(preset, n_rays=16, seed=3)
+    mode_floats = launch.source_state["source_modes"].view(np.float32)
+
+    assert launch.ray_count == 16
+    assert launch.source_state["source_modes"].shape == (16, 12)
+    assert np.unique(np.round(mode_floats[:, :4], 5), axis=0).shape[0] > 1
+    assert np.ptp(np.abs(launch.amplitudes[:, 0])) > 0.0
+    assert launch.profile_contract["texture_shape"] == [2, 2, 10]
 
 
 def test_projector_preview_only_schedules_the_existing_native_pipeline(tmp_path):
@@ -201,6 +266,13 @@ def test_projector_preview_only_schedules_the_existing_native_pipeline(tmp_path)
 
         def in_flight_count(self):
             return self.busy
+
+        def configure_complex_source_modes(
+            self, tags, indices, words, bases, operators,
+        ):
+            self.source_block = (
+                tags, indices, words, bases, operators,
+            )
 
         def submit_rays(self, *args, **kwargs):
             self.submissions.append((args, kwargs))

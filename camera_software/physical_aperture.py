@@ -26,6 +26,7 @@ class AperturePattern(IntEnum):
     SHADOW_MASK = 2
     SLOT_MASK = 3
     APERTURE_GRILLE = 4
+    CIRCULAR_HOLE = 5
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,13 @@ class LivePhysicalAperture:
                 raise ValueError("an iris requires at least three blades")
             if self.opening_x_m >= self.assembly_radius_m:
                 raise ValueError("iris opening must fit inside its assembly")
+        elif self.pattern is AperturePattern.CIRCULAR_HOLE:
+            if self.opening_x_m >= self.assembly_radius_m:
+                raise ValueError("circular opening must fit inside its assembly")
+            if self.element_count < 12:
+                raise ValueError(
+                    "circular-bore display geometry requires at least 12 segments"
+                )
         else:
             if self.pitch_x_m <= 0.0:
                 raise ValueError("a repeated aperture requires positive x pitch")
@@ -77,6 +85,34 @@ class LivePhysicalAperture:
                 raise ValueError("a two-axis aperture requires positive y pitch")
             if self.opening_y_m <= 0.0:
                 raise ValueError("repeated aperture y opening must be positive")
+            if 2.0*self.opening_x_m >= self.pitch_x_m:
+                raise ValueError("x openings must leave finite material between cells")
+            if (
+                self.pattern is not AperturePattern.APERTURE_GRILLE
+                and 2.0*self.opening_y_m >= self.pitch_y_m
+            ):
+                raise ValueError("y openings must leave finite material between cells")
+
+    @staticmethod
+    def _material_index(
+        material_name: str,
+        material_n_real: float | None,
+        material_n_imag: float | None,
+    ) -> tuple[float, float]:
+        if material_n_real is None or material_n_imag is None:
+            from camera_designer.optical_material import MATERIAL_CATALOG
+
+            try:
+                canonical = MATERIAL_CATALOG[str(material_name)]
+            except KeyError as exc:
+                raise ValueError(
+                    f"unknown optical aperture material {material_name!r}"
+                ) from exc
+            if material_n_real is None:
+                material_n_real = float(canonical.n_d)
+            if material_n_imag is None:
+                material_n_imag = float(canonical.k)
+        return float(material_n_real), float(material_n_imag)
 
     @classmethod
     def iris(
@@ -92,19 +128,9 @@ class LivePhysicalAperture:
         material_n_real: float | None = None,
         material_n_imag: float | None = None,
     ) -> "LivePhysicalAperture":
-        if material_n_real is None or material_n_imag is None:
-            from camera_designer.optical_material import MATERIAL_CATALOG
-
-            try:
-                canonical = MATERIAL_CATALOG[str(material_name)]
-            except KeyError as exc:
-                raise ValueError(
-                    f"unknown optical aperture material {material_name!r}"
-                ) from exc
-            if material_n_real is None:
-                material_n_real = float(canonical.n_d)
-            if material_n_imag is None:
-                material_n_imag = float(canonical.k)
+        material_n_real, material_n_imag = cls._material_index(
+            material_name, material_n_real, material_n_imag,
+        )
         result = cls(
             key=key,
             pattern=AperturePattern.IRIS_POLYGON,
@@ -120,6 +146,191 @@ class LivePhysicalAperture:
         )
         result.validate()
         return result
+
+    @classmethod
+    def circular_hole(
+        cls,
+        key: str,
+        *,
+        opening_radius_m: float,
+        assembly_radius_m: float,
+        thickness_m: float,
+        display_segments: int = 96,
+        material_name: str = "blackened_steel",
+        material_n_real: float | None = None,
+        material_n_imag: float | None = None,
+    ) -> "LivePhysicalAperture":
+        """A true circular bore through a finite material plate."""
+
+        material_n_real, material_n_imag = cls._material_index(
+            material_name, material_n_real, material_n_imag,
+        )
+        result = cls(
+            key=key,
+            pattern=AperturePattern.CIRCULAR_HOLE,
+            element_count=int(display_segments),
+            opening_x_m=float(opening_radius_m),
+            opening_y_m=float(opening_radius_m),
+            assembly_radius_m=float(assembly_radius_m),
+            thickness_m=float(thickness_m),
+            material_name=str(material_name),
+            material_n_real=material_n_real,
+            material_n_imag=material_n_imag,
+        )
+        result.validate()
+        return result
+
+    @classmethod
+    def circular_hole_array(
+        cls,
+        key: str,
+        *,
+        hole_radius_m: float,
+        pitch_x_m: float,
+        pitch_y_m: float,
+        assembly_radius_m: float,
+        thickness_m: float,
+        rotation_rad: float = 0.0,
+        material_name: str = "blackened_steel",
+        material_n_real: float | None = None,
+        material_n_imag: float | None = None,
+    ) -> "LivePhysicalAperture":
+        """A two-axis elliptical/circular perforated scientific scrim."""
+
+        material_n_real, material_n_imag = cls._material_index(
+            material_name, material_n_real, material_n_imag,
+        )
+        result = cls(
+            key=key,
+            pattern=AperturePattern.SHADOW_MASK,
+            opening_x_m=float(hole_radius_m),
+            opening_y_m=float(hole_radius_m),
+            pitch_x_m=float(pitch_x_m),
+            pitch_y_m=float(pitch_y_m),
+            assembly_radius_m=float(assembly_radius_m),
+            thickness_m=float(thickness_m),
+            rotation_rad=float(rotation_rad),
+            material_name=str(material_name),
+            material_n_real=material_n_real,
+            material_n_imag=material_n_imag,
+        )
+        result.validate()
+        return result
+
+    @classmethod
+    def slot_array(
+        cls,
+        key: str,
+        *,
+        slot_width_m: float,
+        slot_height_m: float,
+        pitch_x_m: float,
+        pitch_y_m: float,
+        assembly_radius_m: float,
+        thickness_m: float,
+        rotation_rad: float = 0.0,
+        material_name: str = "blackened_steel",
+        material_n_real: float | None = None,
+        material_n_imag: float | None = None,
+    ) -> "LivePhysicalAperture":
+        """A rectangular two-axis slot array with finite bars."""
+
+        material_n_real, material_n_imag = cls._material_index(
+            material_name, material_n_real, material_n_imag,
+        )
+        result = cls(
+            key=key,
+            pattern=AperturePattern.SLOT_MASK,
+            opening_x_m=0.5*float(slot_width_m),
+            opening_y_m=0.5*float(slot_height_m),
+            pitch_x_m=float(pitch_x_m),
+            pitch_y_m=float(pitch_y_m),
+            assembly_radius_m=float(assembly_radius_m),
+            thickness_m=float(thickness_m),
+            rotation_rad=float(rotation_rad),
+            material_name=str(material_name),
+            material_n_real=material_n_real,
+            material_n_imag=material_n_imag,
+        )
+        result.validate()
+        return result
+
+    @classmethod
+    def grating(
+        cls,
+        key: str,
+        *,
+        slit_width_m: float,
+        pitch_m: float,
+        assembly_radius_m: float,
+        thickness_m: float,
+        rotation_rad: float = 0.0,
+        material_name: str = "blackened_steel",
+        material_n_real: float | None = None,
+        material_n_imag: float | None = None,
+    ) -> "LivePhysicalAperture":
+        """A one-dimensional transmission grating made from finite bars."""
+
+        material_n_real, material_n_imag = cls._material_index(
+            material_name, material_n_real, material_n_imag,
+        )
+        result = cls(
+            key=key,
+            pattern=AperturePattern.APERTURE_GRILLE,
+            opening_x_m=0.5*float(slit_width_m),
+            opening_y_m=float(assembly_radius_m),
+            pitch_x_m=float(pitch_m),
+            pitch_y_m=0.0,
+            assembly_radius_m=float(assembly_radius_m),
+            thickness_m=float(thickness_m),
+            rotation_rad=float(rotation_rad),
+            material_name=str(material_name),
+            material_n_real=material_n_real,
+            material_n_imag=material_n_imag,
+        )
+        result.validate()
+        return result
+
+    def open_mask(
+        self,
+        x_m: np.ndarray | float,
+        y_m: np.ndarray | float,
+    ) -> np.ndarray:
+        """Vectorized geometric occupancy matching the native material kernel."""
+
+        self.validate()
+        x = np.asarray(x_m, np.float64)
+        y = np.asarray(y_m, np.float64)
+        c, s = math.cos(self.rotation_rad), math.sin(self.rotation_rad)
+        u, v = c*x+s*y, -s*x+c*y
+        if self.pattern is AperturePattern.CIRCULAR_HOLE:
+            opened = u*u+v*v <= self.opening_x_m*self.opening_x_m
+        elif self.pattern is AperturePattern.IRIS_POLYGON:
+            opened = np.ones(np.broadcast_shapes(u.shape, v.shape), bool)
+            n = self.element_count
+            for edge in range(n):
+                a0, a1 = 2.0*math.pi*edge/n, 2.0*math.pi*(edge+1)/n
+                x0, y0 = self.opening_x_m*math.cos(a0), self.opening_x_m*math.sin(a0)
+                x1, y1 = self.opening_x_m*math.cos(a1), self.opening_x_m*math.sin(a1)
+                opened &= (x1-x0)*(v-y0)-(y1-y0)*(u-x0) >= 0.0
+        elif self.pattern is AperturePattern.SHADOW_MASK:
+            cell_x = u-np.round(u/self.pitch_x_m)*self.pitch_x_m
+            cell_y = v-np.round(v/self.pitch_y_m)*self.pitch_y_m
+            opened = (
+                (cell_x/self.opening_x_m)**2
+                + (cell_y/self.opening_y_m)**2 <= 1.0
+            )
+        elif self.pattern is AperturePattern.SLOT_MASK:
+            cell_x = u-np.round(u/self.pitch_x_m)*self.pitch_x_m
+            cell_y = v-np.round(v/self.pitch_y_m)*self.pitch_y_m
+            opened = (
+                np.abs(cell_x) <= self.opening_x_m
+            ) & (np.abs(cell_y) <= self.opening_y_m)
+        else:
+            cell_x = u-np.round(u/self.pitch_x_m)*self.pitch_x_m
+            opened = np.abs(cell_x) <= self.opening_x_m
+        outside = x*x+y*y > self.assembly_radius_m*self.assembly_radius_m
+        return np.asarray(opened | outside, bool)
 
     def wave_payload(
         self, axis: Sequence[float] = (0.0, 0.0, 1.0),
@@ -190,7 +401,10 @@ class LivePhysicalAperture:
         """
 
         self.validate()
-        if self.pattern is not AperturePattern.IRIS_POLYGON:
+        if self.pattern not in (
+            AperturePattern.IRIS_POLYGON,
+            AperturePattern.CIRCULAR_HOLE,
+        ):
             raise NotImplementedError(
                 "repeated masks/grilles require the instanced parametric path"
             )

@@ -8,6 +8,7 @@ the exact reciprocal lens and any authored T4 arenas to the normal pipeline.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from typing import Any
 
@@ -15,6 +16,14 @@ import numpy as np
 
 from camera_designer.ray_order import RayOrder
 from camera_designer.compound_optics import CompoundLens
+from camera_designer.emitter_profile import CoherenceModel
+from .complex_optical_operators import (
+    ComplexOpticalOperator,
+    ComplexOperatorStateBlock,
+    ComplexSourceMode,
+    TransverseBasis,
+    install_source_mode_block,
+)
 from .surface_scan_preview import current_wgl_handles, restore_wgl_context
 
 
@@ -23,6 +32,9 @@ class ProjectorBackLaunch:
     origins: np.ndarray
     directions: np.ndarray
     amplitudes: np.ndarray
+    ray_tags: np.ndarray
+    source_mode_indices: np.ndarray
+    source_state: dict[str, Any]
     profile_contract: dict[str, Any]
 
     @property
@@ -64,6 +76,7 @@ def prepare_projector_back_launch(
         max(1, int(n_rays)),
         seed=int(seed),
     )
+    source_indices = order.ray_source_indices(max(1, int(n_rays)))
 
     # Leave the emitting triangle robustly in its authored forward direction.
     origins = origins + directions * 2.0e-4
@@ -80,13 +93,85 @@ def prepare_projector_back_launch(
             np.float64,
         )
 
+    # Expand partially polarized source records into independent coherent
+    # modes and attach their Jones/basis state through stable ray tags. Scalar
+    # spectral phase remains in amplitudes; relative s/p phase lives here.
+    expanded_origins: list[np.ndarray] = []
+    expanded_directions: list[np.ndarray] = []
+    expanded_amplitudes: list[np.ndarray] = []
+    state = ComplexOperatorStateBlock()
+    operator_id = state.add_operator(ComplexOpticalOperator())
+    tag_values: list[int] = []
+    mode_indices: list[int] = []
+    coherent_ids: dict[tuple[str, str, int], int] = {}
+    tag_prefix = (
+        0x50524A0000000000
+        | ((int(seed) & 0xFFFF) << 32)
+    )
+    for ray_index, source_index in enumerate(source_indices):
+        source = order.sources[int(source_index)]
+        azimuth = math.atan2(
+            float(source.uv[1])-0.5,
+            float(source.uv[0])-0.5,
+        )
+        modes = source.polarization.coherent_mode_decomposition(azimuth)
+        direction = directions[ray_index]
+        basis_id = state.add_basis(TransverseBasis.from_direction(
+            direction,
+            reference=(0.0, 0.0, 1.0),
+        ))
+        for component_index, (power_weight, jones) in enumerate(modes):
+            expanded_index = len(expanded_origins)
+            tag = (tag_prefix+expanded_index+1) & 0xFFFFFFFFFFFFFFFF
+            if source.phase_state.model is CoherenceModel.COHERENT:
+                coherence_key = (
+                    str(source.spec_label),
+                    str(source.component_label),
+                    component_index,
+                )
+                if coherence_key not in coherent_ids:
+                    coherent_ids[coherence_key] = (
+                        0x5052430000000000+len(coherent_ids)+1
+                    )
+                coherence = coherent_ids[coherence_key]
+            else:
+                coherence = (
+                    0x5052490000000000+expanded_index+1
+                ) & 0xFFFFFFFFFFFFFFFF
+            mode_index = state.add_source_mode(ComplexSourceMode(
+                jones=np.asarray(jones, np.complex128),
+                power_weight=1.0,
+                coherence_id=coherence,
+                basis_id=basis_id,
+                operator_id=operator_id,
+            ))
+            expanded_origins.append(origins[ray_index])
+            expanded_directions.append(direction)
+            expanded_amplitudes.append(
+                amplitudes[ray_index]*math.sqrt(max(0.0, power_weight))
+            )
+            tag_values.append(tag)
+            mode_indices.append(mode_index)
+    origins = np.ascontiguousarray(expanded_origins, np.float64)
+    directions = np.ascontiguousarray(expanded_directions, np.float64)
+    amplitudes = np.ascontiguousarray(expanded_amplitudes, np.complex128)
+    ray_tags = np.ascontiguousarray(tag_values, np.uint64)
+    source_mode_indices = np.ascontiguousarray(mode_indices, np.uint32)
+    source_state = state.freeze()
+
     return ProjectorBackLaunch(
-        origins=np.ascontiguousarray(origins, np.float64),
-        directions=np.ascontiguousarray(directions, np.float64),
-        amplitudes=np.ascontiguousarray(amplitudes, np.complex128),
+        origins=origins,
+        directions=directions,
+        amplitudes=amplitudes,
+        ray_tags=ray_tags,
+        source_mode_indices=source_mode_indices,
+        source_state=source_state,
         profile_contract={
             "source": "camera.projector-back-port",
-            "profile": profile.to_dict(),
+            "emissive_back": projector.source_contract(
+                wavelengths,
+                plane_radius_m=float(spec.radius),
+            ),
             "spatial_samples": int(spec.spatial_samples),
             "plane_radius_m": float(spec.radius),
             "exit_pupil_center_m": pupil_center.tolist(),
@@ -94,6 +179,13 @@ def prepare_projector_back_launch(
             "pupil_sampling": "center-site-first-light-source-optics-boundary",
             "lane_count": int(len(wavelengths)),
             "phase_transport": "fixed-lane-complex",
+            "jones_transport": "pipeline-source-mode-block",
+            "source_mode_count": int(len(source_state["source_modes"])),
+            "source_binding_count": int(len(ray_tags)),
+            "texture_shape": (
+                list(profile.texture.data.shape)
+                if profile.texture is not None else None
+            ),
             "continuous_frequency": "requires-continuous-source-sidecar",
         },
     )
@@ -112,6 +204,12 @@ def submit_projector_back(
     submit = getattr(tracer, "submit_rays", None)
     if not callable(submit):
         raise TypeError("optical tracer does not expose submit_rays")
+    install_source_mode_block(
+        tracer,
+        launch.ray_tags,
+        launch.source_state,
+        mode_indices=launch.source_mode_indices,
+    )
     submit(
         launch.origins,
         launch.directions,
@@ -119,6 +217,7 @@ def submit_projector_back(
         color_flags=np.full(
             launch.ray_count, 1 << 6, dtype=np.uint8
         ),
+        tags=launch.ray_tags,
         max_bounces=int(max_bounces),
         min_amplitude=float(min_amplitude),
         max_children=2,
@@ -148,7 +247,10 @@ class ProjectorBackPreview:
         display_hglrc: int = 0,
         display_hdc: int = 0,
     ) -> None:
-        required = ("submit_rays", "in_flight_count")
+        required = (
+            "submit_rays", "in_flight_count",
+            "configure_complex_source_modes",
+        )
         missing = [
             name for name in required
             if not callable(getattr(tracer, name, None))

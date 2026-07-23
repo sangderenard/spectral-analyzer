@@ -96,6 +96,10 @@ leaving the production ray-pipeline boundary honestly unfinished.
   the central requested field published to the OpenGL panels.
 - live switching between perceptual fixed bands and stratified
   continuous-frequency cohorts at exact widths `1,3,4,8,16,32`.
+- live finite-material selection among a bladed iris, singular circular bore,
+  circular-hole scrim, rectangular slot array, and one-axis transmission
+  grating. The native T4 occupancy and displayed geometry share one authoring
+  object.
 
 The blade material is isotropic, so it does not invent polarization conversion.
 The demo is a qualification and visualization client of shared production T4
@@ -151,8 +155,10 @@ Do not weaken these while continuing:
 - T4 entry is Jones-complete for configured source records in fixed and
   continuous modes; the legacy no-record specialization remains s-only.
 - T4 exit still collapses vector field state to scalar complex ray amplitude.
-- Full Jones projector textures remain unwired. Programmatic fixed and
-  continuous Jones launches are wired through the shared source-mode API.
+- Full Jones projector textures are lowered at distributed source-plane UV
+  sites into the shared source-mode block. Intensity, phase/coherence
+  overrides, local polarization, and complex Jones channels no longer collapse
+  to the texture center.
 - Finite projector pupil-fill and condenser/relay source optics remain after
   the vector boundary is correct.
 

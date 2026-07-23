@@ -195,6 +195,19 @@ class OpticalEngineBackend:
                 lens,
                 lane_count=len(preset.wavelengths),
                 wave_regions=tuple(wave_regions),
+                **(
+                    {
+                        "source_contract": preset.projector_back.source_contract(
+                            preset.wavelengths,
+                            plane_radius_m=(
+                                float(preset.sensor.r_max)
+                                * float(preset.projector_back.radius_scale)
+                            ),
+                            include_profile=False,
+                        )
+                    }
+                    if projector_enabled else {}
+                ),
             )
             installation = install_optical_graph(
                 tracer,

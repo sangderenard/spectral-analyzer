@@ -66,7 +66,7 @@ Usage
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -158,6 +158,7 @@ class SourceRecord:
     profile:           EmitterProfile
     spec_label:        str
     component_label:   str
+    uv:                Tuple[float, float] = (0.5, 0.5)
     tracer_gaps:       List[TracerGap] = field(default_factory=list)
 
 
@@ -455,7 +456,7 @@ def _sample_disc(
     radius:   float,
     n_pts:    int,
     rng:      np.random.Generator,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """Return ``n_pts`` positions sampled from a disc using stratified Halton
     low-discrepancy sampling.
 
@@ -463,10 +464,13 @@ def _sample_disc(
     For n_pts > 1 samples are placed on a sunflower (Fibonacci disc) grid —
     better coverage than random for small N.
 
-    Returns (n_pts, 3) float64.
+    Returns positions ``(n_pts,3)`` and normalized disc UV ``(n_pts,2)``.
     """
     if n_pts == 1:
-        return center.reshape(1, 3).copy()
+        return (
+            center.reshape(1, 3).copy(),
+            np.asarray([[0.5, 0.5]], np.float64),
+        )
 
     # Build orthonormal (u, v) tangent frame for the disc
     n = normal / (np.linalg.norm(normal) + 1e-30)
@@ -490,7 +494,11 @@ def _sample_disc(
     pts = (center[np.newaxis, :]
            + x2d[:, np.newaxis] * u_ax[np.newaxis, :]
            + y2d[:, np.newaxis] * v_ax[np.newaxis, :])
-    return pts.astype(np.float64)
+    uv = np.column_stack((
+        0.5+0.5*x2d/max(radius, 1.0e-30),
+        0.5+0.5*y2d/max(radius, 1.0e-30),
+    ))
+    return pts.astype(np.float64), uv.astype(np.float64)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -716,8 +724,10 @@ class RayOrder:
                 spec_normal = spec_normal / nl
 
             # Spatial sample positions on disc
-            disc_pts = _sample_disc(spec_pos, spec_normal, spec_radius,
-                                    spec_spatial_samples, rng)
+            disc_pts, disc_uv = _sample_disc(
+                spec_pos, spec_normal, spec_radius,
+                spec_spatial_samples, rng,
+            )
 
             for comp_weight, leaf in component_pairs:
                 comp_label = leaf.name
@@ -733,13 +743,6 @@ class RayOrder:
                 else:
                     def _aim_dir(p: np.ndarray) -> np.ndarray:
                         return spec_normal.copy()
-
-                # Spectral amplitude weights at each wavelength
-                raw_spec = leaf.spectral.sample_array(wl)   # preserves dtype
-                # ``sample_array`` already includes radiant_exitance.  Apply
-                # the composite weight exactly once; multiplying exitance
-                # again made source power quadratic.
-                amp_weights = (comp_weight * raw_spec).astype(np.float64)
 
                 # Best-fit directivity
                 row_gaps: List[TracerGap] = []
@@ -793,18 +796,77 @@ class RayOrder:
                     ),
                 ))
 
-                for pt in disc_pts:
+                for pt, uv in zip(disc_pts, disc_uv):
+                    u, v = float(uv[0]), float(uv[1])
+                    # Texture-local spectrum/intensity is evaluated at every
+                    # physical source-plane quadrature site.
+                    amp_weights = (
+                        comp_weight*leaf.sample_weights(wl, u=u, v=v)
+                    ).astype(np.float64)
+                    local_phase = leaf.phase
+                    local_polarization = leaf.polarization
+                    texture = leaf.texture
+                    if texture is not None:
+                        phase_offset = texture.channel(
+                            "phase_offset_rad", u, v,
+                        )
+                        coherence_length = texture.channel(
+                            "coherence_length_um", u, v,
+                        )
+                        if phase_offset is not None or (
+                            coherence_length is not None
+                            and coherence_length > 0.0
+                        ):
+                            local_phase = replace(
+                                leaf.phase,
+                                phase_offset_rad=(
+                                    leaf.phase.phase_offset_rad
+                                    + (0.0 if phase_offset is None else phase_offset)
+                                ),
+                                coherence_length_um=(
+                                    leaf.phase.coherence_length_um
+                                    if coherence_length is None
+                                    or coherence_length <= 0.0
+                                    else coherence_length
+                                ),
+                            )
+                        local_jones = texture.jones_at(u, v)
+                        if local_jones is not None:
+                            norm = float(np.linalg.norm(local_jones))
+                            if norm > 1.0e-15:
+                                local_jones = local_jones/norm
+                                local_polarization = PolarizationState(
+                                    mode=PolarizationMode.ELLIPTICAL,
+                                    jones=[
+                                        float(local_jones[0].real),
+                                        float(local_jones[0].imag),
+                                        float(local_jones[1].real),
+                                        float(local_jones[1].imag),
+                                    ],
+                                    degree_of_polarization=1.0,
+                                )
+                        else:
+                            local_angle = texture.channel(
+                                "polarization_angle_deg", u, v,
+                            )
+                            if local_angle is not None:
+                                local_polarization = replace(
+                                    leaf.polarization,
+                                    mode=PolarizationMode.LINEAR,
+                                    angle_deg=local_angle,
+                                )
                     sources.append(SourceRecord(
                         pos               = pt.copy(),
                         dir               = _aim_dir(pt),
                         directivity       = directivity,
                         amplitude_weights = amp_weights.copy(),
-                        phase_state       = leaf.phase,
-                        polarization      = leaf.polarization,
+                        phase_state       = local_phase,
+                        polarization      = local_polarization,
                         directional_model = leaf.directional.model,
                         profile           = leaf,
                         spec_label        = spec_label,
                         component_label   = comp_label,
+                        uv                = (u, v),
                         tracer_gaps       = list(row_gaps),
                     ))
 
@@ -916,6 +978,25 @@ class RayOrder:
 
     # ── Pre-baked ray batch ───────────────────────────────────────────────
 
+    def ray_source_indices(self, n_rays: int) -> np.ndarray:
+        """Return the deterministic SourceRecord index for every baked ray."""
+
+        n_src = len(self.sources)
+        if n_src == 0:
+            return np.zeros(1, np.int64)
+        requested = max(1, int(n_rays))
+        counts = np.zeros(n_src, np.int64)
+        if requested >= n_src:
+            counts[:] = requested//n_src
+            counts[:requested % n_src] += 1
+        else:
+            selected = np.floor(
+                (np.arange(requested, dtype=np.float64)+0.5)
+                * n_src/requested
+            ).astype(np.int64)
+            counts[selected] = 1
+        return np.repeat(np.arange(n_src, dtype=np.int64), counts)
+
     def bake_rays(self, n_rays: int, seed: int = 0) -> np.ndarray:
         """Expand sources into a flat pre-baked ray array ready for GPU SSBO.
 
@@ -949,19 +1030,10 @@ class RayOrder:
         n_src = len(self.sources)
         if n_src == 0:
             return np.zeros((1, 12), np.float32)
-        requested = max(1, int(n_rays))
-        rays_per_source = np.zeros(n_src, np.int64)
-        if requested >= n_src:
-            rays_per_source[:] = requested // n_src
-            rays_per_source[:requested % n_src] += 1
-        else:
-            # Retain even spatial coverage when the requested batch is smaller
-            # than the expanded source quadrature.
-            selected = np.floor(
-                (np.arange(requested, dtype=np.float64) + 0.5)
-                * n_src / requested
-            ).astype(np.int64)
-            rays_per_source[selected] = 1
+        source_schedule = self.ray_source_indices(n_rays)
+        rays_per_source = np.bincount(
+            source_schedule, minlength=n_src,
+        )
         rows: list = []
 
         for source_index, sr in enumerate(self.sources):
@@ -975,7 +1047,9 @@ class RayOrder:
             if phase.model == CoherenceModel.COHERENT:
                 phase_sigma = 0.0
             elif phase.model == CoherenceModel.PARTIAL:
-                amp = prof.spectral.sample_array(self.wavelengths_um).astype(np.float64)
+                amp = np.maximum(
+                    np.asarray(sr.amplitude_weights, np.float64), 0.0,
+                )
                 amp_s = amp.sum()
                 if amp_s < 1e-30:
                     wl_mean = float(np.mean(self.wavelengths_um))
@@ -991,7 +1065,9 @@ class RayOrder:
             amp_weight   = float(np.sum(sr.amplitude_weights))
 
             # ── Spectral weights for wavelength sampling ──────────────────
-            amp_spec = prof.spectral.sample_array(self.wavelengths_um).astype(np.float64)
+            amp_spec = np.maximum(
+                np.asarray(sr.amplitude_weights, np.float64), 0.0,
+            )
             amp_spec_sum = amp_spec.sum()
             if amp_spec_sum < 1e-30:
                 amp_spec = np.ones(len(self.wavelengths_um), np.float64)

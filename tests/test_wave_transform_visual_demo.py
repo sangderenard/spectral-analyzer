@@ -49,6 +49,8 @@ def test_live_mode_validates_before_opening_a_context():
         run_aperture_live(size=16, spectral_mode="quantized")
     with pytest.raises(ValueError, match="lane_count"):
         run_aperture_live(size=16, lane_count=2)
+    with pytest.raises(ValueError, match="aperture_pattern"):
+        run_aperture_live(size=16, aperture_pattern="ideal-mask")
 
 
 def test_relative_phase_gauge_removes_only_global_piston():
@@ -107,6 +109,7 @@ def test_ultra_bake_preset_writes_plate_hero_and_manifest(tmp_path):
         scale=1,
         quality="balanced",
         lane_count=3,
+        aperture_pattern="circular",
     )
 
     assert len(result["frames"]) == 2
@@ -116,6 +119,7 @@ def test_ultra_bake_preset_writes_plate_hero_and_manifest(tmp_path):
     manifest = __import__("json").loads(manifest_path.read_text())
     assert manifest["spectral_mode"] == "continuous"
     assert manifest["lane_count"] == 3
+    assert manifest["aperture_pattern"] == "circular"
     assert len(manifest["frames"]) == 2
     with Image.open(result["frames"][0]) as image:
         assert image.width > 0

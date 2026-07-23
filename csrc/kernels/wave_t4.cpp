@@ -370,6 +370,9 @@ inline bool aperture_open(const ApertureMaterial& material,
                 u - std::round(u/material.pitch_x_m)*material.pitch_x_m;
             return std::abs(cell_x) <= material.opening_x_m;
         }
+        case AperturePattern::CircularHole:
+            return material.opening_x_m > 0.0
+                && u*u + v*v <= material.opening_x_m*material.opening_x_m;
         case AperturePattern::None:
         default:
             return true;

@@ -71,6 +71,15 @@ Available overrides are:
 - `--ultra-scale`: PNG presentation scale;
 - `--ultra-quality`: `balanced`, `high`, or `bake`;
 - `--ultra-lanes`: exact width `1`, `3`, `4`, `8`, `16`, or `32`.
+- `--ultra-pattern`: finite-material `iris`, `circular`, `hole-array`,
+  `slot-array`, or `grating`.
+
+For example, bake the same continuous-spectrum recipe through a physical
+transmission grating:
+
+```powershell
+python wave_transform_visual_demo.py --ultra-bake iris-spectrum-continuous --ultra-pattern grating --output-dir exposures/ultra_bakes_grating
+```
 
 Lane width and spectral semantics remain separate. A continuous 32-lane bake
 contains 32 stratified continuous-frequency samples; it does not silently

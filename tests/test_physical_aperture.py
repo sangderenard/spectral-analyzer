@@ -85,6 +85,62 @@ def test_repeated_crt_patterns_share_the_live_wave_abi():
         assert int(payload[8]) == int(pattern)
 
 
+def test_canonical_scientific_aperture_factories_share_material_contract():
+    circular = LivePhysicalAperture.circular_hole(
+        "bench.circular",
+        opening_radius_m=2.0e-3,
+        assembly_radius_m=8.0e-3,
+        thickness_m=0.5e-3,
+        display_segments=48,
+    )
+    holes = LivePhysicalAperture.circular_hole_array(
+        "bench.holes",
+        hole_radius_m=0.08e-3,
+        pitch_x_m=0.28e-3,
+        pitch_y_m=0.32e-3,
+        assembly_radius_m=8.0e-3,
+        thickness_m=0.1e-3,
+    )
+    slots = LivePhysicalAperture.slot_array(
+        "bench.slots",
+        slot_width_m=0.10e-3,
+        slot_height_m=0.22e-3,
+        pitch_x_m=0.30e-3,
+        pitch_y_m=0.40e-3,
+        assembly_radius_m=8.0e-3,
+        thickness_m=0.1e-3,
+    )
+    grating = LivePhysicalAperture.grating(
+        "bench.grating",
+        slit_width_m=0.10e-3,
+        pitch_m=0.30e-3,
+        assembly_radius_m=8.0e-3,
+        thickness_m=0.1e-3,
+    )
+
+    vertices, normals = circular.triangle_mesh()
+    assert vertices.shape == (48*12, 9)
+    assert normals.shape == (48*12, 3)
+    for aperture in (circular, holes, slots, grating):
+        assert bool(aperture.open_mask(0.0, 0.0))
+        assert aperture.graph_parameters()["ideal_mask"] is False
+    assert not bool(circular.open_mask(3.0e-3, 0.0))
+    assert not bool(holes.open_mask(0.14e-3, 0.16e-3))
+    assert not bool(slots.open_mask(0.15e-3, 0.20e-3))
+    assert not bool(grating.open_mask(0.15e-3, 0.0))
+
+
+def test_repeated_factory_rejects_zero_material_web():
+    with pytest.raises(ValueError, match="finite material"):
+        LivePhysicalAperture.grating(
+            "bad.grating",
+            slit_width_m=0.30e-3,
+            pitch_m=0.30e-3,
+            assembly_radius_m=8.0e-3,
+            thickness_m=0.1e-3,
+        )
+
+
 def test_native_material_operator_is_reciprocal_and_not_an_ideal_mask():
     kernels = pytest.importorskip("_spectral_kernels")
     from ray_tracer_bridge import per_tri_spectral_to_mat_buf
@@ -138,3 +194,64 @@ def test_native_material_operator_is_reciprocal_and_not_an_ideal_mask():
     assert reverse_value == pytest.approx(forward_value.conjugate(), rel=1.0e-5)
     assert forward["absorbed_power"] > 0.0
     assert forward["ideal_mask"] is False
+
+
+@pytest.mark.parametrize("factory", ["circular", "holes", "slots", "grating"])
+def test_native_scientific_scrims_have_open_and_finite_material_sites(factory):
+    kernels = pytest.importorskip("_spectral_kernels")
+    from ray_tracer_bridge import per_tri_spectral_to_mat_buf
+
+    wavelength = np.asarray([550.0e-9], np.float64)
+    frequency = 299_792_458.0/wavelength
+    zero = np.zeros((1, 1), np.float64)
+    mat_idx, mat_buf, mat_count = per_tri_spectral_to_mat_buf(
+        zero, zero, zero, frequency,
+    )
+    tracer = kernels.RayTracer(
+        1,
+        np.asarray([[0., 0., 0., 1., 0., 0., 1., 1., 0.]], np.float64),
+        np.asarray([[0., 0., 1.]], np.float64),
+        mat_idx, mat_buf, int(mat_count), frequency,
+        299_792_458.0, np.zeros(1, np.float64),
+    )
+    common = dict(
+        assembly_radius_m=15.0e-6,
+        thickness_m=0.2e-6,
+        material_n_real=1.45,
+        material_n_imag=0.02,
+    )
+    if factory == "circular":
+        aperture = LivePhysicalAperture.circular_hole(
+            "native.circular", opening_radius_m=3.0e-6, **common,
+        )
+        material_site = (16, 24)
+    elif factory == "holes":
+        aperture = LivePhysicalAperture.circular_hole_array(
+            "native.holes", hole_radius_m=1.0e-6,
+            pitch_x_m=6.0e-6, pitch_y_m=6.0e-6, **common,
+        )
+        material_site = (16, 18)
+    elif factory == "slots":
+        aperture = LivePhysicalAperture.slot_array(
+            "native.slots", slot_width_m=2.0e-6, slot_height_m=3.0e-6,
+            pitch_x_m=6.0e-6, pitch_y_m=6.0e-6, **common,
+        )
+        material_site = (16, 18)
+    else:
+        aperture = LivePhysicalAperture.grating(
+            "native.grating", slit_width_m=2.0e-6, pitch_m=6.0e-6,
+            **common,
+        )
+        material_site = (16, 18)
+    re = np.ones((1, 32, 32), np.float32)
+    im = np.zeros_like(re)
+    result = tracer.t4_apply_aperture_material(
+        1, 32, 32, 1.0e-6, aperture.thickness_m, 1,
+        wavelength, aperture.wave_payload(), re, im,
+    )
+
+    assert re[0, 16, 16] == pytest.approx(1.0)
+    assert 0.0 < abs(complex(
+        re[(0, *material_site)], im[(0, *material_site)]
+    )) < 1.0
+    assert result["absorbed_power"] > 0.0

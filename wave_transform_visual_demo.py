@@ -441,6 +441,82 @@ def _compose_grid(
     return image
 
 
+def _publish_square_texture(
+    plate: Image.Image,
+    output_size: int,
+) -> Image.Image:
+    """Fit a scientific plate into an exact square RGBA texture.
+
+    Aspect ratio is retained: scientific panels are never stretched to fill
+    the square.  The surrounding pixels use the compositor background so the
+    result remains directly usable as an OpenGL/UI texture.
+    """
+
+    edge = int(output_size)
+    if edge < 64:
+        raise ValueError("square output texture must be at least 64 pixels")
+    ratio = min(edge/plate.width, edge/plate.height)
+    fitted_size = (
+        max(1, int(round(plate.width*ratio))),
+        max(1, int(round(plate.height*ratio))),
+    )
+    fitted = plate.resize(fitted_size, Image.Resampling.LANCZOS)
+    texture = Image.new("RGBA", (edge, edge), (4, 7, 12, 255))
+    texture.alpha_composite(
+        fitted,
+        ((edge-fitted.width)//2, (edge-fitted.height)//2),
+    )
+    return texture
+
+
+def _select_scientific_panel(
+    panels: tuple[np.ndarray, ...],
+    labels: tuple[str, ...],
+    selector: str,
+) -> tuple[int, np.ndarray, str]:
+    """Resolve a stable index or a descriptive panel-name fragment."""
+
+    token = str(selector).strip().lower()
+    if not token:
+        raise ValueError("single-panel selector must be non-empty")
+    if token.isdigit():
+        index = int(token)
+        if 0 <= index < len(panels):
+            return index, panels[index], labels[index]
+    aliases = {
+        "physical": 0,
+        "geometry": 0,
+        "blades": 0,
+        "spectral": 1,
+        "spectrum": 1,
+        "power": 2,
+        "intensity": 2,
+        "polarization": 3,
+        "stokes-q": 4,
+        "q": 4,
+        "stokes-v": 5,
+        "v": 5,
+    }
+    if token in aliases and aliases[token] < len(panels):
+        index = aliases[token]
+        return index, panels[index], labels[index]
+    normalized = [
+        label.lower().replace(" ", "-").replace("/", "-")
+        for label in labels
+    ]
+    matches = [
+        index for index, label in enumerate(normalized)
+        if token in label
+    ]
+    if len(matches) == 1:
+        index = matches[0]
+        return index, panels[index], labels[index]
+    raise ValueError(
+        f"unknown or ambiguous panel {selector!r}; use index 0.."
+        f"{len(panels)-1} or one of {tuple(labels)}"
+    )
+
+
 def _transport_table_rgba(
     arena: dict[str, object] | list[dict[str, object]],
     detector_position: np.ndarray | None,
@@ -1068,6 +1144,8 @@ def render_aperture_bake(
     quality: str | None = None,
     lane_count: int | None = None,
     aperture_pattern: str | None = None,
+    output_size: int | None = None,
+    panel: str | None = None,
     pitch_m: float = 0.75e-6,
     wavelength_m: float = 532.0e-9,
 ) -> dict[str, object]:
@@ -1108,6 +1186,15 @@ def render_aperture_bake(
         raise ValueError(
             f"ultra bake aperture pattern must be one of {_APERTURE_PATTERNS}"
         )
+    if output_size is not None and int(output_size) < 64:
+        raise ValueError("ultra bake output size must be at least 64 pixels")
+    if panel is not None and output_size is not None:
+        expected = active_size*active_scale
+        if int(output_size) != expected:
+            raise ValueError(
+                "single-panel output is never resampled; output_size must "
+                f"equal the computed panel size {expected}"
+            )
 
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
@@ -1164,12 +1251,36 @@ def render_aperture_bake(
             f"D={2.0*visual['opening_radius_m']*1e6:.2f}um | "
             f"edge={visual['border_fraction']:.1e}"
         )
-        plate = _compose_grid(
-            visual["panels"],
-            visual["labels"],
-            scale=active_scale,
-            footer=footer,
-        )
+        selected_panel_index = None
+        selected_panel_label = None
+        if panel is None:
+            plate = _compose_grid(
+                visual["panels"],
+                visual["labels"],
+                scale=active_scale,
+                footer=footer,
+            )
+            native_plate_size = [int(plate.width), int(plate.height)]
+            if output_size is not None:
+                plate = _publish_square_texture(plate, int(output_size))
+        else:
+            (
+                selected_panel_index,
+                panel_rgba,
+                selected_panel_label,
+            ) = _select_scientific_panel(
+                visual["panels"], visual["labels"], panel,
+            )
+            plate = Image.fromarray(panel_rgba, "RGBA")
+            if active_scale != 1:
+                plate = plate.resize(
+                    (
+                        plate.width*active_scale,
+                        plate.height*active_scale,
+                    ),
+                    Image.Resampling.NEAREST,
+                )
+            native_plate_size = [int(plate.width), int(plate.height)]
         frame_path = destination / f"frame_{frame_index:03d}.png"
         plate.save(frame_path, compress_level=6)
         if frame_index == hero_index:
@@ -1187,6 +1298,10 @@ def render_aperture_bake(
                 float(value*1.0e9) for value in visual["wavelengths_m"]
             ],
             "solve_shape": [solve_height, solve_width],
+            "native_plate_size": native_plate_size,
+            "published_texture_size": [int(plate.width), int(plate.height)],
+            "selected_panel_index": selected_panel_index,
+            "selected_panel_label": selected_panel_label,
             "propagation_steps": visual["propagation_steps"],
             "solve_seconds": solve_seconds,
             "retention": visual["retention"],
@@ -1209,6 +1324,19 @@ def render_aperture_bake(
         "spectral_mode": recipe["spectral_mode"],
         "lane_count": active_lanes,
         "aperture_pattern": active_pattern,
+        "output_size": (
+            None if output_size is None else int(output_size)
+        ),
+        "publication_layout": (
+            "single-scientific-panel"
+            if panel is not None else
+            (
+                "native-3x2-plate"
+                if output_size is None else
+                "aspect-preserving-square-texture"
+            )
+        ),
+        "selected_panel": panel,
         "aperture": {
             "blade_count": 9,
             "thickness_m": 0.10e-6,
@@ -1938,6 +2066,17 @@ def main() -> int:
         help="override preset physical aperture or scrim geometry",
     )
     parser.add_argument(
+        "--ultra-output-size", type=int,
+        help="publish each composite as an exact square RGBA texture",
+    )
+    parser.add_argument(
+        "--ultra-panel",
+        help=(
+            "publish one raw square scientific panel by index or name "
+            "(physical, spectral, power, polarization, stokes-q, stokes-v)"
+        ),
+    )
+    parser.add_argument(
         "--aperture-polarization",
         choices=_APERTURE_POLARIZATION_MODES,
         default="radial",
@@ -1994,6 +2133,8 @@ def main() -> int:
             quality=args.ultra_quality,
             lane_count=args.ultra_lanes,
             aperture_pattern=args.ultra_pattern,
+            output_size=args.ultra_output_size,
+            panel=args.ultra_panel,
         )
         print(f"[ultra-bake] index={result['index']}")
         return 0

@@ -110,6 +110,7 @@ def test_ultra_bake_preset_writes_plate_hero_and_manifest(tmp_path):
         quality="balanced",
         lane_count=3,
         aperture_pattern="circular",
+        output_size=256,
     )
 
     assert len(result["frames"]) == 2
@@ -120,10 +121,13 @@ def test_ultra_bake_preset_writes_plate_hero_and_manifest(tmp_path):
     assert manifest["spectral_mode"] == "continuous"
     assert manifest["lane_count"] == 3
     assert manifest["aperture_pattern"] == "circular"
+    assert manifest["output_size"] == 256
+    assert manifest["publication_layout"] == (
+        "aspect-preserving-square-texture"
+    )
     assert len(manifest["frames"]) == 2
     with Image.open(result["frames"][0]) as image:
-        assert image.width > 0
-        assert image.height > 0
+        assert image.size == (256, 256)
         assert image.mode == "RGBA"
 
 
@@ -139,6 +143,29 @@ def test_ultra_bake_recipes_are_detached_and_validate():
     assert ultra_bake_presets()["iris-spectrum-fixed"]["size"] == 64
     with pytest.raises(ValueError, match="unknown ultra bake"):
         render_aperture_bake(".", preset="made-up")
+
+
+def test_ultra_bake_can_publish_one_unscaled_scientific_square(tmp_path):
+    result = render_aperture_bake(
+        tmp_path,
+        preset="iris-spectrum-fixed",
+        size=8,
+        frames=1,
+        scale=1,
+        quality="balanced",
+        lane_count=1,
+        panel="spectral",
+    )
+    manifest = __import__("json").loads(
+        Path(result["manifest"]).read_text()
+    )
+
+    with Image.open(result["hero"]) as image:
+        assert image.size == (8, 8)
+    assert manifest["publication_layout"] == "single-scientific-panel"
+    assert manifest["frames"][0]["selected_panel_label"] == (
+        "SPECTRAL POWER / RGB"
+    )
 
 
 def test_signed_stokes_display_opacity_follows_beam_support():

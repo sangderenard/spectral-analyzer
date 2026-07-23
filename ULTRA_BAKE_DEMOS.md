@@ -73,6 +73,11 @@ Available overrides are:
 - `--ultra-lanes`: exact width `1`, `3`, `4`, `8`, `16`, or `32`.
 - `--ultra-pattern`: finite-material `iris`, `circular`, `hole-array`,
   `slot-array`, or `grating`.
+- `--ultra-output-size`: publish each composite as an exact square RGBA
+  texture while preserving the scientific plate's aspect ratio.
+- `--ultra-panel`: publish one chosen scientific panel as a raw square instead
+  of making the six-panel plate. It accepts indices `0..5` or names including
+  `physical`, `spectral`, `power`, `polarization`, `stokes-q`, and `stokes-v`.
 
 For example, bake the same continuous-spectrum recipe through a physical
 transmission grating:
@@ -80,6 +85,24 @@ transmission grating:
 ```powershell
 python wave_transform_visual_demo.py --ultra-bake iris-spectrum-continuous --ultra-pattern grating --output-dir exposures/ultra_bakes_grating
 ```
+
+One 2048×2048 composite texture:
+
+```powershell
+python wave_transform_visual_demo.py --ultra-bake iris-spectrum-continuous --ultra-frames 1 --ultra-output-size 2048 --output-dir exposures/ultra_bakes_2048
+```
+
+One genuinely computed 2048×2048 spectral field—not an enlarged contact
+sheet:
+
+```powershell
+python wave_transform_visual_demo.py --ultra-bake iris-spectrum-continuous --ultra-frames 1 --ultra-size 2048 --ultra-scale 1 --ultra-quality balanced --ultra-lanes 1 --ultra-panel spectral --output-dir exposures/ultra_field_2048
+```
+
+At `balanced`, the 2048 published field uses a 4096×4096 absorbing solve.
+Selecting `bake` would use a 16384×16384 solve and should only be attempted
+after spectral/state streaming is implemented or on a substantially larger
+machine.
 
 Lane width and spectral semantics remain separate. A continuous 32-lane bake
 contains 32 stratified continuous-frequency samples; it does not silently

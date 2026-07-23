@@ -33,6 +33,7 @@ SUPPORTED_LANE_COUNTS = (1, 3, 4, 8, 16, 32)
 class OpticalExecutionDomain(str, Enum):
     PIPELINE_PORT = "pipeline-port"
     T2_PARAMETRIC = "t2-parametric"
+    T3_MATERIAL = "t3-material"
     T4_WAVE_ARENA = "t4-wave-arena"
     MAXWELL_ARTIFACT = "maxwell-artifact"
 

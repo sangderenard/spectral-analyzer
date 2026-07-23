@@ -3,6 +3,10 @@
 Status: compiler/ABI scaffold with native T4 installation  
 Schema: `optical-transport-graph-v1`
 
+The graph's loadable component boundary and its native inspection commands are
+documented in `OPTICAL_COMPONENT_ARENA.md`. Components compile into this graph;
+they do not add a second graph evaluator or numerical solver.
+
 ## Purpose
 
 The optical transport graph gives the existing `GraphSolver` authority over

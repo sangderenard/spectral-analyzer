@@ -10,6 +10,7 @@ or hard array mask is used.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import math
 from pathlib import Path
@@ -769,6 +770,7 @@ def _solve_aperture_visual(
     piston_removed: bool = True,
     coherence_seed: int = 0,
     spectral_panel: bool = False,
+    aperture_template=None,
 ) -> dict[str, object]:
     """Solve one physical-aperture frame through shared production kernels."""
 
@@ -792,14 +794,33 @@ def _solve_aperture_visual(
         (solve_width-1)*pitch_m,
         (solve_height-1)*pitch_m,
     )
-    aperture = _build_aperture_pattern(
-        aperture_pattern,
-        opening_radius_m=float(opening),
-        sweep=float(sweep),
-        assembly_radius_m=aperture_extent,
-        pitch_m=pitch_m,
-        rotation_rad=cycle_phase*0.2,
-    )
+    if aperture_template is None:
+        aperture = _build_aperture_pattern(
+            aperture_pattern,
+            opening_radius_m=float(opening),
+            sweep=float(sweep),
+            assembly_radius_m=aperture_extent,
+            pitch_m=pitch_m,
+            rotation_rad=cycle_phase*0.2,
+        )
+    else:
+        # The arena animates the component it loaded; it must not silently
+        # author a second demo-private aperture.  Preserve its blade/material
+        # contract while fitting its physical extent to this sampled domain.
+        scale = aperture_extent/max(
+            float(aperture_template.assembly_radius_m), 1.0e-30
+        )
+        aperture = replace(
+            aperture_template,
+            opening_x_m=float(opening),
+            opening_y_m=float(opening),
+            assembly_radius_m=float(aperture_extent),
+            thickness_m=float(aperture_template.thickness_m)*scale,
+            rotation_rad=(
+                float(aperture_template.rotation_rad)+cycle_phase*0.2
+            ),
+        )
+        aperture.validate()
     payload = aperture.wave_payload()
     scalar_field = domain.uniform_scalar_field(bands=lane_count)
     scalar_field *= spectral_amplitudes[:, None, None]
@@ -1803,6 +1824,537 @@ def run_aperture_live(
         pygame.quit()
 
 
+def _arena_fit_points(
+    points: np.ndarray,
+    size: int,
+    *,
+    margin: int = 24,
+    axes: tuple[int, int] | None = None,
+) -> tuple[np.ndarray, tuple[int, int]]:
+    values = np.asarray(points, np.float64).reshape(-1, 3)
+    if axes is None:
+        spans = np.ptp(values, axis=0)
+        selected = tuple(int(value) for value in np.argsort(spans)[-2:])
+        axes = (selected[0], selected[1])
+    projected = values[:, axes]
+    lo = np.min(projected, axis=0)
+    hi = np.max(projected, axis=0)
+    span = np.maximum(hi-lo, 1.0e-12)
+    scale = min(
+        (size-2*margin)/float(span[0]),
+        (size-2*margin)/float(span[1]),
+    )
+    center = 0.5*(lo+hi)
+    screen = (projected-center)*scale
+    screen[:, 0] += 0.5*size
+    screen[:, 1] = 0.5*size-screen[:, 1]
+    return screen, axes
+
+
+def _arena_unit(value, name: str) -> np.ndarray:
+    vector = np.asarray(value, np.float64).reshape(3)
+    length = float(np.linalg.norm(vector))
+    if not np.all(np.isfinite(vector)) or length <= 1.0e-12:
+        raise ValueError(f"{name} must be a finite non-zero vector")
+    return vector/length
+
+
+def _arena_geometry_panel(compiled, size: int) -> np.ndarray:
+    image = Image.new("RGBA", (size, size), (6, 10, 18, 255))
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    geometry = compiled.display_geometry
+    if geometry is None:
+        draw.text((12, 12), "PARAMETRIC GEOMETRY", font=font,
+                  fill=(210, 225, 245, 255))
+        draw.text((12, 36), "mesh-independent exact component", font=font,
+                  fill=(115, 180, 240, 255))
+        for index, face in enumerate(
+            compiled.metadata.get("registered_faces", ())
+        ):
+            draw.text((12, 58+index*15), str(face), font=font,
+                      fill=(155, 175, 205, 255))
+        return np.asarray(image, np.uint8)
+
+    triangles = np.asarray(geometry.triangles, np.float64)
+    screen, axes = _arena_fit_points(triangles.reshape(-1, 3), size)
+    screen = screen.reshape(-1, 3, 2)
+    palette = {
+        "reflective_surface": (95, 190, 255, 220),
+        "entrance_glass": (90, 220, 235, 125),
+        "exit_glass": (90, 220, 235, 125),
+        "silvered_reflector_1": (225, 235, 250, 230),
+        "silvered_reflector_2": (225, 235, 250, 230),
+        "blackened_prism_face": (28, 35, 48, 245),
+        "blackened_prism_side": (28, 35, 48, 245),
+        "aperture_material": (75, 90, 115, 240),
+    }
+    for triangle, role in zip(screen, geometry.roles):
+        color = palette.get(role, (120, 145, 185, 190))
+        xy = [tuple(float(value) for value in point) for point in triangle]
+        draw.polygon(xy, fill=color, outline=(175, 205, 235, 210))
+    draw.rectangle((5, 5, size-6, 24), fill=(5, 9, 16, 220))
+    draw.text(
+        (10, 9),
+        f"REPRESENTATIVE GEOMETRY  axes={axes[0]}/{axes[1]}",
+        font=font, fill=(220, 232, 248, 255),
+    )
+    return np.asarray(image, np.uint8)
+
+
+def _arena_text_panel(
+    title: str,
+    lines: list[str],
+    size: int,
+    *,
+    accent: tuple[int, int, int, int] = (95, 195, 255, 255),
+) -> np.ndarray:
+    image = Image.new("RGBA", (size, size), (7, 11, 19, 255))
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    draw.text((10, 10), title, font=font, fill=accent)
+    y = 34
+    for line in lines:
+        words = str(line).split()
+        rows: list[str] = []
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if len(candidate) > max(20, size//7) and current:
+                rows.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            rows.append(current)
+        for row in rows:
+            if y > size-18:
+                draw.text((10, y), "...", font=font, fill=(130, 145, 170, 255))
+                return np.asarray(image, np.uint8)
+            draw.text((10, y), row, font=font, fill=(175, 195, 220, 255))
+            y += 15
+        y += 4
+    return np.asarray(image, np.uint8)
+
+
+def _arena_graph_panel(compiled, size: int) -> np.ndarray:
+    contract = compiled.graph.contract()
+    nodes = contract["nodes"]
+    links = contract["links"]
+    image = Image.new("RGBA", (size, size), (7, 11, 19, 255))
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    draw.text((10, 9), "COMPILED TRANSPORT GRAPH", font=font,
+              fill=(160, 120, 255, 255))
+    if not nodes:
+        return np.asarray(image, np.uint8)
+    box_h = max(13, min(42, (size-46)//len(nodes)))
+    centers: dict[str, tuple[float, float]] = {}
+    for index, node in enumerate(nodes):
+        y0 = 34+index*box_h
+        y1 = min(size-8, y0+max(8, box_h-4))
+        if y0 >= size-8:
+            break
+        x0, x1 = 16, size-16
+        domain = node["domain"]
+        color = {
+            "pipeline-port": (65, 115, 165, 255),
+            "t2-parametric": (65, 170, 120, 255),
+            "t3-material": (205, 145, 55, 255),
+            "t4-wave-arena": (135, 90, 220, 255),
+        }.get(domain, (100, 110, 135, 255))
+        draw.rounded_rectangle((x0, y0, x1, y1), radius=5,
+                               fill=tuple((*color[:3], 75)), outline=color)
+        label = f"{node['operation']}  [{domain}]"
+        draw.text((x0+7, y0+6), label[:max(20, size//7)],
+                  font=font, fill=(225, 235, 248, 255))
+        centers[node["key"]] = (0.5*(x0+x1), 0.5*(y0+y1))
+    for link in links:
+        if link["src"] not in centers or link["dst"] not in centers:
+            continue
+        a, b = centers[link["src"]], centers[link["dst"]]
+        draw.line((a[0], a[1]+8, b[0], b[1]-8),
+                  fill=(210, 220, 238, 200), width=2)
+    return np.asarray(image, np.uint8)
+
+
+def _arena_probe_paths(component, compiled, phase: float) -> list[np.ndarray]:
+    from camera_software.optical_components import (
+        CompoundLensComponent, PentaprismComponent, PlaneMirrorComponent,
+    )
+    paths: list[np.ndarray] = []
+    if isinstance(component, CompoundLensComponent):
+        front = component.lens.side("front")
+        back = component.lens.side("back")
+        axial_span = max(abs(back.x_pos-front.x_pos), front.radius, 1.0e-3)
+        launch_x = front.x_pos-0.35*axial_span
+        angle = 0.035*math.sin(phase)
+        for offset in np.linspace(-0.72*front.radius, 0.72*front.radius, 9):
+            result = component.lens.trace_detailed(
+                (launch_x, float(offset), 0.0),
+                (1.0, angle, 0.0),
+            )
+            points = [np.asarray((launch_x, offset, 0.0), np.float64)]
+            points.extend(event.p1 for event in result.events)
+            if result.events:
+                tail = np.asarray(result.events[-1].p1, np.float64)
+                direction = np.asarray(result.events[-1].dir_out, np.float64)
+                points.append(tail+direction*0.35*axial_span)
+            paths.append(np.asarray(points))
+    elif isinstance(component, PlaneMirrorComponent):
+        normal = _arena_unit(component.normal, "mirror normal")
+        incoming = _arena_unit(
+            (1.0, 0.22*math.sin(phase), 0.0), "probe"
+        )
+        reflected = component.reflected_direction(incoming)
+        center = np.asarray(component.center_m, np.float64)
+        tangent = _arena_unit(
+            np.cross(normal, (0.0, 0.0, 1.0)), "mirror tangent"
+        )
+        for offset in np.linspace(-0.7, 0.7, 9):
+            hit = center+offset*component.radius_m*tangent
+            paths.append(np.stack((
+                hit-incoming*2.2*component.radius_m,
+                hit,
+                hit+reflected*2.2*component.radius_m,
+            )))
+    elif isinstance(component, PentaprismComponent):
+        assembly = component.spec.build()
+        chief = np.asarray(assembly.primary_path, np.float64)
+        extrusion = _arena_unit(
+            np.cross(component.spec.input_axis, component.spec.output_axis),
+            "pentaprism extrusion",
+        )
+        for offset in np.linspace(-0.35, 0.35, 7):
+            paths.append(chief+offset*component.spec.depth_m*extrusion)
+    return paths
+
+
+def _arena_probe_panel(
+    component,
+    compiled,
+    size: int,
+    phase: float,
+    native_paths: list[np.ndarray] | None = None,
+) -> np.ndarray:
+    paths = (
+        native_paths
+        if native_paths is not None
+        else _arena_probe_paths(component, compiled, phase)
+    )
+    image = Image.new("RGBA", (size, size), (4, 8, 14, 255))
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    if not paths:
+        draw.text((10, 10), "FIELD-DOMAIN PROBE", font=font,
+                  fill=(110, 220, 255, 255))
+        draw.text((10, 34), "see complex field products", font=font,
+                  fill=(165, 190, 220, 255))
+        return np.asarray(image, np.uint8)
+    all_points = np.concatenate(paths)
+    screen, axes = _arena_fit_points(all_points, size, margin=22)
+    cursor = 0
+    colors = (
+        (80, 210, 255, 235), (115, 135, 255, 235),
+        (235, 105, 255, 235), (255, 150, 95, 235),
+    )
+    for index, path in enumerate(paths):
+        count = len(path)
+        line = screen[cursor:cursor+count]
+        cursor += count
+        draw.line(
+            [tuple(float(v) for v in point) for point in line],
+            fill=colors[index % len(colors)], width=2,
+        )
+        for point in line[1:-1]:
+            x, y = float(point[0]), float(point[1])
+            draw.ellipse((x-2, y-2, x+2, y+2),
+                         fill=(245, 250, 255, 255))
+    prefix = "NATIVE T1/T3" if native_paths is not None else "CANONICAL"
+    draw.text((10, 9), f"{prefix} PROBE PATHS axes={axes[0]}/{axes[1]}",
+              font=font, fill=(220, 235, 250, 255))
+    return np.asarray(image, np.uint8)
+
+
+def _component_static_panels(
+    component,
+    compiled,
+    size: int,
+    phase: float,
+    *,
+    native_paths: list[np.ndarray] | None = None,
+):
+    contract = compiled.contract()
+    materials = [
+        f"{entry['role']}: {entry['material']} / {entry['interaction']}"
+        for entry in contract["material_roles"]
+    ] or ["no T3 material geometry; exact parametric artifact"]
+    controls = [
+        f"{entry['label']} = {entry['default']} {entry['unit']} "
+        f"[{entry['rebuild_scope']}]"
+        for entry in contract["controls"]
+    ] or ["no authored controls"]
+    ports = [
+        f"{entry['key']}  {entry['direction']}  "
+        f"{entry['representation']} axis={entry['axis']}"
+        for entry in contract["ports"]
+    ]
+    status = [
+        f"component: {contract['key']}",
+        f"kind: {contract['component_kind']}",
+        f"lanes: {contract['lane_count']}",
+        f"T1/T3 triangles: {contract['transport_triangle_count']}",
+        f"T2 artifacts: {len(compiled.graph.t2_payloads)}",
+        f"T4 regions: {len(compiled.graph.t4_descriptors)}",
+        "execution: compiled; never hot node interpretation",
+    ]
+    return (
+        (
+            _arena_geometry_panel(compiled, size),
+            _arena_probe_panel(
+                component, compiled, size, phase, native_paths
+            ),
+            _arena_graph_panel(compiled, size),
+            _arena_text_panel("PORTS", ports, size),
+            _arena_text_panel("CANONICAL MATERIAL ROLES", materials, size),
+            _arena_text_panel("COMPONENT / CONTROLS", status+controls, size),
+        ),
+        ("GEOMETRY", "TRANSPORT PROBE", "GRAPH", "PORTS", "MATERIALS", "STATE"),
+    )
+
+
+def run_component_arena_live(
+    component_key: str,
+    *,
+    lane_count: int = 4,
+    size: int = 384,
+    fps: int = 30,
+    wavelength_m: float = 532.0e-9,
+    _max_display_frames: int | None = None,
+) -> None:
+    """Load one canonical component into the shared OpenGL inspection arena."""
+
+    if size < 64 or fps < 1:
+        raise ValueError("component arena size/fps are invalid")
+    import pygame
+    from OpenGL import GL as gl
+    from camera_software.gpu_preview import (
+        GLPreviewCompositor, PreviewProductKind, PreviewTextureProduct,
+    )
+    from camera_software.optical_components import (
+        PentaprismComponent,
+        PhysicalApertureComponent,
+        PlaneMirrorComponent,
+        build_native_component_scene,
+        default_optical_component_registry,
+    )
+
+    registry = default_optical_component_registry()
+    component = registry.create(component_key, lane_count)
+    compiled = component.compile(lane_count)
+    compiled.validate()
+    pygame.init()
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+    pygame.display.gl_set_attribute(
+        pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE
+    )
+    pygame.display.set_mode(
+        (1500, 820), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
+    )
+    textures = [int(value) for value in gl.glGenTextures(6)]
+    compositor = GLPreviewCompositor()
+    compositor.init_gl()
+    for texture in textures:
+        gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexImage2D(
+            gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, size, size, 0,
+            gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, None,
+        )
+    tracer = (
+        _calibration_tracer(wavelength_m)
+        if isinstance(component, PhysicalApertureComponent) else None
+    )
+    native_tracer = None
+    native_submitted = False
+    native_paths: list[np.ndarray] | None = None
+    if isinstance(component, (PlaneMirrorComponent, PentaprismComponent)):
+        wavelengths = np.linspace(420.0e-9, 700.0e-9, lane_count)
+        frequencies = 299_792_458.0/wavelengths
+        native_scene = build_native_component_scene(compiled, frequencies)
+        native_tracer = native_scene.create_tracer()
+        native_tracer.ensure_pipeline(
+            max_children=max(2, lane_count+1),
+            min_amplitude=1.0e-12,
+        )
+    clock = pygame.time.Clock()
+    running, paused = True, False
+    generation = displayed_frames = 0
+    try:
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                        running = False
+                    elif event.key == pygame.K_SPACE:
+                        paused = not paused
+            if not paused:
+                generation += 1
+            phase = generation*0.025
+            if (
+                native_tracer is not None
+                and native_submitted
+                and int(native_tracer.in_flight_count()) == 0
+            ):
+                records = native_tracer.drain_records(4096)
+                starts = np.asarray(records["seg_start"], np.float64)
+                ends = np.asarray(records["pos"], np.float64)
+                native_paths = [
+                    np.stack((start, end))
+                    for start, end in zip(starts, ends)
+                    if np.all(np.isfinite(start)) and np.all(np.isfinite(end))
+                    and float(np.linalg.norm(end-start)) > 1.0e-12
+                ]
+                native_submitted = False
+            if (
+                native_tracer is not None
+                and not paused
+                and not native_submitted
+                and int(native_tracer.in_flight_count()) == 0
+            ):
+                if isinstance(component, PlaneMirrorComponent):
+                    direction = _arena_unit(
+                        (1.0, 0.18*math.sin(phase), 0.0), "mirror probe"
+                    )
+                    origin = (
+                        np.asarray(component.center_m, np.float64)
+                        - direction*2.2*component.radius_m
+                    )
+                else:
+                    assembly = component.spec.build()
+                    direction = _arena_unit(
+                        component.spec.input_axis, "pentaprism probe"
+                    )
+                    origin = (
+                        np.asarray(assembly.primary_path[0], np.float64)
+                        - direction*0.25*component.spec.clear_size_m
+                    )
+                amplitudes = np.full(
+                    (1, lane_count),
+                    1.0/math.sqrt(max(1, lane_count))+0.0j,
+                    np.complex128,
+                )
+                native_tracer.submit_rays(
+                    origin[None],
+                    direction[None],
+                    amplitudes,
+                    max_bounces=12,
+                    min_amplitude=1.0e-12,
+                    max_children=max(2, lane_count+1),
+                )
+                native_submitted = True
+            if isinstance(component, PhysicalApertureComponent):
+                visual = _solve_aperture_visual(
+                    tracer,
+                    size=size,
+                    pitch_m=1.5e-6,
+                    wavelength_m=wavelength_m,
+                    cycle_phase=phase,
+                    aperture_pattern="iris",
+                    polarization_mode="radial",
+                    quality="balanced",
+                    spectral_mode="fixed",
+                    lane_count=lane_count,
+                    spectral_epoch=0,
+                    source_angle_deg=0.0,
+                    analyzer_angle_deg=0.0,
+                    vector_page=True,
+                    piston_removed=True,
+                    coherence_seed=generation << 8,
+                    aperture_template=component.aperture,
+                )
+                panels, labels = visual["panels"], visual["labels"]
+            else:
+                panels, labels = _component_static_panels(
+                    component, compiled, size, phase,
+                    native_paths=native_paths,
+                )
+            for texture, rgba in zip(textures, panels):
+                gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+                gl.glTexSubImage2D(
+                    gl.GL_TEXTURE_2D, 0, 0, 0, size, size,
+                    gl.GL_RGBA, gl.GL_UNSIGNED_BYTE,
+                    np.ascontiguousarray(rgba),
+                )
+            width, height = pygame.display.get_window_size()
+            gl.glViewport(0, 0, width, height)
+            gl.glClearColor(0.015, 0.022, 0.035, 1.0)
+            gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+            gap = max(4, width//288)
+            pane_width = max(1, (width-gap*4)//3)
+            pane_height = max(1, (height-gap*3)//2)
+            for index, texture in enumerate(textures):
+                row, column = divmod(index, 3)
+                compositor.draw(
+                    PreviewTextureProduct(
+                        product_id=f"component.{component_key}.{index}",
+                        tab_label=labels[index],
+                        texture_id=texture,
+                        width=size,
+                        height=size,
+                        generation=generation,
+                        producer="canonical-optical-component-arena",
+                        internal_format=int(gl.GL_RGBA8),
+                        kind=(
+                            PreviewProductKind.COMPLEX_FIELD
+                            if isinstance(component, PhysicalApertureComponent)
+                            else (
+                                PreviewProductKind.CAMERA_GEOMETRY,
+                                PreviewProductKind.LIGHT_FIELD,
+                                PreviewProductKind.PROCESSING_GROUP,
+                                PreviewProductKind.PROCESSING_GROUP,
+                                PreviewProductKind.PROCESSING_GROUP,
+                                PreviewProductKind.ACCUMULATION,
+                            )[index]
+                        ),
+                        orientation="top-left",
+                        alpha_mode="straight",
+                    ),
+                    (
+                        gap+column*(pane_width+gap),
+                        gap+row*(pane_height+gap),
+                        pane_width, pane_height,
+                    ),
+                    height,
+                    tone_map=False,
+                )
+            pygame.display.flip()
+            displayed_frames += 1
+            pygame.display.set_caption(
+                f"Optical component arena — {component_key} "
+                f"[{compiled.component_kind}] lanes={lane_count} "
+                f"generation={generation} "
+                f"{'PAUSED ' if paused else ''}"
+                "[Space pause, Esc close]"
+            )
+            clock.tick(fps)
+            if (
+                _max_display_frames is not None
+                and displayed_frames >= _max_display_frames
+            ):
+                running = False
+    finally:
+        if native_tracer is not None:
+            native_tracer.stop_pipeline()
+        compositor.destroy()
+        gl.glDeleteTextures(len(textures), textures)
+        pygame.quit()
+
+
 def run_transport_live(
     *,
     wavelength_m: float = 532.0e-9,
@@ -2033,6 +2585,22 @@ def main() -> int:
         help="animate Jones-resolved finite material iris interaction in OpenGL",
     )
     parser.add_argument(
+        "--component-live", action="store_true",
+        help="load a canonical optical component into the shared OpenGL arena",
+    )
+    parser.add_argument(
+        "--component", default="aperture.iris",
+        help="component registry key for --component-live",
+    )
+    parser.add_argument(
+        "--component-lanes", type=int, choices=_APERTURE_LANE_COUNTS, default=4,
+        help="exact compiled lane width for --component-live",
+    )
+    parser.add_argument(
+        "--list-components", action="store_true",
+        help="print canonical optical-component registry keys and exit",
+    )
+    parser.add_argument(
         "--ultra-bake",
         choices=("all", *_ULTRA_BAKE_PRESETS),
         help="bake a named high-investment physical-aperture showcase",
@@ -2113,6 +2681,14 @@ def main() -> int:
         help="forward steps before the live animation reverses",
     )
     args = parser.parse_args()
+    if args.list_components:
+        from camera_software.optical_components import (
+            default_optical_component_registry,
+        )
+        print(json.dumps(
+            list(default_optical_component_registry().keys()), indent=2
+        ))
+        return 0
     if args.list_ultra_bakes:
         print(json.dumps(ultra_bake_presets(), indent=2))
         return 0
@@ -2120,6 +2696,7 @@ def main() -> int:
         bool(args.live),
         bool(args.transport_live),
         bool(args.aperture_live),
+        bool(args.component_live),
         bool(args.ultra_bake),
     )) > 1:
         parser.error("choose one live or bake mode")
@@ -2147,6 +2724,14 @@ def main() -> int:
             spectral_mode=args.aperture_spectrum,
             lane_count=args.aperture_lanes,
             aperture_pattern=args.aperture_pattern,
+        )
+        return 0
+    if args.component_live:
+        run_component_arena_live(
+            args.component,
+            lane_count=args.component_lanes,
+            size=max(64, args.size),
+            fps=args.fps,
         )
         return 0
     if args.transport_live:

@@ -5,6 +5,7 @@ from PIL import Image
 import pytest
 
 from wave_transform_visual_demo import (
+    _component_static_panels,
     _aperture_sweep_radius,
     _aperture_spectral_samples,
     _remove_piston_phase,
@@ -12,6 +13,7 @@ from wave_transform_visual_demo import (
     render_aperture_bake,
     render_sequence,
     run_aperture_live,
+    run_component_arena_live,
     run_live,
     run_transport_live,
     ultra_bake_presets,
@@ -51,6 +53,30 @@ def test_live_mode_validates_before_opening_a_context():
         run_aperture_live(size=16, lane_count=2)
     with pytest.raises(ValueError, match="aperture_pattern"):
         run_aperture_live(size=16, aperture_pattern="ideal-mask")
+    with pytest.raises(ValueError, match="size/fps"):
+        run_component_arena_live("mirror.plane", size=32)
+
+
+@pytest.mark.parametrize(
+    "component_key",
+    ("lens.default-camera", "mirror.plane", "pentaprism.finder"),
+)
+def test_component_arena_panels_use_compiled_component_artifacts(component_key):
+    from camera_software.optical_components import (
+        default_optical_component_registry,
+    )
+
+    registry = default_optical_component_registry()
+    component = registry.create(component_key, 4)
+    compiled = component.compile(4)
+    panels, labels = _component_static_panels(
+        component, compiled, 128, phase=0.37
+    )
+
+    assert len(panels) == len(labels) == 6
+    assert all(panel.shape == (128, 128, 4) for panel in panels)
+    assert np.count_nonzero(panels[1][..., :3]) > 0
+    assert "GRAPH" in labels
 
 
 def test_relative_phase_gauge_removes_only_global_piston():

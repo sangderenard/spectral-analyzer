@@ -10,8 +10,10 @@ or hard array mask is used.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
+import time
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -235,6 +237,35 @@ def _polarization_rgba(stokes: tuple[np.ndarray, ...]) -> np.ndarray:
     ).astype(np.uint8)
 
 
+def _spectral_power_rgba(
+    band_power: np.ndarray,
+    wavelengths_m: np.ndarray,
+) -> np.ndarray:
+    """Integrate resolved band power using the renderer's spectral RGB map."""
+
+    from camera_software.transport_contract import native_display_rgb_weight
+
+    power = np.maximum(np.asarray(band_power, np.float64), 0.0)
+    wavelengths = np.asarray(wavelengths_m, np.float64).reshape(-1)
+    if power.ndim != 3 or power.shape[0] != len(wavelengths):
+        raise ValueError("spectral power requires [band,y,x] and wavelengths")
+    weights = np.asarray([
+        native_display_rgb_weight(value * 1.0e9) for value in wavelengths
+    ], np.float64)
+    rgb = np.einsum("byx,bc->yxc", power, weights, optimize=True)
+    peak = float(np.percentile(np.max(rgb, axis=2), 99.8))
+    if peak > 0.0:
+        rgb = np.sqrt(np.clip(rgb / peak, 0.0, 1.0))
+    alpha = (
+        np.max(power, axis=0)
+        > max(float(np.max(power))*1.0e-10, 1.0e-30)
+    ).astype(np.float64)
+    return np.clip(
+        np.concatenate((rgb, alpha[..., None]), axis=2) * 255.0,
+        0.0, 255.0,
+    ).astype(np.uint8)
+
+
 _APERTURE_POLARIZATION_MODES = (
     "linear", "circular+", "circular-", "radial", "azimuthal",
     "partial", "unpolarized",
@@ -367,6 +398,42 @@ def _compose(panels: list[Image.Image], footer: str) -> Image.Image:
     return image
 
 
+def _compose_grid(
+    panels: tuple[np.ndarray, ...],
+    labels: tuple[str, ...],
+    *,
+    scale: int,
+    footer: str,
+) -> Image.Image:
+    """Compose six scientific panels into the same 3x2 shape as the live UI."""
+
+    if len(panels) != 6 or len(labels) != 6:
+        raise ValueError("aperture plates require exactly six panels")
+    labelled = [
+        _labelled_panel(panel, label, scale)
+        for panel, label in zip(panels, labels)
+    ]
+    gap = 8
+    footer_h = 34
+    cell_width = max(panel.width for panel in labelled)
+    cell_height = max(panel.height for panel in labelled)
+    width = 3*cell_width + 2*gap
+    height = 2*cell_height + gap + footer_h
+    image = Image.new("RGBA", (width, height), (4, 7, 12, 255))
+    for index, panel in enumerate(labelled):
+        row, column = divmod(index, 3)
+        image.paste(
+            panel,
+            (column*(cell_width+gap), row*(cell_height+gap)),
+            panel,
+        )
+    ImageDraw.Draw(image).text(
+        (8, height-footer_h+9), footer,
+        fill=(150, 175, 205, 255), font=ImageFont.load_default(),
+    )
+    return image
+
+
 def _transport_table_rgba(
     arena: dict[str, object] | list[dict[str, object]],
     detector_position: np.ndarray | None,
@@ -492,13 +559,6 @@ def _aperture_geometry_rgba(
         draw.polygon(
             polygon, fill=(70, 76, 88, 255), outline=(155, 172, 194, 255)
         )
-    draw.text(
-        (8, 8),
-        f"{aperture.element_count} material blades\n"
-        f"{aperture.thickness_m*1e6:.2f} um {aperture.material_name}",
-        fill=(220, 230, 242, 255),
-        font=ImageFont.load_default(),
-    )
     return np.asarray(image, np.uint8)
 
 
@@ -517,6 +577,192 @@ def _aperture_sweep_radius(
         + sweep*np.log(clear_field_radius/pinhole_radius)
     )
     return float(opening), float(assembly_radius), float(sweep)
+
+
+def _solve_aperture_visual(
+    tracer,
+    *,
+    size: int,
+    pitch_m: float,
+    wavelength_m: float,
+    cycle_phase: float,
+    polarization_mode: str,
+    quality: str,
+    spectral_mode: str,
+    lane_count: int,
+    spectral_epoch: int = 0,
+    source_angle_deg: float = 0.0,
+    analyzer_angle_deg: float = 0.0,
+    vector_page: bool = True,
+    piston_removed: bool = True,
+    coherence_seed: int = 0,
+    spectral_panel: bool = False,
+) -> dict[str, object]:
+    """Solve one physical-aperture frame through shared production kernels."""
+
+    from camera_software.physical_aperture import LivePhysicalAperture
+    from camera_software.vector_wave_adapter import (
+        JonesFieldState,
+        PaddedWaveDomain,
+    )
+
+    opening, _display_extent, sweep = _aperture_sweep_radius(
+        cycle_phase, size, pitch_m,
+    )
+    wavelengths, spectral_amplitudes = _aperture_spectral_samples(
+        spectral_mode,
+        lane_count,
+        wavelength_m=wavelength_m,
+        sample_epoch=spectral_epoch,
+    )
+    domain = PaddedWaveDomain.for_quality((size, size), quality)
+    solve_height, solve_width = domain.solve_shape
+    aperture_extent = 0.51 * math.hypot(
+        (solve_width-1)*pitch_m,
+        (solve_height-1)*pitch_m,
+    )
+    aperture = LivePhysicalAperture.iris(
+        "demo.physical-iris",
+        blade_count=9,
+        opening_radius_m=float(opening),
+        assembly_radius_m=aperture_extent,
+        thickness_m=0.10e-6,
+        rotation_rad=cycle_phase*0.2,
+        material_name="blackened_steel",
+        material_n_real=2.9,
+        material_n_imag=3.0,
+    )
+    payload = aperture.wave_payload()
+    scalar_field = domain.uniform_scalar_field(bands=lane_count)
+    scalar_field *= spectral_amplitudes[:, None, None]
+    initial = JonesFieldState.from_scalar_field(
+        scalar_field,
+        _aperture_polarization_state(
+            polarization_mode, source_angle_deg,
+        ),
+        coherence_seed=int(coherence_seed),
+    )
+    material, accounting = initial.apply_isotropic_material_native(
+        tracer,
+        pitch_m=pitch_m,
+        distance_m=aperture.thickness_m,
+        direction_sign=1,
+        wavelengths_m=wavelengths,
+        payload=payload,
+    )
+    distance = 90.0e-6
+    forward, boundary = material.propagate_open_native(
+        tracer,
+        pitch_m=pitch_m,
+        distance_m=distance,
+        direction_sign=1,
+        wavelengths_m=wavelengths,
+        domain=domain,
+    )
+    forward_stokes = tuple(domain.crop(value) for value in forward.stokes())
+    geometry = _aperture_geometry_rgba(
+        aperture,
+        size,
+        view_radius_m=0.5*(size-1)*pitch_m,
+    )
+    spectral_power = domain.crop(np.sum(
+        np.abs(forward.fields.astype(np.complex128))**2,
+        axis=(0, 1),
+    ))
+    spectral_rgba = _spectral_power_rgba(spectral_power, wavelengths)
+
+    if vector_page:
+        if spectral_panel:
+            panels = (
+                geometry,
+                spectral_rgba,
+                _scalar_rgba(forward_stokes[0]),
+                _polarization_rgba(forward_stokes),
+                _signed_scalar_rgba(forward_stokes[1], forward_stokes[0]),
+                _signed_scalar_rgba(forward_stokes[3], forward_stokes[0]),
+            )
+            labels = (
+                "PHYSICAL BLADES",
+                "SPECTRAL POWER / RGB",
+                "STOKES I / POWER",
+                "POLARIZATION",
+                "STOKES Q / I",
+                "STOKES V / I",
+            )
+        else:
+            panels = (
+                geometry,
+                _scalar_rgba(forward_stokes[0]),
+                _polarization_rgba(forward_stokes),
+                _signed_scalar_rgba(forward_stokes[1], forward_stokes[0]),
+                _signed_scalar_rgba(forward_stokes[3], forward_stokes[0]),
+                _scalar_rgba(domain.crop(
+                    forward.analyzer_intensity(analyzer_angle_deg)
+                )),
+            )
+            labels = (
+                "PHYSICAL BLADES",
+                "STOKES I / POWER",
+                "POLARIZATION",
+                "STOKES Q / I",
+                "STOKES V / I",
+                f"ANALYZER {analyzer_angle_deg%180.0:.0f} DEG",
+            )
+    else:
+        reverse_material, _reverse_accounting = (
+            initial.apply_isotropic_material_native(
+                tracer,
+                pitch_m=pitch_m,
+                distance_m=aperture.thickness_m,
+                direction_sign=-1,
+                wavelengths_m=wavelengths,
+                payload=payload,
+            )
+        )
+        reverse, _reverse_boundary = reverse_material.propagate_open_native(
+            tracer,
+            pitch_m=pitch_m,
+            distance_m=distance,
+            direction_sign=-1,
+            wavelengths_m=wavelengths,
+            domain=domain,
+        )
+        reverse_stokes = tuple(domain.crop(value) for value in reverse.stokes())
+        material_s = domain.crop(material.fields[0, 0, 0])
+        material_p = domain.crop(material.fields[0, 1, 0])
+        forward_s = domain.crop(forward.fields[0, 0, 0])
+        forward_p = domain.crop(forward.fields[0, 1, 0])
+        panels = (
+            geometry,
+            _phase_rgba(material_s, remove_piston=piston_removed),
+            _phase_rgba(material_p, remove_piston=piston_removed),
+            _phase_rgba(forward_s, remove_piston=piston_removed),
+            _phase_rgba(forward_p, remove_piston=piston_removed),
+            _polarization_rgba(reverse_stokes),
+        )
+        labels = (
+            "PHYSICAL BLADES",
+            f"MODE 0 {wavelengths[0]*1e9:.1f}NM MATERIAL S",
+            f"MODE 0 {wavelengths[0]*1e9:.1f}NM MATERIAL P",
+            f"MODE 0 {wavelengths[0]*1e9:.1f}NM FORWARD S",
+            f"MODE 0 {wavelengths[0]*1e9:.1f}NM FORWARD P",
+            "REVERSE POLARIZATION",
+        )
+
+    input_power = float(accounting["input_power"])
+    output_power = float(accounting["output_power"])
+    return {
+        "panels": panels,
+        "labels": labels,
+        "opening_radius_m": float(opening),
+        "sweep": float(sweep),
+        "wavelengths_m": wavelengths.copy(),
+        "solve_shape": (int(solve_height), int(solve_width)),
+        "propagation_steps": int(domain.propagation_steps),
+        "retention": output_power/max(input_power, 1.0e-30),
+        "border_fraction": float(boundary["border_fraction"]),
+        "mode_count": int(forward.mode_count),
+    }
 
 
 def _boundary_power_rgba(
@@ -645,6 +891,267 @@ def render_sequence(
         "max_roundtrip_error": float(np.max(error)),
         "rms_roundtrip_error": float(np.sqrt(np.mean(error**2))),
     }
+
+
+_ULTRA_BAKE_PRESETS: dict[str, dict[str, object]] = {
+    "iris-spectrum-fixed": {
+        "description": "32 perceptual fixed bands through the physical iris",
+        "size": 64,
+        "frames": 7,
+        "scale": 4,
+        "quality": "bake",
+        "spectral_mode": "fixed",
+        "lane_count": 32,
+        "polarizations": ("radial",),
+        "vector_page": True,
+        "spectral_panel": True,
+        "phase_mode": "sweep",
+    },
+    "iris-spectrum-continuous": {
+        "description": "resampled 32-lane continuous-frequency cohorts",
+        "size": 64,
+        "frames": 7,
+        "scale": 4,
+        "quality": "bake",
+        "spectral_mode": "continuous",
+        "lane_count": 32,
+        "polarizations": ("circular+",),
+        "vector_page": True,
+        "spectral_panel": True,
+        "phase_mode": "sweep",
+    },
+    "iris-polarization": {
+        "description": "Jones/Stokes response across canonical source states",
+        "size": 64,
+        "frames": 7,
+        "scale": 4,
+        "quality": "bake",
+        "spectral_mode": "fixed",
+        "lane_count": 16,
+        "polarizations": _APERTURE_POLARIZATION_MODES,
+        "vector_page": True,
+        "spectral_panel": True,
+        "phase_mode": "hold",
+    },
+    "iris-coherent-phase": {
+        "description": "piston-free s/p material and propagated phase",
+        "size": 64,
+        "frames": 7,
+        "scale": 4,
+        "quality": "bake",
+        "spectral_mode": "fixed",
+        "lane_count": 16,
+        "polarizations": ("circular+",),
+        "vector_page": False,
+        "spectral_panel": False,
+        "phase_mode": "sweep",
+    },
+}
+
+
+def ultra_bake_presets() -> dict[str, dict[str, object]]:
+    """Return a detached, JSON-friendly description of showcase recipes."""
+
+    return {
+        name: {
+            key: list(value) if isinstance(value, tuple) else value
+            for key, value in recipe.items()
+        }
+        for name, recipe in _ULTRA_BAKE_PRESETS.items()
+    }
+
+
+def render_aperture_bake(
+    output_dir: str | Path,
+    *,
+    preset: str,
+    size: int | None = None,
+    frames: int | None = None,
+    scale: int | None = None,
+    quality: str | None = None,
+    lane_count: int | None = None,
+    pitch_m: float = 0.75e-6,
+    wavelength_m: float = 532.0e-9,
+) -> dict[str, object]:
+    """Bake one named aperture showcase through the production wave kernels."""
+
+    if preset not in _ULTRA_BAKE_PRESETS:
+        raise ValueError(
+            f"unknown ultra bake {preset!r}; "
+            f"expected {tuple(_ULTRA_BAKE_PRESETS)}"
+        )
+    recipe = dict(_ULTRA_BAKE_PRESETS[preset])
+    active_size = int(recipe["size"] if size is None else size)
+    active_frames = int(recipe["frames"] if frames is None else frames)
+    active_scale = int(recipe["scale"] if scale is None else scale)
+    active_quality = str(recipe["quality"] if quality is None else quality)
+    active_lanes = int(
+        recipe["lane_count"] if lane_count is None else lane_count
+    )
+    if active_size < 8 or active_size & (active_size-1):
+        raise ValueError("ultra bake size must be a power of two and at least 8")
+    if active_frames < 1:
+        raise ValueError("ultra bake frames must be positive")
+    if active_scale < 1:
+        raise ValueError("ultra bake scale must be positive")
+    if active_quality not in _APERTURE_QUALITY_MODES:
+        raise ValueError(
+            f"ultra bake quality must be one of {_APERTURE_QUALITY_MODES}"
+        )
+    if active_lanes not in _APERTURE_LANE_COUNTS:
+        raise ValueError(
+            f"ultra bake lane count must be one of {_APERTURE_LANE_COUNTS}"
+        )
+
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    tracer = _calibration_tracer(wavelength_m)
+    polarizations = tuple(recipe["polarizations"])
+    frame_paths: list[str] = []
+    frame_records: list[dict[str, object]] = []
+    if recipe["phase_mode"] == "hold":
+        cycle_phases = np.full(active_frames, 0.62*np.pi, np.float64)
+    elif active_frames == 1:
+        cycle_phases = np.asarray([0.55*np.pi], np.float64)
+    else:
+        cycle_phases = np.linspace(0.0, np.pi, active_frames)
+
+    hero_index = active_frames//2
+    for frame_index, cycle_phase in enumerate(cycle_phases):
+        polarization = polarizations[frame_index % len(polarizations)]
+        print(
+            f"[ultra-bake] start {preset} {frame_index+1}/{active_frames} "
+            f"visible={active_size} quality={active_quality} "
+            f"lanes={active_lanes}",
+            flush=True,
+        )
+        solve_started = time.perf_counter()
+        visual = _solve_aperture_visual(
+            tracer,
+            size=active_size,
+            pitch_m=pitch_m,
+            wavelength_m=wavelength_m,
+            cycle_phase=float(cycle_phase),
+            polarization_mode=polarization,
+            quality=active_quality,
+            spectral_mode=str(recipe["spectral_mode"]),
+            lane_count=active_lanes,
+            spectral_epoch=frame_index,
+            vector_page=bool(recipe["vector_page"]),
+            piston_removed=True,
+            coherence_seed=(frame_index+1) << 16,
+            spectral_panel=bool(recipe["spectral_panel"]),
+        )
+        solve_seconds = time.perf_counter() - solve_started
+        solve_height, solve_width = visual["solve_shape"]
+        footer = (
+            f"{polarization} | {recipe['spectral_mode']}:{active_lanes} | "
+            f"{solve_width}x{solve_height} solve | "
+            f"D={2.0*visual['opening_radius_m']*1e6:.2f}um | "
+            f"edge={visual['border_fraction']:.1e}"
+        )
+        plate = _compose_grid(
+            visual["panels"],
+            visual["labels"],
+            scale=active_scale,
+            footer=footer,
+        )
+        frame_path = destination / f"frame_{frame_index:03d}.png"
+        plate.save(frame_path, compress_level=6)
+        if frame_index == hero_index:
+            plate.save(destination / "hero.png", compress_level=6)
+        frame_paths.append(str(frame_path))
+        frame_records.append({
+            "index": frame_index,
+            "path": str(frame_path),
+            "polarization": polarization,
+            "cycle_phase_rad": float(cycle_phase),
+            "opening_radius_m": visual["opening_radius_m"],
+            "sweep": visual["sweep"],
+            "wavelengths_nm": [
+                float(value*1.0e9) for value in visual["wavelengths_m"]
+            ],
+            "solve_shape": [solve_height, solve_width],
+            "propagation_steps": visual["propagation_steps"],
+            "solve_seconds": solve_seconds,
+            "retention": visual["retention"],
+            "border_fraction": visual["border_fraction"],
+        })
+        print(
+            f"[ultra-bake] done {preset} {frame_index+1}/{active_frames} "
+            f"solve={solve_width}x{solve_height} lanes={active_lanes} "
+            f"seconds={solve_seconds:.2f}",
+            flush=True,
+        )
+
+    manifest = {
+        "schema": "spectral-aperture-ultra-bake-v1",
+        "preset": preset,
+        "description": recipe["description"],
+        "size": active_size,
+        "scale": active_scale,
+        "quality": active_quality,
+        "spectral_mode": recipe["spectral_mode"],
+        "lane_count": active_lanes,
+        "aperture": {
+            "blade_count": 9,
+            "thickness_m": 0.10e-6,
+            "material_name": "blackened_steel",
+            "material_n_real": 2.9,
+            "material_n_imag": 3.0,
+        },
+        "frames": frame_records,
+    }
+    manifest_path = destination / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
+    return {
+        "preset": preset,
+        "frames": tuple(frame_paths),
+        "hero": str(destination / "hero.png"),
+        "manifest": str(manifest_path),
+    }
+
+
+def render_ultra_bakes(
+    output_dir: str | Path,
+    *,
+    preset: str,
+    **overrides,
+) -> dict[str, object]:
+    """Render one named showcase or the complete showcase collection."""
+
+    destination = Path(output_dir)
+    names = (
+        tuple(_ULTRA_BAKE_PRESETS)
+        if preset == "all" else (preset,)
+    )
+    results = {
+        name: render_aperture_bake(
+            destination / name,
+            preset=name,
+            **overrides,
+        )
+        for name in names
+    }
+    index_path = destination / "ultra_bakes.json"
+    destination.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(
+        json.dumps({
+            "schema": "spectral-ultra-bake-collection-v1",
+            "presets": {
+                name: {
+                    "hero": result["hero"],
+                    "manifest": result["manifest"],
+                    "frame_count": len(result["frames"]),
+                }
+                for name, result in results.items()
+            },
+        }, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return {"presets": results, "index": str(index_path)}
 
 
 def run_live(
@@ -856,12 +1363,6 @@ def run_aperture_live(
     from camera_software.gpu_preview import (
         GLPreviewCompositor, PreviewProductKind, PreviewTextureProduct,
     )
-    from camera_software.physical_aperture import LivePhysicalAperture
-    from camera_software.vector_wave_adapter import (
-        JonesFieldState,
-        PaddedWaveDomain,
-    )
-
     pygame.init()
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
@@ -946,155 +1447,32 @@ def run_aperture_live(
             if not paused:
                 generation += 1
             phase = generation*0.018
-            opening, _display_extent, sweep = _aperture_sweep_radius(
-                phase, size, pitch_m,
-            )
             active_quality = _APERTURE_QUALITY_MODES[quality_index]
             active_spectral = _APERTURE_SPECTRAL_MODES[spectral_index]
             active_lanes = _APERTURE_LANE_COUNTS[lane_index]
-            wavelengths, spectral_amplitudes = _aperture_spectral_samples(
-                active_spectral,
-                active_lanes,
-                wavelength_m=wavelength_m,
-                sample_epoch=spectral_epoch,
-            )
-            domain = PaddedWaveDomain.for_quality(
-                (size, size), active_quality
-            )
-            solve_height, solve_width = domain.solve_shape
-            # Cover the complete hidden rectangle with physical blade
-            # material. A display-sized assembly would leave an unintended
-            # clear annulus in the guard region.
-            aperture_extent = 0.51 * math.hypot(
-                (solve_width - 1) * pitch_m,
-                (solve_height - 1) * pitch_m,
-            )
-            aperture = LivePhysicalAperture.iris(
-                "demo.live-iris",
-                blade_count=9,
-                opening_radius_m=float(opening),
-                assembly_radius_m=aperture_extent,
-                thickness_m=0.10e-6,
-                rotation_rad=phase*0.2,
-                material_name="blackened_steel",
-                material_n_real=2.9,
-                material_n_imag=3.0,
-            )
-            payload = aperture.wave_payload()
             active_polarization = _APERTURE_POLARIZATION_MODES[
                 polarization_index
             ]
-            scalar_field = domain.uniform_scalar_field(bands=active_lanes)
-            scalar_field *= spectral_amplitudes[:, None, None]
-            initial = JonesFieldState.from_scalar_field(
-                scalar_field,
-                _aperture_polarization_state(
-                    active_polarization, source_angle_deg
-                ),
+            visual = _solve_aperture_visual(
+                tracer,
+                size=size,
+                pitch_m=pitch_m,
+                wavelength_m=wavelength_m,
+                cycle_phase=phase,
+                polarization_mode=active_polarization,
+                quality=active_quality,
+                spectral_mode=active_spectral,
+                lane_count=active_lanes,
+                spectral_epoch=spectral_epoch,
+                source_angle_deg=source_angle_deg,
+                analyzer_angle_deg=analyzer_angle_deg,
+                vector_page=vector_page,
+                piston_removed=piston_removed,
                 coherence_seed=generation << 8,
             )
-            material, accounting = initial.apply_isotropic_material_native(
-                tracer,
-                pitch_m=pitch_m,
-                distance_m=aperture.thickness_m,
-                direction_sign=1,
-                wavelengths_m=wavelengths,
-                payload=payload,
-            )
-            distance = 90.0e-6
-            forward, boundary = material.propagate_open_native(
-                tracer,
-                pitch_m=pitch_m,
-                distance_m=distance,
-                direction_sign=1,
-                wavelengths_m=wavelengths,
-                domain=domain,
-            )
-            forward_stokes = tuple(
-                domain.crop(value) for value in forward.stokes()
-            )
-            if vector_page:
-                panels = (
-                    _aperture_geometry_rgba(
-                        aperture,
-                        size,
-                        view_radius_m=0.5*(size-1)*pitch_m,
-                    ),
-                    _scalar_rgba(forward_stokes[0]),
-                    _polarization_rgba(forward_stokes),
-                    _signed_scalar_rgba(
-                        forward_stokes[1], forward_stokes[0]
-                    ),
-                    _signed_scalar_rgba(
-                        forward_stokes[3], forward_stokes[0]
-                    ),
-                    _scalar_rgba(
-                        domain.crop(
-                            forward.analyzer_intensity(analyzer_angle_deg)
-                        )
-                    ),
-                )
-                labels = (
-                    "PHYSICAL BLADES",
-                    "STOKES I / POWER",
-                    "POLARIZATION",
-                    "STOKES Q / I",
-                    "STOKES V / I",
-                    f"ANALYZER {analyzer_angle_deg%180.0:.0f} DEG",
-                )
-            else:
-                # Reverse work is needed only on the coherent diagnostics
-                # page; skipping it on the Stokes page pays for the larger
-                # open solve domain without compromising its result.
-                reverse_material, _reverse_accounting = (
-                    initial.apply_isotropic_material_native(
-                        tracer,
-                        pitch_m=pitch_m,
-                        distance_m=aperture.thickness_m,
-                        direction_sign=-1,
-                        wavelengths_m=wavelengths,
-                        payload=payload,
-                    )
-                )
-                reverse, _reverse_boundary = (
-                    reverse_material.propagate_open_native(
-                        tracer,
-                        pitch_m=pitch_m,
-                        distance_m=distance,
-                        direction_sign=-1,
-                        wavelengths_m=wavelengths,
-                        domain=domain,
-                    )
-                )
-                reverse_stokes = tuple(
-                    domain.crop(value) for value in reverse.stokes()
-                )
-                # Phase is meaningful per coherent mode. Mode zero is shown
-                # explicitly; incoherent modes are never summed in amplitude.
-                material_s = domain.crop(material.fields[0, 0, 0])
-                material_p = domain.crop(material.fields[0, 1, 0])
-                forward_s = domain.crop(forward.fields[0, 0, 0])
-                forward_p = domain.crop(forward.fields[0, 1, 0])
-                panels = (
-                    _aperture_geometry_rgba(
-                        aperture,
-                        size,
-                        view_radius_m=0.5*(size-1)*pitch_m,
-                    ),
-                    _phase_rgba(material_s, remove_piston=piston_removed),
-                    _phase_rgba(material_p, remove_piston=piston_removed),
-                    _phase_rgba(forward_s, remove_piston=piston_removed),
-                    _phase_rgba(forward_p, remove_piston=piston_removed),
-                    _polarization_rgba(reverse_stokes),
-                )
-                labels = (
-                    "PHYSICAL BLADES",
-                    f"MODE 0 {wavelengths[0]*1e9:.1f}NM MATERIAL S",
-                    f"MODE 0 {wavelengths[0]*1e9:.1f}NM MATERIAL P",
-                    f"MODE 0 {wavelengths[0]*1e9:.1f}NM FORWARD S",
-                    f"MODE 0 {wavelengths[0]*1e9:.1f}NM FORWARD P",
-                    "REVERSE POLARIZATION",
-                )
+            panels = visual["panels"]
+            labels = visual["labels"]
+            solve_height, solve_width = visual["solve_shape"]
             for texture, rgba in zip(textures, panels):
                 gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
                 gl.glTexSubImage2D(
@@ -1140,15 +1518,15 @@ def run_aperture_live(
                 f"{'STOKES' if vector_page else 'COHERENT PHASE'}  "
                 f"source={active_polarization} "
                 f"angle={source_angle_deg%180.0:.0f}deg "
-                f"modes={forward.mode_count} "
+                f"modes={visual['mode_count']} "
                 f"quality={active_quality} "
                 f"spectrum={active_spectral}:{active_lanes} "
                 f"solve={solve_width}x{solve_height}/{size}x{size} "
-                f"steps={domain.propagation_steps} "
-                f"diameter={2.0*opening*1e6:.2f} um "
-                f"range={sweep*100.0:.1f}% "
-                f"retention={accounting['output_power']/max(accounting['input_power'],1e-30):.5f} "
-                f"edge={boundary['border_fraction']:.2e} "
+                f"steps={visual['propagation_steps']} "
+                f"diameter={2.0*visual['opening_radius_m']*1e6:.2f} um "
+                f"range={visual['sweep']*100.0:.1f}% "
+                f"retention={visual['retention']:.5f} "
+                f"edge={visual['border_fraction']:.2e} "
                 f"phase={'RELATIVE' if piston_removed else 'ABSOLUTE'} "
                 f"{'PAUSED ' if paused else ''}"
                 "[J source, K quality, F fixed/continuous, L lanes, "
@@ -1397,6 +1775,35 @@ def main() -> int:
         help="animate Jones-resolved finite material iris interaction in OpenGL",
     )
     parser.add_argument(
+        "--ultra-bake",
+        choices=("all", *_ULTRA_BAKE_PRESETS),
+        help="bake a named high-investment physical-aperture showcase",
+    )
+    parser.add_argument(
+        "--list-ultra-bakes", action="store_true",
+        help="print named showcase recipes as JSON and exit",
+    )
+    parser.add_argument(
+        "--ultra-size", type=int,
+        help="override preset visible field width (power of two)",
+    )
+    parser.add_argument(
+        "--ultra-frames", type=int,
+        help="override preset frame count",
+    )
+    parser.add_argument(
+        "--ultra-scale", type=int,
+        help="override preset PNG presentation scale",
+    )
+    parser.add_argument(
+        "--ultra-quality", choices=_APERTURE_QUALITY_MODES,
+        help="override preset hidden-domain investment",
+    )
+    parser.add_argument(
+        "--ultra-lanes", type=int, choices=_APERTURE_LANE_COUNTS,
+        help="override preset exact spectral lane width",
+    )
+    parser.add_argument(
         "--aperture-polarization",
         choices=_APERTURE_POLARIZATION_MODES,
         default="radial",
@@ -1427,8 +1834,28 @@ def main() -> int:
         help="forward steps before the live animation reverses",
     )
     args = parser.parse_args()
-    if sum((args.live, args.transport_live, args.aperture_live)) > 1:
-        parser.error("choose one live mode")
+    if args.list_ultra_bakes:
+        print(json.dumps(ultra_bake_presets(), indent=2))
+        return 0
+    if sum((
+        bool(args.live),
+        bool(args.transport_live),
+        bool(args.aperture_live),
+        bool(args.ultra_bake),
+    )) > 1:
+        parser.error("choose one live or bake mode")
+    if args.ultra_bake:
+        result = render_ultra_bakes(
+            args.output_dir,
+            preset=args.ultra_bake,
+            size=args.ultra_size,
+            frames=args.ultra_frames,
+            scale=args.ultra_scale,
+            quality=args.ultra_quality,
+            lane_count=args.ultra_lanes,
+        )
+        print(f"[ultra-bake] index={result['index']}")
+        return 0
     if args.aperture_live:
         run_aperture_live(
             size=args.aperture_size,

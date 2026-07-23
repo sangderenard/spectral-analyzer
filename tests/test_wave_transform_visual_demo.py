@@ -8,10 +8,12 @@ from wave_transform_visual_demo import (
     _aperture_sweep_radius,
     _aperture_spectral_samples,
     _remove_piston_phase,
+    render_aperture_bake,
     render_sequence,
     run_aperture_live,
     run_live,
     run_transport_live,
+    ultra_bake_presets,
 )
 
 
@@ -93,3 +95,42 @@ def test_aperture_fixed_and_continuous_spectra_share_exact_lane_widths():
     assert not np.allclose(
         continuous_a, continuous_b, rtol=1.0e-6, atol=1.0e-12
     )
+
+
+def test_ultra_bake_preset_writes_plate_hero_and_manifest(tmp_path):
+    result = render_aperture_bake(
+        tmp_path,
+        preset="iris-spectrum-continuous",
+        size=8,
+        frames=2,
+        scale=1,
+        quality="balanced",
+        lane_count=3,
+    )
+
+    assert len(result["frames"]) == 2
+    assert Path(result["hero"]).is_file()
+    manifest_path = Path(result["manifest"])
+    assert manifest_path.is_file()
+    manifest = __import__("json").loads(manifest_path.read_text())
+    assert manifest["spectral_mode"] == "continuous"
+    assert manifest["lane_count"] == 3
+    assert len(manifest["frames"]) == 2
+    with Image.open(result["frames"][0]) as image:
+        assert image.width > 0
+        assert image.height > 0
+        assert image.mode == "RGBA"
+
+
+def test_ultra_bake_recipes_are_detached_and_validate():
+    recipes = ultra_bake_presets()
+    assert set(recipes) == {
+        "iris-spectrum-fixed",
+        "iris-spectrum-continuous",
+        "iris-polarization",
+        "iris-coherent-phase",
+    }
+    recipes["iris-spectrum-fixed"]["size"] = 1
+    assert ultra_bake_presets()["iris-spectrum-fixed"]["size"] == 64
+    with pytest.raises(ValueError, match="unknown ultra bake"):
+        render_aperture_bake(".", preset="made-up")

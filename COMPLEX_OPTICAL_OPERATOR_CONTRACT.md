@@ -211,6 +211,16 @@ amplitudes. Because the current blade material is isotropic, it correctly
 does not manufacture polarization conversion; radial and azimuthal inputs
 still expose spatially varying vector diffraction.
 
+Final-quality offline plates use this same solve path:
+
+```powershell
+python wave_transform_visual_demo.py --ultra-bake iris-spectrum-fixed --output-dir exposures/ultra_bakes
+```
+
+Fixed-spectrum, continuous-spectrum, polarization, and coherent-phase recipes,
+including rehearsal overrides and product descriptions, are documented in
+`ULTRA_BAKE_DEMOS.md`.
+
 The raw calibration FFT remains available for transform qualification, but it
 must not be mistaken for an open experiment: without padding it is periodic.
 The aperture client deliberately uses `PaddedWaveDomain` and

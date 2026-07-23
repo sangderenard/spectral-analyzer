@@ -538,6 +538,10 @@ struct PyRayTracer
     int               _transparent_mode   = RT_CAM_TRANSPARENCY_BLOCK;
     bool              _depth_cull_enabled  = false;
     double            _depth_cull_m        = 0.0;
+    /* Scale-context payload pointers are borrowed by the native ABI. Keep the
+     * Python owners alive until clear/destruction so graph descriptors cannot
+     * become dangling after an installer/helper returns. */
+    std::vector<py::object> _scale_context_payloads;
 
     /* Persistent pipeline — created on first submit_rays(), destroyed with tracer. */
     RayPipelineState* _pipeline   = nullptr;
@@ -3348,6 +3352,11 @@ struct PyRayTracer
                 continue;
             py::dict d;
             d["arena_id"] = s.arena_id;
+            d["context_id"] = s.context_id;
+            d["next_forward"] = s.next_forward;
+            d["next_backward"] = s.next_backward;
+            d["linked_transfers"] =
+                static_cast<unsigned long long>(s.linked_transfers);
             d["bands"] = s.bands;
             d["band_specialization"] = s.band_specialization;
             d["spectral_mode"] = s.spectral_mode;
@@ -3416,6 +3425,10 @@ struct PyRayTracer
                 s.boundary_propagated_field_power;
             boundary["output_ray_power"] =
                 s.boundary_output_ray_power;
+            boundary["linked_from_arena"] =
+                s.boundary_linked_from_arena;
+            boundary["linked_to_arena"] =
+                s.boundary_linked_to_arena;
             boundary["entry_adapter"] =
                 "unit-l2-gaussian-with-transverse-phase";
             boundary["exit_adapter"] =
@@ -4118,6 +4131,8 @@ struct PyRayTracer
         int rc = ray_tracer_add_scale_context(handle, &ctx);
         if (rc < 0)
             throw std::runtime_error("ray_tracer_add_scale_context failed: rc=" + std::to_string(rc));
+        if (!payload.is_none())
+            _scale_context_payloads.push_back(std::move(payload));
         return rc; /* returns context_id */
     }
 
@@ -4125,6 +4140,17 @@ struct PyRayTracer
     {
         if (!handle) throw std::runtime_error("RayTracer not initialised");
         ray_tracer_clear_scale_contexts(handle);
+        _scale_context_payloads.clear();
+    }
+
+    void add_wave_context_link(int src_context_id, int dst_context_id)
+    {
+        if (!handle) throw std::runtime_error("RayTracer not initialised");
+        const int rc = ray_tracer_add_wave_context_link(
+            handle, src_context_id, dst_context_id);
+        if (rc != SK_OK)
+            throw std::invalid_argument(
+                "wave context link requires two distinct registered wave contexts");
     }
 
     /* Trace multiscale, write into caller-owned (capacity, 14) float32 buffer.
@@ -6910,6 +6936,9 @@ payload      : optional bytes/array carrying kind-specific parameters.
 
 Returns the assigned context_id integer.
 )doc")
+        .def("add_wave_context_link", &PyRayTracer::add_wave_context_link,
+             py::arg("src_context_id"), py::arg("dst_context_id"),
+             "Link compatible persistent wave fields without ray extraction.")
         .def("clear_scale_contexts", &PyRayTracer::clear_scale_contexts,
              "Remove all registered scale-context spheres.")
         .def("trace_multiscale_into", &PyRayTracer::trace_multiscale_into,

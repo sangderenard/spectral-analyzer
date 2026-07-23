@@ -148,6 +148,7 @@ class _RecordingTracer:
     def __init__(self):
         self.clears = 0
         self.contexts = []
+        self.wave_links = []
 
     def clear_scale_contexts(self):
         self.clears += 1
@@ -155,6 +156,9 @@ class _RecordingTracer:
     def add_scale_context(self, **values):
         self.contexts.append(values)
         return len(self.contexts) - 1
+
+    def add_wave_context_link(self, src_context_id, dst_context_id):
+        self.wave_links.append((src_context_id, dst_context_id))
 
 
 def test_installer_places_real_angular_arena_without_registering_surrogate_lens():
@@ -202,6 +206,40 @@ def test_installer_places_real_angular_arena_without_registering_surrogate_lens(
     arena_contract = receipt.contract()["wave_arenas"][0]
     assert arena_contract["boundary_geometry"] == "oriented-plane-to-plane-patch"
     assert arena_contract["longitudinal_extent_m"] == pytest.approx(9.6e-4)
+
+
+def test_installer_lowers_field_to_field_edge_to_native_persistent_link():
+    first_nodes, first_links = wave_context_nodes(
+        "bench.first", 4, center_m=(0.0, 0.0, -8.0e-6),
+        radius_m=64.0e-6, longitudinal_step_m=2.0e-6,
+        longitudinal_steps=8,
+    )
+    second_nodes, second_links = wave_context_nodes(
+        "bench.second", 4, center_m=(0.0, 0.0, 8.0e-6),
+        radius_m=64.0e-6, longitudinal_step_m=2.0e-6,
+        longitudinal_steps=8,
+    )
+    field_link = OpticalLinkSpec(
+        first_nodes[1].key, second_nodes[1].key, "persistent-field-port"
+    )
+    compiled = compile_optical_graph(OpticalTransportGraphSpec(
+        nodes=first_nodes + second_nodes,
+        links=first_links + second_links + (field_link,),
+        entry_keys=(first_nodes[0].key,),
+        product_keys=(second_nodes[-1].key,),
+    ))
+    tracer = _RecordingTracer()
+
+    receipt = install_optical_graph(
+        tracer, compiled, exact_t2_registered=False
+    )
+
+    assert tracer.wave_links == [(0, 1)]
+    assert len(receipt.wave_links) == 1
+    assert receipt.contract()["wave_links"][0]["transfer"] == (
+        "persistent-full-field"
+    )
+    assert receipt.contract()["wave_links"][0]["resampling"] == "forbidden"
 
 
 def test_installer_refuses_unsupported_split_step_substitution():

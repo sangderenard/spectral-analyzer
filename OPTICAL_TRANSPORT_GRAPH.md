@@ -188,6 +188,11 @@ This equivalence is a regression gate.
 - it retains borrowed axis payload storage for the installation lifetime;
 - it returns node-to-context receipts and identifies native
   `wave_arena_stats()` as the transition-telemetry authority.
+- direct T4-field-to-T4-field graph edges lower to native persistent field
+  links. Forward transport follows source to destination and backward
+  transport follows the reciprocal edge. Cold pipeline construction rejects
+  branching, cycles, lane/grid mismatch, basis/index mismatch, or
+  noncoincident planes; it never inserts an implicit resampler.
 
 The installed production code identifies itself as `AngularSpectrum`.
 `angular-spectrum-fft` graph nodes lower directly to the exact-lane native
@@ -231,6 +236,13 @@ it `power-preserving-first-moment-ray`. Systems requiring the complete exit
 field must connect it to another field/operator port rather than use this
 reduction.
 
+That complete-field connection now exists for identity-compatible ports. It
+copies active S/P complex planes directly between already-allocated contiguous
+state blocks and marches the destination before any ray extraction. There is
+no hot allocation, and only the terminal field port emits a representative
+ray. `linked_transfers`, `next_forward`, `next_backward`, and boundary
+`linked_from_arena`/`linked_to_arena` telemetry make the route observable.
+
 `wave_arena_stats()` exposes entry/exit world and local coordinates,
 directions, input/seeded/propagated/output power, adapter identity, and the
 transition generation without adding per-ray state to ordinary pipeline
@@ -255,7 +267,9 @@ records.
    - prohibit hot allocation and generic per-node interpretation.
 5. **T4 transition runner**
    - use graph port metadata to seed/extract persistent arenas;
-   - replace readback-steered arena routing with GPU-resident cohort assembly.
+   - compatible full-field arena links are complete on the native CPU
+     executor; replace readback-steered arena routing with GPU-resident cohort
+     assembly.
    - bounded raw field snapshots and an opt-in shared display texture are
      complete; direct GPU FFT state-to-display resolution remains.
 6. **Scientific equivalence**
@@ -274,6 +288,9 @@ records.
   multi-operation graph schedule.
 - T4 descriptors construct the vector angular-spectrum arena, but the native
   GPU FFT executor is not implemented; the production CPU kernel is used.
+- Persistent field links currently support identity-compatible ports only.
+  Basis rotations, refractive interfaces, grid changes, and branch operators
+  require explicit compiled field operators and remain intentionally rejected.
 - The live T4 texture is currently staged from CPU-resident production state.
   It is never generated unless requested, but will become a direct GPU resolve
   when the GLSL FFT executor owns the arena state.

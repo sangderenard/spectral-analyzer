@@ -187,6 +187,16 @@ class InstalledWaveArena:
     longitudinal_steps: int
 
 
+@dataclass(frozen=True)
+class InstalledWaveLink:
+    """A native full-field edge between compatible persistent T4 ports."""
+
+    src_node_key: str
+    dst_node_key: str
+    src_context_id: int
+    dst_context_id: int
+
+
 @dataclass
 class InstalledOpticalTransportGraph:
     """Cold installation receipt and payload-lifetime owner.
@@ -198,6 +208,7 @@ class InstalledOpticalTransportGraph:
 
     compiled: CompiledOpticalTransportGraph
     wave_arenas: tuple[InstalledWaveArena, ...]
+    wave_links: tuple[InstalledWaveLink, ...]
     borrowed_payloads: tuple[np.ndarray, ...]
     exact_t2_registration: str
 
@@ -222,6 +233,17 @@ class InstalledOpticalTransportGraph:
                     "longitudinal_steps": arena.longitudinal_steps,
                 }
                 for arena in self.wave_arenas
+            ],
+            "wave_links": [
+                {
+                    "src_node_key": link.src_node_key,
+                    "dst_node_key": link.dst_node_key,
+                    "src_context_id": link.src_context_id,
+                    "dst_context_id": link.dst_context_id,
+                    "transfer": "persistent-full-field",
+                    "resampling": "forbidden",
+                }
+                for link in self.wave_links
             ],
             "transition_telemetry": {
                 "source": "native-wave-arena-stats",
@@ -423,9 +445,35 @@ def install_optical_graph(
             longitudinal_step_m=float(descriptor["longitudinal_step_m"]),
             longitudinal_steps=int(descriptor["longitudinal_steps"]),
         ))
+    installed_by_node = {arena.node_key: arena for arena in installed}
+    native_links: list[InstalledWaveLink] = []
+    add_wave_link = getattr(tracer, "add_wave_context_link", None)
+    nodes_by_key = {node.key: node for node in compiled.spec.nodes}
+    for link in compiled.spec.links:
+        src = nodes_by_key[link.src_key]
+        dst = nodes_by_key[link.dst_key]
+        if (
+            src.domain is not OpticalExecutionDomain.T4_WAVE_ARENA
+            or dst.domain is not OpticalExecutionDomain.T4_WAVE_ARENA
+        ):
+            continue
+        if not callable(add_wave_link):
+            raise TypeError(
+                "tracer does not expose native persistent wave-context links"
+            )
+        src_arena = installed_by_node[src.key]
+        dst_arena = installed_by_node[dst.key]
+        add_wave_link(src_arena.context_id, dst_arena.context_id)
+        native_links.append(InstalledWaveLink(
+            src_node_key=src.key,
+            dst_node_key=dst.key,
+            src_context_id=src_arena.context_id,
+            dst_context_id=dst_arena.context_id,
+        ))
     return InstalledOpticalTransportGraph(
         compiled=compiled,
         wave_arenas=tuple(installed),
+        wave_links=tuple(native_links),
         borrowed_payloads=tuple(payloads),
         exact_t2_registration=(
             "camera-builder-confirmed" if compiled.t2_payloads else "not-required"

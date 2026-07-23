@@ -723,6 +723,12 @@ private:
 
 struct WaveArena {
     int              id      = -1;
+    int              context_id = -1;
+    int              next_forward = -1;
+    int              next_backward = -1;
+    uint64_t         linked_transfers = 0;
+    uint64_t         linked_generation = 0;
+    int              linked_terminal_arena = -1;
     Eigen::Vector3d  center;
     double           radius  = 0.0;
     double           radius_sq = 0.0;
@@ -771,6 +777,8 @@ struct WaveArena {
         double seeded_field_power = 0.0;
         double propagated_field_power = 0.0;
         double output_ray_power = 0.0;
+        int linked_from_arena = -1;
+        int linked_to_arena = -1;
     } boundary_telemetry;
     size_t plane_size = 0;
     float* field_re(wave_t4::Direction direction,
@@ -1127,6 +1135,10 @@ void ray_pipeline_set_wave_arena_display_enabled(RayPipelineState* ps,
 
 struct WaveArenaSnapshot {
     int arena_id;
+    int context_id;
+    int next_forward;
+    int next_backward;
+    uint64_t linked_transfers;
     int bands;
     int band_specialization;
     int spectral_mode;
@@ -1173,6 +1185,8 @@ struct WaveArenaSnapshot {
     double boundary_seeded_field_power;
     double boundary_propagated_field_power;
     double boundary_output_ray_power;
+    int boundary_linked_from_arena;
+    int boundary_linked_to_arena;
 };
 
 int ray_pipeline_wave_arena_count(const RayPipelineState* ps);

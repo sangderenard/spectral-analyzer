@@ -649,6 +649,7 @@ struct RayTracerState {
     std::vector<float>          tex_stack_chunk; /* (mat_n_mats, 16) TextureStack    */
     RtMaterialSurfaceCache      surf_cache;      /* precomputed GGX/enamel lookups   */
     std::vector<RtScaleContext> scale_contexts; /* multi-scale zones, smallest-radius-first */
+    std::vector<std::pair<int, int>> wave_context_links; /* stable context IDs */
     double                      speed_m_s = 343.0; /* cached for context k scaling */
     Eigen::VectorXd             freq_hz_vec; /* cached for context k scaling */
 
@@ -4142,10 +4143,37 @@ int ray_tracer_add_scale_context(RayTracerState* st, RtScaleContext* ctx)
     return ctx->context_id;
 }
 
+int ray_tracer_add_wave_context_link(
+    RayTracerState* st, int src_context_id, int dst_context_id)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    if (src_context_id < 0 || dst_context_id < 0
+        || src_context_id == dst_context_id)
+        return SK_ERR_DIM_MISMATCH;
+    auto find_context = [&](int stable_id) -> const RtScaleContext* {
+        for (const RtScaleContext& ctx : st->scale_contexts)
+            if (ctx.context_id == stable_id) return &ctx;
+        return nullptr;
+    };
+    const RtScaleContext* src = find_context(src_context_id);
+    const RtScaleContext* dst = find_context(dst_context_id);
+    if (!src || !dst
+        || src->scale_type != RT_SCALE_WAVE
+        || dst->scale_type != RT_SCALE_WAVE)
+        return SK_ERR_DIM_MISMATCH;
+    const std::pair<int, int> link{src_context_id, dst_context_id};
+    if (std::find(st->wave_context_links.begin(),
+                  st->wave_context_links.end(), link)
+        == st->wave_context_links.end())
+        st->wave_context_links.push_back(link);
+    return SK_OK;
+}
+
 int ray_tracer_clear_scale_contexts(RayTracerState* st)
 {
     if (!st) return SK_ERR_NULL_STATE;
     st->scale_contexts.clear();
+    st->wave_context_links.clear();
     return SK_OK;
 }
 
@@ -7988,7 +8016,15 @@ static void band_to_display_rgb(int b, int n_bands,
 static void wave_arena_seed(WaveArena& arena, const RayIntent& ray);
 static void wave_arena_seed_continuous_cohort(
     WaveArena& arena, const std::array<WaveIntent*, 32>& cohort, int count);
+static void wave_arena_measure_all(WaveArena& arena);
 static bool wave_arena_march(WaveArena& arena);
+static bool wave_arena_ports_compatible(
+    const WaveArena& src, const WaveArena& dst, double* plane_error = nullptr);
+static bool wave_arena_transfer(
+    WaveArena& src, WaveArena& dst, wave_t4::Direction direction);
+static bool wave_arena_follow_link(
+    RayPipelineState& ps, WaveArena& arena, RayIntent& lineage,
+    int state_lane, ChildRay& out, int& terminal_arena, int depth);
 static ChildRay wave_arena_extract(WaveArena& arena, const RayIntent& src,
                                    int state_lane = -1);
 static void wave_arena_complete(RayPipelineState& ps,
@@ -14655,6 +14691,7 @@ static void wave_arena_build(
     const RayTracerState&    st)
 {
     arena.id     = id;
+    arena.context_id = ctx.context_id;
     arena.center = V3d(ctx.center[0], ctx.center[1], ctx.center[2]);
     arena.radius = ctx.radius;
     arena.radius_sq = arena.radius * arena.radius;
@@ -14731,6 +14768,71 @@ static V3d wave_arena_to_local(const WaveArena& a, const V3d& wp)
 {
     V3d off = wp - a.center;
     return V3d(off.dot(a.axis_x), off.dot(a.axis_y), off.dot(a.axis_z));
+}
+
+static bool wave_arena_ports_compatible(
+    const WaveArena& src, const WaveArena& dst, double* plane_error)
+{
+    const V3d src_exit = src.center + src.axis_z * src.half_depth;
+    const V3d dst_entry = dst.center - dst.axis_z * dst.half_depth;
+    const V3d src_entry = src.center - src.axis_z * src.half_depth;
+    const V3d dst_exit = dst.center + dst.axis_z * dst.half_depth;
+    const double error = std::min(
+        (src_exit - dst_entry).norm(),
+        (src_entry - dst_exit).norm());
+    if (plane_error) *plane_error = error;
+    const double tolerance = std::max(
+        1.0e-12, 0.25 * std::min(src.dx, dst.dx));
+    return src.n_bands == dst.n_bands
+        && src.fft_nx == dst.fft_nx
+        && src.fft_ny == dst.fft_ny
+        && src.plane_size == dst.plane_size
+        && std::abs(src.n_real - dst.n_real)
+            <= 1.0e-12 * std::max(src.n_real, dst.n_real)
+        && std::abs(src.dx - dst.dx)
+            <= 1.0e-9 * std::max(src.dx, dst.dx)
+        && src.axis_x.dot(dst.axis_x) > 1.0 - 1.0e-10
+        && src.axis_y.dot(dst.axis_y) > 1.0 - 1.0e-10
+        && src.axis_z.dot(dst.axis_z) > 1.0 - 1.0e-10
+        && error <= tolerance;
+}
+
+/* Copy a complete vector field between compatible persistent ports.  This is
+ * deliberately an in-place state-block operation: no ray reconstruction, no
+ * heap allocation, and no implicit interpolation occurs in the hot path. */
+static bool wave_arena_transfer(
+    WaveArena& src, WaveArena& dst, wave_t4::Direction direction)
+{
+    if (!wave_arena_ports_compatible(src, dst)) return false;
+    std::fill(dst.state_block.begin(), dst.state_block.end(), 0.0f);
+    dst.field_active.fill(0u);
+    dst.spectral_mode = src.spectral_mode;
+    dst.spectral_lanes = src.spectral_lanes;
+    for (int band = 0; band < dst.n_bands; ++band)
+        dst.wavelengths_m[band] = src.wavelengths_m[band];
+    for (int component = 0;
+         component < wave_t4::kTransverseComponentCount; ++component) {
+        const auto c =
+            static_cast<wave_t4::TransverseComponent>(component);
+        const int field = wave_t4::field_index(direction, c);
+        if (!src.field_active[static_cast<size_t>(field)]) continue;
+        dst.field_active[static_cast<size_t>(field)] = 1u;
+        std::copy_n(src.field_re(direction, c), src.plane_size,
+                    dst.field_re(direction, c));
+        std::copy_n(src.field_im(direction, c), src.plane_size,
+                    dst.field_im(direction, c));
+    }
+    dst.progress = {};
+    wave_arena_measure_all(dst);
+    dst.progress.input_power = dst.progress.field_power;
+    dst.boundary_telemetry = {};
+    dst.boundary_telemetry.direction = static_cast<int>(direction);
+    dst.boundary_telemetry.seeded_field_power = dst.progress.field_power;
+    dst.boundary_telemetry.input_ray_power = dst.progress.field_power;
+    dst.boundary_telemetry.linked_from_arena = src.id;
+    src.boundary_telemetry.linked_to_arena = dst.id;
+    ++src.linked_transfers;
+    return true;
 }
 
 static bool wave_arena_entry_distance(const WaveArena& arena,
@@ -15260,6 +15362,51 @@ static void pipeline_spawn_child(RayPipelineState& ps, RayIntent child)
         ps.Q_intent.push(std::move(child));
 }
 
+/* Follow cold-compiled compatible field links while retaining the complete
+ * persistent vector field.  Every recursive frame owns the destination lock;
+ * graph validation prevents branching and the depth guard prevents a malformed
+ * native client from turning a cycle into unbounded recursion. */
+static bool wave_arena_follow_link(
+    RayPipelineState& ps, WaveArena& arena, RayIntent& lineage,
+    int state_lane, ChildRay& out, int& terminal_arena, int depth)
+{
+    if (depth >= static_cast<int>(ps.arenas.size())) return false;
+    const auto direction = wave_arena_direction(arena, lineage);
+    const int next = direction == wave_t4::Direction::Forward
+        ? arena.next_forward : arena.next_backward;
+    if (next < 0) {
+        out = wave_arena_extract(arena, lineage, state_lane);
+        terminal_arena = arena.id;
+        return true;
+    }
+    if (next >= static_cast<int>(ps.arenas.size())) return false;
+
+    const double sign =
+        direction == wave_t4::Direction::Forward ? 1.0 : -1.0;
+    const V3d port = arena.center + arena.axis_z*(sign*arena.half_depth);
+    arena.boundary_telemetry.generation = arena.progress.generation;
+    arena.boundary_telemetry.exit_world = port;
+    arena.boundary_telemetry.exit_local = wave_arena_to_local(arena, port);
+    arena.boundary_telemetry.exit_direction = lineage.dir;
+    arena.boundary_telemetry.propagated_field_power =
+        arena.progress.field_power;
+    lineage.path_len += (port - lineage.pos).norm();
+    lineage.pos = port;
+
+    WaveArena& destination = ps.arenas[static_cast<size_t>(next)];
+    std::lock_guard<std::mutex> destination_lock(destination.mu);
+    if (!wave_arena_transfer(arena, destination, direction))
+        return false;
+    destination.boundary_telemetry.entry_world = port;
+    destination.boundary_telemetry.entry_local =
+        wave_arena_to_local(destination, port);
+    destination.boundary_telemetry.entry_direction = lineage.dir;
+    if (!wave_arena_march(destination)) return false;
+    return wave_arena_follow_link(
+        ps, destination, lineage, state_lane,
+        out, terminal_arena, depth + 1);
+}
+
 /* Publish one completed arena traversal and return its extracted continuation
  * to T1.  Both CPU and GPU T4 backends call this exact function so queue and
  * BDPT in-flight accounting cannot drift between implementations. */
@@ -15268,14 +15415,54 @@ static void wave_arena_complete(RayPipelineState& ps,
                                 WaveArena& arena,
                                 int state_lane)
 {
-    ChildRay cr = wave_arena_extract(arena, wi.ray, state_lane);
+    ChildRay cr;
+    RayIntent lineage = wi.ray;
+    int terminal_arena = arena.id;
+    const bool cached_link = arena.linked_terminal_arena >= 0
+        && arena.linked_generation == arena.progress.generation;
+    if (cached_link) {
+        terminal_arena = arena.linked_terminal_arena;
+        WaveArena* cursor = &arena;
+        int traversed = 0;
+        while (cursor->id != terminal_arena
+               && traversed++ < static_cast<int>(ps.arenas.size())) {
+            const auto direction = wave_arena_direction(*cursor, lineage);
+            const double sign =
+                direction == wave_t4::Direction::Forward ? 1.0 : -1.0;
+            const V3d port =
+                cursor->center + cursor->axis_z*(sign*cursor->half_depth);
+            lineage.path_len += (port - lineage.pos).norm();
+            lineage.pos = port;
+            const int next = direction == wave_t4::Direction::Forward
+                ? cursor->next_forward : cursor->next_backward;
+            if (next < 0 || next >= static_cast<int>(ps.arenas.size()))
+                break;
+            cursor = &ps.arenas[static_cast<size_t>(next)];
+        }
+        if (cursor->id != terminal_arena) {
+            pipeline_finish_ray(ps, wi.ray.color_flag);
+            return;
+        }
+        std::lock_guard<std::mutex> terminal_lock(cursor->mu);
+        cr = wave_arena_extract(*cursor, lineage, state_lane);
+    } else {
+        if (!wave_arena_follow_link(
+                ps, arena, lineage, state_lane, cr, terminal_arena, 0)) {
+            pipeline_finish_ray(ps, wi.ray.color_flag);
+            return;
+        }
+        if (terminal_arena != arena.id) {
+            arena.linked_generation = arena.progress.generation;
+            arena.linked_terminal_arena = terminal_arena;
+        }
+    }
 
     RayRecord rec;
     rec.kind       = RayRecordKind::FIELD;
     rec.tag        = wi.ray.tag;
     rec.src_id     = wi.ray.src_id;
     rec.bounce     = wi.ray.bounce;
-    rec.arena_id   = wi.arena_id;
+    rec.arena_id   = terminal_arena;
     rec.color_flag = wi.ray.color_flag;
     rec.sensor_origin_y = wi.ray.sensor_origin_y;
     rec.sensor_origin_z = wi.ray.sensor_origin_z;
@@ -16531,6 +16718,60 @@ RayPipelineState* ray_pipeline_create(
         wave_arena_build(ps->arenas.back(),
                          (int)ps->arenas.size() - 1,
                          ctx, ps->cfg, *st);
+    }
+    auto arena_for_context = [&](int context_id) -> int {
+        for (int arena_id = 0;
+             arena_id < static_cast<int>(ps->arenas.size()); ++arena_id)
+            if (ps->arenas[static_cast<size_t>(arena_id)].context_id
+                == context_id)
+                return arena_id;
+        return -1;
+    };
+    for (const auto& link : st->wave_context_links) {
+        const int src_id = arena_for_context(link.first);
+        const int dst_id = arena_for_context(link.second);
+        if (src_id < 0 || dst_id < 0) {
+            fprintf(stderr,
+                    "[T4-link] context link %d -> %d has no native arena\n",
+                    link.first, link.second);
+            delete ps;
+            return nullptr;
+        }
+        WaveArena& src = ps->arenas[static_cast<size_t>(src_id)];
+        WaveArena& dst = ps->arenas[static_cast<size_t>(dst_id)];
+        double plane_error = 0.0;
+        if (src.next_forward >= 0 || dst.next_backward >= 0
+            || !wave_arena_ports_compatible(src, dst, &plane_error)) {
+            fprintf(stderr,
+                    "[T4-link] rejected incompatible/branching field link "
+                    "%d -> %d (plane error %.9g m)\n",
+                    link.first, link.second, plane_error);
+            delete ps;
+            return nullptr;
+        }
+        src.next_forward = dst_id;
+        dst.next_backward = src_id;
+        fprintf(stderr,
+                "[T4-link] field ports connected arena %d -> %d "
+                "(context %d -> %d, zero-copy-shape/no-resample)\n",
+                src_id, dst_id, link.first, link.second);
+    }
+    for (int start = 0;
+         start < static_cast<int>(ps->arenas.size()); ++start) {
+        int cursor = start;
+        int traversed = 0;
+        while (cursor >= 0
+               && traversed <= static_cast<int>(ps->arenas.size())) {
+            cursor = ps->arenas[static_cast<size_t>(cursor)].next_forward;
+            ++traversed;
+        }
+        if (cursor >= 0) {
+            fprintf(stderr,
+                    "[T4-link] rejected cyclic field graph at arena %d\n",
+                    start);
+            delete ps;
+            return nullptr;
+        }
     }
 
     const uint64_t base  = static_cast<uint64_t>(ps->cfg.seed);
@@ -18770,6 +19011,10 @@ int ray_pipeline_get_wave_arena_snapshot(const RayPipelineState* ps,
     const WaveArena& arena = ps->arenas[static_cast<size_t>(arena_id)];
     std::lock_guard<std::mutex> lk(arena.mu);
     out->arena_id = arena.id;
+    out->context_id = arena.context_id;
+    out->next_forward = arena.next_forward;
+    out->next_backward = arena.next_backward;
+    out->linked_transfers = arena.linked_transfers;
     out->bands = arena.n_bands;
     out->band_specialization = arena.band_specialization;
     out->spectral_mode = static_cast<int>(arena.spectral_mode);
@@ -18827,6 +19072,8 @@ int ray_pipeline_get_wave_arena_snapshot(const RayPipelineState* ps,
     out->boundary_seeded_field_power = bt.seeded_field_power;
     out->boundary_propagated_field_power = bt.propagated_field_power;
     out->boundary_output_ray_power = bt.output_ray_power;
+    out->boundary_linked_from_arena = bt.linked_from_arena;
+    out->boundary_linked_to_arena = bt.linked_to_arena;
     return SK_OK;
 }
 

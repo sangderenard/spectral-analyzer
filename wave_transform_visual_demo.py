@@ -59,17 +59,25 @@ def _transport_calibration_tracer(wavelength_m: float):
         2, triangles, normals, mat_idx, mat_buf, int(mat_count),
         frequency, 299_792_458.0, np.zeros(1, np.float64),
     )
-    tracer.add_scale_context(
-        np.asarray([0.0, 0.0, 0.0], np.float64),
-        96.0e-6,
-        1,
-        4.0e-6,
-        32,
-        1.0,
-        0.0,
-        1,
-        np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 1.0], np.float64),
-    )
+    context_ids = []
+    axis_payloads = []
+    for center_z in (-64.0e-6, 64.0e-6):
+        payload = np.asarray(
+            [0.0, 0.0, 0.0, 0.0, 0.0, 1.0], np.float64
+        )
+        axis_payloads.append(payload)
+        context_ids.append(tracer.add_scale_context(
+            np.asarray([0.0, 0.0, center_z], np.float64),
+            96.0e-6,
+            1,
+            4.0e-6,
+            32,
+            1.0,
+            0.0,
+            1,
+            payload,
+        ))
+    tracer.add_wave_context_link(context_ids[0], context_ids[1])
     tracer.ensure_pipeline(max_children=1, min_amplitude=1.0e-12)
     return tracer
 
@@ -170,7 +178,7 @@ def _compose(panels: list[Image.Image], footer: str) -> Image.Image:
 
 
 def _transport_table_rgba(
-    arena: dict[str, object],
+    arena: dict[str, object] | list[dict[str, object]],
     detector_position: np.ndarray | None,
     size: int,
 ) -> np.ndarray:
@@ -179,14 +187,25 @@ def _transport_table_rgba(
     image = Image.new("RGBA", (size, size), (7, 11, 18, 255))
     draw = ImageDraw.Draw(image)
     font = ImageFont.load_default()
-    boundary = dict(arena["boundary"])
-    center = np.asarray(arena["center_world"], np.float64)
-    half_x = float(arena["transverse_half_extent_m"])
-    half_z = 0.5 * float(arena["longitudinal_extent_m"])
-    entry = np.asarray(boundary["entry_world"], np.float64)
-    exit_position = np.asarray(boundary["exit_world"], np.float64)
-    entry_direction = np.asarray(boundary["entry_direction"], np.float64)
-    exit_direction = np.asarray(boundary["exit_direction"], np.float64)
+    arenas = arena if isinstance(arena, list) else [arena]
+    first = next(
+        (value for value in arenas if int(value["next_forward"]) >= 0),
+        arenas[0],
+    )
+    terminal = next(
+        (value for value in arenas if int(value["next_forward"]) < 0),
+        arenas[-1],
+    )
+    first_boundary = dict(first["boundary"])
+    terminal_boundary = dict(terminal["boundary"])
+    entry = np.asarray(first_boundary["entry_world"], np.float64)
+    exit_position = np.asarray(terminal_boundary["exit_world"], np.float64)
+    entry_direction = np.asarray(
+        first_boundary["entry_direction"], np.float64
+    )
+    exit_direction = np.asarray(
+        terminal_boundary["exit_direction"], np.float64
+    )
     z_min, z_max = -850.0e-6, 520.0e-6
     x_min, x_max = -260.0e-6, 260.0e-6
 
@@ -199,15 +218,24 @@ def _transport_table_rgba(
         ))
         return px, py
 
-    patch_lo = point(center + np.asarray([-half_x, 0.0, -half_z]))
-    patch_hi = point(center + np.asarray([half_x, 0.0, half_z]))
-    rectangle = (
-        min(patch_lo[0], patch_hi[0]), min(patch_lo[1], patch_hi[1]),
-        max(patch_lo[0], patch_hi[0]), max(patch_lo[1], patch_hi[1]),
-    )
-    draw.rectangle(rectangle, fill=(18, 48, 72, 220), outline=(55, 210, 245, 255), width=2)
-    draw.text((rectangle[0]+5, rectangle[1]+5), "T4 FIELD PATCH", font=font,
-              fill=(120, 225, 255, 255))
+    for index, value in enumerate(arenas):
+        center = np.asarray(value["center_world"], np.float64)
+        half_x = float(value["transverse_half_extent_m"])
+        half_z = 0.5 * float(value["longitudinal_extent_m"])
+        patch_lo = point(center + np.asarray([-half_x, 0.0, -half_z]))
+        patch_hi = point(center + np.asarray([half_x, 0.0, half_z]))
+        rectangle = (
+            min(patch_lo[0], patch_hi[0]), min(patch_lo[1], patch_hi[1]),
+            max(patch_lo[0], patch_hi[0]), max(patch_lo[1], patch_hi[1]),
+        )
+        color = (55, 210, 245, 255) if index == 0 else (165, 110, 255, 255)
+        draw.rectangle(
+            rectangle, fill=(18, 48, 72, 220), outline=color, width=2
+        )
+        draw.text(
+            (rectangle[0]+5, rectangle[1]+5), f"T4-{index}",
+            font=font, fill=color,
+        )
 
     source = entry - entry_direction * 700.0e-6
     draw.line((point(source), point(entry)), fill=(255, 190, 72, 255), width=3)
@@ -231,7 +259,7 @@ def _transport_table_rgba(
         draw.ellipse((hit[0]-6, hit[1]-6, hit[0]+6, hit[1]+6),
                      outline=(255, 80, 190, 255), width=2)
 
-    draw.text((8, 8), "ACTUAL T1 -> T4 -> T1 -> DETECTOR", font=font,
+    draw.text((8, 8), "T1 -> T4-0 ==FIELD==> T4-1 -> T1", font=font,
               fill=(225, 235, 250, 255))
     draw.text(
         (8, size-48),
@@ -246,27 +274,52 @@ def _transport_table_rgba(
     return np.asarray(image, np.uint8)
 
 
-def _boundary_power_rgba(arena: dict[str, object], size: int) -> np.ndarray:
+def _boundary_power_rgba(
+    arena: dict[str, object],
+    size: int,
+    linked_arena: dict[str, object] | None = None,
+) -> np.ndarray:
     image = Image.new("RGBA", (size, size), (7, 11, 18, 255))
     draw = ImageDraw.Draw(image)
     font = ImageFont.load_default()
     boundary = dict(arena["boundary"])
-    values = [
-        ("INPUT RAY", float(boundary["input_ray_power"]), (255, 185, 70, 255)),
-        ("SEEDED FIELD", float(boundary["seeded_field_power"]), (80, 205, 255, 255)),
-        ("PROPAGATED", float(boundary["propagated_field_power"]), (120, 125, 255, 255)),
-        ("OUTPUT RAY", float(boundary["output_ray_power"]), (100, 255, 150, 255)),
-    ]
+    values = [("INPUT RAY", float(boundary["input_ray_power"]),
+               (255, 185, 70, 255))]
+    values.append(("T4-0 EXIT FIELD", float(boundary["propagated_field_power"]),
+                   (80, 205, 255, 255)))
+    if linked_arena is not None:
+        linked = dict(linked_arena["boundary"])
+        values.extend([
+            ("T4-1 LINK INPUT", float(linked["seeded_field_power"]),
+             (165, 110, 255, 255)),
+            ("T4-1 EXIT FIELD", float(linked["propagated_field_power"]),
+             (120, 125, 255, 255)),
+            ("OUTPUT RAY", float(linked["output_ray_power"]),
+             (100, 255, 150, 255)),
+        ])
+    else:
+        values.extend([
+            ("SEEDED FIELD", float(boundary["seeded_field_power"]),
+             (80, 205, 255, 255)),
+            ("PROPAGATED", float(boundary["propagated_field_power"]),
+             (120, 125, 255, 255)),
+            ("OUTPUT RAY", float(boundary["output_ray_power"]),
+             (100, 255, 150, 255)),
+        ])
     peak = max([value for _label, value, _color in values] + [1.0e-30])
     draw.text((8, 8), "BOUNDARY POWER CONTRACT", font=font,
               fill=(225, 235, 250, 255))
     for index, (label, value, color) in enumerate(values):
-        y = 42 + index * max(36, (size-75)//4)
+        y = 42 + index * max(30, (size-75)//len(values))
         draw.text((10, y), f"{label}  {value:.6e}", font=font, fill=color)
         bar_width = int(round((size-24) * min(1.0, value/peak)))
         draw.rectangle((10, y+16, 10+bar_width, y+28), fill=color)
     seeded = float(boundary["seeded_field_power"])
-    propagated = float(boundary["propagated_field_power"])
+    propagated = float(
+        dict(linked_arena["boundary"])["propagated_field_power"]
+        if linked_arena is not None
+        else boundary["propagated_field_power"]
+    )
     draw.text(
         (8, size-24),
         f"field retention {propagated/max(seeded, 1e-30):.8f}",
@@ -544,10 +597,10 @@ def run_transport_live(
         pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE
     )
     pygame.display.set_mode(
-        (1320, 500), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
+        (1600, 500), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
     )
     tracer = _transport_calibration_tracer(wavelength_m)
-    textures = [int(value) for value in gl.glGenTextures(3)]
+    textures = [int(value) for value in gl.glGenTextures(4)]
     compositor = GLPreviewCompositor()
     compositor.init_gl()
     for texture in textures:
@@ -569,7 +622,7 @@ def run_transport_live(
 
     panels = [
         np.zeros((panel_size, panel_size, 4), np.uint8)
-        for _ in range(3)
+        for _ in range(4)
     ]
     for panel in panels:
         panel[..., 3] = 255
@@ -593,8 +646,18 @@ def run_transport_live(
 
             if submitted and int(tracer.in_flight_count()) == 0:
                 records = tracer.drain_records(64)
-                arena = dict(tracer.wave_arena_stats()[0])
-                boundary = dict(arena["boundary"])
+                arenas = [
+                    dict(value) for value in tracer.wave_arena_stats()
+                ]
+                first = next(
+                    value for value in arenas
+                    if int(value["next_forward"]) >= 0
+                )
+                terminal = next(
+                    value for value in arenas
+                    if int(value["next_forward"]) < 0
+                )
+                boundary = dict(terminal["boundary"])
                 detector_position = None
                 kinds = np.asarray(records["kind"])
                 strike_indices = np.flatnonzero(kinds == 0)
@@ -602,20 +665,31 @@ def run_transport_live(
                     detector_position = np.asarray(
                         records["pos"], np.float64
                     )[int(strike_indices[-1])]
-                field_snapshot = tracer.wave_arena_field_snapshot(
-                    0, int(boundary["direction"]), 0, 0
-                )
-                field = (
-                    np.asarray(field_snapshot["re"], np.float64)
-                    + 1j*np.asarray(field_snapshot["im"], np.float64)
-                )
-                phase = Image.fromarray(_phase_rgba(field), "RGBA").resize(
-                    (panel_size, panel_size), Image.Resampling.BICUBIC
-                )
+                phases = []
+                for value in (first, terminal):
+                    value_boundary = dict(value["boundary"])
+                    field_snapshot = tracer.wave_arena_field_snapshot(
+                        int(value["arena_id"]),
+                        int(value_boundary["direction"]), 0, 0,
+                    )
+                    field = (
+                        np.asarray(field_snapshot["re"], np.float64)
+                        + 1j*np.asarray(field_snapshot["im"], np.float64)
+                    )
+                    phases.append(np.asarray(
+                        Image.fromarray(_phase_rgba(field), "RGBA").resize(
+                            (panel_size, panel_size),
+                            Image.Resampling.BICUBIC,
+                        ),
+                        np.uint8,
+                    ))
                 panels = [
-                    _transport_table_rgba(arena, detector_position, panel_size),
-                    np.asarray(phase, np.uint8),
-                    _boundary_power_rgba(arena, panel_size),
+                    _transport_table_rgba(
+                        arenas, detector_position, panel_size
+                    ),
+                    phases[0],
+                    phases[1],
+                    _boundary_power_rgba(first, panel_size, terminal),
                 ]
                 last_boundary = boundary
                 generation += 1
@@ -651,13 +725,15 @@ def run_transport_live(
             gl.glClearColor(0.018, 0.025, 0.04, 1.0)
             gl.glClear(gl.GL_COLOR_BUFFER_BIT)
             gap = max(4, width//250)
-            pane_width = max(1, (width-gap*4)//3)
+            pane_width = max(1, (width-gap*5)//4)
             pane_height = max(1, height-gap*2)
             for index, texture in enumerate(textures):
                 compositor.draw(
                     PreviewTextureProduct(
                         product_id=f"t4.transport.{index}",
-                        tab_label=("TABLE", "EXIT FIELD", "POWER")[index],
+                        tab_label=(
+                            "TABLE", "T4-0 EXIT", "T4-1 EXIT", "POWER"
+                        )[index],
                         texture_id=texture,
                         width=panel_size,
                         height=panel_size,
@@ -683,7 +759,7 @@ def run_transport_live(
                 propagated = float(last_boundary["propagated_field_power"])
                 retention = f" retention={propagated/max(seeded, 1e-30):.8f}"
             pygame.display.set_caption(
-                "Native transport table — ACTUAL PATH | EXIT PHASE | POWER "
+                "Native linked transport — TABLE | T4-0 | T4-1 | POWER "
                 f"generation={generation}{retention} "
                 f"{'PAUSED' if paused else ''}  [Space pause, Esc close]"
             )

@@ -164,6 +164,20 @@ discarded calibration backend is available only through Git history.
 - Publish progressive intensity, phase, polarization, residual, and boundary
   diagnostics without readback steering the solve.
 
+Transform execution is backend-owned under the shared field ABI:
+
+- Torch-owned CUDA contexts should use `torch.fft`/cuFFT rather than a custom
+  transform;
+- GL-owned contexts require the staged GLSL FFT so fields do not cross an API
+  boundary or synchronize through Python;
+- the vendored `third_party/fftfree` complex Cooley--Tukey engine is the
+  planned vectorized native CPU executor/reference because it already supports
+  in-place batched axes, explicit strides, preplanned workspace, 2D transpose,
+  caller-owned dispatch, and transform telemetry;
+- Stockham and mixed-radix variants remain opt-in until isolated parity and
+  no-hot-allocation gates pass. CQT/VQT/NSGT and wavelet engines remain
+  frequency-analysis operators, not substitutes for the spatial 2D DFT.
+
 Exit gate: plane/Gaussian propagation, physical double slit, dielectric slab,
 prism, thick lens, reciprocity, and open-boundary reflection gates pass.
 

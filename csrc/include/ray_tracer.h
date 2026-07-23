@@ -930,6 +930,19 @@ SK_API int ray_tracer_add_scale_context(
     RtScaleContext*       ctx           /* context_id filled in on success */
 );
 
+/**
+ * Join two registered wave contexts without a ray-domain adapter.
+ *
+ * Forward fields travel src -> dst and backward fields travel dst -> src.
+ * Pipeline construction accepts only identical lane/grid/component layouts,
+ * aligned bases, and coincident boundary planes.  It never inserts an
+ * implicit resampler.
+ */
+SK_API int ray_tracer_add_wave_context_link(
+    RayTracerState* st,
+    int             src_context_id,
+    int             dst_context_id);
+
 /** Remove all registered scale contexts from the tracer. */
 SK_API int ray_tracer_clear_scale_contexts(RayTracerState* st);
 

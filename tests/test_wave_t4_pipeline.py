@@ -187,6 +187,56 @@ def test_wave_boundary_preserves_power_tilt_and_authored_axial_extent():
     assert np.asarray(records["pos"])[field_index, 2] > 0.0
 
 
+def test_compatible_wave_contexts_chain_without_intermediate_ray_collapse():
+    tracer = _tracer(np.array([550e-9]))
+    radius = 64.0e-6
+    dz = 2.0e-6
+    steps = 8
+    axis_payloads = []
+    context_ids = []
+    for center_z in (-8.0e-6, 8.0e-6):
+        payload = np.array(
+            [0.0, 0.0, 0.0, 0.0, 0.0, 1.0], np.float64
+        )
+        axis_payloads.append(payload)
+        context_ids.append(tracer.add_scale_context(
+            np.array([0.0, 0.0, center_z]),
+            radius, 1, dz, steps, 1.0, 0.0, 1, payload,
+        ))
+    tracer.add_wave_context_link(context_ids[0], context_ids[1])
+    tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+    tracer.submit_rays(
+        np.array([[12.0e-6, -7.0e-6, -0.001]]),
+        np.array([[0.006, -0.004, np.sqrt(1.0 - 0.006**2 - 0.004**2)]]),
+        np.array([[1.0 + 0.0j]]),
+        max_bounces=2,
+        min_amplitude=1e-12,
+    )
+    _wait(tracer)
+
+    arenas = tracer.wave_arena_stats()
+    by_context = {arena["context_id"]: arena for arena in arenas}
+    first = by_context[context_ids[0]]
+    second = by_context[context_ids[1]]
+    assert first["generation"] == 1
+    assert second["generation"] == 1
+    assert first["linked_transfers"] == 1
+    assert first["next_forward"] == second["arena_id"]
+    assert second["next_backward"] == first["arena_id"]
+    assert first["boundary"]["linked_to_arena"] == second["arena_id"]
+    assert second["boundary"]["linked_from_arena"] == first["arena_id"]
+    assert second["boundary"]["seeded_field_power"] == pytest.approx(
+        first["field_power"], rel=2.0e-6
+    )
+
+    records = tracer.drain_records(16)
+    field_records = np.flatnonzero(np.asarray(records["kind"]) == 3)
+    assert len(field_records) == 1
+    assert int(np.asarray(records["arena_id"])[field_records[0]]) == (
+        second["arena_id"]
+    )
+
+
 def test_production_angular_spectrum_plane_wave_phase_and_reverse():
     wavelength = 550.0e-9
     tracer = _tracer(np.array([wavelength]))
@@ -248,6 +298,57 @@ def test_continuous_paths_share_one_exact_width_complex_dispatch():
         arena["boundary"]["propagated_field_power"], rel=2.0e-5
     )
     assert np.asarray(tracer.drain_records(16)["kind"]).tolist() == [3, 3, 3, 3]
+
+
+def test_continuous_cohort_marches_linked_field_chain_only_once():
+    tracer = _tracer(np.array([450e-9, 500e-9, 600e-9, 700e-9]))
+    tracer.configure_spectral_luts(
+        np.zeros(4, np.int32),
+        np.array([0, 2], np.int32),
+        np.array([4.0e14, 7.5e14]),
+        np.ones(2),
+    )
+    context_ids = []
+    payloads = []
+    for center_z in (-8.0e-6, 8.0e-6):
+        payload = np.array(
+            [0.0, 0.0, 0.0, 0.0, 0.0, 1.0], np.float64
+        )
+        payloads.append(payload)
+        context_ids.append(tracer.add_scale_context(
+            np.array([0.0, 0.0, center_z]),
+            64.0e-6, 1, 2.0e-6, 8, 1.0, 0.0, 1, payload,
+        ))
+    tracer.add_wave_context_link(context_ids[0], context_ids[1])
+    tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+    origins = np.array([
+        [x, 0.0, -0.001] for x in (-12e-6, -4e-6, 4e-6, 12e-6)
+    ])
+    tracer.submit_rays(
+        origins,
+        np.tile([0.0, 0.0, 1.0], (4, 1)),
+        np.ones((4, 4), np.complex128),
+        tags=np.array([11, 22, 33, 44], np.uint64),
+        max_bounces=2,
+        min_amplitude=1e-12,
+    )
+    _wait(tracer)
+
+    arenas = tracer.wave_arena_stats()
+    by_context = {arena["context_id"]: arena for arena in arenas}
+    first = by_context[context_ids[0]]
+    second = by_context[context_ids[1]]
+    assert first["spectral_mode"] == 1
+    assert second["spectral_mode"] == 1
+    assert first["generation"] == 1
+    assert second["generation"] == 1
+    assert first["linked_transfers"] == 1
+    records = tracer.drain_records(16)
+    field_mask = np.asarray(records["kind"]) == 3
+    assert int(np.count_nonzero(field_mask)) == 4
+    assert set(np.asarray(records["arena_id"])[field_mask].tolist()) == {
+        second["arena_id"]
+    }
 
 
 def test_gpu_t1_routes_empty_space_continuous_cohort_to_t4():

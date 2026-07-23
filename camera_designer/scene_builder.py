@@ -681,6 +681,10 @@ def _collect_optical_geometry(
         r_out = float(ap.r_outer)
         n_bl  = int(ap.n_blades) if ap.n_blades >= 3 else 0
         a_rot = float(ap.aperture_rot)
+        aperture_material = MATERIAL_CATALOG.get(
+            str(getattr(ap, "material_name", "blackened_steel")),
+            MATERIAL_CATALOG["blackened_steel"],
+        )
 
         blade_verts_list:   List[np.ndarray] = []
         blade_normals_list: List[np.ndarray] = []
@@ -694,36 +698,25 @@ def _collect_optical_geometry(
                                        n_rings=12, n_sectors=256)
             blade_verts_list.append(bv); blade_normals_list.append(bn)
         else:
-            # Each opaque blade occupies the region OUTSIDE one edge of the
-            # clear N-gon.  The old center-out wedges inverted the aperture and
-            # left only a pinhole.  These material quads meet at the inscribed
-            # opening and extend into the surrounding barrel, so rays interact
-            # with real blade geometry rather than a perfect aperture mask.
-            clear_poly = ap.blade_polygon_xy()
-            blade_outer = r_out * 2.0
-            all_blade_verts: List[np.ndarray] = []
-            all_blade_normals: List[np.ndarray] = []
-            for bi in range(n_bl):
-                q0 = clear_poly[bi]
-                q1 = clear_poly[(bi + 1) % n_bl]
-                a0 = math.atan2(float(q0[1]), float(q0[0]))
-                a1 = math.atan2(float(q1[1]), float(q1[0]))
-                p0 = np.array([q0[0], q0[1], z_ap], np.float64)
-                p1 = np.array([q1[0], q1[1], z_ap], np.float64)
-                o0 = np.array([blade_outer * math.cos(a0),
-                               blade_outer * math.sin(a0), z_ap], np.float64)
-                o1 = np.array([blade_outer * math.cos(a1),
-                               blade_outer * math.sin(a1), z_ap], np.float64)
-                for a, b_pt, c in ((p0, o0, o1), (p0, o1, p1)):
-                    nv = np.cross(b_pt - a, c - a)
-                    nl = np.linalg.norm(nv)
-                    if nl < 1e-30:
-                        continue
-                    all_blade_verts.append(np.concatenate([a, b_pt, c]))
-                    all_blade_normals.append(nv / nl)
-            if all_blade_verts:
-                blade_verts_list.append(np.array(all_blade_verts,   np.float64))
-                blade_normals_list.append(np.array(all_blade_normals, np.float64))
+            # The shared live descriptor produces finite-thickness material
+            # blades for ray/GL use and the same parameters feed T4's localized
+            # complex-index operator. This replaces the old zero-thickness
+            # camera-only quads without introducing an ideal aperture mask.
+            from camera_software.physical_aperture import LivePhysicalAperture
+            live_aperture = LivePhysicalAperture.iris(
+                f"camera.iris.{z_ap:.9g}",
+                blade_count=n_bl,
+                opening_radius_m=r_out,
+                assembly_radius_m=r_out*2.0,
+                thickness_m=float(getattr(ap, "thickness_m", 1.0e-4)),
+                rotation_rad=a_rot,
+                material_name=aperture_material.name,
+                material_n_real=float(aperture_material.n_d),
+                material_n_imag=float(aperture_material.k),
+            )
+            bv, bn = live_aperture.triangle_mesh(z_center_m=z_ap)
+            blade_verts_list.append(bv)
+            blade_normals_list.append(bn)
             if r_in > 1e-9:
                 bv, bn = _triangulate_disk(
                     lambda r: 0.0, z_ap, 0.0, r_in,
@@ -742,8 +735,9 @@ def _collect_optical_geometry(
             ior_specs.append((_tri_cursor, n_new, 1.0, 1.0, _GEO_FLAG_APERTURE_STOP))
             mat_groups.append((
                 _tri_cursor, n_new,
-                (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0),
-                1.0, 1.0, _GEO_FLAG_APERTURE_STOP,
+                aperture_material.tint[:3], aperture_material.tint[:3],
+                aperture_material.tint[:3],
+                float(aperture_material.n_d), 1.0, _GEO_FLAG_APERTURE_STOP,
             ))
             _tri_cursor += n_new
 

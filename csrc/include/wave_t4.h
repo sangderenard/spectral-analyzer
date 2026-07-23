@@ -14,6 +14,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace wave_t4 {
@@ -41,6 +42,14 @@ enum class SpectralMode : int {
  * method. Backends can change without changing the packed-state contract. */
 enum class BackendKind : int {
     AngularSpectrum = 0,
+};
+
+enum class AperturePattern : int {
+    None = 0,
+    IrisPolygon = 1,
+    ShadowMask = 2,
+    SlotMask = 3,
+    ApertureGrille = 4,
 };
 
 enum class Direction : int {
@@ -88,6 +97,28 @@ struct Progress {
     double absorbed_power = 0.0;
 };
 
+/** Fixed-layout live material operator embedded in a wave-arena payload.
+ *
+ * This describes material occupancy, not an ideal transmission mask. The
+ * complex index and finite path length determine phase and attenuation.
+ * Repeated patterns share the same ABI as an iris so CRT masks/grilles do not
+ * require a second wave implementation.
+ */
+struct ApertureMaterial {
+    AperturePattern pattern = AperturePattern::None;
+    int element_count = 0;       /* iris blades; unused by repeated patterns */
+    double opening_x_m = 0.0;    /* iris circumradius / hole or slot half-width */
+    double opening_y_m = 0.0;    /* hole or slot half-height */
+    double pitch_x_m = 0.0;
+    double pitch_y_m = 0.0;
+    double rotation_rad = 0.0;
+    double assembly_radius_m = 0.0;
+    double thickness_m = 0.0;
+    double background_n_real = 1.0;
+    double material_n_real = 1.0;
+    double material_n_imag = 0.0;
+};
+
 struct FftAxisPlan {
     int size = 0;
     std::vector<std::uint32_t> bit_reverse;
@@ -100,6 +131,9 @@ struct AngularSpectrumPlan {
     int ny = 0;
     FftAxisPlan x;
     FftAxisPlan y;
+    /* Cold-owned implementation state. This remains opaque so the persistent
+     * T4 ABI does not acquire an Eigen/fftfree dependency. */
+    std::shared_ptr<void> transform_executor;
 };
 
 /** Build immutable transform metadata during cold arena construction. */
@@ -132,8 +166,8 @@ bool measure(int bands,
  * nx and ny are the padded FFT dimensions and must both be powers of two.
  * The field is laid out band-major as [band][y][x].  Positive direction_sign
  * advances the forward field; negative advances the backward field.  No
- * allocation occurs in this call: transforms operate directly on the
- * caller-owned persistent arena planes.
+ * allocation occurs in this call: split-complex arena planes are staged
+ * through one cold plan-owned interleaved workspace and copied back in place.
  */
 bool angular_spectrum_step(int bands,
                            int nx,
@@ -145,5 +179,35 @@ bool angular_spectrum_step(int bands,
                            const AngularSpectrumPlan* plan,
                            float* re,
                            float* im) noexcept;
+
+/** Diagnostic reference using the original split-complex radix-2 transform.
+ * Kept for numerical qualification of replacement executors, not scheduling. */
+bool angular_spectrum_step_reference(int bands,
+                                     int nx,
+                                     int ny,
+                                     double dx,
+                                     double dz,
+                                     const double* wavelengths_m,
+                                     int direction_sign,
+                                     const AngularSpectrumPlan* plan,
+                                     float* re,
+                                     float* im) noexcept;
+
+/** Apply a finite material slice to an existing complex field in-place.
+ * The slice is centered on the field grid and uses the same exact lane
+ * specializations as propagation. distance_m is the actual material path
+ * represented by this split step; phase is signed by direction_sign while
+ * extinction is reciprocal. */
+bool apply_aperture_material(int bands,
+                             int nx,
+                             int ny,
+                             double dx,
+                             const double* wavelengths_m,
+                             int direction_sign,
+                             const ApertureMaterial& material,
+                             double distance_m,
+                             float* re,
+                             float* im,
+                             Progress* progress) noexcept;
 
 }  // namespace wave_t4

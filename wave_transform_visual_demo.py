@@ -274,6 +274,39 @@ def _transport_table_rgba(
     return np.asarray(image, np.uint8)
 
 
+def _aperture_geometry_rgba(aperture, size: int) -> np.ndarray:
+    """Orthographic projection of the actual finite blade triangle mesh."""
+
+    vertices, _ = aperture.triangle_mesh()
+    image = Image.new("RGBA", (size, size), (7, 11, 18, 255))
+    draw = ImageDraw.Draw(image)
+    radius = aperture.assembly_radius_m
+
+    def point(value):
+        return (
+            int(round((0.5+0.46*float(value[0])/radius)*size)),
+            int(round((0.5-0.46*float(value[1])/radius)*size)),
+        )
+
+    for triangle in vertices.reshape(-1, 3, 3):
+        # Draw only the front/back faces in this top-down projection; side
+        # triangles collapse to lines and are represented by the outline.
+        if np.ptp(triangle[:, 2]) > 1.0e-15:
+            continue
+        polygon = [point(vertex) for vertex in triangle]
+        draw.polygon(
+            polygon, fill=(70, 76, 88, 255), outline=(155, 172, 194, 255)
+        )
+    draw.text(
+        (8, 8),
+        f"{aperture.element_count} material blades\n"
+        f"{aperture.thickness_m*1e6:.2f} um {aperture.material_name}",
+        fill=(220, 230, 242, 255),
+        font=ImageFont.load_default(),
+    )
+    return np.asarray(image, np.uint8)
+
+
 def _boundary_power_rgba(
     arena: dict[str, object],
     size: int,
@@ -571,6 +604,179 @@ def run_live(
         pygame.quit()
 
 
+def run_aperture_live(
+    *,
+    size: int = 64,
+    pitch_m: float = 0.75e-6,
+    wavelength_m: float = 532.0e-9,
+    fps: int = 30,
+    _max_display_frames: int | None = None,
+) -> None:
+    """Animate reciprocal constant-field interaction with physical iris blades."""
+
+    if size < 8 or size & (size-1):
+        raise ValueError("size must be a power of two and at least 8")
+    import pygame
+    from OpenGL import GL as gl
+    from camera_software.gpu_preview import (
+        GLPreviewCompositor, PreviewProductKind, PreviewTextureProduct,
+    )
+    from camera_software.physical_aperture import LivePhysicalAperture
+
+    pygame.init()
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+    pygame.display.gl_set_attribute(
+        pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE
+    )
+    pygame.display.set_mode(
+        (1440, 420), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
+    )
+    tracer = _calibration_tracer(wavelength_m)
+    wavelengths = np.asarray([wavelength_m], np.float64)
+    textures = [int(value) for value in gl.glGenTextures(4)]
+    compositor = GLPreviewCompositor()
+    compositor.init_gl()
+    for texture in textures:
+        gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(
+            gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE
+        )
+        gl.glTexParameteri(
+            gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE
+        )
+        gl.glTexImage2D(
+            gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, size, size, 0,
+            gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, None,
+        )
+    clock = pygame.time.Clock()
+    running = True
+    paused = False
+    generation = 0
+    displayed_frames = 0
+    try:
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                        running = False
+                    elif event.key == pygame.K_SPACE:
+                        paused = not paused
+            if not paused:
+                generation += 1
+            phase = generation*0.025
+            field_radius = 0.5*(size-1)*pitch_m
+            opening = field_radius*(0.16+0.075*(1.0+np.sin(phase)))
+            aperture = LivePhysicalAperture.iris(
+                "demo.live-iris",
+                blade_count=9,
+                opening_radius_m=float(opening),
+                assembly_radius_m=field_radius*1.45,
+                thickness_m=0.10e-6,
+                rotation_rad=phase*0.2,
+                material_name="blackened_steel",
+                material_n_real=2.9,
+                material_n_imag=3.0,
+            )
+            payload = aperture.wave_payload()
+            forward_re = np.ones((1, size, size), np.float32)
+            forward_im = np.zeros_like(forward_re)
+            reverse_re, reverse_im = forward_re.copy(), forward_im.copy()
+            tracer.t4_apply_aperture_material(
+                1, size, size, pitch_m, aperture.thickness_m, 1,
+                wavelengths, payload, forward_re, forward_im,
+            )
+            material_field = (
+                forward_re[0].astype(np.float64)
+                + 1j*forward_im[0].astype(np.float64)
+            )
+            tracer.t4_apply_aperture_material(
+                1, size, size, pitch_m, aperture.thickness_m, -1,
+                wavelengths, payload, reverse_re, reverse_im,
+            )
+            distance = 90.0e-6
+            tracer.t4_angular_spectrum_step(
+                1, size, size, pitch_m, distance, 1,
+                wavelengths, forward_re, forward_im,
+            )
+            tracer.t4_angular_spectrum_step(
+                1, size, size, pitch_m, distance, -1,
+                wavelengths, reverse_re, reverse_im,
+            )
+            forward = (
+                forward_re[0].astype(np.float64)
+                + 1j*forward_im[0].astype(np.float64)
+            )
+            reverse = (
+                reverse_re[0].astype(np.float64)
+                + 1j*reverse_im[0].astype(np.float64)
+            )
+            panels = (
+                _aperture_geometry_rgba(aperture, size),
+                _phase_rgba(material_field),
+                _phase_rgba(forward),
+                _phase_rgba(reverse),
+            )
+            for texture, rgba in zip(textures, panels):
+                gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+                gl.glTexSubImage2D(
+                    gl.GL_TEXTURE_2D, 0, 0, 0, size, size,
+                    gl.GL_RGBA, gl.GL_UNSIGNED_BYTE,
+                    np.ascontiguousarray(rgba),
+                )
+            width, height = pygame.display.get_window_size()
+            gl.glViewport(0, 0, width, height)
+            gl.glClearColor(0.018, 0.025, 0.04, 1.0)
+            gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+            gap = max(4, width//288)
+            pane_width = max(1, (width-gap*5)//4)
+            pane_height = max(1, height-gap*2)
+            labels = ("PHYSICAL BLADES", "MATERIAL EXIT", "FORWARD", "REVERSE")
+            for index, texture in enumerate(textures):
+                compositor.draw(
+                    PreviewTextureProduct(
+                        product_id=f"t4.aperture.{index}",
+                        tab_label=labels[index],
+                        texture_id=texture,
+                        width=size,
+                        height=size,
+                        generation=generation,
+                        producer="production-t4-physical-aperture",
+                        internal_format=int(gl.GL_RGBA8),
+                        kind=PreviewProductKind.COMPLEX_FIELD,
+                        orientation="top-left",
+                        alpha_mode="straight",
+                    ),
+                    (
+                        gap+index*(pane_width+gap), gap,
+                        pane_width, pane_height,
+                    ),
+                    height,
+                    tone_map=False,
+                )
+            pygame.display.flip()
+            displayed_frames += 1
+            pygame.display.set_caption(
+                "Physical aperture — GEOMETRY | MATERIAL | FORWARD | REVERSE  "
+                f"opening={opening*1e6:.2f} um "
+                f"{'PAUSED' if paused else ''} [Space pause, Esc close]"
+            )
+            clock.tick(fps)
+            if (
+                _max_display_frames is not None
+                and displayed_frames >= _max_display_frames
+            ):
+                running = False
+    finally:
+        compositor.destroy()
+        gl.glDeleteTextures(len(textures), textures)
+        pygame.quit()
+
+
 def run_transport_live(
     *,
     wavelength_m: float = 532.0e-9,
@@ -782,6 +988,10 @@ def main() -> int:
         "--output-dir", default="exposures/wave_transform_visual"
     )
     parser.add_argument("--size", type=int, default=128)
+    parser.add_argument(
+        "--aperture-size", type=int, default=64,
+        help="power-of-two field width for --aperture-live",
+    )
     parser.add_argument("--frames", type=int, default=12)
     parser.add_argument("--scale", type=int, default=2)
     parser.add_argument(
@@ -792,14 +1002,21 @@ def main() -> int:
         "--transport-live", action="store_true",
         help="animate the native T1/T4 boundary and detector in OpenGL",
     )
+    parser.add_argument(
+        "--aperture-live", action="store_true",
+        help="animate finite material iris interaction in OpenGL",
+    )
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument(
         "--cycle-steps", type=int, default=120,
         help="forward steps before the live animation reverses",
     )
     args = parser.parse_args()
-    if args.live and args.transport_live:
-        parser.error("choose --live or --transport-live")
+    if sum((args.live, args.transport_live, args.aperture_live)) > 1:
+        parser.error("choose one live mode")
+    if args.aperture_live:
+        run_aperture_live(size=args.aperture_size, fps=args.fps)
+        return 0
     if args.transport_live:
         run_transport_live(fps=args.fps)
         return 0

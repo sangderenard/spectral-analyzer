@@ -2775,7 +2775,9 @@ inline void cooleytukey_execute_axis(const Plan<T>& P, const AxisLayout<T>& layo
 
   {
     auto permute_fn = [&](size_t start, size_t end, int worker_id) {
-      std::vector<Complex*> columns(static_cast<size_t>(active_lane_cols));
+      constexpr size_t kMaxLaneColumns =
+          static_cast<size_t>(Plan<T>::Limits::compile_time_max_lane_capacity());
+      std::array<Complex*, kMaxLaneColumns> columns{};
       for (size_t chunk = start; chunk < end; ++chunk) {
         const int col = static_cast<int>(chunk) * active_lane_cols;
         const int width = std::min(active_lane_cols, B - col);
@@ -2873,10 +2875,16 @@ inline void cooleytukey_execute_axis(const Plan<T>& P, const AxisLayout<T>& layo
   TraceLogger::instance().log(std::string("[ct] permute forced inline"));
 #endif
     }
-    permute_dispatcher->parallel_for_with_restore(static_cast<size_t>(chunk_count), 1, permute_fn,
-                  std::function<void(size_t,size_t)>(),
-                  permute_ops,
-                  enable_recovery ? static_cast<void*>(&permute_recovery) : nullptr);
+    if (permute_dispatcher == &InlineDispatcher::instance() && !enable_recovery) {
+      // The production single-thread path is deliberately allocation-free:
+      // bypass JobDispatcher's type-erased std::function ABI.
+      permute_fn(0, static_cast<size_t>(chunk_count), 0);
+    } else {
+      permute_dispatcher->parallel_for_with_restore(static_cast<size_t>(chunk_count), 1, permute_fn,
+                    std::function<void(size_t,size_t)>(),
+                    permute_ops,
+                    enable_recovery ? static_cast<void*>(&permute_recovery) : nullptr);
+    }
   }
   
 #if EIGFFT_TRACE_THREADS
@@ -2917,11 +2925,13 @@ inline void cooleytukey_execute_axis(const Plan<T>& P, const AxisLayout<T>& layo
     const bool capture_twmap_single = twmap.enabled();
 
     auto stage_chunk = [&](size_t start, size_t end, int worker_id) {
-      std::vector<Complex*> columns(static_cast<size_t>(active_lane_cols));
-      std::vector<Complex> a_buf(static_cast<size_t>(active_lane_cols));
-      std::vector<Complex> b_buf(static_cast<size_t>(active_lane_cols));
-      std::vector<Complex> a_orig(static_cast<size_t>(active_lane_cols));
-      std::vector<Complex> b_orig(static_cast<size_t>(active_lane_cols));
+      constexpr size_t kMaxLaneColumns =
+          static_cast<size_t>(Plan<T>::Limits::compile_time_max_lane_capacity());
+      std::array<Complex*, kMaxLaneColumns> columns{};
+      std::array<Complex, kMaxLaneColumns> a_buf{};
+      std::array<Complex, kMaxLaneColumns> b_buf{};
+      std::array<Complex, kMaxLaneColumns> a_orig{};
+      std::array<Complex, kMaxLaneColumns> b_orig{};
       std::complex<T>* invariant_local = invariant_global;
       for (size_t chunk = start; chunk < end; ++chunk) {
         const int col = static_cast<int>(chunk) * active_lane_cols;
@@ -3042,10 +3052,15 @@ inline void cooleytukey_execute_axis(const Plan<T>& P, const AxisLayout<T>& layo
     void* stage_ctx = (enable_recovery && stage_ops.init)
                           ? static_cast<void*>(&stage_recovery)
                           : nullptr;
-    stage_dispatcher->parallel_for_with_restore(static_cast<size_t>(chunk_count), 1, stage_chunk,
-                                                std::function<void(size_t,size_t)>(),
-                                                stage_ops,
-                                                stage_ctx);
+    if (stage_dispatcher == &InlineDispatcher::instance() && !enable_recovery) {
+      // As above, keep the ordinary hot path free of type-erasure allocation.
+      stage_chunk(0, static_cast<size_t>(chunk_count), 0);
+    } else {
+      stage_dispatcher->parallel_for_with_restore(static_cast<size_t>(chunk_count), 1, stage_chunk,
+                                                  std::function<void(size_t,size_t)>(),
+                                                  stage_ops,
+                                                  stage_ctx);
+    }
 #if EIGFFT_TRACE_THREADS
     {
       std::ostringstream _oss;

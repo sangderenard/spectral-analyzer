@@ -542,6 +542,13 @@ struct PyRayTracer
      * Python owners alive until clear/destruction so graph descriptors cannot
      * become dangling after an installer/helper returns. */
     std::vector<py::object> _scale_context_payloads;
+    /* Calibration calls share one cold transform plan. Production arenas own
+     * their own plans; this cache prevents live preview hosts from rebuilding
+     * four FFT environments every frame. */
+    std::mutex _t4_calibration_plan_mu;
+    wave_t4::AngularSpectrumPlan _t4_calibration_plan;
+    int _t4_calibration_plan_w = 0;
+    int _t4_calibration_plan_h = 0;
 
     /* Persistent pipeline — created on first submit_rays(), destroyed with tracer. */
     RayPipelineState* _pipeline   = nullptr;
@@ -3372,6 +3379,15 @@ struct PyRayTracer
                 static_cast<unsigned long long>(s.state_float_count);
             d["longitudinal_steps"] = s.longitudinal_steps;
             d["absorber_cells"] = s.absorber_cells;
+            py::dict aperture_material;
+            aperture_material["pattern"] = s.aperture_pattern;
+            aperture_material["element_count"] = s.aperture_element_count;
+            aperture_material["opening_x_m"] = s.aperture_opening_x_m;
+            aperture_material["opening_y_m"] = s.aperture_opening_y_m;
+            aperture_material["thickness_m"] = s.aperture_thickness_m;
+            aperture_material["n_real"] = s.aperture_material_n_real;
+            aperture_material["n_imag"] = s.aperture_material_n_imag;
+            d["aperture_material"] = std::move(aperture_material);
             d["transverse_half_extent_m"] = s.transverse_half_extent_m;
             d["longitudinal_extent_m"] = s.longitudinal_extent_m;
             d["sample_pitch_m"] = s.sample_pitch_m;
@@ -4405,16 +4421,111 @@ struct PyRayTracer
             || re.size != expected || im.size != expected)
             throw std::invalid_argument(
                 "T4 angular-spectrum buffers do not match band/grid dimensions");
-        wave_t4::AngularSpectrumPlan plan;
-        if (!wave_t4::build_angular_spectrum_plan(w, h, &plan)
-            || !wave_t4::angular_spectrum_step(
+        std::lock_guard<std::mutex> lock(_t4_calibration_plan_mu);
+        if ((_t4_calibration_plan_w != w || _t4_calibration_plan_h != h)
+            && !wave_t4::build_angular_spectrum_plan(
+                w, h, &_t4_calibration_plan))
+            throw std::runtime_error("failed to build T4 calibration plan");
+        _t4_calibration_plan_w = w;
+        _t4_calibration_plan_h = h;
+        if (!wave_t4::angular_spectrum_step(
                 n_bands, w, h, dx, dz,
                 static_cast<const double*>(wavelengths.ptr),
-                direction_sign, &plan,
+                direction_sign, &_t4_calibration_plan,
                 static_cast<float*>(re.ptr),
                 static_cast<float*>(im.ptr)))
             throw std::runtime_error(
                 "T4 angular-spectrum step rejected its dimensions or lane count");
+    }
+
+    void t4_angular_spectrum_step_reference(
+        int n_bands,
+        int w,
+        int h,
+        double dx,
+        double dz,
+        int direction_sign,
+        py::array_t<double, py::array::c_style> wavelengths_arr,
+        py::array_t<float, py::array::c_style> re_arr,
+        py::array_t<float, py::array::c_style> im_arr)
+    {
+        auto wavelengths = wavelengths_arr.request();
+        auto re = re_arr.request();
+        auto im = im_arr.request();
+        const py::ssize_t expected =
+            static_cast<py::ssize_t>(n_bands) * w * h;
+        if (wavelengths.size != n_bands
+            || re.size != expected || im.size != expected)
+            throw std::invalid_argument(
+                "T4 reference buffers do not match band/grid dimensions");
+        std::lock_guard<std::mutex> lock(_t4_calibration_plan_mu);
+        if ((_t4_calibration_plan_w != w || _t4_calibration_plan_h != h)
+            && !wave_t4::build_angular_spectrum_plan(
+                w, h, &_t4_calibration_plan))
+            throw std::runtime_error("failed to build T4 calibration plan");
+        _t4_calibration_plan_w = w;
+        _t4_calibration_plan_h = h;
+        if (!wave_t4::angular_spectrum_step_reference(
+                n_bands, w, h, dx, dz,
+                static_cast<const double*>(wavelengths.ptr),
+                direction_sign, &_t4_calibration_plan,
+                static_cast<float*>(re.ptr),
+                static_cast<float*>(im.ptr)))
+            throw std::runtime_error(
+                "T4 reference step rejected its dimensions or lane count");
+    }
+
+    py::dict t4_apply_aperture_material(
+        int n_bands,
+        int w,
+        int h,
+        double dx,
+        double distance_m,
+        int direction_sign,
+        py::array_t<double, py::array::c_style> wavelengths_arr,
+        py::array_t<double, py::array::c_style> payload_arr,
+        py::array_t<float, py::array::c_style> re_arr,
+        py::array_t<float, py::array::c_style> im_arr)
+    {
+        auto wavelengths = wavelengths_arr.request();
+        auto payload = payload_arr.request();
+        auto re = re_arr.request();
+        auto im = im_arr.request();
+        const py::ssize_t expected =
+            static_cast<py::ssize_t>(n_bands) * w * h;
+        if (wavelengths.size != n_bands || payload.size != 19
+            || re.size != expected || im.size != expected)
+            throw std::invalid_argument(
+                "T4 aperture material buffers or payload dimensions are invalid");
+        const double* p = static_cast<const double*>(payload.ptr);
+        if (p[6] != 41505434.0 || p[7] != 1.0)
+            throw std::invalid_argument("unsupported physical-aperture payload ABI");
+        wave_t4::ApertureMaterial material;
+        material.pattern =
+            static_cast<wave_t4::AperturePattern>(static_cast<int>(p[8]));
+        material.element_count = static_cast<int>(p[9]);
+        material.opening_x_m = p[10];
+        material.opening_y_m = p[11];
+        material.pitch_x_m = p[12];
+        material.pitch_y_m = p[13];
+        material.rotation_rad = p[14];
+        material.assembly_radius_m = p[15];
+        material.thickness_m = p[16];
+        material.material_n_real = p[17];
+        material.material_n_imag = p[18];
+        wave_t4::Progress progress{};
+        if (!wave_t4::apply_aperture_material(
+                n_bands, w, h, dx,
+                static_cast<const double*>(wavelengths.ptr),
+                direction_sign, material, distance_m,
+                static_cast<float*>(re.ptr), static_cast<float*>(im.ptr),
+                &progress))
+            throw std::runtime_error("T4 aperture material operator rejected input");
+        py::dict result;
+        result["absorbed_power"] = progress.absorbed_power;
+        result["pattern"] = static_cast<int>(material.pattern);
+        result["ideal_mask"] = false;
+        return result;
     }
 
     /* ── Stateful scheduler ─────────────────────────────────────────────── */
@@ -7118,6 +7229,37 @@ Run one exact homogeneous step through the production T4 kernel.
 This is a calibration aperture into the same native implementation used by
 wave arenas, not a separate solver. Width and height must be powers of two.
 The buffers are band-major float32 complex planes and are modified in place.
+)doc")
+        .def("t4_angular_spectrum_step_reference",
+             &PyRayTracer::t4_angular_spectrum_step_reference,
+             py::arg("n_bands"),
+             py::arg("w"),
+             py::arg("h"),
+             py::arg("dx"),
+             py::arg("dz"),
+             py::arg("direction_sign"),
+             py::arg("wavelengths_m"),
+             py::arg("re"),
+             py::arg("im"),
+             "Diagnostic split-complex reference transform for parity tests.")
+        .def("t4_apply_aperture_material",
+             &PyRayTracer::t4_apply_aperture_material,
+             py::arg("n_bands"),
+             py::arg("w"),
+             py::arg("h"),
+             py::arg("dx"),
+             py::arg("distance_m"),
+             py::arg("direction_sign"),
+             py::arg("wavelengths_m"),
+             py::arg("aperture_payload"),
+             py::arg("re"),
+             py::arg("im"),
+             R"doc(
+Apply the production T4 finite complex-index aperture operator in place.
+
+The fixed payload is emitted by LivePhysicalAperture. This calibration entry
+uses the same exact-lane material implementation as a persistent wave arena;
+it is not an ideal mask or a separate propagation solver.
 )doc")
         .def("spawn", &PyRayTracer::spawn,
              py::arg("src_pos"),

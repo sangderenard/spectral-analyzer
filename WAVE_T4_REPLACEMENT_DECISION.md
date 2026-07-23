@@ -143,6 +143,24 @@ Physical and numerical boundaries are distinct.
   and residual energy. A PML finite-difference edge backend remains an option
   if the padded complex absorber cannot satisfy the reflection gates.
 
+### Live physical-aperture ABI
+
+`camera_software.physical_aperture.LivePhysicalAperture` is the shared live
+authoring object for iris blades and repeated mask/grille assemblies. It emits:
+
+- finite-thickness material triangles for ray and OpenGL camera geometry;
+- a cold optical-graph contract naming pattern, dimensions, material, and the
+  explicit `ideal_mask: false` invariant;
+- one fixed 19-double `APTR` v1 payload copied into arena-owned configuration.
+
+The present T4 consumer is a localized scalar split-step complex-index volume
+operator. It provides phase, reciprocal attenuation, diffraction after
+propagation, and material power accounting. It does **not** yet provide the
+required reflected field, vector polarization coupling, oblique path-length
+correction, or sharp-interface Fresnel/Jones operator. Those omissions remain
+release gates; the thin material operator must not be relabelled as completion
+of a fully physical blade boundary.
+
 ## Stateful ownership
 
 T4 is split into independently testable responsibilities:

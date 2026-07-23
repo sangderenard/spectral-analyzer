@@ -5,13 +5,69 @@
  * exact-band selection and boundary accounting defined here.
  */
 #include "wave_t4.h"
+#include "plan_support.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstddef>
+#include <memory>
+#include <vector>
 
 namespace wave_t4 {
 namespace {
+
+using FftMatrix = Eigen::Matrix<std::complex<float>,
+                                Eigen::Dynamic,
+                                Eigen::Dynamic,
+                                Eigen::ColMajor>;
+
+struct FftfreeExecutor {
+    eigfft::PlanEnvironment<float> forward_x;
+    eigfft::PlanEnvironment<float> forward_y;
+    eigfft::PlanEnvironment<float> inverse_x;
+    eigfft::PlanEnvironment<float> inverse_y;
+    std::vector<std::complex<float>> interleaved;
+
+    FftfreeExecutor(int nx, int ny)
+        : interleaved(static_cast<std::size_t>(nx) * ny)
+    {
+        eigfft::PlanRuntimeConfig config;
+        config.threads = 1;
+        config.lanes =
+            eigfft::Plan<float>::Limits::compile_time_max_lane_capacity();
+        config.transpose_capacity = interleaved.size();
+        config.allow_outer_parallel = false;
+        config.allow_inner_parallel = false;
+        config.transform = 0;
+        forward_x.initialize(nx, false, config);
+        forward_y.initialize(ny, false, config);
+        inverse_x.initialize(nx, true, config);
+        inverse_y.initialize(ny, true, config);
+        forward_x.plan().use_kernel(eigfft::KernelKind::CooleyTukey);
+        forward_y.plan().use_kernel(eigfft::KernelKind::CooleyTukey);
+        inverse_x.plan().use_kernel(eigfft::KernelKind::CooleyTukey);
+        inverse_y.plan().use_kernel(eigfft::KernelKind::CooleyTukey);
+    }
+
+    void transform(float* re, float* im, int nx, int ny, bool inverse)
+    {
+        const std::size_t count = static_cast<std::size_t>(nx) * ny;
+        for (std::size_t i = 0; i < count; ++i)
+            interleaved[i] = {re[i], im[i]};
+        Eigen::Map<FftMatrix> matrix(interleaved.data(), nx, ny);
+        if (inverse)
+            eigfft::fft_inplace_2d<float>(
+                matrix, inverse_x.plan(), inverse_y.plan());
+        else
+            eigfft::fft_inplace_2d<float>(
+                matrix, forward_x.plan(), forward_y.plan());
+        for (std::size_t i = 0; i < count; ++i) {
+            re[i] = interleaved[i].real();
+            im[i] = interleaved[i].imag();
+        }
+    }
+};
 
 inline bool is_power_of_two(int value) noexcept
 {
@@ -95,7 +151,7 @@ void fft_2d(float* re,
                     static_cast<std::size_t>(nx), plan.y, inverse);
 }
 
-template <int B>
+template <int B, bool UseFftfree>
 bool angular_spectrum_exact(int nx,
                             int ny,
                             double dx,
@@ -115,12 +171,26 @@ bool angular_spectrum_exact(int nx,
     constexpr double tau = 6.283185307179586476925286766559;
     const std::size_t plane = static_cast<std::size_t>(nx) * ny;
     const double signed_distance = direction_sign * dz;
+    FftfreeExecutor* executor = nullptr;
+    if constexpr (UseFftfree) {
+        executor = static_cast<FftfreeExecutor*>(
+            plan->transform_executor.get());
+        if (!executor) return false;
+    }
     for (int band = 0; band < B; ++band) {
         const double wavelength = wavelengths_m[band];
         if (!(wavelength > 0.0)) continue;
         float* band_re = re + static_cast<std::size_t>(band) * plane;
         float* band_im = im + static_cast<std::size_t>(band) * plane;
-        fft_2d(band_re, band_im, *plan, false);
+        if constexpr (UseFftfree) {
+            try {
+                executor->transform(band_re, band_im, nx, ny, false);
+            } catch (...) {
+                return false;
+            }
+        } else {
+            fft_2d(band_re, band_im, *plan, false);
+        }
 
         const double k = tau / wavelength;
         for (int y = 0; y < ny; ++y) {
@@ -151,7 +221,15 @@ bool angular_spectrum_exact(int nx,
                     static_cast<float>(ar * transfer_im + ai * transfer_re);
             }
         }
-        fft_2d(band_re, band_im, *plan, true);
+        if constexpr (UseFftfree) {
+            try {
+                executor->transform(band_re, band_im, nx, ny, true);
+            } catch (...) {
+                return false;
+            }
+        } else {
+            fft_2d(band_re, band_im, *plan, true);
+        }
     }
     return true;
 }
@@ -235,6 +313,131 @@ bool absorb_exact(int nx,
     return measure_exact<B>(nx, ny, config, re, im, progress);
 }
 
+inline bool aperture_open(const ApertureMaterial& material,
+                          double x,
+                          double y) noexcept
+{
+    const double c = std::cos(material.rotation_rad);
+    const double s = std::sin(material.rotation_rad);
+    const double u = c*x + s*y;
+    const double v = -s*x + c*y;
+    switch (material.pattern) {
+        case AperturePattern::IrisPolygon: {
+            if (material.element_count < 3 || material.opening_x_m <= 0.0)
+                return false;
+            const double radius = material.opening_x_m;
+            for (int edge = 0; edge < material.element_count; ++edge) {
+                const double a0 =
+                    6.2831853071795864769 * edge / material.element_count;
+                const double a1 =
+                    6.2831853071795864769 * (edge + 1)
+                    / material.element_count;
+                const double x0 = radius * std::cos(a0);
+                const double y0 = radius * std::sin(a0);
+                const double x1 = radius * std::cos(a1);
+                const double y1 = radius * std::sin(a1);
+                if ((x1-x0)*(v-y0) - (y1-y0)*(u-x0) < 0.0)
+                    return false;
+            }
+            return true;
+        }
+        case AperturePattern::ShadowMask: {
+            if (material.pitch_x_m <= 0.0 || material.pitch_y_m <= 0.0
+                || material.opening_x_m <= 0.0
+                || material.opening_y_m <= 0.0)
+                return false;
+            const double cell_x =
+                u - std::round(u/material.pitch_x_m)*material.pitch_x_m;
+            const double cell_y =
+                v - std::round(v/material.pitch_y_m)*material.pitch_y_m;
+            const double ex = cell_x/material.opening_x_m;
+            const double ey = cell_y/material.opening_y_m;
+            return ex*ex + ey*ey <= 1.0;
+        }
+        case AperturePattern::SlotMask: {
+            if (material.pitch_x_m <= 0.0 || material.pitch_y_m <= 0.0)
+                return false;
+            const double cell_x =
+                u - std::round(u/material.pitch_x_m)*material.pitch_x_m;
+            const double cell_y =
+                v - std::round(v/material.pitch_y_m)*material.pitch_y_m;
+            return std::abs(cell_x) <= material.opening_x_m
+                && std::abs(cell_y) <= material.opening_y_m;
+        }
+        case AperturePattern::ApertureGrille: {
+            if (material.pitch_x_m <= 0.0) return false;
+            const double cell_x =
+                u - std::round(u/material.pitch_x_m)*material.pitch_x_m;
+            return std::abs(cell_x) <= material.opening_x_m;
+        }
+        case AperturePattern::None:
+        default:
+            return true;
+    }
+}
+
+template <int B>
+bool aperture_material_exact(int nx,
+                             int ny,
+                             double dx,
+                             const double* wavelengths_m,
+                             int direction_sign,
+                             const ApertureMaterial& material,
+                             double distance_m,
+                             float* re,
+                             float* im,
+                             Progress* progress) noexcept
+{
+    if (!re || !im || !wavelengths_m || !progress || nx <= 0 || ny <= 0
+        || !(dx > 0.0) || !(distance_m > 0.0)
+        || (direction_sign != 1 && direction_sign != -1)
+        || material.pattern == AperturePattern::None
+        || material.assembly_radius_m <= 0.0
+        || material.material_n_imag < 0.0)
+        return false;
+    constexpr double tau = 6.283185307179586476925286766559;
+    const std::size_t plane = static_cast<std::size_t>(nx) * ny;
+    const double origin_x = 0.5 * static_cast<double>(nx - 1) * dx;
+    const double origin_y = 0.5 * static_cast<double>(ny - 1) * dx;
+    const double assembly_r2 =
+        material.assembly_radius_m * material.assembly_radius_m;
+    double removed = 0.0;
+    for (int y = 0; y < ny; ++y) {
+        const double ym = y*dx - origin_y;
+        for (int x = 0; x < nx; ++x) {
+            const double xm = x*dx - origin_x;
+            if (xm*xm + ym*ym > assembly_r2
+                || aperture_open(material, xm, ym))
+                continue;
+            const std::size_t pixel = static_cast<std::size_t>(y)*nx + x;
+            for (int band = 0; band < B; ++band) {
+                const double wavelength = wavelengths_m[band];
+                if (!(wavelength > 0.0)) continue;
+                const double k0 = tau/wavelength;
+                const double phase = direction_sign * k0
+                    * (material.material_n_real-material.background_n_real)
+                    * distance_m;
+                const double attenuation = std::exp(
+                    -k0*material.material_n_imag*distance_m);
+                const double tr = attenuation*std::cos(phase);
+                const double ti = attenuation*std::sin(phase);
+                const std::size_t i =
+                    static_cast<std::size_t>(band)*plane + pixel;
+                const double ar = re[i];
+                const double ai = im[i];
+                const double before = ar*ar + ai*ai;
+                const double nr = ar*tr - ai*ti;
+                const double ni = ar*ti + ai*tr;
+                re[i] = static_cast<float>(nr);
+                im[i] = static_cast<float>(ni);
+                removed += std::max(0.0, before-(nr*nr+ni*ni));
+            }
+        }
+    }
+    progress->absorbed_power += removed;
+    return true;
+}
+
 }  // namespace
 
 bool build_angular_spectrum_plan(int nx,
@@ -273,6 +476,8 @@ bool build_angular_spectrum_plan(int nx,
         plan->ny = ny;
         build_axis(nx, plan->x);
         build_axis(ny, plan->y);
+        plan->transform_executor =
+            std::make_shared<FftfreeExecutor>(nx, ny);
     } catch (...) {
         *plan = {};
         return false;
@@ -330,7 +535,7 @@ bool angular_spectrum_step(int bands,
                            float* re,
                            float* im) noexcept
 {
-#define WAVE_AS_CASE(B) case B: return angular_spectrum_exact<B>( \
+#define WAVE_AS_CASE(B) case B: return angular_spectrum_exact<B, true>( \
     nx, ny, dx, dz, wavelengths_m, direction_sign, plan, re, im)
     switch (bands) {
         WAVE_AS_CASE(1);
@@ -342,6 +547,58 @@ bool angular_spectrum_step(int bands,
         default: return false;
     }
 #undef WAVE_AS_CASE
+}
+
+bool angular_spectrum_step_reference(int bands,
+                                     int nx,
+                                     int ny,
+                                     double dx,
+                                     double dz,
+                                     const double* wavelengths_m,
+                                     int direction_sign,
+                                     const AngularSpectrumPlan* plan,
+                                     float* re,
+                                     float* im) noexcept
+{
+#define WAVE_AS_REF_CASE(B) case B: return angular_spectrum_exact<B, false>( \
+    nx, ny, dx, dz, wavelengths_m, direction_sign, plan, re, im)
+    switch (bands) {
+        WAVE_AS_REF_CASE(1);
+        WAVE_AS_REF_CASE(3);
+        WAVE_AS_REF_CASE(4);
+        WAVE_AS_REF_CASE(8);
+        WAVE_AS_REF_CASE(16);
+        WAVE_AS_REF_CASE(32);
+        default: return false;
+    }
+#undef WAVE_AS_REF_CASE
+}
+
+bool apply_aperture_material(int bands,
+                             int nx,
+                             int ny,
+                             double dx,
+                             const double* wavelengths_m,
+                             int direction_sign,
+                             const ApertureMaterial& material,
+                             double distance_m,
+                             float* re,
+                             float* im,
+                             Progress* progress) noexcept
+{
+#define WAVE_APERTURE_CASE(B) case B: return aperture_material_exact<B>( \
+    nx, ny, dx, wavelengths_m, direction_sign, material, distance_m, \
+    re, im, progress)
+    switch (bands) {
+        WAVE_APERTURE_CASE(1);
+        WAVE_APERTURE_CASE(3);
+        WAVE_APERTURE_CASE(4);
+        WAVE_APERTURE_CASE(8);
+        WAVE_APERTURE_CASE(16);
+        WAVE_APERTURE_CASE(32);
+        default: return false;
+    }
+#undef WAVE_APERTURE_CASE
 }
 
 }  // namespace wave_t4

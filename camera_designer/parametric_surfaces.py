@@ -530,31 +530,34 @@ bool {fn_name}(vec3 ro, vec3 rd, out float t, out vec3 normal) {{
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Aperture stop — annular mask (no geometry, just a gating plane)
+# Aperture stop — analytic opening plus shared physical assembly authoring
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class ApertureStop(ParametricSurface):
-    """Opaque plane at z=``z_pos`` with a clear aperture opening.
+    """Author a clear opening and its finite material blade assembly.
 
     Shape of the opening:
       n_blades == 0  →  circular annulus  r ∈ [r_inner, r_outer]
       n_blades >= 3  →  regular N-gon inscribed in r_outer, rotated by
                         aperture_rot radians (first-blade edge angle).
 
-    Rays hitting the opaque region are terminated (return t=inf).
-    Rays through the clear opening pass with t from the plane hit.
+    ``intersect`` is the exact-parametric clear-opening query. The production
+    scene builder lowers the same values through ``LivePhysicalAperture`` into
+    finite-thickness material geometry; T4 receives its matching live material
+    payload. The analytic query is not a substitute opaque plane.
 
     ``blade_polygon_xy()`` returns the (n_blades, 2) float64 vertex array
-    of the opening polygon in metres — suitable for passing directly to
-    ``ray_tracer_apply_aperture_mask``.  For n_blades==0 a high-resolution
-    circle approximation is returned instead.
+    of the opening polygon in metres for geometry/display diagnostics. The
+    legacy ideal field-mask function is not a production consumer.
     """
     z_pos:       float = 0.0
     r_inner:     float = 0.0
     r_outer:     float = 0.010
     n_blades:    int   = 0      # 0 = circle; >=3 = regular N-gon iris
     aperture_rot: float = 0.0   # first-blade edge angle, radians
+    thickness_m: float = 1.0e-4
+    material_name: str = "blackened_steel"
 
     glsl_type = "aperture_stop"
 
@@ -662,6 +665,8 @@ bool {fn_name}(vec3 ro, vec3 rd, out float t, out vec3 normal) {{
             "r_outer":      self.r_outer,
             "n_blades":     self.n_blades,
             "aperture_rot": self.aperture_rot,
+            "thickness_m":  self.thickness_m,
+            "material_name": self.material_name,
         }
 
 

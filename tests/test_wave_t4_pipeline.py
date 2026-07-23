@@ -266,6 +266,35 @@ def test_production_angular_spectrum_plane_wave_phase_and_reverse():
     )
 
 
+@pytest.mark.parametrize("bands", [1, 3, 4, 8, 16, 32])
+@pytest.mark.parametrize("width,height", [(8, 16), (16, 8), (32, 16)])
+@pytest.mark.parametrize("direction_sign", [1, -1])
+def test_fftfree_t4_matches_split_complex_reference(
+    bands, width, height, direction_sign
+):
+    wavelengths = np.linspace(400.0e-9, 700.0e-9, bands, dtype=np.float64)
+    tracer = _tracer(wavelengths)
+    rng = np.random.default_rng(
+        0xF4 + bands * 101 + width * 17 + height + direction_sign
+    )
+    source_re = rng.normal(size=(bands, height, width)).astype(np.float32)
+    source_im = rng.normal(size=(bands, height, width)).astype(np.float32)
+    actual_re, actual_im = source_re.copy(), source_im.copy()
+    expect_re, expect_im = source_re.copy(), source_im.copy()
+
+    tracer.t4_angular_spectrum_step(
+        bands, width, height, 0.75e-6, 2.25e-6, direction_sign,
+        wavelengths, actual_re, actual_im,
+    )
+    tracer.t4_angular_spectrum_step_reference(
+        bands, width, height, 0.75e-6, 2.25e-6, direction_sign,
+        wavelengths, expect_re, expect_im,
+    )
+
+    np.testing.assert_allclose(actual_re, expect_re, rtol=8.0e-5, atol=8.0e-5)
+    np.testing.assert_allclose(actual_im, expect_im, rtol=8.0e-5, atol=8.0e-5)
+
+
 def test_continuous_paths_share_one_exact_width_complex_dispatch():
     tracer = _tracer(np.array([450e-9, 500e-9, 600e-9, 700e-9]))
     tracer.configure_spectral_luts(

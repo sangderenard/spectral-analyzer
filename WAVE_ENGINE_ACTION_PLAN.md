@@ -178,6 +178,27 @@ Transform execution is backend-owned under the shared field ABI:
   no-hot-allocation gates pass. CQT/VQT/NSGT and wavelet engines remain
   frequency-analysis operators, not substitutes for the spatial 2D DFT.
 
+Native CPU checkpoint (2026-07-23): the proven vendored Cooley--Tukey path is
+now cold-planned behind the existing T4 transform ABI. Its ordinary inline
+execution uses fixed compile-time lane scratch rather than hot `std::vector`
+construction. Forward/reverse rectangular-grid parity passes for all exact
+lane widths. With a retained cold plan, a 256x256, 32-lane calibration measured
+about 0.91--0.92 s versus 1.20--1.23 s for the retained split-complex
+reference, including the current split/interleaved copies. The reference
+remains diagnostic-only.
+Native calibration/preview calls retain one dimension-keyed cold plan on their
+`RayTracer` host; changing dimensions rebuilds it, ordinary frames do not.
+
+The first physical-aperture checkpoint uses one
+`LivePhysicalAperture` descriptor for finite-thickness ray/GL blade geometry,
+optical-graph self-description, and a fixed live T4 payload. T4 applies complex
+index phase/extinction only over the material thickness in the intersecting
+split step; it never zeros an ideal polygon mask. The same ABI identifies iris,
+CRT shadow-mask, slot-mask, and aperture-grille patterns. This checkpoint is a
+scalar material-volume interaction, not completion of the sharp-interface
+Fresnel/Jones/reflection work required below. Its OpenGL calibration host is
+`python wave_transform_visual_demo.py --aperture-live`.
+
 Exit gate: plane/Gaussian propagation, physical double slit, dielectric slab,
 prism, thick lens, reciprocity, and open-boundary reflection gates pass.
 

@@ -752,6 +752,9 @@ struct WaveArena {
     wave_t4::BackendKind backend = wave_t4::BackendKind::AngularSpectrum;
     std::array<wave_t4::SpectralLane, 32> spectral_lanes = {};
     wave_t4::BoundaryConfig boundary;
+    wave_t4::ApertureMaterial aperture_material;
+    bool             has_aperture_material = false;
+    double           aperture_center_z_m = 0.0;
     wave_t4::Progress       progress;
     wave_t4::AngularSpectrumPlan angular_plan;
     double           wavelengths_m[32] = {};
@@ -1153,6 +1156,13 @@ struct WaveArenaSnapshot {
     uint64_t state_float_count;
     int longitudinal_steps;
     int absorber_cells;
+    int aperture_pattern;
+    int aperture_element_count;
+    double aperture_opening_x_m;
+    double aperture_opening_y_m;
+    double aperture_thickness_m;
+    double aperture_material_n_real;
+    double aperture_material_n_imag;
     double transverse_half_extent_m;
     double longitudinal_extent_m;
     double sample_pitch_m;

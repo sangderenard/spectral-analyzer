@@ -14717,6 +14717,38 @@ static void wave_arena_build(
         V3d cand(p[3], p[4], p[5]);
         if (cand.norm() > 0.5) arena.axis_z = cand.normalized();
     }
+    /* Optional fixed-layout live aperture material ABI. The payload is copied
+     * into arena-owned configuration here; the hot march never dereferences
+     * Python memory or allocates an operator. */
+    constexpr double aperture_payload_magic = 41505434.0; /* "APTR" */
+    constexpr int aperture_payload_values = 19;
+    if (ctx.payload
+        && ctx.payload_size_bytes >= aperture_payload_values*(int)sizeof(double)) {
+        const double* p = static_cast<const double*>(ctx.payload);
+        if (p[6] == aperture_payload_magic && p[7] == 1.0) {
+            const int pattern = static_cast<int>(p[8]);
+            if (pattern >= static_cast<int>(wave_t4::AperturePattern::IrisPolygon)
+                && pattern <= static_cast<int>(
+                    wave_t4::AperturePattern::ApertureGrille)) {
+                arena.has_aperture_material = true;
+                arena.aperture_material.pattern =
+                    static_cast<wave_t4::AperturePattern>(pattern);
+                arena.aperture_material.element_count =
+                    std::max(0, static_cast<int>(p[9]));
+                arena.aperture_material.opening_x_m = p[10];
+                arena.aperture_material.opening_y_m = p[11];
+                arena.aperture_material.pitch_x_m = p[12];
+                arena.aperture_material.pitch_y_m = p[13];
+                arena.aperture_material.rotation_rad = p[14];
+                arena.aperture_material.assembly_radius_m = p[15];
+                arena.aperture_material.thickness_m = p[16];
+                arena.aperture_material.background_n_real = arena.n_real;
+                arena.aperture_material.material_n_real = p[17];
+                arena.aperture_material.material_n_imag = p[18];
+                arena.aperture_center_z_m = 0.0;
+            }
+        }
+    }
     V3d up = (std::abs(arena.axis_z.dot(V3d(0,1,0))) < 0.9)
            ? V3d(0,1,0) : V3d(1,0,0);
     arena.axis_x = arena.axis_z.cross(up).normalized();
@@ -15111,11 +15143,48 @@ static bool wave_arena_march(WaveArena& arena)
                     d == wave_t4::Direction::Forward ? 1 : -1;
                 float* re = arena.field_re(d, c);
                 float* im = arena.field_im(d, c);
-                if (!wave_t4::angular_spectrum_step(
-                        arena.n_bands, arena.fft_nx, arena.fft_ny,
-                        arena.dx, arena.dz, arena.wavelengths_m,
-                        sign, &arena.angular_plan, re, im))
-                    return false;
+                double material_distance = 0.0;
+                if (arena.has_aperture_material) {
+                    const double segment_center = sign > 0
+                        ? -arena.half_depth + (step+0.5)*arena.dz
+                        :  arena.half_depth - (step+0.5)*arena.dz;
+                    const double segment_lo = segment_center-0.5*arena.dz;
+                    const double segment_hi = segment_center+0.5*arena.dz;
+                    const double material_lo = arena.aperture_center_z_m
+                        - 0.5*arena.aperture_material.thickness_m;
+                    const double material_hi = arena.aperture_center_z_m
+                        + 0.5*arena.aperture_material.thickness_m;
+                    material_distance = std::max(
+                        0.0, std::min(segment_hi, material_hi)
+                           - std::max(segment_lo, material_lo));
+                }
+                if (material_distance > 0.0) {
+                    if (!wave_t4::angular_spectrum_step(
+                            arena.n_bands, arena.fft_nx, arena.fft_ny,
+                            arena.dx, 0.5*arena.dz, arena.wavelengths_m,
+                            sign, &arena.angular_plan, re, im))
+                        return false;
+                    wave_t4::Progress material_progress{};
+                    if (!wave_t4::apply_aperture_material(
+                            arena.n_bands, arena.fft_nx, arena.fft_ny,
+                            arena.dx, arena.wavelengths_m, sign,
+                            arena.aperture_material, material_distance,
+                            re, im, &material_progress))
+                        return false;
+                    arena.progress.absorbed_power +=
+                        material_progress.absorbed_power;
+                    if (!wave_t4::angular_spectrum_step(
+                            arena.n_bands, arena.fft_nx, arena.fft_ny,
+                            arena.dx, 0.5*arena.dz, arena.wavelengths_m,
+                            sign, &arena.angular_plan, re, im))
+                        return false;
+                } else {
+                    if (!wave_t4::angular_spectrum_step(
+                            arena.n_bands, arena.fft_nx, arena.fft_ny,
+                            arena.dx, arena.dz, arena.wavelengths_m,
+                            sign, &arena.angular_plan, re, im))
+                        return false;
+                }
                 wave_t4::Progress field_progress{};
                 wave_t4::apply_absorbing_border(
                     arena.n_bands, arena.fft_nx, arena.fft_ny,
@@ -19030,6 +19099,20 @@ int ray_pipeline_get_wave_arena_snapshot(const RayPipelineState* ps,
         static_cast<uint64_t>(arena.state_block.size());
     out->longitudinal_steps = arena.nz;
     out->absorber_cells = arena.boundary.absorber_cells;
+    out->aperture_pattern = arena.has_aperture_material
+        ? static_cast<int>(arena.aperture_material.pattern) : 0;
+    out->aperture_element_count =
+        arena.aperture_material.element_count;
+    out->aperture_opening_x_m =
+        arena.aperture_material.opening_x_m;
+    out->aperture_opening_y_m =
+        arena.aperture_material.opening_y_m;
+    out->aperture_thickness_m =
+        arena.aperture_material.thickness_m;
+    out->aperture_material_n_real =
+        arena.aperture_material.material_n_real;
+    out->aperture_material_n_imag =
+        arena.aperture_material.material_n_imag;
     out->transverse_half_extent_m = arena.radius;
     out->longitudinal_extent_m = 2.0 * arena.half_depth;
     out->sample_pitch_m = arena.dx;

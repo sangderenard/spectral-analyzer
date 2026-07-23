@@ -349,6 +349,13 @@ from .optical_transport_graph import (
     compile_optical_graph,
     compile_compound_lens_graph,
 )
+from .physical_aperture import (
+    APERTURE_PAYLOAD_MAGIC,
+    APERTURE_PAYLOAD_VERSION,
+    APERTURE_PAYLOAD_VALUES,
+    AperturePattern,
+    LivePhysicalAperture,
+)
 from .sprite_compositor import (
     SPRITE_SCHEMA_VERSION,
     DEFAULT_MONOFONT_HORIZONTAL_SPACING_PX,
@@ -696,6 +703,11 @@ __all__ = [
     "install_optical_graph",
     "compile_optical_graph",
     "compile_compound_lens_graph",
+    "APERTURE_PAYLOAD_MAGIC",
+    "APERTURE_PAYLOAD_VERSION",
+    "APERTURE_PAYLOAD_VALUES",
+    "AperturePattern",
+    "LivePhysicalAperture",
     "SDCard",
     "tonemap_reinhard",
     "tonemap_log1p",

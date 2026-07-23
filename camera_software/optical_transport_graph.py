@@ -185,6 +185,7 @@ class InstalledWaveArena:
     radius_m: float
     longitudinal_step_m: float
     longitudinal_steps: int
+    aperture_material: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -231,6 +232,10 @@ class InstalledOpticalTransportGraph:
                     ),
                     "longitudinal_step_m": arena.longitudinal_step_m,
                     "longitudinal_steps": arena.longitudinal_steps,
+                    "aperture_material": (
+                        dict(arena.aperture_material)
+                        if arena.aperture_material is not None else None
+                    ),
                 }
                 for arena in self.wave_arenas
             ],
@@ -270,6 +275,7 @@ def wave_context_nodes(
     longitudinal_steps: int | None = None,
     medium_n_real: float = 1.0,
     medium_n_imag: float = 0.0,
+    aperture_material: Any | None = None,
 ) -> tuple[tuple[OpticalNodeSpec, ...], tuple[OpticalLinkSpec, ...]]:
     """Return explicit complex-ray→field→complex-ray T4 boundary modules."""
 
@@ -314,6 +320,31 @@ def wave_context_nodes(
         raise ValueError("wave arena medium_n_real must be positive")
     if not np.isfinite(medium_n_imag) or medium_n_imag < 0.0:
         raise ValueError("wave arena medium_n_imag must be non-negative")
+    if aperture_material is not None:
+        graph_parameters = getattr(aperture_material, "graph_parameters", None)
+        wave_payload = getattr(aperture_material, "wave_payload", None)
+        if not callable(graph_parameters) or not callable(wave_payload):
+            raise TypeError(
+                "aperture_material must implement the live physical-aperture contract"
+            )
+        aperture_contract = dict(graph_parameters())
+        if radius_m is not None and (
+            float(aperture_contract["assembly_radius_m"]) > float(radius_m)
+        ):
+            raise ValueError("physical aperture assembly does not fit in wave arena")
+        if (
+            longitudinal_step_m is not None
+            and longitudinal_steps is not None
+            and float(aperture_contract["thickness_m"])
+            > float(longitudinal_step_m)*int(longitudinal_steps)
+        ):
+            raise ValueError(
+                "physical aperture thickness does not fit in wave arena"
+            )
+        physical["aperture_material"] = aperture_contract
+        physical["aperture_payload"] = tuple(
+            float(value) for value in wave_payload(direction / norm)
+        )
 
     arena = OpticalNodeSpec(
         key=f"{prefix}.arena",
@@ -419,10 +450,15 @@ def install_optical_graph(
             raise ValueError(f"T4 node {node.key!r} has a zero propagation axis")
         axis = axis / axis_norm
         # Native WaveArena reads its propagation axis from payload[3:6].
-        payload = np.ascontiguousarray(
-            [0.0, 0.0, 0.0, axis[0], axis[1], axis[2]],
-            np.float64,
-        )
+        if "aperture_payload" in descriptor:
+            payload = np.ascontiguousarray(
+                descriptor["aperture_payload"], np.float64
+            )
+        else:
+            payload = np.ascontiguousarray(
+                [0.0, 0.0, 0.0, axis[0], axis[1], axis[2]],
+                np.float64,
+            )
         payloads.append(payload)
         context_id = int(add_context(
             pos=np.ascontiguousarray(center, np.float64),
@@ -444,6 +480,10 @@ def install_optical_graph(
             radius_m=float(descriptor["radius_m"]),
             longitudinal_step_m=float(descriptor["longitudinal_step_m"]),
             longitudinal_steps=int(descriptor["longitudinal_steps"]),
+            aperture_material=(
+                dict(descriptor["aperture_material"])
+                if "aperture_material" in descriptor else None
+            ),
         ))
     installed_by_node = {arena.node_key: arena for arena in installed}
     native_links: list[InstalledWaveLink] = []

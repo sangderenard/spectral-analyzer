@@ -204,6 +204,175 @@ def render_sequence(
     }
 
 
+def run_live(
+    *,
+    size: int = 128,
+    cycle_steps: int = 120,
+    pitch_m: float = 1.5e-6,
+    step_m: float = 25.0e-6,
+    wavelength_m: float = 532.0e-9,
+    fps: int = 30,
+    _max_display_frames: int | None = None,
+) -> None:
+    """Animate production T4 transforms in OpenGL without writing captures."""
+
+    if size < 8 or size & (size - 1):
+        raise ValueError("size must be a power of two and at least 8")
+    if cycle_steps < 1:
+        raise ValueError("cycle_steps must be positive")
+    if fps < 1:
+        raise ValueError("fps must be positive")
+
+    import pygame
+    from OpenGL import GL as gl
+
+    from camera_software.gpu_preview import (
+        GLPreviewCompositor,
+        PreviewProductKind,
+        PreviewTextureProduct,
+    )
+
+    pygame.init()
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+    pygame.display.gl_set_attribute(
+        pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE
+    )
+    pygame.display.set_mode(
+        (1200, 460), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
+    )
+    pygame.display.set_caption(
+        "Production T4 transform — POWER | PHASE | CHANGE   "
+        "[Space pause, R reset, Esc close]"
+    )
+
+    tracer = _calibration_tracer(wavelength_m)
+    wavelengths = np.asarray([wavelength_m], np.float64)
+    initial = _source_field(size, pitch_m)
+    initial_peak = float(np.max(np.abs(initial) ** 2))
+    re = np.ascontiguousarray(initial.real[None], np.float32)
+    im = np.ascontiguousarray(initial.imag[None], np.float32)
+    textures = [int(value) for value in gl.glGenTextures(3)]
+    compositor = GLPreviewCompositor()
+    compositor.init_gl()
+    for texture in textures:
+        gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(
+            gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE
+        )
+        gl.glTexParameteri(
+            gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE
+        )
+        gl.glTexImage2D(
+            gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, size, size, 0,
+            gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, None,
+        )
+    gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+
+    clock = pygame.time.Clock()
+    running = True
+    paused = False
+    direction = 1
+    step_index = 0
+    generation = 0
+    displayed_frames = 0
+    try:
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                        running = False
+                    elif event.key == pygame.K_SPACE:
+                        paused = not paused
+                    elif event.key == pygame.K_r:
+                        re[0] = initial.real
+                        im[0] = initial.imag
+                        direction = 1
+                        step_index = 0
+
+            if not paused:
+                tracer.t4_angular_spectrum_step(
+                    1, size, size, pitch_m, step_m, direction,
+                    wavelengths, re, im,
+                )
+                step_index += direction
+                if step_index >= cycle_steps:
+                    direction = -1
+                elif step_index <= 0:
+                    direction = 1
+                generation += 1
+
+            field = re[0].astype(np.float64) + 1j * im[0].astype(np.float64)
+            panels = (
+                _scalar_rgba(np.abs(field) ** 2, relative_peak=initial_peak),
+                _phase_rgba(field),
+                _scalar_rgba(np.abs(field - initial)),
+            )
+            for texture, rgba in zip(textures, panels):
+                gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+                gl.glTexSubImage2D(
+                    gl.GL_TEXTURE_2D, 0, 0, 0, size, size,
+                    gl.GL_RGBA, gl.GL_UNSIGNED_BYTE,
+                    np.ascontiguousarray(rgba),
+                )
+            gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+
+            width, height = pygame.display.get_window_size()
+            gl.glViewport(0, 0, width, height)
+            gl.glClearColor(0.018, 0.025, 0.04, 1.0)
+            gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+            gap = max(4, width // 240)
+            pane_width = max(1, (width - gap * 4) // 3)
+            pane_height = max(1, height - gap * 2)
+            for index, texture in enumerate(textures):
+                product = PreviewTextureProduct(
+                    product_id=f"t4.live.{index}",
+                    tab_label=("POWER", "PHASE", "CHANGE")[index],
+                    texture_id=texture,
+                    width=size,
+                    height=size,
+                    generation=generation,
+                    producer="production-t4-visual",
+                    internal_format=int(gl.GL_RGBA8),
+                    kind=PreviewProductKind.COMPLEX_FIELD,
+                    orientation="top-left",
+                    alpha_mode="straight",
+                )
+                compositor.draw(
+                    product,
+                    (
+                        gap + index * (pane_width + gap),
+                        gap,
+                        pane_width,
+                        pane_height,
+                    ),
+                    height,
+                    tone_map=False,
+                )
+            pygame.display.flip()
+            displayed_frames += 1
+            pygame.display.set_caption(
+                "Production T4 transform — POWER | PHASE | CHANGE   "
+                f"z={step_index * step_m * 1e3:.4f} mm "
+                f"{'PAUSED' if paused else ('forward' if direction > 0 else 'reverse')}   "
+                "[Space pause, R reset, Esc close]"
+            )
+            clock.tick(fps)
+            if (
+                _max_display_frames is not None
+                and displayed_frames >= _max_display_frames
+            ):
+                running = False
+    finally:
+        compositor.destroy()
+        gl.glDeleteTextures(len(textures), textures)
+        pygame.quit()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -212,7 +381,23 @@ def main() -> int:
     parser.add_argument("--size", type=int, default=128)
     parser.add_argument("--frames", type=int, default=12)
     parser.add_argument("--scale", type=int, default=2)
+    parser.add_argument(
+        "--live", action="store_true",
+        help="animate in OpenGL until closed; creates no output files",
+    )
+    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument(
+        "--cycle-steps", type=int, default=120,
+        help="forward steps before the live animation reverses",
+    )
     args = parser.parse_args()
+    if args.live:
+        run_live(
+            size=args.size,
+            cycle_steps=args.cycle_steps,
+            fps=args.fps,
+        )
+        return 0
     result = render_sequence(
         args.output_dir, size=args.size, frames=args.frames, scale=args.scale
     )

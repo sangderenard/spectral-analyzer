@@ -21,6 +21,9 @@ import numpy as np
 from .complex_optical_operators import (
     ComplexOpticalOperator,
     ComplexOperatorStateBlock,
+    JonesOperator,
+    PhaseSpaceJacobian,
+    RigidFieldInterface,
     TransverseBasis,
     canonical_operator_contract,
 )
@@ -101,6 +104,7 @@ class OpticalLinkSpec:
     dst_key: str
     semantic_role: str = "optical-transport"
     adapter: str = ""
+    parameters: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -150,6 +154,7 @@ class CompiledOpticalTransportGraph:
     t2_payloads: dict[str, np.ndarray]
     t4_descriptors: dict[str, dict[str, Any]]
     operator_state_block: dict[str, Any]
+    field_interfaces: dict[tuple[str, str], RigidFieldInterface]
 
     def contract(self) -> dict[str, Any]:
         stats = self.topology_solver.graph_stats()
@@ -197,9 +202,13 @@ class CompiledOpticalTransportGraph:
                 "dst": link.dst_key,
                 "semantic_role": link.semantic_role,
                 "adapter": link.adapter,
+                "parameters": dict(link.parameters),
             } for link in self.spec.links],
             "t2_payload_keys": sorted(self.t2_payloads),
             "t4_descriptor_keys": sorted(self.t4_descriptors),
+            "field_interface_keys": [
+                f"{src}->{dst}" for src, dst in sorted(self.field_interfaces)
+            ],
             "graph_stats": dict(stats),
         }
 
@@ -227,6 +236,8 @@ class InstalledWaveLink:
     dst_node_key: str
     src_context_id: int
     dst_context_id: int
+    interface: str = "aligned-direct"
+    coordinate_map: int = -1
 
 
 @dataclass
@@ -277,7 +288,12 @@ class InstalledOpticalTransportGraph:
                     "src_context_id": link.src_context_id,
                     "dst_context_id": link.dst_context_id,
                     "transfer": "persistent-full-field",
-                    "resampling": "forbidden",
+                    "interface": link.interface,
+                    "coordinate_map": link.coordinate_map,
+                    "resampling": (
+                        "forbidden" if link.coordinate_map < 0
+                        else "none-exact-signed-permutation"
+                    ),
                 }
                 for link in self.wave_links
             ],
@@ -519,6 +535,9 @@ def install_optical_graph(
     installed_by_node = {arena.node_key: arena for arena in installed}
     native_links: list[InstalledWaveLink] = []
     add_wave_link = getattr(tracer, "add_wave_context_link", None)
+    add_wave_interface_link = getattr(
+        tracer, "add_wave_context_interface_link", None
+    )
     nodes_by_key = {node.key: node for node in compiled.spec.nodes}
     for link in compiled.spec.links:
         src = nodes_by_key[link.src_key]
@@ -528,18 +547,38 @@ def install_optical_graph(
             or dst.domain is not OpticalExecutionDomain.T4_WAVE_ARENA
         ):
             continue
-        if not callable(add_wave_link):
-            raise TypeError(
-                "tracer does not expose native persistent wave-context links"
-            )
         src_arena = installed_by_node[src.key]
         dst_arena = installed_by_node[dst.key]
-        add_wave_link(src_arena.context_id, dst_arena.context_id)
+        interface = compiled.field_interfaces.get((src.key, dst.key))
+        if interface is None:
+            if not callable(add_wave_link):
+                raise TypeError(
+                    "tracer does not expose native persistent wave-context links"
+                )
+            add_wave_link(src_arena.context_id, dst_arena.context_id)
+            interface_name = "aligned-direct"
+            coordinate_map = -1
+        else:
+            if not callable(add_wave_interface_link):
+                raise TypeError(
+                    "tracer does not expose native rigid field-interface links"
+                )
+            add_wave_interface_link(
+                src_arena.context_id,
+                dst_arena.context_id,
+                int(interface.coordinate_map),
+                np.ascontiguousarray(interface.jones.real, np.float32),
+                np.ascontiguousarray(interface.jones.imag, np.float32),
+            )
+            interface_name = interface.interaction
+            coordinate_map = int(interface.coordinate_map)
         native_links.append(InstalledWaveLink(
             src_node_key=src.key,
             dst_node_key=dst.key,
             src_context_id=src_arena.context_id,
             dst_context_id=dst_arena.context_id,
+            interface=interface_name,
+            coordinate_map=coordinate_map,
         ))
     return InstalledOpticalTransportGraph(
         compiled=compiled,
@@ -556,6 +595,9 @@ def compile_optical_graph(
     spec: OpticalTransportGraphSpec,
     *,
     t2_payloads: Mapping[str, np.ndarray] | None = None,
+    field_interfaces: Mapping[
+        tuple[str, str], RigidFieldInterface
+    ] | None = None,
 ) -> CompiledOpticalTransportGraph:
     """Validate with GraphSolver and lower nodes to T2/T4 artifacts."""
 
@@ -612,14 +654,48 @@ def compile_optical_graph(
         for node in spec.nodes
         if node.domain is OpticalExecutionDomain.T4_WAVE_ARENA
     }
+    interfaces = dict(field_interfaces or {})
+    link_keys = {(link.src_key, link.dst_key) for link in spec.links}
+    unknown_interfaces = set(interfaces)-link_keys
+    if unknown_interfaces:
+        raise ValueError(
+            f"field interfaces reference unknown links {sorted(unknown_interfaces)}"
+        )
+    for key, interface in interfaces.items():
+        if interface.lane_count != node_map[key[0]].lane_count:
+            raise ValueError(f"field interface {key!r} lane count is inconsistent")
+        link = next(
+            value for value in spec.links
+            if (value.src_key, value.dst_key) == key
+        )
+        if link.adapter != "rigid-complex-field-interface":
+            raise ValueError(
+                f"field interface {key!r} requires its explicit rigid adapter"
+            )
+        if (
+            node_map[key[0]].output_representation
+            is not OpticalRepresentation.TRANSVERSE_FIELD
+            or node_map[key[1]].input_representation
+            is not OpticalRepresentation.TRANSVERSE_FIELD
+        ):
+            raise ValueError("rigid field interfaces require field-to-field links")
+
     operator_builder = ComplexOperatorStateBlock()
     operator_builder.add_basis(
         TransverseBasis.from_direction((1.0, 0.0, 0.0))
     )
     operator_builder.add_operator(ComplexOpticalOperator())
+    for interface in interfaces.values():
+        operator_builder.add_basis(interface.source_basis)
+        operator_builder.add_basis(interface.destination_basis)
+        for lane_matrix in interface.jones:
+            operator_builder.add_operator(ComplexOpticalOperator(
+                JonesOperator(lane_matrix),
+                PhaseSpaceJacobian.identity(),
+            ))
     operator_state = operator_builder.freeze()
     return CompiledOpticalTransportGraph(
-        spec, solver, payload_map, t4, operator_state
+        spec, solver, payload_map, t4, operator_state, interfaces
     )
 
 

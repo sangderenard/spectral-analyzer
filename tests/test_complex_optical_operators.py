@@ -10,10 +10,12 @@ from camera_software.complex_optical_operators import (
     ComplexSourceMode,
     JonesOperator,
     PhaseSpaceJacobian,
+    RigidFieldMap,
     TransverseBasis,
     basis_change,
     canonical_operator_contract,
     dielectric_interface,
+    compile_planar_reflection_interface,
     estimate_compound_lens_phase_space,
     optical_phase,
 )
@@ -92,6 +94,30 @@ def test_jones_composition_and_reciprocal_reverse_are_explicit():
     assert rotation.reciprocal_reverse().matrix == pytest.approx(
         rotation.matrix.T
     )
+
+
+def test_planar_mirror_compiles_exact_pentaprism_field_turn():
+    incoming = np.asarray((1.0, 0.0, 0.0))
+    outgoing = np.asarray((1.0, 1.0, 0.0))/np.sqrt(2.0)
+    normal = (incoming-outgoing)/np.linalg.norm(incoming-outgoing)
+    source = TransverseBasis.from_direction(incoming)
+    destination = TransverseBasis.from_direction(outgoing)
+
+    artifact = compile_planar_reflection_interface(
+        source,
+        destination,
+        normal,
+        (450e-9, 550e-9, 650e-9),
+        material_name="aluminum_mirror",
+        n_incident=1.5168,
+    )
+
+    assert artifact.coordinate_map is RigidFieldMap.FLIP_X
+    assert artifact.jones.shape == (3, 2, 2)
+    assert np.all(np.sum(np.abs(artifact.jones)**2, axis=1) < 1.0)
+    contract = artifact.graph_parameters()
+    assert contract["resampling"] == "none-exact-signed-permutation"
+    assert contract["allocation"] == "cold-only"
 
 
 def test_emitter_polarization_becomes_incoherent_jones_modes_without_faking_it():

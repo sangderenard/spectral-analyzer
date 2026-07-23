@@ -943,6 +943,23 @@ SK_API int ray_tracer_add_wave_context_link(
     int             src_context_id,
     int             dst_context_id);
 
+/**
+ * Join two persistent wave contexts through one exact-grid complex interface.
+ *
+ * coordinate_map is wave_t4::RigidFieldMap encoded as 0..7. Jones arrays are
+ * split-complex [n_bands][2][2] row-major values copied into tracer-owned cold
+ * storage. The reverse edge uses the reciprocal transpose and inverse rigid
+ * map. No interface storage is allocated during T4 transfer.
+ */
+SK_API int ray_tracer_add_wave_context_interface_link(
+    RayTracerState* st,
+    int             src_context_id,
+    int             dst_context_id,
+    int             coordinate_map,
+    int             n_bands,
+    const float*    jones_re,
+    const float*    jones_im);
+
 /** Remove all registered scale contexts from the tracer. */
 SK_API int ray_tracer_clear_scale_contexts(RayTracerState* st);
 

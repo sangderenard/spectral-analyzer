@@ -345,6 +345,56 @@ def test_compatible_wave_contexts_chain_without_intermediate_ray_collapse():
     )
 
 
+def test_rigid_interface_link_turns_and_attenuates_persistent_field():
+    tracer = _tracer(np.array([550e-9]))
+    radius = 64.0e-6
+    dz = 2.0e-6
+    steps = 8
+    half = 0.5*dz*steps
+    incoming = np.asarray((1.0, 0.0, 0.0))
+    outgoing = np.asarray((1.0, 1.0, 0.0))/np.sqrt(2.0)
+    payloads = [
+        np.asarray((0.0, 0.0, 0.0, *incoming), np.float64),
+        np.asarray((0.0, 0.0, 0.0, *outgoing), np.float64),
+    ]
+    context_ids = [
+        tracer.add_scale_context(
+            -incoming*half, radius, 1, dz, steps, 1.0, 0.0, 1,
+            payloads[0],
+        ),
+        tracer.add_scale_context(
+            outgoing*half, radius, 1, dz, steps, 1.0, 0.0, 1,
+            payloads[1],
+        ),
+    ]
+    jones = np.asarray([[[0.5, 0.0], [0.0, 0.5]]], np.complex64)
+    tracer.add_wave_context_interface_link(
+        context_ids[0], context_ids[1], 1, jones.real, jones.imag
+    )
+    tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+    tracer.submit_rays(
+        np.asarray([[-0.001, 7.0e-6, 0.0]]),
+        incoming[None],
+        np.asarray([[1.0+0.0j]]),
+        max_bounces=2,
+        min_amplitude=1e-12,
+    )
+    _wait(tracer)
+
+    arenas = tracer.wave_arena_stats()
+    first, second = arenas
+    assert first["next_forward"] == second["arena_id"]
+    assert second["next_backward"] == first["arena_id"]
+    assert second["boundary"]["seeded_field_power"] == pytest.approx(
+        0.25*first["field_power"], rel=3.0e-6
+    )
+    records = tracer.drain_records(16)
+    field_index = int(np.flatnonzero(np.asarray(records["kind"]) == 3)[0])
+    np.testing.assert_allclose(
+        np.asarray(records["dir"])[field_index], outgoing, atol=2.0e-3
+    )
+
+
 def test_production_angular_spectrum_plane_wave_phase_and_reverse():
     wavelength = 550.0e-9
     tracer = _tracer(np.array([wavelength]))

@@ -743,6 +743,12 @@ struct WaveArena {
     int              context_id = -1;
     int              next_forward = -1;
     int              next_backward = -1;
+    int              next_forward_coordinate_map = -1;
+    int              next_backward_coordinate_map = -1;
+    std::array<float, 32 * 4> next_forward_jones_re = {};
+    std::array<float, 32 * 4> next_forward_jones_im = {};
+    std::array<float, 32 * 4> next_backward_jones_re = {};
+    std::array<float, 32 * 4> next_backward_jones_im = {};
     uint64_t         linked_transfers = 0;
     uint64_t         linked_generation = 0;
     int              linked_terminal_arena = -1;

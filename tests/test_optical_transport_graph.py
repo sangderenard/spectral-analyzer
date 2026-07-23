@@ -5,6 +5,10 @@ import pytest
 
 from camera_designer.camera_preset import simple_doublet_preset
 from camera_designer.compound_optics import CompoundLens
+from camera_software.complex_optical_operators import (
+    TransverseBasis,
+    compile_planar_reflection_interface,
+)
 from camera_software.optical_transport_graph import (
     OPTICAL_GRAPH_SCHEMA,
     OpticalExecutionDomain,
@@ -29,6 +33,49 @@ def _lens(lane_count: int) -> CompoundLens:
         preset,
         wavelengths_um=wavelengths,
     )
+
+
+def test_graph_cold_compiles_rigid_field_interface_without_resampler():
+    incoming = np.asarray((1.0, 0.0, 0.0))
+    outgoing = np.asarray((1.0, 1.0, 0.0))/np.sqrt(2.0)
+    normal = (incoming-outgoing)/np.linalg.norm(incoming-outgoing)
+    interface = compile_planar_reflection_interface(
+        TransverseBasis.from_direction(incoming),
+        TransverseBasis.from_direction(outgoing),
+        normal,
+        np.linspace(450e-9, 650e-9, 4),
+    )
+    first = OpticalNodeSpec(
+        "prism.leg-1", "wave-propagation",
+        OpticalExecutionDomain.T4_WAVE_ARENA,
+        OpticalRepresentation.TRANSVERSE_FIELD,
+        OpticalRepresentation.TRANSVERSE_FIELD,
+        4, persistent_state=True,
+    )
+    second = OpticalNodeSpec(
+        "prism.leg-2", "wave-propagation",
+        OpticalExecutionDomain.T4_WAVE_ARENA,
+        OpticalRepresentation.TRANSVERSE_FIELD,
+        OpticalRepresentation.TRANSVERSE_FIELD,
+        4, persistent_state=True,
+    )
+    link = OpticalLinkSpec(
+        first.key, second.key, "silvered-reflection",
+        "rigid-complex-field-interface",
+        interface.graph_parameters(),
+    )
+    compiled = compile_optical_graph(
+        OpticalTransportGraphSpec(
+            (first, second), (link,), (first.key,), (second.key,)
+        ),
+        field_interfaces={(first.key, second.key): interface},
+    )
+
+    assert compiled.field_interfaces[(first.key, second.key)] is interface
+    assert compiled.contract()["field_interface_keys"] == [
+        "prism.leg-1->prism.leg-2"
+    ]
+    assert compiled.operator_state_block["operators"].shape[0] == 5
 
 
 @pytest.mark.parametrize("lane_count", [1, 3, 4, 8, 16, 32])

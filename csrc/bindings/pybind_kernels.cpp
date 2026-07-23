@@ -4389,6 +4389,31 @@ struct PyRayTracer
                 "wave context link requires two distinct registered wave contexts");
     }
 
+    void add_wave_context_interface_link(
+        int src_context_id,
+        int dst_context_id,
+        int coordinate_map,
+        py::array_t<float, py::array::c_style> jones_re_arr,
+        py::array_t<float, py::array::c_style> jones_im_arr)
+    {
+        if (!handle) throw std::runtime_error("RayTracer not initialised");
+        auto jones_re = jones_re_arr.request();
+        auto jones_im = jones_im_arr.request();
+        const py::ssize_t expected = static_cast<py::ssize_t>(_n_bands)*4;
+        if (jones_re.size != expected || jones_im.size != expected)
+            throw std::invalid_argument(
+                "wave interface Jones arrays must contain n_bands*2*2 values");
+        const int rc = ray_tracer_add_wave_context_interface_link(
+            handle, src_context_id, dst_context_id,
+            coordinate_map, _n_bands,
+            static_cast<const float*>(jones_re.ptr),
+            static_cast<const float*>(jones_im.ptr));
+        if (rc != SK_OK)
+            throw std::invalid_argument(
+                "wave interface link requires distinct compatible contexts, "
+                "an exact rigid map, and the tracer's exact lane width");
+    }
+
     /* Trace multiscale, write into caller-owned (capacity, 14) float32 buffer.
      * Returns n_written. */
     int trace_multiscale_into(
@@ -7404,6 +7429,12 @@ Returns the assigned context_id integer.
         .def("add_wave_context_link", &PyRayTracer::add_wave_context_link,
              py::arg("src_context_id"), py::arg("dst_context_id"),
              "Link compatible persistent wave fields without ray extraction.")
+        .def("add_wave_context_interface_link",
+             &PyRayTracer::add_wave_context_interface_link,
+             py::arg("src_context_id"), py::arg("dst_context_id"),
+             py::arg("coordinate_map"), py::arg("jones_re"),
+             py::arg("jones_im"),
+             "Link persistent fields through an exact rigid Jones interface.")
         .def("clear_scale_contexts", &PyRayTracer::clear_scale_contexts,
              "Remove all registered scale-context spheres.")
         .def("trace_multiscale_into", &PyRayTracer::trace_multiscale_into,

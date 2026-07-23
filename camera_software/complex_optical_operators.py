@@ -19,6 +19,7 @@ Conventions
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import IntEnum
 import math
 from typing import Any, Callable, Sequence
 
@@ -195,6 +196,164 @@ class JonesOperator:
             m[0, 0].real, m[0, 0].imag, m[0, 1].real, m[0, 1].imag,
             m[1, 0].real, m[1, 0].imag, m[1, 1].real, m[1, 1].imag,
         ], np.float32)
+
+
+class RigidFieldMap(IntEnum):
+    IDENTITY = 0
+    FLIP_X = 1
+    FLIP_Y = 2
+    FLIP_XY = 3
+    TRANSPOSE = 4
+    TRANSPOSE_FLIP_X = 5
+    TRANSPOSE_FLIP_Y = 6
+    TRANSPOSE_FLIP_XY = 7
+
+
+@dataclass(frozen=True)
+class RigidFieldInterface:
+    """Cold exact-grid field map plus one Jones matrix per spectral lane."""
+
+    coordinate_map: RigidFieldMap
+    jones: np.ndarray
+    source_basis: TransverseBasis
+    destination_basis: TransverseBasis
+    interaction: str
+    material_name: str
+
+    def __post_init__(self) -> None:
+        matrices = np.ascontiguousarray(self.jones, np.complex64)
+        if (
+            matrices.ndim != 3
+            or matrices.shape[1:] != (2, 2)
+            or not np.all(np.isfinite(matrices))
+        ):
+            raise ValueError("rigid field interface Jones data must be [lanes,2,2]")
+        object.__setattr__(self, "jones", matrices)
+
+    @property
+    def lane_count(self) -> int:
+        return int(self.jones.shape[0])
+
+    def graph_parameters(self) -> dict[str, Any]:
+        return {
+            "operator": "rigid-complex-field-interface",
+            "coordinate_map": int(self.coordinate_map),
+            "jones_re": self.jones.real.tolist(),
+            "jones_im": self.jones.imag.tolist(),
+            "lane_count": self.lane_count,
+            "interaction": self.interaction,
+            "material": self.material_name,
+            "allocation": "cold-only",
+            "resampling": "none-exact-signed-permutation",
+        }
+
+
+def _rigid_field_map(
+    source_basis: TransverseBasis,
+    destination_basis: TransverseBasis,
+    world_transform: np.ndarray,
+    *,
+    tolerance: float = 1.0e-8,
+) -> RigidFieldMap:
+    transform = np.asarray(world_transform, np.float64).reshape(3, 3)
+    if not np.allclose(transform.T@transform, np.eye(3), atol=tolerance):
+        raise ValueError("rigid field transform must be orthogonal")
+    source_axes = np.column_stack((source_basis.s, source_basis.p))
+    destination_axes = np.column_stack((
+        destination_basis.s, destination_basis.p
+    ))
+    mapping = source_axes.T@transform.T@destination_axes
+    candidates = {
+        RigidFieldMap.IDENTITY: ((1, 0), (0, 1)),
+        RigidFieldMap.FLIP_X: ((-1, 0), (0, 1)),
+        RigidFieldMap.FLIP_Y: ((1, 0), (0, -1)),
+        RigidFieldMap.FLIP_XY: ((-1, 0), (0, -1)),
+        RigidFieldMap.TRANSPOSE: ((0, 1), (1, 0)),
+        RigidFieldMap.TRANSPOSE_FLIP_X: ((0, -1), (1, 0)),
+        RigidFieldMap.TRANSPOSE_FLIP_Y: ((0, 1), (-1, 0)),
+        RigidFieldMap.TRANSPOSE_FLIP_XY: ((0, -1), (-1, 0)),
+    }
+    for key, candidate in candidates.items():
+        if np.allclose(mapping, candidate, atol=tolerance, rtol=0.0):
+            return key
+    raise ValueError(
+        "field frames require non-rigid resampling; exact interface refused"
+    )
+
+
+def _basis_matrix(
+    source: TransverseBasis,
+    destination: TransverseBasis,
+) -> np.ndarray:
+    return np.asarray([
+        [np.dot(destination.s, source.s), np.dot(destination.s, source.p)],
+        [np.dot(destination.p, source.s), np.dot(destination.p, source.p)],
+    ], np.complex128)
+
+
+def compile_planar_reflection_interface(
+    source_basis: TransverseBasis,
+    destination_basis: TransverseBasis,
+    interface_normal: Sequence[float],
+    wavelengths_m: Sequence[float],
+    *,
+    material_name: str = "aluminum_mirror",
+    n_incident: float = 1.0,
+) -> RigidFieldInterface:
+    """Compile a conductor reflection into an exact rigid field-port map."""
+
+    from camera_designer.optical_material import MATERIAL_CATALOG
+
+    try:
+        material = MATERIAL_CATALOG[str(material_name)]
+    except KeyError as exc:
+        raise ValueError(f"unknown mirror material {material_name!r}") from exc
+    normal = _unit(interface_normal, name="interface normal")
+    incident = source_basis.k
+    if float(np.dot(incident, normal)) > 0.0:
+        normal = -normal
+    reflected = _unit(
+        incident-2.0*float(np.dot(incident, normal))*normal,
+        name="reflected direction",
+    )
+    if float(np.dot(reflected, destination_basis.k)) < 1.0-1.0e-8:
+        raise ValueError("destination field basis does not follow reflection")
+    world_reflection = np.eye(3)-2.0*np.outer(normal, normal)
+    coordinate_map = _rigid_field_map(
+        source_basis, destination_basis, world_reflection
+    )
+    shared_s = np.cross(incident, normal)
+    incident_basis = TransverseBasis.incidence(
+        incident, normal,
+        shared_s=None if np.linalg.norm(shared_s) <= _EPS else shared_s,
+    )
+    reflected_basis = TransverseBasis.incidence(
+        reflected, normal, shared_s=incident_basis.s
+    )
+    source_to_incidence = _basis_matrix(source_basis, incident_basis)
+    reflected_to_destination = _basis_matrix(
+        reflected_basis, destination_basis
+    )
+    cos_i = max(0.0, -float(np.dot(incident, normal)))
+    sin2_i = max(0.0, 1.0-cos_i*cos_i)
+    matrices = []
+    for wavelength in np.asarray(wavelengths_m, np.float64).reshape(-1):
+        if not np.isfinite(wavelength) or wavelength <= 0.0:
+            raise ValueError("interface wavelengths must be finite and positive")
+        n2 = complex(material.n_at(float(wavelength)*1.0e6), material.k)
+        eta = complex(float(n_incident), 0.0)/n2
+        cos_t = np.sqrt(1.0-eta*eta*sin2_i+0.0j)
+        if cos_t.real < 0.0:
+            cos_t = -cos_t
+        rs = (n_incident*cos_i-n2*cos_t)/(n_incident*cos_i+n2*cos_t)
+        rp = (n2*cos_i-n_incident*cos_t)/(n2*cos_i+n_incident*cos_t)
+        matrices.append(
+            reflected_to_destination@np.diag((rs, rp))@source_to_incidence
+        )
+    return RigidFieldInterface(
+        coordinate_map, np.stack(matrices), source_basis, destination_basis,
+        "conductor-reflection", str(material_name),
+    )
 
 
 def basis_change(
@@ -725,6 +884,9 @@ __all__ = [
     "parse_wave_exit_states",
     "TransverseBasis",
     "JonesOperator",
+    "RigidFieldMap",
+    "RigidFieldInterface",
+    "compile_planar_reflection_interface",
     "DielectricInterfaceResult",
     "dielectric_interface",
     "basis_change",

@@ -1859,20 +1859,32 @@ def _arena_unit(value, name: str) -> np.ndarray:
     return vector/length
 
 
+def _arena_font(size: int, *, title: bool = False):
+    """Compact instrumentation type, about half the previous bitmap scale."""
+
+    pixel_size = max(5, min(7 if title else 6, size//48))
+    try:
+        return ImageFont.truetype(
+            "C:/Windows/Fonts/consola.ttf", pixel_size
+        )
+    except OSError:
+        return ImageFont.load_default()
+
+
 def _arena_geometry_panel(compiled, size: int) -> np.ndarray:
     image = Image.new("RGBA", (size, size), (6, 10, 18, 255))
     draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default()
+    font = _arena_font(size)
     geometry = compiled.display_geometry
     if geometry is None:
         draw.text((12, 12), "PARAMETRIC GEOMETRY", font=font,
                   fill=(210, 225, 245, 255))
-        draw.text((12, 36), "mesh-independent exact component", font=font,
+        draw.text((12, 27), "mesh-independent exact component", font=font,
                   fill=(115, 180, 240, 255))
         for index, face in enumerate(
             compiled.metadata.get("registered_faces", ())
         ):
-            draw.text((12, 58+index*15), str(face), font=font,
+            draw.text((12, 40+index*9), str(face), font=font,
                       fill=(155, 175, 205, 255))
         return np.asarray(image, np.uint8)
 
@@ -1893,9 +1905,9 @@ def _arena_geometry_panel(compiled, size: int) -> np.ndarray:
         color = palette.get(role, (120, 145, 185, 190))
         xy = [tuple(float(value) for value in point) for point in triangle]
         draw.polygon(xy, fill=color, outline=(175, 205, 235, 210))
-    draw.rectangle((5, 5, size-6, 24), fill=(5, 9, 16, 220))
+    draw.rectangle((5, 5, size-6, 18), fill=(5, 9, 16, 220))
     draw.text(
-        (10, 9),
+        (10, 7),
         f"REPRESENTATIVE GEOMETRY  axes={axes[0]}/{axes[1]}",
         font=font, fill=(220, 232, 248, 255),
     )
@@ -1911,16 +1923,18 @@ def _arena_text_panel(
 ) -> np.ndarray:
     image = Image.new("RGBA", (size, size), (7, 11, 19, 255))
     draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default()
-    draw.text((10, 10), title, font=font, fill=accent)
-    y = 34
+    font = _arena_font(size)
+    title_font = _arena_font(size, title=True)
+    draw.text((10, 8), title, font=title_font, fill=accent)
+    y = 23
+    line_step = max(7, size//48)
     for line in lines:
         words = str(line).split()
         rows: list[str] = []
         current = ""
         for word in words:
             candidate = f"{current} {word}".strip()
-            if len(candidate) > max(20, size//7) and current:
+            if len(candidate) > max(32, size//4) and current:
                 rows.append(current)
                 current = word
             else:
@@ -1928,12 +1942,12 @@ def _arena_text_panel(
         if current:
             rows.append(current)
         for row in rows:
-            if y > size-18:
+            if y > size-line_step-5:
                 draw.text((10, y), "...", font=font, fill=(130, 145, 170, 255))
                 return np.asarray(image, np.uint8)
             draw.text((10, y), row, font=font, fill=(175, 195, 220, 255))
-            y += 15
-        y += 4
+            y += line_step
+        y += 2
     return np.asarray(image, np.uint8)
 
 
@@ -1943,15 +1957,16 @@ def _arena_graph_panel(compiled, size: int) -> np.ndarray:
     links = contract["links"]
     image = Image.new("RGBA", (size, size), (7, 11, 19, 255))
     draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default()
-    draw.text((10, 9), "COMPILED TRANSPORT GRAPH", font=font,
+    font = _arena_font(size)
+    title_font = _arena_font(size, title=True)
+    draw.text((10, 7), "COMPILED TRANSPORT GRAPH", font=title_font,
               fill=(160, 120, 255, 255))
     if not nodes:
         return np.asarray(image, np.uint8)
-    box_h = max(13, min(42, (size-46)//len(nodes)))
+    box_h = max(11, min(36, (size-31)//len(nodes)))
     centers: dict[str, tuple[float, float]] = {}
     for index, node in enumerate(nodes):
-        y0 = 34+index*box_h
+        y0 = 22+index*box_h
         y1 = min(size-8, y0+max(8, box_h-4))
         if y0 >= size-8:
             break
@@ -1966,7 +1981,7 @@ def _arena_graph_panel(compiled, size: int) -> np.ndarray:
         draw.rounded_rectangle((x0, y0, x1, y1), radius=5,
                                fill=tuple((*color[:3], 75)), outline=color)
         label = f"{node['operation']}  [{domain}]"
-        draw.text((x0+7, y0+6), label[:max(20, size//7)],
+        draw.text((x0+6, y0+3), label[:max(32, size//4)],
                   font=font, fill=(225, 235, 248, 255))
         centers[node["key"]] = (0.5*(x0+x1), 0.5*(y0+y1))
     for link in links:
@@ -2035,7 +2050,7 @@ def _arena_probe_panel(
     compiled,
     size: int,
     phase: float,
-    native_paths: list[np.ndarray] | None = None,
+    native_paths: list[object] | None = None,
 ) -> np.ndarray:
     paths = (
         native_paths
@@ -2044,35 +2059,61 @@ def _arena_probe_panel(
     )
     image = Image.new("RGBA", (size, size), (4, 8, 14, 255))
     draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default()
+    font = _arena_font(size)
+    title_font = _arena_font(size, title=True)
     if not paths:
-        draw.text((10, 10), "FIELD-DOMAIN PROBE", font=font,
+        draw.text((10, 8), "FIELD-DOMAIN PROBE", font=title_font,
                   fill=(110, 220, 255, 255))
-        draw.text((10, 34), "see complex field products", font=font,
+        draw.text((10, 22), "see complex field products", font=font,
                   fill=(165, 190, 220, 255))
         return np.asarray(image, np.uint8)
-    all_points = np.concatenate(paths)
+    path_points = [
+        np.asarray(path["points"] if isinstance(path, dict) else path)
+        for path in paths
+    ]
+    all_points = np.concatenate(path_points)
     screen, axes = _arena_fit_points(all_points, size, margin=22)
     cursor = 0
     colors = (
         (80, 210, 255, 235), (115, 135, 255, 235),
         (235, 105, 255, 235), (255, 150, 95, 235),
     )
-    for index, path in enumerate(paths):
+    for index, path_entry in enumerate(paths):
+        path = path_points[index]
         count = len(path)
         line = screen[cursor:cursor+count]
         cursor += count
+        measured = isinstance(path_entry, dict)
+        if measured:
+            rgb = np.asarray(path_entry["rgb"], np.float64)
+            power = float(path_entry["relative_power"])
+            color = tuple(
+                int(value) for value in np.clip(rgb*255.0, 0.0, 255.0)
+            )+(245,)
+            glow = tuple(
+                int(value) for value in np.clip(rgb*125.0, 0.0, 255.0)
+            )+(max(20, int(120*math.sqrt(power))),)
+            xy = [tuple(float(v) for v in point) for point in line]
+            draw.line(xy, fill=glow, width=max(3, size//96))
+        else:
+            color = colors[index % len(colors)]
         draw.line(
             [tuple(float(v) for v in point) for point in line],
-            fill=colors[index % len(colors)], width=2,
+            fill=color, width=max(1, size//192),
         )
         for point in line[1:-1]:
             x, y = float(point[0]), float(point[1])
             draw.ellipse((x-2, y-2, x+2, y+2),
                          fill=(245, 250, 255, 255))
-    prefix = "NATIVE T1/T3" if native_paths is not None else "CANONICAL"
-    draw.text((10, 9), f"{prefix} PROBE PATHS axes={axes[0]}/{axes[1]}",
-              font=font, fill=(220, 235, 250, 255))
+    if native_paths is not None:
+        title = f"NATIVE LIGHT STATE axes={axes[0]}/{axes[1]}"
+        legend = "COLOR=spectrum  GLOW=|E|^2"
+    else:
+        title = f"EXACT GEOMETRIC PATH axes={axes[0]}/{axes[1]}"
+        legend = "path geometry; complex state not shown"
+    draw.rectangle((5, 5, size-6, 25), fill=(4, 8, 14, 205))
+    draw.text((10, 7), title, font=title_font, fill=(220, 235, 250, 255))
+    draw.text((10, 16), legend, font=font, fill=(135, 175, 210, 255))
     return np.asarray(image, np.uint8)
 
 
@@ -2082,7 +2123,7 @@ def _component_static_panels(
     size: int,
     phase: float,
     *,
-    native_paths: list[np.ndarray] | None = None,
+    native_paths: list[object] | None = None,
 ):
     contract = compiled.contract()
     materials = [
@@ -2179,7 +2220,7 @@ def run_component_arena_live(
     )
     native_tracer = None
     native_submitted = False
-    native_paths: list[np.ndarray] | None = None
+    native_paths: list[object] | None = None
     if isinstance(component, (PlaneMirrorComponent, PentaprismComponent)):
         wavelengths = np.linspace(420.0e-9, 700.0e-9, lane_count)
         frequencies = 299_792_458.0/wavelengths
@@ -2213,12 +2254,38 @@ def run_component_arena_live(
                 records = native_tracer.drain_records(4096)
                 starts = np.asarray(records["seg_start"], np.float64)
                 ends = np.asarray(records["pos"], np.float64)
-                native_paths = [
-                    np.stack((start, end))
-                    for start, end in zip(starts, ends)
-                    if np.all(np.isfinite(start)) and np.all(np.isfinite(end))
-                    and float(np.linalg.norm(end-start)) > 1.0e-12
-                ]
+                fields = (
+                    np.asarray(records["amp_re"], np.float64)
+                    + 1j*np.asarray(records["amp_im"], np.float64)
+                )
+                powers = np.sum(np.abs(fields)**2, axis=1)
+                peak_power = max(float(np.max(powers, initial=0.0)), 1.0e-30)
+                from camera_software.transport_contract import (
+                    native_display_rgb_weight,
+                )
+                rgb_weights = np.asarray([
+                    native_display_rgb_weight(value*1.0e9)
+                    for value in wavelengths
+                ], np.float64)
+                native_paths = []
+                for start, end, lane_power, power in zip(
+                    starts, ends, np.abs(fields)**2, powers
+                ):
+                    if (
+                        not np.all(np.isfinite(start))
+                        or not np.all(np.isfinite(end))
+                        or float(np.linalg.norm(end-start)) <= 1.0e-12
+                    ):
+                        continue
+                    rgb = np.asarray(lane_power @ rgb_weights, np.float64)
+                    rgb_peak = float(np.max(rgb, initial=0.0))
+                    if rgb_peak > 0.0:
+                        rgb /= rgb_peak
+                    native_paths.append({
+                        "points": np.stack((start, end)),
+                        "rgb": np.sqrt(np.clip(rgb, 0.0, 1.0)),
+                        "relative_power": float(power/peak_power),
+                    })
                 native_submitted = False
             if (
                 native_tracer is not None

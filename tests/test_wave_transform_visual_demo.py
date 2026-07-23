@@ -5,6 +5,7 @@ from PIL import Image
 import pytest
 
 from wave_transform_visual_demo import (
+    _arena_probe_panel,
     _component_static_panels,
     _aperture_sweep_radius,
     _aperture_spectral_samples,
@@ -77,6 +78,31 @@ def test_component_arena_panels_use_compiled_component_artifacts(component_key):
     assert all(panel.shape == (128, 128, 4) for panel in panels)
     assert np.count_nonzero(panels[1][..., :3]) > 0
     assert "GRAPH" in labels
+
+
+def test_native_probe_panel_encodes_measured_spectrum_and_field_power():
+    from camera_software.optical_components import PlaneMirrorComponent
+
+    component = PlaneMirrorComponent()
+    compiled = component.compile(4)
+    dim = {
+        "points": np.asarray(((-0.02, 0.0, 0.0), (0.0, 0.0, 0.0))),
+        "rgb": np.asarray((0.1, 0.3, 1.0)),
+        "relative_power": 0.04,
+    }
+    bright = {
+        "points": np.asarray(((0.0, 0.0, 0.0), (-0.02, 0.01, 0.0))),
+        "rgb": np.asarray((1.0, 0.2, 0.05)),
+        "relative_power": 1.0,
+    }
+
+    panel = _arena_probe_panel(
+        component, compiled, 128, 0.0, [dim, bright]
+    )
+
+    assert panel.shape == (128, 128, 4)
+    assert np.max(panel[..., 0]) > 200
+    assert np.max(panel[..., 2]) > 200
 
 
 def test_relative_phase_gauge_removes_only_global_piston():

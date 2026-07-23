@@ -64,6 +64,23 @@ The six panes have stable meanings:
 5. canonical material-role bindings;
 6. component identity, exact lane width, and controls.
 
+The compact type is intentionally instrumentation-scale so the data does not
+consume the visualization. A pane names the provenance of what it shows:
+
+- `NATIVE LIGHT STATE` means segments drained from T1/T3. Their hue is
+  computed from the actual per-lane spectral power and their glow follows
+  transported field power `|E|^2`.
+- `EXACT GEOMETRIC PATH` means the authoritative parametric path is shown but
+  the complex sidecar is not yet available at that observation point.
+- `COMPILED TRANSPORT GRAPH`, ports, materials, and state are contracts rather
+  than light measurements.
+- aperture Stokes, polarization, phase, analyzer, and spectral-power panes are
+  resolved directly from the production vector complex field.
+
+This provenance labeling is a rule for future arena products: a beautiful
+diagnostic must state which physical quantity supplies color, opacity, and
+brightness. Decorative rays must never masquerade as measured light state.
+
 For the aperture, the panes are the production vector-field products. Its
 animated opening is derived from the loaded `LivePhysicalAperture`, preserving
 its physical blade count, named material, finite thickness, and rotation. No

@@ -98,7 +98,34 @@ def _source_field(size: int, pitch_m: float) -> np.ndarray:
     ).astype(np.complex64)
 
 
-def _phase_rgba(field: np.ndarray) -> np.ndarray:
+def _remove_piston_phase(field: np.ndarray) -> tuple[np.ndarray, float]:
+    """Remove one intensity-weighted global phase without changing amplitude.
+
+    This is a presentation gauge choice only. It removes the spatially uniform
+    carrier/time-of-flight rotation ("piston") while retaining every relative
+    phase difference that describes wavefront shape and interference.
+    """
+
+    complex_field = np.asarray(field, np.complex128)
+    amplitude = np.abs(complex_field)
+    peak = float(np.max(amplitude))
+    if peak <= 0.0:
+        return complex_field.copy(), 0.0
+    valid = amplitude > peak*1.0e-8
+    phasor = np.sum(complex_field[valid]*amplitude[valid])
+    if abs(phasor) <= np.finfo(np.float64).eps*np.sum(amplitude[valid]**2):
+        peak_index = np.unravel_index(np.argmax(amplitude), amplitude.shape)
+        piston = float(np.angle(complex_field[peak_index]))
+    else:
+        piston = float(np.angle(phasor))
+    return complex_field*np.exp(-1j*piston), piston
+
+
+def _phase_rgba(
+    field: np.ndarray, *, remove_piston: bool = False,
+) -> np.ndarray:
+    if remove_piston:
+        field, _ = _remove_piston_phase(field)
     amplitude = np.abs(field).astype(np.float64)
     peak = float(np.max(amplitude))
     value = np.zeros_like(amplitude) if peak <= 0.0 else np.power(
@@ -305,6 +332,23 @@ def _aperture_geometry_rgba(aperture, size: int) -> np.ndarray:
         font=ImageFont.load_default(),
     )
     return np.asarray(image, np.uint8)
+
+
+def _aperture_sweep_radius(
+    cycle_phase: float, size: int, pitch_m: float,
+) -> tuple[float, float, float]:
+    """Return (opening radius, assembly radius, normalized sweep position)."""
+
+    field_radius = 0.5*(size-1)*pitch_m
+    assembly_radius = field_radius*1.62
+    pinhole_radius = pitch_m*0.76
+    clear_field_radius = field_radius*1.51
+    sweep = 0.5-0.5*np.cos(cycle_phase)
+    opening = np.exp(
+        np.log(pinhole_radius)
+        + sweep*np.log(clear_field_radius/pinhole_radius)
+    )
+    return float(opening), float(assembly_radius), float(sweep)
 
 
 def _boundary_power_rgba(
@@ -654,6 +698,7 @@ def run_aperture_live(
     clock = pygame.time.Clock()
     running = True
     paused = False
+    piston_removed = True
     generation = 0
     displayed_frames = 0
     try:
@@ -666,16 +711,19 @@ def run_aperture_live(
                         running = False
                     elif event.key == pygame.K_SPACE:
                         paused = not paused
+                    elif event.key == pygame.K_p:
+                        piston_removed = not piston_removed
             if not paused:
                 generation += 1
-            phase = generation*0.025
-            field_radius = 0.5*(size-1)*pitch_m
-            opening = field_radius*(0.16+0.075*(1.0+np.sin(phase)))
+            phase = generation*0.018
+            opening, aperture_extent, sweep = _aperture_sweep_radius(
+                phase, size, pitch_m,
+            )
             aperture = LivePhysicalAperture.iris(
                 "demo.live-iris",
                 blade_count=9,
                 opening_radius_m=float(opening),
-                assembly_radius_m=field_radius*1.45,
+                assembly_radius_m=aperture_extent,
                 thickness_m=0.10e-6,
                 rotation_rad=phase*0.2,
                 material_name="blackened_steel",
@@ -717,9 +765,11 @@ def run_aperture_live(
             )
             panels = (
                 _aperture_geometry_rgba(aperture, size),
-                _phase_rgba(material_field),
-                _phase_rgba(forward),
-                _phase_rgba(reverse),
+                _phase_rgba(
+                    material_field, remove_piston=piston_removed,
+                ),
+                _phase_rgba(forward, remove_piston=piston_removed),
+                _phase_rgba(reverse, remove_piston=piston_removed),
             )
             for texture, rgba in zip(textures, panels):
                 gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
@@ -762,8 +812,11 @@ def run_aperture_live(
             displayed_frames += 1
             pygame.display.set_caption(
                 "Physical aperture — GEOMETRY | MATERIAL | FORWARD | REVERSE  "
-                f"opening={opening*1e6:.2f} um "
-                f"{'PAUSED' if paused else ''} [Space pause, Esc close]"
+                f"diameter={2.0*opening*1e6:.2f} um "
+                f"range={sweep*100.0:.1f}% "
+                f"phase={'RELATIVE' if piston_removed else 'ABSOLUTE'} "
+                f"{'PAUSED ' if paused else ''}"
+                "[Space pause, P phase gauge, Esc close]"
             )
             clock.tick(fps)
             if (

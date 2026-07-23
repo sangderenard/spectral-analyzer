@@ -198,6 +198,12 @@ CRT shadow-mask, slot-mask, and aperture-grille patterns. This checkpoint is a
 scalar material-volume interaction, not completion of the sharp-interface
 Fresnel/Jones/reflection work required below. Its OpenGL calibration host is
 `python wave_transform_visual_demo.py --aperture-live`.
+That host sweeps opening radius logarithmically from a sampling-scale pinhole
+to a polygon large enough to clear the entire field. Phase panels remove the
+intensity-weighted global piston by default, so hue reports spatial phase
+evolution rather than uniform carrier/time-of-flight rotation; `P` toggles the
+absolute phase gauge for comparison. Gauge removal is presentation-only and
+does not modify the propagated complex buffers.
 
 Exit gate: plane/Gaussian propagation, physical double slit, dielectric slab,
 prism, thick lens, reciprocity, and open-boundary reflection gates pass.

@@ -3,7 +3,11 @@ from pathlib import Path
 from PIL import Image
 import pytest
 
-from wave_transform_visual_demo import render_sequence, run_live
+from wave_transform_visual_demo import (
+    render_sequence,
+    run_live,
+    run_transport_live,
+)
 
 
 def test_visual_demo_uses_production_transform_and_writes_sequence(tmp_path):
@@ -25,3 +29,5 @@ def test_live_mode_validates_before_opening_a_context():
         run_live(cycle_steps=0)
     with pytest.raises(ValueError, match="fps"):
         run_live(fps=0)
+    with pytest.raises(ValueError, match="panel_size"):
+        run_transport_live(panel_size=32)

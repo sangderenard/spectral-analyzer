@@ -196,6 +196,12 @@ def test_installer_places_real_angular_arena_without_registering_surrogate_lens(
         "field_texture_source"
     ] == "persistent-t4-state-display-resolve"
     assert receipt.contract()["transition_telemetry"]["field_texture_opt_in"] is True
+    assert receipt.contract()["transition_telemetry"][
+        "entry_adapter"
+    ] == "unit-l2-gaussian-with-transverse-phase"
+    arena_contract = receipt.contract()["wave_arenas"][0]
+    assert arena_contract["boundary_geometry"] == "oriented-plane-to-plane-patch"
+    assert arena_contract["longitudinal_extent_m"] == pytest.approx(9.6e-4)
 
 
 def test_installer_refuses_unsupported_split_step_substitution():

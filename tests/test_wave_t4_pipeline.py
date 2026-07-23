@@ -136,6 +136,57 @@ def test_compiled_optical_graph_installs_and_drives_native_t4():
     assert sum(arena["field_active"]) == 1
 
 
+def test_wave_boundary_preserves_power_tilt_and_authored_axial_extent():
+    tracer = _tracer(np.array([550e-9]))
+    radius = 64.0e-6
+    dz = 2.0e-6
+    steps = 8
+    tracer.add_scale_context(
+        np.array([0.0, 0.0, 0.0]),
+        radius,
+        1,
+        dz,
+        steps,
+        1.0,
+        0.0,
+        1,
+        np.array([0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+    )
+    tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+    tilt = 0.01
+    direction = np.array([tilt, 0.0, np.sqrt(1.0 - tilt * tilt)])
+    tracer.submit_rays(
+        np.array([[0.0, 0.0, -0.001]]),
+        direction[None],
+        np.array([[1.0 + 0.0j]]),
+        max_bounces=2,
+        min_amplitude=1e-12,
+    )
+    _wait(tracer)
+
+    arena = tracer.wave_arena_stats()[0]
+    boundary = arena["boundary"]
+    assert arena["longitudinal_extent_m"] == pytest.approx(dz * steps)
+    assert boundary["entry_local"][2] == pytest.approx(
+        -0.5 * dz * steps, abs=2.0e-8
+    )
+    assert boundary["exit_local"][2] == pytest.approx(
+        0.5 * dz * steps, abs=2.0e-8
+    )
+    assert boundary["seeded_field_power"] == pytest.approx(
+        boundary["input_ray_power"], rel=2.0e-5
+    )
+    assert boundary["output_ray_power"] == pytest.approx(
+        boundary["propagated_field_power"], rel=2.0e-5
+    )
+    assert boundary["exit_direction"][0] == pytest.approx(tilt, abs=2.5e-3)
+
+    records = tracer.drain_records(16)
+    field_index = int(np.flatnonzero(np.asarray(records["kind"]) == 3)[0])
+    assert np.asarray(records["seg_start"])[field_index, 2] < 0.0
+    assert np.asarray(records["pos"])[field_index, 2] > 0.0
+
+
 def test_production_angular_spectrum_plane_wave_phase_and_reverse():
     wavelength = 550.0e-9
     tracer = _tracer(np.array([wavelength]))
@@ -190,6 +241,12 @@ def test_continuous_paths_share_one_exact_width_complex_dispatch():
     assert arena["generation"] == 1
     assert sum(lane["active"] for lane in arena["lanes"]) == 4
     assert len({lane["frequency_hz"] for lane in arena["lanes"] if lane["active"]}) > 1
+    assert arena["boundary"]["seeded_field_power"] == pytest.approx(
+        arena["boundary"]["input_ray_power"], rel=2.0e-5
+    )
+    assert arena["boundary"]["output_ray_power"] == pytest.approx(
+        arena["boundary"]["propagated_field_power"], rel=2.0e-5
+    )
     assert np.asarray(tracer.drain_records(16)["kind"]).tolist() == [3, 3, 3, 3]
 
 
@@ -228,4 +285,7 @@ def test_gpu_t1_routes_empty_space_continuous_cohort_to_t4():
     assert arena["spectral_mode"] == 1
     assert len(active) == 4
     assert [lane["coherence_id"] for lane in active] == tags.tolist()
+    assert arena["boundary"]["output_ray_power"] == pytest.approx(
+        arena["boundary"]["propagated_field_power"], rel=3.0e-5
+    )
     assert np.asarray(tracer.drain_records(16)["kind"]).tolist() == [3, 3, 3, 3]

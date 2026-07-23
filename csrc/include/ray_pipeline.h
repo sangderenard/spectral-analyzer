@@ -726,6 +726,10 @@ struct WaveArena {
     Eigen::Vector3d  center;
     double           radius  = 0.0;
     double           radius_sq = 0.0;
+    /* Oriented plane-to-plane wave patch. radius is the transverse half
+     * extent; half_depth is derived exactly from nz*dz so routing geometry
+     * and numerical propagation can never describe different distances. */
+    double           half_depth = 0.0;
     double           n_real  = 1.0;
     double           speed_m_s = 299792458.0;
     Eigen::Vector3d  axis_z;
@@ -753,6 +757,21 @@ struct WaveArena {
     std::array<size_t, wave_t4::kFieldCount> re_offsets = {};
     std::array<size_t, wave_t4::kFieldCount> im_offsets = {};
     std::array<unsigned char, wave_t4::kFieldCount> field_active = {};
+    struct BoundaryTelemetry {
+        uint64_t generation = 0;
+        int state_lane = -1;
+        int direction = 0;
+        Eigen::Vector3d entry_world = Eigen::Vector3d::Zero();
+        Eigen::Vector3d exit_world = Eigen::Vector3d::Zero();
+        Eigen::Vector3d entry_local = Eigen::Vector3d::Zero();
+        Eigen::Vector3d exit_local = Eigen::Vector3d::Zero();
+        Eigen::Vector3d entry_direction = Eigen::Vector3d::Zero();
+        Eigen::Vector3d exit_direction = Eigen::Vector3d::Zero();
+        double input_ray_power = 0.0;
+        double seeded_field_power = 0.0;
+        double propagated_field_power = 0.0;
+        double output_ray_power = 0.0;
+    } boundary_telemetry;
     size_t plane_size = 0;
     float* field_re(wave_t4::Direction direction,
                     wave_t4::TransverseComponent component) noexcept {
@@ -1122,6 +1141,14 @@ struct WaveArenaSnapshot {
     uint64_t state_float_count;
     int longitudinal_steps;
     int absorber_cells;
+    double transverse_half_extent_m;
+    double longitudinal_extent_m;
+    double sample_pitch_m;
+    double longitudinal_step_m;
+    double center_world[3];
+    double axis_x_world[3];
+    double axis_y_world[3];
+    double axis_z_world[3];
     uint64_t generation;
     uint64_t completed_steps;
     double input_power;
@@ -1133,6 +1160,19 @@ struct WaveArenaSnapshot {
     uint32_t coherence_id[32];
     uint32_t lane_active[32];
     uint32_t field_active[wave_t4::kFieldCount];
+    uint64_t boundary_generation;
+    int boundary_state_lane;
+    int boundary_direction;
+    double boundary_entry_world[3];
+    double boundary_exit_world[3];
+    double boundary_entry_local[3];
+    double boundary_exit_local[3];
+    double boundary_entry_direction[3];
+    double boundary_exit_direction[3];
+    double boundary_input_ray_power;
+    double boundary_seeded_field_power;
+    double boundary_propagated_field_power;
+    double boundary_output_ray_power;
 };
 
 int ray_pipeline_wave_arena_count(const RayPipelineState* ps);

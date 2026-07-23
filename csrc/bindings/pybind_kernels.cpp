@@ -3363,6 +3363,10 @@ struct PyRayTracer
                 static_cast<unsigned long long>(s.state_float_count);
             d["longitudinal_steps"] = s.longitudinal_steps;
             d["absorber_cells"] = s.absorber_cells;
+            d["transverse_half_extent_m"] = s.transverse_half_extent_m;
+            d["longitudinal_extent_m"] = s.longitudinal_extent_m;
+            d["sample_pitch_m"] = s.sample_pitch_m;
+            d["longitudinal_step_m"] = s.longitudinal_step_m;
             d["generation"] = s.generation;
             d["completed_steps"] = s.completed_steps;
             d["input_power"] = s.input_power;
@@ -3383,6 +3387,40 @@ struct PyRayTracer
             for (int field = 0; field < wave_t4::kFieldCount; ++field)
                 fields.append(s.field_active[field] != 0u);
             d["field_active"] = std::move(fields);
+            py::dict boundary;
+            boundary["generation"] = s.boundary_generation;
+            boundary["state_lane"] = s.boundary_state_lane;
+            boundary["direction"] = s.boundary_direction;
+            auto vector3 = [](const double* value) {
+                py::tuple result(3);
+                for (int axis = 0; axis < 3; ++axis)
+                    result[axis] = value[axis];
+                return result;
+            };
+            d["center_world"] = vector3(s.center_world);
+            d["axis_x_world"] = vector3(s.axis_x_world);
+            d["axis_y_world"] = vector3(s.axis_y_world);
+            d["axis_z_world"] = vector3(s.axis_z_world);
+            boundary["entry_world"] = vector3(s.boundary_entry_world);
+            boundary["exit_world"] = vector3(s.boundary_exit_world);
+            boundary["entry_local"] = vector3(s.boundary_entry_local);
+            boundary["exit_local"] = vector3(s.boundary_exit_local);
+            boundary["entry_direction"] =
+                vector3(s.boundary_entry_direction);
+            boundary["exit_direction"] =
+                vector3(s.boundary_exit_direction);
+            boundary["input_ray_power"] = s.boundary_input_ray_power;
+            boundary["seeded_field_power"] =
+                s.boundary_seeded_field_power;
+            boundary["propagated_field_power"] =
+                s.boundary_propagated_field_power;
+            boundary["output_ray_power"] =
+                s.boundary_output_ray_power;
+            boundary["entry_adapter"] =
+                "unit-l2-gaussian-with-transverse-phase";
+            boundary["exit_adapter"] =
+                "power-preserving-first-moment-ray";
+            d["boundary"] = std::move(boundary);
             result.append(std::move(d));
         }
         return result;

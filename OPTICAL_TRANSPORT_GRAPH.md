@@ -209,6 +209,33 @@ bounded raw complex-field calibration/capture API. The display resolve is
 opt-in through the optical request's `wave_arena` product so an unobserved
 arena does not pay CPU staging or texture-upload cost.
 
+## Ray/field boundary contract
+
+An installed T4 region is an oriented plane-to-plane patch. `radius_m` is its
+transverse half-extent; its longitudinal extent is exactly
+`longitudinal_step_m * longitudinal_steps`. CPU and GPU T1 intersect that same
+oriented box, so routing geometry cannot silently disagree with the distance
+advanced by the angular-spectrum kernel.
+
+The current scalar entry adapter deposits each complex-ray lane as a compact
+three-cell Gaussian reconstruction kernel. The kernel has unit discrete L2
+power and carries the ray's transverse phase ramp, preserving input power,
+phase, position, and paraxial direction. This is explicitly an adapter kernel:
+a geometric ray contains no authored beam waist.
+
+The current exit adapter emits one representative complex ray per lane using
+the field's power centroid and global phase-correlation direction. Its complex
+amplitude magnitude is the square root of total lane power. This preserves
+power but intentionally discards higher spatial moments; graph contracts call
+it `power-preserving-first-moment-ray`. Systems requiring the complete exit
+field must connect it to another field/operator port rather than use this
+reduction.
+
+`wave_arena_stats()` exposes entry/exit world and local coordinates,
+directions, input/seeded/propagated/output power, adapter identity, and the
+transition generation without adding per-ray state to ordinary pipeline
+records.
+
 ## Adoption gates
 
 1. **Contract scaffold**

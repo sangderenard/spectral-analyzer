@@ -73,10 +73,11 @@
  *    mat_band(m,b,field) = mat_bands[(m * 32 + b) * 12 + field]
  *    field 7 = n_real, field 8 = n_imag
  *
- *  SceneBandBuf  (2 × n_bands + 4 × n_arenas floats):
+ *  SceneBandBuf  (2 × n_bands + 8 × n_arenas floats):
  *    [0..nb-1]     k_real[b]    (= 2π*freq[b]/c)
  *    [nb..2nb-1]   atmo_abs[b]
- *    [2nb..]        arena center xyz + radius
+ *    [2nb..]        arena center xyz + transverse half-extent +
+ *                   axis_z xyz + longitudinal half-extent
  *
  *  CounterBuf (24 uint words; shared pipeline control):
  *    [0]=hit_count  [1]=miss_count  [2]=wave_count
@@ -104,6 +105,7 @@ layout(local_size_x = 64) in;
 #define MAT_FULL_BANDS    32      /* MAX_SPECTRAL_BANDS in C++ */
 
 #define T_SELF            1e-4    /* self-intersection guard                   */
+#define WAVE_PORT_T_SELF  1e-8    /* port entry; independent of mesh epsilon  */
 #define BVH_STACK_SIZE    64      /* max BVH depth                             */
 #define EPS               1e-10
 
@@ -151,6 +153,39 @@ uint  intent_u(int base, int i)  { return floatBitsToUint(intents[base + i]); }
 void hit_wf(int base, int i, float v)  { hits[base + i] = v; }
 void hit_wi(int base, int i, int v)    { hits[base + i] = intBitsToFloat(v); }
 void hit_wu(int base, int i, uint v)   { hits[base + i] = uintBitsToFloat(v); }
+
+float wave_patch_entry(
+    vec3 pos, vec3 dir, vec3 center, float half_xy,
+    vec3 axis_z, float half_z)
+{
+    vec3 up = abs(dot(axis_z, vec3(0.0, 1.0, 0.0))) < 0.9
+        ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 axis_x = normalize(cross(axis_z, up));
+    vec3 axis_y = normalize(cross(axis_z, axis_x));
+    vec3 offset = pos - center;
+    vec3 local_pos = vec3(
+        dot(offset, axis_x), dot(offset, axis_y), dot(offset, axis_z));
+    vec3 local_dir = vec3(
+        dot(dir, axis_x), dot(dir, axis_y), dot(dir, axis_z));
+    vec3 bounds = vec3(half_xy, half_xy, half_z);
+    float t_near = -3.402823466e+38;
+    float t_far = 3.402823466e+38;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (abs(local_dir[axis]) <= 1.0e-12) {
+            if (abs(local_pos[axis]) > bounds[axis]) return -1.0;
+            continue;
+        }
+        float a = (-bounds[axis] - local_pos[axis]) / local_dir[axis];
+        float b = ( bounds[axis] - local_pos[axis]) / local_dir[axis];
+        if (a > b) {
+            float swap_value = a; a = b; b = swap_value;
+        }
+        t_near = max(t_near, a);
+        t_far = min(t_far, b);
+        if (t_near > t_far) return -1.0;
+    }
+    return t_near > WAVE_PORT_T_SELF ? t_near : -1.0;
+}
 
 /* ── BVH helpers ────────────────────────────────────────────────────────── */
 
@@ -293,22 +328,19 @@ void main() {
     float best_u   = 0.0;
     float best_v   = 0.0;
 
-    /* Seed the nearest-event distance with the nearest arena boundary. BVH
-     * traversal replaces it only when authored geometry is closer. */
+    /* Seed nearest-event distance with the nearest oriented wave-patch entry.
+     * BVH traversal replaces it only when authored geometry is closer. */
     int wave_arena_id = -1;
     for (int ai = 0; ai < n_arenas; ++ai) {
-        int ab = 2 * n_bands + 4 * ai;
+        int ab = 2 * n_bands + 8 * ai;
         vec3 center = vec3(scene_bands[ab], scene_bands[ab+1], scene_bands[ab+2]);
-        vec3 oc = pos - center;
-        float radius = scene_bands[ab+3];
-        float qb = dot(oc, dir);
-        float qc = dot(oc, oc) - radius * radius;
-        float disc = qb * qb - qc;
-        if (disc < 0.0) continue;
-        float root = sqrt(disc);
-        float candidate = -qb - root;
-        if (candidate <= T_SELF) candidate = -qb + root;
-        if (candidate > T_SELF && candidate < best_t) {
+        float half_xy = scene_bands[ab+3];
+        vec3 axis_z = normalize(vec3(
+            scene_bands[ab+4], scene_bands[ab+5], scene_bands[ab+6]));
+        float half_z = scene_bands[ab+7];
+        float candidate = wave_patch_entry(
+            pos, dir, center, half_xy, axis_z, half_z);
+        if (candidate > WAVE_PORT_T_SELF && candidate < best_t) {
             best_t = candidate;
             wave_arena_id = ai;
         }

@@ -7989,11 +7989,11 @@ static void wave_arena_seed(WaveArena& arena, const RayIntent& ray);
 static void wave_arena_seed_continuous_cohort(
     WaveArena& arena, const std::array<WaveIntent*, 32>& cohort, int count);
 static bool wave_arena_march(WaveArena& arena);
-static ChildRay wave_arena_extract(const WaveArena& arena, const RayIntent& src,
+static ChildRay wave_arena_extract(WaveArena& arena, const RayIntent& src,
                                    int state_lane = -1);
 static void wave_arena_complete(RayPipelineState& ps,
                                 WaveIntent& wi,
-                                const WaveArena& arena,
+                                WaveArena& arena,
                                 int state_lane = -1);
 static void pipeline_finish_ray(RayPipelineState& ps, uint8_t color_flag = 255);
 
@@ -12522,23 +12522,28 @@ public:
             upload_ssbo(ssbo_mat_band, st.mat_buf.data(),
                         (GLsizeiptr)(st.mat_buf.size() * sizeof(float)));
 
-        /* Scene channel buffer: k_real | atmo_abs | arena(center.xyz,radius).
+        /* Scene channel buffer: k_real | atmo_abs |
+         * arena(center.xyz, transverse half-extent, axis_z.xyz, half-depth).
          * Reusing binding 7 avoids both a ninth SSBO and a fixed uniform cap. */
         {
             const int nb = st.n_bands;
             const int na = (int)ps.arenas.size();
-            std::vector<float> sb(nb * 2 + na * 4);
+            std::vector<float> sb(nb * 2 + na * 8);
             for (int b = 0; b < nb; ++b) {
                 sb[b]      = (float)st.k_real[b];
                 sb[nb + b] = (float)st.atmo_abs[b];
             }
             for (int i = 0; i < na; ++i) {
                 const auto& a = ps.arenas[static_cast<size_t>(i)];
-                const int o = nb * 2 + i * 4;
+                const int o = nb * 2 + i * 8;
                 sb[o]   = (float)a.center.x();
                 sb[o+1] = (float)a.center.y();
                 sb[o+2] = (float)a.center.z();
                 sb[o+3] = (float)a.radius;
+                sb[o+4] = (float)a.axis_z.x();
+                sb[o+5] = (float)a.axis_z.y();
+                sb[o+6] = (float)a.axis_z.z();
+                sb[o+7] = (float)a.half_depth;
             }
             upload_ssbo(ssbo_scene_band, sb.data(),
                         (GLsizeiptr)(sb.size() * sizeof(float)));
@@ -14658,6 +14663,7 @@ static void wave_arena_build(
     arena.dz     = (ctx.dt_m > 0.0) ? ctx.dt_m : cfg.wave_grid_dx_m * 0.5;
     arena.nz     = (ctx.n_substeps > 0) ? ctx.n_substeps
                  : std::max(4, (int)std::ceil(2.0 * ctx.radius / arena.dz));
+    arena.half_depth = 0.5 * arena.dz * static_cast<double>(arena.nz);
     const double diameter = 2.0 * ctx.radius;
     const double requested_dx = std::max(cfg.wave_grid_dx_m, 1.0e-12);
     const int requested_dim = std::max(16,
@@ -14727,6 +14733,45 @@ static V3d wave_arena_to_local(const WaveArena& a, const V3d& wp)
     return V3d(off.dot(a.axis_x), off.dot(a.axis_y), off.dot(a.axis_z));
 }
 
+static bool wave_arena_entry_distance(const WaveArena& arena,
+                                      const V3d& world_pos,
+                                      const V3d& world_dir,
+                                      double max_distance,
+                                      double& distance)
+{
+    constexpr double wave_port_self = 1.0e-8;
+    const V3d local_pos = wave_arena_to_local(arena, world_pos);
+    const V3d local_dir(
+        world_dir.dot(arena.axis_x),
+        world_dir.dot(arena.axis_y),
+        world_dir.dot(arena.axis_z));
+    const double bounds[3] = {
+        arena.radius, arena.radius, arena.half_depth
+    };
+    double t_near = -std::numeric_limits<double>::infinity();
+    double t_far = std::numeric_limits<double>::infinity();
+    for (int axis = 0; axis < 3; ++axis) {
+        if (std::abs(local_dir[axis]) <= 1.0e-15) {
+            if (std::abs(local_pos[axis]) > bounds[axis])
+                return false;
+            continue;
+        }
+        double a = (-bounds[axis] - local_pos[axis]) / local_dir[axis];
+        double b = ( bounds[axis] - local_pos[axis]) / local_dir[axis];
+        if (a > b) std::swap(a, b);
+        t_near = std::max(t_near, a);
+        t_far = std::min(t_far, b);
+        if (t_near > t_far) return false;
+    }
+    /* A continuation is placed beyond the exit plane. Refusing an inside
+     * origin here prevents that continuation from immediately re-entering the
+     * same patch and paying T4 twice. */
+    if (t_near <= wave_port_self || t_near >= max_distance)
+        return false;
+    distance = t_near;
+    return true;
+}
+
 static wave_t4::Direction wave_arena_direction(
     const WaveArena& arena, const RayIntent& ray) noexcept
 {
@@ -14759,7 +14804,60 @@ static void wave_arena_measure_all(WaveArena& arena)
     arena.progress.border_power = border_power;
 }
 
-/* Seed the entry plane from a ray: Gaussian envelope centred at entry point. */
+/* Deposit one representative complex ray as a unit-L2 Gaussian wave packet.
+ * The normalized kernel preserves discrete field power, while the transverse
+ * phase ramp preserves the incoming paraxial direction. A geometric ray has
+ * no authored beam waist, so the compact 3-cell kernel is explicitly an
+ * adapter/reconstruction kernel rather than invented source geometry. */
+static void wave_arena_deposit_lane(WaveArena& arena,
+                                    const RayIntent& ray,
+                                    const V3d& local,
+                                    double wavelength_m,
+                                    cd amplitude,
+                                    float* out_re,
+                                    float* out_im)
+{
+    const double ox = ((arena.nx - 1) * 0.5) * arena.dx;
+    const double oy = ((arena.ny - 1) * 0.5) * arena.dx;
+    const double sigma = 3.0 * arena.dx;
+    double norm_sq = 0.0;
+    for (int iy = 0; iy < arena.ny; ++iy) {
+        const double ym = iy * arena.dx - oy;
+        for (int ix = 0; ix < arena.nx; ++ix) {
+            const double xm = ix * arena.dx - ox;
+            const double r2 = (xm-local.x())*(xm-local.x())
+                            + (ym-local.y())*(ym-local.y());
+            const double envelope = std::exp(-r2 / (2.0*sigma*sigma));
+            norm_sq += envelope * envelope;
+        }
+    }
+    if (norm_sq <= 0.0 || wavelength_m <= 0.0) return;
+    const double inv_norm = 1.0 / std::sqrt(norm_sq);
+    const double k0 = TWO_PI / wavelength_m;
+    const double kx = k0 * ray.dir.dot(arena.axis_x);
+    const double ky = k0 * ray.dir.dot(arena.axis_y);
+    for (int iy = 0; iy < arena.ny; ++iy) {
+        const double ym = iy * arena.dx - oy;
+        for (int ix = 0; ix < arena.nx; ++ix) {
+            const double xm = ix * arena.dx - ox;
+            const double dx = xm - local.x();
+            const double dy = ym - local.y();
+            const double r2 = dx*dx + dy*dy;
+            const double envelope =
+                std::exp(-r2 / (2.0*sigma*sigma)) * inv_norm;
+            if (envelope < 1.0e-12) continue;
+            const cd value = amplitude
+                * std::polar(envelope, kx*dx + ky*dy);
+            const size_t p =
+                static_cast<size_t>(iy + arena.pad_y) * arena.fft_nx
+                + static_cast<size_t>(ix + arena.pad_x);
+            out_re[p] = static_cast<float>(value.real());
+            out_im[p] = static_cast<float>(value.imag());
+        }
+    }
+}
+
+/* Seed the entry plane from a ray using the declared boundary adapter. */
 static void wave_arena_seed(WaveArena& arena, const RayIntent& ray)
 {
     std::fill(arena.state_block.begin(), arena.state_block.end(), 0.0f);
@@ -14795,11 +14893,7 @@ static void wave_arena_seed(WaveArena& arena, const RayIntent& ray)
         }
     }
 
-    V3d lpos  = wave_arena_to_local(arena, ray.pos);
-    double lx = lpos.x(), ly = lpos.y();
-    double ox  = ((arena.nx - 1) * 0.5) * arena.dx;
-    double oy  = ((arena.ny - 1) * 0.5) * arena.dx;
-    const double sigma = 3.0 * arena.dx;
+    const V3d lpos = wave_arena_to_local(arena, ray.pos);
     const auto direction = wave_arena_direction(arena, ray);
     const auto component = wave_t4::TransverseComponent::S;
     arena.field_active[static_cast<size_t>(
@@ -14808,28 +14902,26 @@ static void wave_arena_seed(WaveArena& arena, const RayIntent& ray)
     float* field_im = arena.field_im(direction, component);
     const size_t fft_plane =
         static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
-
-    for (int iy = 0; iy < arena.ny; ++iy) {
-        for (int ix = 0; ix < arena.nx; ++ix) {
-            double xm = ix * arena.dx - ox;
-            double ym = iy * arena.dx - oy;
-            double r2 = (xm - lx)*(xm - lx) + (ym - ly)*(ym - ly);
-            float  env = static_cast<float>(std::exp(-r2 / (2.0 * sigma * sigma)));
-            if (env < 1e-9f) continue;
-            size_t xy_off =
-                static_cast<size_t>(iy + arena.pad_y) * arena.fft_nx
-                + static_cast<size_t>(ix + arena.pad_x);
-            for (int b = 0; b < arena.n_bands && b < (int)ray.amp.size(); ++b) {
-                cd a = ray.amp[b] * static_cast<double>(env);
-                size_t idx = static_cast<size_t>(b) * fft_plane + xy_off;
-                field_re[idx] = static_cast<float>(a.real());
-                field_im[idx] = static_cast<float>(a.imag());
-            }
-        }
+    double input_power = 0.0;
+    for (int b = 0; b < arena.n_bands && b < (int)ray.amp.size(); ++b) {
+        input_power += std::norm(ray.amp[b]);
+        wave_arena_deposit_lane(
+            arena, ray, lpos, arena.wavelengths_m[b], ray.amp[b],
+            field_re + static_cast<size_t>(b)*fft_plane,
+            field_im + static_cast<size_t>(b)*fft_plane);
     }
     arena.progress = {};
     wave_arena_measure_all(arena);
     arena.progress.input_power = arena.progress.field_power;
+    arena.boundary_telemetry = {};
+    arena.boundary_telemetry.state_lane = -1;
+    arena.boundary_telemetry.direction = static_cast<int>(direction);
+    arena.boundary_telemetry.entry_world = ray.pos;
+    arena.boundary_telemetry.entry_local = lpos;
+    arena.boundary_telemetry.entry_direction = ray.dir;
+    arena.boundary_telemetry.input_ray_power = input_power;
+    arena.boundary_telemetry.seeded_field_power =
+        arena.progress.field_power;
 }
 
 /* Pack independent continuous paths into the exact-width complex state. Each
@@ -14846,9 +14938,6 @@ static void wave_arena_seed_continuous_cohort(
 
     const int used = std::min(count, arena.n_bands);
     const size_t npix = static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
-    const double ox = ((arena.nx - 1) * 0.5) * arena.dx;
-    const double oy = ((arena.ny - 1) * 0.5) * arena.dx;
-    const double sigma = 3.0 * arena.dx;
     const auto direction =
         wave_arena_direction(arena, cohort[0]->ray);
     const auto component = wave_t4::TransverseComponent::S;
@@ -14875,26 +14964,31 @@ static void wave_arena_seed_continuous_cohort(
         const V3d local = wave_arena_to_local(arena, ray.pos);
         float* re = state_re + static_cast<size_t>(state_lane) * npix;
         float* im = state_im + static_cast<size_t>(state_lane) * npix;
-        for (int iy = 0; iy < arena.ny; ++iy) {
-            const double ym = iy * arena.dx - oy;
-            for (int ix = 0; ix < arena.nx; ++ix) {
-                const double xm = ix * arena.dx - ox;
-                const double r2 = (xm-local.x())*(xm-local.x())
-                                + (ym-local.y())*(ym-local.y());
-                const double env = std::exp(-r2 / (2.0 * sigma * sigma));
-                if (env < 1.0e-9) continue;
-                const size_t p =
-                    static_cast<size_t>(iy + arena.pad_y) * arena.fft_nx
-                    + static_cast<size_t>(ix + arena.pad_x);
-                const cd value = source_amp * env;
-                re[p] = static_cast<float>(value.real());
-                im[p] = static_cast<float>(value.imag());
-            }
-        }
+        wave_arena_deposit_lane(
+            arena, ray, local, lane.wavelength_m, source_amp, re, im);
     }
     arena.progress = {};
     wave_arena_measure_all(arena);
     arena.progress.input_power = arena.progress.field_power;
+    arena.boundary_telemetry = {};
+    arena.boundary_telemetry.state_lane = used > 0 ? used - 1 : -1;
+    arena.boundary_telemetry.direction = static_cast<int>(direction);
+    arena.boundary_telemetry.entry_world = cohort[0]->ray.pos;
+    arena.boundary_telemetry.entry_local =
+        wave_arena_to_local(arena, cohort[0]->ray.pos);
+    arena.boundary_telemetry.entry_direction = cohort[0]->ray.dir;
+    double input_power = 0.0;
+    for (int lane = 0; lane < used; ++lane) {
+        const RayIntent& source = cohort[static_cast<size_t>(lane)]->ray;
+        const int source_lane = source.amp.size() > 0
+            ? std::min<int>(source.spectral_lane_id,
+                            static_cast<int>(source.amp.size()) - 1) : 0;
+        if (source.amp.size() > 0)
+            input_power += std::norm(source.amp[source_lane]);
+    }
+    arena.boundary_telemetry.input_ray_power = input_power;
+    arena.boundary_telemetry.seeded_field_power =
+        arena.progress.field_power;
 }
 
 /* March both transverse components in the active propagation direction. */
@@ -14936,116 +15030,178 @@ static bool wave_arena_march(WaveArena& arena)
     return true;
 }
 
-/* Extract exit ray: power-weighted centroid for position, phase-gradient
- * for direction, field value at centroid for per-band amplitude. */
-static ChildRay wave_arena_extract(const WaveArena& arena, const RayIntent& src,
+/* Reduce the propagated packet to one representative continuation. Position
+ * and direction are the first spatial/angular moments. Per-lane amplitude
+ * magnitude is sqrt(total field power), so the deliberate single-ray
+ * reduction preserves power while exposing its unavoidable loss of shape. */
+static ChildRay wave_arena_extract(WaveArena& arena, const RayIntent& src,
                                    int state_lane)
 {
-    const int    nb   = arena.n_bands;
-    const int    nx   = arena.nx, ny = arena.ny;
+    const int nb = arena.n_bands;
+    const int nx = arena.nx, ny = arena.ny;
     const size_t npix =
         static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
     const int band_begin = state_lane >= 0 ? state_lane : 0;
     const int band_end = state_lane >= 0 ? state_lane + 1 : nb;
     const auto direction = wave_arena_direction(arena, src);
-    const float* s_re_all = arena.field_re(
-        direction, wave_t4::TransverseComponent::S);
-    const float* s_im_all = arena.field_im(
-        direction, wave_t4::TransverseComponent::S);
-    const float* p_re_all = arena.field_re(
-        direction, wave_t4::TransverseComponent::P);
-    const float* p_im_all = arena.field_im(
-        direction, wave_t4::TransverseComponent::P);
     auto padded_index = [&](int ix, int iy) -> size_t {
         return static_cast<size_t>(iy + arena.pad_y) * arena.fft_nx
              + static_cast<size_t>(ix + arena.pad_x);
     };
 
-    double sum_pow = 0.0, cx = 0.0, cy = 0.0;
+    std::array<double, 32> band_power{};
+    double sum_power = 0.0, centroid_x = 0.0, centroid_y = 0.0;
     for (int b = band_begin; b < band_end; ++b) {
-        const float* s_re = s_re_all + static_cast<size_t>(b) * npix;
-        const float* s_im = s_im_all + static_cast<size_t>(b) * npix;
-        const float* p_re = p_re_all + static_cast<size_t>(b) * npix;
-        const float* p_im = p_im_all + static_cast<size_t>(b) * npix;
-        for (int iy = 0; iy < ny; ++iy) {
-            for (int ix = 0; ix < nx; ++ix) {
-                const size_t i = padded_index(ix, iy);
-                const double power =
-                    static_cast<double>(s_re[i]) * s_re[i]
-                    + static_cast<double>(s_im[i]) * s_im[i]
-                    + static_cast<double>(p_re[i]) * p_re[i]
-                    + static_cast<double>(p_im[i]) * p_im[i];
-                sum_pow += power;
-                cx += power * ix;
-                cy += power * iy;
+        for (int component = 0;
+             component < wave_t4::kTransverseComponentCount; ++component) {
+            const auto c =
+                static_cast<wave_t4::TransverseComponent>(component);
+            const float* re = arena.field_re(direction, c)
+                + static_cast<size_t>(b) * npix;
+            const float* im = arena.field_im(direction, c)
+                + static_cast<size_t>(b) * npix;
+            for (int iy = 0; iy < ny; ++iy) {
+                for (int ix = 0; ix < nx; ++ix) {
+                    const size_t i = padded_index(ix, iy);
+                    const double power =
+                        static_cast<double>(re[i])*re[i]
+                        + static_cast<double>(im[i])*im[i];
+                    band_power[static_cast<size_t>(b)] += power;
+                    sum_power += power;
+                    centroid_x += power * ix;
+                    centroid_y += power * iy;
+                }
             }
         }
     }
-    int ic_x = (sum_pow > 0.0) ? (int)std::round(cx / sum_pow) : nx / 2;
-    int ic_y = (sum_pow > 0.0) ? (int)std::round(cy / sum_pow) : ny / 2;
+    int ic_x = sum_power > 0.0
+        ? static_cast<int>(std::round(centroid_x / sum_power)) : nx/2;
+    int ic_y = sum_power > 0.0
+        ? static_cast<int>(std::round(centroid_y / sum_power)) : ny/2;
     ic_x = std::max(1, std::min(nx - 2, ic_x));
     ic_y = std::max(1, std::min(ny - 2, ic_y));
 
-    /* Phase-gradient estimate for exit direction */
-    double kx_sum = 0.0, ky_sum = 0.0;
-    int    k_count = 0;
+    double slope_x_sum = 0.0, slope_y_sum = 0.0, slope_weight = 0.0;
     for (int b = band_begin; b < band_end; ++b) {
-        const float* re = s_re_all + static_cast<size_t>(b) * npix;
-        const float* im = s_im_all + static_cast<size_t>(b) * npix;
-        auto at = [&](int ix, int iy) -> cd {
-            const size_t i = padded_index(ix, iy);
-            return cd(re[i], im[i]);
-        };
-        cd Ux_fwd = at(ic_x+1, ic_y), Ux_bwd = at(ic_x-1, ic_y);
-        cd Uy_fwd = at(ic_x, ic_y+1), Uy_bwd = at(ic_x, ic_y-1);
-        if (std::abs(Ux_fwd) > 1e-30 && std::abs(Ux_bwd) > 1e-30) {
-            kx_sum += std::arg(Ux_fwd * std::conj(Ux_bwd)) / (2.0 * arena.dx);
-            ky_sum += std::arg(Uy_fwd * std::conj(Uy_bwd)) / (2.0 * arena.dx);
-            ++k_count;
+        cd correlation_x(0.0, 0.0), correlation_y(0.0, 0.0);
+        for (int component = 0;
+             component < wave_t4::kTransverseComponentCount; ++component) {
+            const auto c =
+                static_cast<wave_t4::TransverseComponent>(component);
+            const float* re = arena.field_re(direction, c)
+                + static_cast<size_t>(b) * npix;
+            const float* im = arena.field_im(direction, c)
+                + static_cast<size_t>(b) * npix;
+            for (int iy = 0; iy < ny; ++iy) {
+                for (int ix = 0; ix < nx; ++ix) {
+                    const size_t i = padded_index(ix, iy);
+                    const cd value(re[i], im[i]);
+                    if (ix + 1 < nx) {
+                        const size_t j = padded_index(ix + 1, iy);
+                        correlation_x +=
+                            std::conj(value) * cd(re[j], im[j]);
+                    }
+                    if (iy + 1 < ny) {
+                        const size_t j = padded_index(ix, iy + 1);
+                        correlation_y +=
+                            std::conj(value) * cd(re[j], im[j]);
+                    }
+                }
+            }
         }
+        const double k0 = arena.wavelengths_m[b] > 0.0
+            ? TWO_PI / arena.wavelengths_m[b] : 0.0;
+        const double weight = band_power[static_cast<size_t>(b)];
+        if (k0 <= 0.0 || weight <= 0.0) continue;
+        slope_x_sum += weight * std::arg(correlation_x) / (arena.dx*k0);
+        slope_y_sum += weight * std::arg(correlation_y) / (arena.dx*k0);
+        slope_weight += weight;
     }
-    double kx = (k_count > 0) ? kx_sum / k_count : 0.0;
-    double ky = (k_count > 0) ? ky_sum / k_count : 0.0;
-    const int k_band = state_lane >= 0 ? state_lane : 0;
-    double k0  = (nb > 0 && arena.wavelengths_m[k_band] > 0.0)
-               ? (TWO_PI / arena.wavelengths_m[k_band]) : 1.0;
-    double kz2 = k0*k0 - kx*kx - ky*ky;
-    double kz  = (kz2 > 0.0) ? std::sqrt(kz2) : k0;
-    const double propagation_sign = src.dir.dot(arena.axis_z) >= 0.0 ? 1.0 : -1.0;
-    V3d exit_dir = (arena.axis_x * (kx/k0)
-                  + arena.axis_y * (ky/k0)
-                  + arena.axis_z * (propagation_sign * kz/k0)).normalized();
+    double slope_x = slope_weight > 0.0 ? slope_x_sum/slope_weight : 0.0;
+    double slope_y = slope_weight > 0.0 ? slope_y_sum/slope_weight : 0.0;
+    const double transverse_sq = slope_x*slope_x + slope_y*slope_y;
+    if (transverse_sq >= 1.0) {
+        const double scale = (1.0 - 1.0e-12) / std::sqrt(transverse_sq);
+        slope_x *= scale;
+        slope_y *= scale;
+    }
+    const double slope_z = std::sqrt(std::max(
+        0.0, 1.0 - slope_x*slope_x - slope_y*slope_y));
+    const double sign = src.dir.dot(arena.axis_z) >= 0.0 ? 1.0 : -1.0;
+    const V3d exit_dir = (
+        arena.axis_x*slope_x + arena.axis_y*slope_y
+        + arena.axis_z*(sign*slope_z)).normalized();
 
-    double ox = ((nx - 1) * 0.5) * arena.dx;
-    double oy = ((ny - 1) * 0.5) * arena.dx;
-    V3d exit_pos = arena.center
-                 + arena.axis_z * (propagation_sign * arena.radius)
-                 + arena.axis_x * (ic_x * arena.dx - ox)
-                 + arena.axis_y * (ic_y * arena.dx - oy)
-                 + exit_dir * (EPS * 200.0);
+    const double ox = ((nx - 1)*0.5)*arena.dx;
+    const double oy = ((ny - 1)*0.5)*arena.dx;
+    const V3d physical_exit =
+        arena.center + arena.axis_z*(sign*arena.half_depth)
+        + arena.axis_x*(ic_x*arena.dx - ox)
+        + arena.axis_y*(ic_y*arena.dx - oy);
+    const V3d exit_pos = physical_exit + exit_dir*(EPS*200.0);
 
     VXcd exit_amp = state_lane >= 0
         ? VXcd::Zero(std::max<int>(static_cast<int>(src.amp.size()), nb))
         : VXcd(nb);
+    const size_t sample = padded_index(ic_x, ic_y);
     for (int b = band_begin; b < band_end; ++b) {
-        const float* re = s_re_all + static_cast<size_t>(b) * npix;
-        const float* im = s_im_all + static_cast<size_t>(b) * npix;
-        const int dst = state_lane >= 0
-            ? std::min<int>(src.spectral_lane_id, static_cast<int>(exit_amp.size()) - 1) : b;
-        const size_t sample = padded_index(ic_x, ic_y);
-        exit_amp[dst] = cd(re[sample], im[sample]);
+        const float* s_re = arena.field_re(
+            direction, wave_t4::TransverseComponent::S)
+            + static_cast<size_t>(b)*npix;
+        const float* s_im = arena.field_im(
+            direction, wave_t4::TransverseComponent::S)
+            + static_cast<size_t>(b)*npix;
+        const float* p_re = arena.field_re(
+            direction, wave_t4::TransverseComponent::P)
+            + static_cast<size_t>(b)*npix;
+        const float* p_im = arena.field_im(
+            direction, wave_t4::TransverseComponent::P)
+            + static_cast<size_t>(b)*npix;
+        const cd s_value(s_re[sample], s_im[sample]);
+        const cd p_value(p_re[sample], p_im[sample]);
+        const cd phase_source =
+            std::norm(p_value) > std::norm(s_value) ? p_value : s_value;
+        const double phase = std::abs(phase_source) > 0.0
+            ? std::arg(phase_source) : 0.0;
+        const int destination = state_lane >= 0
+            ? std::min<int>(
+                src.spectral_lane_id, static_cast<int>(exit_amp.size()) - 1)
+            : b;
+        exit_amp[destination] = std::polar(
+            std::sqrt(band_power[static_cast<size_t>(b)]), phase);
     }
 
-    ChildRay cr;
-    cr.intent              = src;
-    cr.intent.pos          = exit_pos;
-    cr.intent.dir          = exit_dir;
-    cr.intent.amp          = exit_amp;
-    cr.intent.path_len    += 2.0 * arena.radius;
-    cr.intent.bounce      += 1;
-    cr.intent.bounces_left = std::max(0, src.bounces_left - 1);
-    if (cr.intent.bdpt_vertex < 0xFFFFu) cr.intent.bdpt_vertex += 1u;
-    return cr;
+    ChildRay child;
+    child.intent = src;
+    child.intent.pos = exit_pos;
+    child.intent.dir = exit_dir;
+    child.intent.amp = exit_amp;
+    child.intent.path_len += (physical_exit - src.pos).norm();
+    child.intent.bounce += 1;
+    child.intent.bounces_left = std::max(0, src.bounces_left - 1);
+    if (child.intent.bdpt_vertex < 0xFFFFu)
+        child.intent.bdpt_vertex += 1u;
+
+    arena.boundary_telemetry.generation = arena.progress.generation;
+    arena.boundary_telemetry.state_lane = state_lane;
+    arena.boundary_telemetry.direction = static_cast<int>(direction);
+    arena.boundary_telemetry.exit_world = physical_exit;
+    arena.boundary_telemetry.exit_local =
+        wave_arena_to_local(arena, physical_exit);
+    arena.boundary_telemetry.exit_direction = exit_dir;
+    arena.boundary_telemetry.propagated_field_power =
+        arena.progress.field_power;
+    double output_power = 0.0;
+    for (int b = 0; b < static_cast<int>(exit_amp.size()); ++b)
+        output_power += std::norm(exit_amp[b]);
+    if (state_lane >= 0) {
+        if (state_lane == 0)
+            arena.boundary_telemetry.output_ray_power = 0.0;
+        arena.boundary_telemetry.output_ray_power += output_power;
+    } else {
+        arena.boundary_telemetry.output_ray_power = output_power;
+    }
+    return child;
 }
 
 /* ── In-flight accounting ─────────────────────────────────────────────────── */
@@ -15109,7 +15265,7 @@ static void pipeline_spawn_child(RayPipelineState& ps, RayIntent child)
  * BDPT in-flight accounting cannot drift between implementations. */
 static void wave_arena_complete(RayPipelineState& ps,
                                 WaveIntent& wi,
-                                const WaveArena& arena,
+                                WaveArena& arena,
                                 int state_lane)
 {
     ChildRay cr = wave_arena_extract(arena, wi.ray, state_lane);
@@ -15123,13 +15279,17 @@ static void wave_arena_complete(RayPipelineState& ps,
     rec.color_flag = wi.ray.color_flag;
     rec.sensor_origin_y = wi.ray.sensor_origin_y;
     rec.sensor_origin_z = wi.ray.sensor_origin_z;
-    rec.pos[0]   = static_cast<float>(wi.ray.pos.x());
-    rec.pos[1]   = static_cast<float>(wi.ray.pos.y());
-    rec.pos[2]   = static_cast<float>(wi.ray.pos.z());
-    rec.dir[0]   = static_cast<float>(wi.ray.dir.x());
-    rec.dir[1]   = static_cast<float>(wi.ray.dir.y());
-    rec.dir[2]   = static_cast<float>(wi.ray.dir.z());
-    rec.path_len = static_cast<float>(wi.ray.path_len);
+    rec.seg_start[0] = static_cast<float>(wi.ray.pos.x());
+    rec.seg_start[1] = static_cast<float>(wi.ray.pos.y());
+    rec.seg_start[2] = static_cast<float>(wi.ray.pos.z());
+    rec.pos[0]   = static_cast<float>(cr.intent.pos.x());
+    rec.pos[1]   = static_cast<float>(cr.intent.pos.y());
+    rec.pos[2]   = static_cast<float>(cr.intent.pos.z());
+    rec.dir[0]   = static_cast<float>(cr.intent.dir.x());
+    rec.dir[1]   = static_cast<float>(cr.intent.dir.y());
+    rec.dir[2]   = static_cast<float>(cr.intent.dir.z());
+    rec.path_at_seg_start = static_cast<float>(wi.ray.path_len);
+    rec.path_len = static_cast<float>(cr.intent.path_len);
     const int nb = std::min((int)cr.intent.amp.size(), RAY_RECORD_MAX_BANDS);
     rec.n_bands  = nb;
     for (int b = 0; b < nb; ++b) {
@@ -15198,23 +15358,16 @@ static void pipeline_intersector(RayPipelineState& ps)
                 }
             }
 
-            /* Wave arenas are volumes, not annotations on triangle hits. Route
-             * at the first positive sphere entry that precedes ordinary scene
-             * geometry. This also catches a ray crossing an otherwise empty
-             * arena, which the old hit-position test could never see. */
+            /* Wave arenas are oriented plane-to-plane patches, not spherical
+             * annotations. Their axial extent is exactly nz*dz, so routing and
+             * numerical propagation describe the same physical distance. */
             int wave_id = -1;
             double t_wave = 1e18;
             for (int ai = 0; ai < (int)ps.arenas.size(); ++ai) {
                 const WaveArena& arena = ps.arenas[static_cast<size_t>(ai)];
-                const V3d oc = pos0 - arena.center;
-                const double b = oc.dot(dir);
-                const double c = oc.squaredNorm() - arena.radius_sq;
-                const double disc = b*b - c;
-                if (disc < 0.0) continue;
-                const double root = std::sqrt(disc);
-                double candidate = -b - root;
-                if (candidate <= T_SELF) candidate = -b + root;
-                if (candidate > T_SELF && candidate < t_wave && candidate < t_hit) {
+                double candidate = 0.0;
+                if (wave_arena_entry_distance(
+                        arena, pos0, dir, std::min(t_wave, t_hit), candidate)) {
                     t_wave = candidate;
                     wave_id = ai;
                 }
@@ -18632,6 +18785,16 @@ int ray_pipeline_get_wave_arena_snapshot(const RayPipelineState* ps,
         static_cast<uint64_t>(arena.state_block.size());
     out->longitudinal_steps = arena.nz;
     out->absorber_cells = arena.boundary.absorber_cells;
+    out->transverse_half_extent_m = arena.radius;
+    out->longitudinal_extent_m = 2.0 * arena.half_depth;
+    out->sample_pitch_m = arena.dx;
+    out->longitudinal_step_m = arena.dz;
+    for (int axis = 0; axis < 3; ++axis) {
+        out->center_world[axis] = arena.center[axis];
+        out->axis_x_world[axis] = arena.axis_x[axis];
+        out->axis_y_world[axis] = arena.axis_y[axis];
+        out->axis_z_world[axis] = arena.axis_z[axis];
+    }
     out->generation = arena.progress.generation;
     out->completed_steps = arena.progress.completed_steps;
     out->input_power = arena.progress.input_power;
@@ -18648,6 +18811,22 @@ int ray_pipeline_get_wave_arena_snapshot(const RayPipelineState* ps,
     for (int field = 0; field < wave_t4::kFieldCount; ++field)
         out->field_active[field] =
             arena.field_active[static_cast<size_t>(field)];
+    const auto& bt = arena.boundary_telemetry;
+    out->boundary_generation = bt.generation;
+    out->boundary_state_lane = bt.state_lane;
+    out->boundary_direction = bt.direction;
+    for (int axis = 0; axis < 3; ++axis) {
+        out->boundary_entry_world[axis] = bt.entry_world[axis];
+        out->boundary_exit_world[axis] = bt.exit_world[axis];
+        out->boundary_entry_local[axis] = bt.entry_local[axis];
+        out->boundary_exit_local[axis] = bt.exit_local[axis];
+        out->boundary_entry_direction[axis] = bt.entry_direction[axis];
+        out->boundary_exit_direction[axis] = bt.exit_direction[axis];
+    }
+    out->boundary_input_ray_power = bt.input_ray_power;
+    out->boundary_seeded_field_power = bt.seeded_field_power;
+    out->boundary_propagated_field_power = bt.propagated_field_power;
+    out->boundary_output_ray_power = bt.output_ray_power;
     return SK_OK;
 }
 

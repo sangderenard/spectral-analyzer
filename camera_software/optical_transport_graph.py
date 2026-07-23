@@ -213,6 +213,11 @@ class InstalledOpticalTransportGraph:
                     "center_m": list(arena.center_m),
                     "axis": list(arena.axis),
                     "radius_m": arena.radius_m,
+                    "boundary_geometry": "oriented-plane-to-plane-patch",
+                    "transverse_half_extent_m": arena.radius_m,
+                    "longitudinal_extent_m": (
+                        arena.longitudinal_step_m * arena.longitudinal_steps
+                    ),
                     "longitudinal_step_m": arena.longitudinal_step_m,
                     "longitudinal_steps": arena.longitudinal_steps,
                 }
@@ -223,6 +228,8 @@ class InstalledOpticalTransportGraph:
                 "available_after_pipeline_start": True,
                 "field_texture_source": "persistent-t4-state-display-resolve",
                 "field_texture_opt_in": True,
+                "entry_adapter": "unit-l2-gaussian-with-transverse-phase",
+                "exit_adapter": "power-preserving-first-moment-ray",
             },
         }
 

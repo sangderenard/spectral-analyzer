@@ -267,6 +267,24 @@ def test_production_angular_spectrum_plane_wave_phase_and_reverse():
 
 
 @pytest.mark.parametrize("bands", [1, 3, 4, 8, 16, 32])
+def test_production_absorbing_border_is_exact_lane_and_keeps_interior(bands):
+    tracer = _tracer(np.linspace(450.0e-9, 650.0e-9, bands))
+    re = np.ones((bands, 16, 16), np.float32)
+    im = np.zeros_like(re)
+    result = tracer.t4_apply_absorbing_border(
+        bands, 16, 16, 4, 8.0, 1.0, re, im,
+    )
+
+    assert result["absorbed_power"] > 0.0
+    assert result["border_power"] < float(bands * 16 * 16)
+    assert result["field_power"] == pytest.approx(
+        float(np.sum(re*re + im*im)), rel=1.0e-6
+    )
+    assert re[0, 8, 8] == pytest.approx(1.0)
+    assert re[0, 0, 0] < 0.001
+
+
+@pytest.mark.parametrize("bands", [1, 3, 4, 8, 16, 32])
 @pytest.mark.parametrize("width,height", [(8, 16), (16, 8), (32, 16)])
 @pytest.mark.parametrize("direction_sign", [1, -1])
 def test_fftfree_t4_matches_split_complex_reference(

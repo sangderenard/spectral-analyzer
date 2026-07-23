@@ -263,6 +263,13 @@ that adapter to qualify vector transport. This demonstrates that the existing
 T4 kernels can carry the state; it does not claim that the scalar production
 ray-to-arena or arena-to-ray adapters have been replaced.
 
+The aperture qualification client now surrounds its visible crop with a
+power-of-two hidden solve domain and applies the production numerical exterior
+after each propagation substep. Its balanced/high/bake tiers deliberately
+trade 4x/16x/64x visible-sample memory for boundary distance and convergence.
+This removes the former unpadded calibration FFT's square periodic-box
+signature without introducing a demo-private propagation or absorber.
+
 ## Removal gates
 
 Legacy production paths are deleted only after the replacement passes:

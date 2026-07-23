@@ -10,6 +10,7 @@ or hard array mask is used.
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import numpy as np
@@ -238,6 +239,7 @@ _APERTURE_POLARIZATION_MODES = (
     "linear", "circular+", "circular-", "radial", "azimuthal",
     "partial", "unpolarized",
 )
+_APERTURE_QUALITY_MODES = ("balanced", "high", "bake")
 
 
 def _aperture_polarization_state(name: str, angle_deg: float = 0.0):
@@ -403,13 +405,18 @@ def _transport_table_rgba(
     return np.asarray(image, np.uint8)
 
 
-def _aperture_geometry_rgba(aperture, size: int) -> np.ndarray:
+def _aperture_geometry_rgba(
+    aperture, size: int, *, view_radius_m: float | None = None,
+) -> np.ndarray:
     """Orthographic projection of the actual finite blade triangle mesh."""
 
     vertices, _ = aperture.triangle_mesh()
     image = Image.new("RGBA", (size, size), (7, 11, 18, 255))
     draw = ImageDraw.Draw(image)
-    radius = aperture.assembly_radius_m
+    radius = (
+        aperture.assembly_radius_m
+        if view_radius_m is None else float(view_radius_m)
+    )
 
     def point(value):
         return (
@@ -757,6 +764,7 @@ def run_aperture_live(
     wavelength_m: float = 532.0e-9,
     fps: int = 30,
     polarization_mode: str = "radial",
+    quality: str = "balanced",
     _max_display_frames: int | None = None,
 ) -> None:
     """Animate Jones-resolved interaction with physical material iris blades."""
@@ -770,13 +778,19 @@ def run_aperture_live(
         raise ValueError(
             f"polarization_mode must be one of {_APERTURE_POLARIZATION_MODES}"
         )
+    quality_key = str(quality).strip().lower()
+    if quality_key not in _APERTURE_QUALITY_MODES:
+        raise ValueError(f"quality must be one of {_APERTURE_QUALITY_MODES}")
     import pygame
     from OpenGL import GL as gl
     from camera_software.gpu_preview import (
         GLPreviewCompositor, PreviewProductKind, PreviewTextureProduct,
     )
     from camera_software.physical_aperture import LivePhysicalAperture
-    from camera_software.vector_wave_adapter import JonesFieldState
+    from camera_software.vector_wave_adapter import (
+        JonesFieldState,
+        PaddedWaveDomain,
+    )
 
     pygame.init()
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
@@ -814,6 +828,7 @@ def run_aperture_live(
     source_angle_deg = 0.0
     analyzer_angle_deg = 0.0
     polarization_index = _APERTURE_POLARIZATION_MODES.index(polarization_key)
+    quality_index = _APERTURE_QUALITY_MODES.index(quality_key)
     generation = 0
     displayed_frames = 0
     try:
@@ -834,6 +849,10 @@ def run_aperture_live(
                         polarization_index = (
                             polarization_index + 1
                         ) % len(_APERTURE_POLARIZATION_MODES)
+                    elif event.key == pygame.K_k:
+                        quality_index = (
+                            quality_index + 1
+                        ) % len(_APERTURE_QUALITY_MODES)
                     elif event.key == pygame.K_LEFT:
                         analyzer_angle_deg -= 5.0
                     elif event.key == pygame.K_RIGHT:
@@ -845,8 +864,20 @@ def run_aperture_live(
             if not paused:
                 generation += 1
             phase = generation*0.018
-            opening, aperture_extent, sweep = _aperture_sweep_radius(
+            opening, _display_extent, sweep = _aperture_sweep_radius(
                 phase, size, pitch_m,
+            )
+            active_quality = _APERTURE_QUALITY_MODES[quality_index]
+            domain = PaddedWaveDomain.for_quality(
+                (size, size), active_quality
+            )
+            solve_height, solve_width = domain.solve_shape
+            # Cover the complete hidden rectangle with physical blade
+            # material. A display-sized assembly would leave an unintended
+            # clear annulus in the guard region.
+            aperture_extent = 0.51 * math.hypot(
+                (solve_width - 1) * pitch_m,
+                (solve_height - 1) * pitch_m,
             )
             aperture = LivePhysicalAperture.iris(
                 "demo.live-iris",
@@ -864,7 +895,7 @@ def run_aperture_live(
                 polarization_index
             ]
             initial = JonesFieldState.from_scalar_field(
-                np.ones((size, size), np.complex64),
+                domain.uniform_scalar_field(),
                 _aperture_polarization_state(
                     active_polarization, source_angle_deg
                 ),
@@ -878,36 +909,25 @@ def run_aperture_live(
                 wavelengths_m=wavelengths,
                 payload=payload,
             )
-            reverse_material, _reverse_accounting = (
-                initial.apply_isotropic_material_native(
-                    tracer,
-                    pitch_m=pitch_m,
-                    distance_m=aperture.thickness_m,
-                    direction_sign=-1,
-                    wavelengths_m=wavelengths,
-                    payload=payload,
-                )
-            )
             distance = 90.0e-6
-            forward = material.propagate_native(
+            forward, boundary = material.propagate_open_native(
                 tracer,
                 pitch_m=pitch_m,
                 distance_m=distance,
                 direction_sign=1,
                 wavelengths_m=wavelengths,
+                domain=domain,
             )
-            reverse = reverse_material.propagate_native(
-                tracer,
-                pitch_m=pitch_m,
-                distance_m=distance,
-                direction_sign=-1,
-                wavelengths_m=wavelengths,
+            forward_stokes = tuple(
+                domain.crop(value) for value in forward.stokes()
             )
-            forward_stokes = forward.stokes()
-            reverse_stokes = reverse.stokes()
             if vector_page:
                 panels = (
-                    _aperture_geometry_rgba(aperture, size),
+                    _aperture_geometry_rgba(
+                        aperture,
+                        size,
+                        view_radius_m=0.5*(size-1)*pitch_m,
+                    ),
                     _scalar_rgba(forward_stokes[0]),
                     _polarization_rgba(forward_stokes),
                     _signed_scalar_rgba(
@@ -917,7 +937,9 @@ def run_aperture_live(
                         forward_stokes[3], forward_stokes[0]
                     ),
                     _scalar_rgba(
-                        forward.analyzer_intensity(analyzer_angle_deg)
+                        domain.crop(
+                            forward.analyzer_intensity(analyzer_angle_deg)
+                        )
                     ),
                 )
                 labels = (
@@ -929,14 +951,44 @@ def run_aperture_live(
                     f"ANALYZER {analyzer_angle_deg%180.0:.0f} DEG",
                 )
             else:
+                # Reverse work is needed only on the coherent diagnostics
+                # page; skipping it on the Stokes page pays for the larger
+                # open solve domain without compromising its result.
+                reverse_material, _reverse_accounting = (
+                    initial.apply_isotropic_material_native(
+                        tracer,
+                        pitch_m=pitch_m,
+                        distance_m=aperture.thickness_m,
+                        direction_sign=-1,
+                        wavelengths_m=wavelengths,
+                        payload=payload,
+                    )
+                )
+                reverse, _reverse_boundary = (
+                    reverse_material.propagate_open_native(
+                        tracer,
+                        pitch_m=pitch_m,
+                        distance_m=distance,
+                        direction_sign=-1,
+                        wavelengths_m=wavelengths,
+                        domain=domain,
+                    )
+                )
+                reverse_stokes = tuple(
+                    domain.crop(value) for value in reverse.stokes()
+                )
                 # Phase is meaningful per coherent mode. Mode zero is shown
                 # explicitly; incoherent modes are never summed in amplitude.
-                material_s = material.fields[0, 0, 0]
-                material_p = material.fields[0, 1, 0]
-                forward_s = forward.fields[0, 0, 0]
-                forward_p = forward.fields[0, 1, 0]
+                material_s = domain.crop(material.fields[0, 0, 0])
+                material_p = domain.crop(material.fields[0, 1, 0])
+                forward_s = domain.crop(forward.fields[0, 0, 0])
+                forward_p = domain.crop(forward.fields[0, 1, 0])
                 panels = (
-                    _aperture_geometry_rgba(aperture, size),
+                    _aperture_geometry_rgba(
+                        aperture,
+                        size,
+                        view_radius_m=0.5*(size-1)*pitch_m,
+                    ),
                     _phase_rgba(material_s, remove_piston=piston_removed),
                     _phase_rgba(material_p, remove_piston=piston_removed),
                     _phase_rgba(forward_s, remove_piston=piston_removed),
@@ -997,12 +1049,16 @@ def run_aperture_live(
                 f"source={active_polarization} "
                 f"angle={source_angle_deg%180.0:.0f}deg "
                 f"modes={forward.mode_count} "
+                f"quality={active_quality} "
+                f"solve={solve_width}x{solve_height}/{size}x{size} "
+                f"steps={domain.propagation_steps} "
                 f"diameter={2.0*opening*1e6:.2f} um "
                 f"range={sweep*100.0:.1f}% "
                 f"retention={accounting['output_power']/max(accounting['input_power'],1e-30):.5f} "
+                f"edge={boundary['border_fraction']:.2e} "
                 f"phase={'RELATIVE' if piston_removed else 'ABSOLUTE'} "
                 f"{'PAUSED ' if paused else ''}"
-                "[J source, [/] source angle, arrows analyzer, V page, "
+                "[J source, K quality, [/] source angle, arrows analyzer, V page, "
                 "P phase gauge, Space pause, Esc close]"
             )
             clock.tick(fps)
@@ -1252,6 +1308,12 @@ def main() -> int:
         default="radial",
         help="initial Jones/coherence source for --aperture-live",
     )
+    parser.add_argument(
+        "--aperture-quality",
+        choices=_APERTURE_QUALITY_MODES,
+        default="balanced",
+        help="hidden padded solve investment for --aperture-live",
+    )
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument(
         "--cycle-steps", type=int, default=120,
@@ -1265,6 +1327,7 @@ def main() -> int:
             size=args.aperture_size,
             fps=args.fps,
             polarization_mode=args.aperture_polarization,
+            quality=args.aperture_quality,
         )
         return 0
     if args.transport_live:

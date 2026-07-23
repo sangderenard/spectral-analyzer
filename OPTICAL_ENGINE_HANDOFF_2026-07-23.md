@@ -86,6 +86,12 @@ leaving the production ray-pipeline boundary honestly unfinished.
 - coherent s/p material and propagated phase views;
 - forward and reverse vector propagation through real finite material blades;
 - relative-phase display with piston removed, or absolute phase on demand.
+- padded open-boundary solve tiers:
+  - balanced: 2x width, 4x samples, 4 propagation substeps;
+  - high: 4x width, 16x samples, 8 propagation substeps;
+  - bake: 8x width, 64x samples, 16 propagation substeps;
+- the production exact-lane absorbing exterior after every substep, with only
+  the central requested field published to the OpenGL panels.
 
 The blade material is isotropic, so it does not invent polarization conversion.
 The demo is a qualification and visualization client of shared production T4

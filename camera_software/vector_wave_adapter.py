@@ -18,6 +18,97 @@ from camera_designer.emitter_profile import PolarizationMode, PolarizationState
 from .complex_optical_operators import TransverseBasis
 
 
+_OPEN_DOMAIN_QUALITY = {
+    # solve-width multiplier, propagation substeps, absorber width divisor
+    "balanced": (2, 4, 8),
+    "high": (4, 8, 8),
+    "bake": (8, 16, 8),
+}
+
+
+@dataclass(frozen=True)
+class PaddedWaveDomain:
+    """Hidden open-boundary solve domain surrounding a visible field crop."""
+
+    visible_shape: tuple[int, int]
+    solve_shape: tuple[int, int]
+    crop_y: slice
+    crop_x: slice
+    absorber_cells: int
+    absorber_strength: float
+    propagation_steps: int
+    quality: str
+
+    @classmethod
+    def for_quality(
+        cls,
+        visible_shape: tuple[int, int],
+        quality: str = "balanced",
+        *,
+        absorber_strength: float = 8.0,
+    ) -> "PaddedWaveDomain":
+        height, width = (int(value) for value in visible_shape)
+        if height < 1 or width < 1:
+            raise ValueError("visible wave-domain dimensions must be positive")
+        key = str(quality).strip().lower()
+        try:
+            scale, steps, absorber_divisor = _OPEN_DOMAIN_QUALITY[key]
+        except KeyError as exc:
+            raise ValueError(
+                f"wave-domain quality must be one of "
+                f"{tuple(_OPEN_DOMAIN_QUALITY)}"
+            ) from exc
+
+        def power_of_two_ceiling(value: int) -> int:
+            return 1 << (max(1, value) - 1).bit_length()
+
+        solve_height = power_of_two_ceiling(height * scale)
+        solve_width = power_of_two_ceiling(width * scale)
+        pad_y = (solve_height - height) // 2
+        pad_x = (solve_width - width) // 2
+        exterior_margin = min(pad_y, pad_x)
+        absorber_cells = min(
+            max(12, min(solve_height, solve_width) // absorber_divisor),
+            max(1, exterior_margin - 4),
+        )
+        if not math.isfinite(absorber_strength) or absorber_strength < 0.0:
+            raise ValueError("absorber strength must be finite and non-negative")
+        return cls(
+            visible_shape=(height, width),
+            solve_shape=(solve_height, solve_width),
+            crop_y=slice(pad_y, pad_y + height),
+            crop_x=slice(pad_x, pad_x + width),
+            absorber_cells=absorber_cells,
+            absorber_strength=float(absorber_strength),
+            propagation_steps=steps,
+            quality=key,
+        )
+
+    @property
+    def sample_count(self) -> int:
+        return int(self.solve_shape[0] * self.solve_shape[1])
+
+    @property
+    def investment_ratio(self) -> float:
+        visible = self.visible_shape[0] * self.visible_shape[1]
+        return float(self.sample_count / visible)
+
+    def uniform_scalar_field(
+        self, *, bands: int = 1, value: complex = 1.0 + 0.0j,
+    ) -> np.ndarray:
+        if int(bands) < 1:
+            raise ValueError("wave-domain band count must be positive")
+        return np.full(
+            (int(bands), *self.solve_shape), value, dtype=np.complex64
+        )
+
+    def crop(self, values: np.ndarray) -> np.ndarray:
+        array = np.asarray(values)
+        if array.shape[-2:] != self.solve_shape:
+            raise ValueError("field does not match padded solve dimensions")
+        return array[..., self.crop_y, self.crop_x]
+
+
 @dataclass(frozen=True)
 class JonesFieldState:
     """Independent coherent modes over s/p, spectral band, y, and x."""
@@ -231,5 +322,76 @@ class JonesFieldState:
             self.operator_id,
         )
 
+    def propagate_open_native(
+        self,
+        tracer: Any,
+        *,
+        pitch_m: float,
+        distance_m: float,
+        direction_sign: int,
+        wavelengths_m: np.ndarray,
+        domain: PaddedWaveDomain,
+    ) -> tuple["JonesFieldState", dict[str, float]]:
+        """Substep propagation through the production absorbing exterior."""
 
-__all__ = ["JonesFieldState"]
+        if self.shape != domain.solve_shape:
+            raise ValueError("Jones field must occupy the padded solve domain")
+        output = self.fields.copy()
+        steps = int(domain.propagation_steps)
+        step_distance = float(distance_m) / steps
+        absorbed = 0.0
+        border_power = 0.0
+        for _step in range(steps):
+            step_border_power = 0.0
+            for mode_index in range(self.mode_count):
+                for component in range(2):
+                    values = output[mode_index, component]
+                    re = np.ascontiguousarray(values.real, np.float32)
+                    im = np.ascontiguousarray(values.imag, np.float32)
+                    tracer.t4_angular_spectrum_step(
+                        self.band_count,
+                        self.shape[1],
+                        self.shape[0],
+                        float(pitch_m),
+                        step_distance,
+                        int(direction_sign),
+                        np.ascontiguousarray(wavelengths_m, np.float64),
+                        re,
+                        im,
+                    )
+                    result = tracer.t4_apply_absorbing_border(
+                        self.band_count,
+                        self.shape[1],
+                        self.shape[0],
+                        int(domain.absorber_cells),
+                        float(domain.absorber_strength),
+                        1.0 / steps,
+                        re,
+                        im,
+                    )
+                    output[mode_index, component] = re + 1j * im
+                    absorbed += float(result.get("absorbed_power", 0.0))
+                    step_border_power += float(
+                        result.get("border_power", 0.0)
+                    )
+            border_power = step_border_power
+        state = JonesFieldState(
+            output,
+            self.coherence_ids,
+            self.basis,
+            self.basis_id,
+            self.operator_id,
+        )
+        return state, {
+            "input_power": self.total_power(),
+            "output_power": state.total_power(),
+            "absorbed_power": absorbed,
+            "border_power": border_power,
+            "border_fraction": border_power / max(state.total_power(), 1.0e-30),
+            "steps": float(steps),
+            "solve_samples": float(domain.sample_count),
+            "investment_ratio": domain.investment_ratio,
+        }
+
+
+__all__ = ["JonesFieldState", "PaddedWaveDomain"]

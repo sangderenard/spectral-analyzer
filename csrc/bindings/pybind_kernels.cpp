@@ -4578,6 +4578,44 @@ struct PyRayTracer
         return result;
     }
 
+    py::dict t4_apply_absorbing_border(
+        int n_bands,
+        int w,
+        int h,
+        int absorber_cells,
+        float absorber_strength,
+        float step_fraction,
+        py::array_t<float, py::array::c_style> re_arr,
+        py::array_t<float, py::array::c_style> im_arr)
+    {
+        auto re = re_arr.request();
+        auto im = im_arr.request();
+        const py::ssize_t expected =
+            static_cast<py::ssize_t>(n_bands) * w * h;
+        if (re.size != expected || im.size != expected
+            || absorber_cells < 0 || absorber_strength < 0.0f
+            || step_fraction < 0.0f)
+            throw std::invalid_argument(
+                "T4 absorbing-border dimensions or parameters are invalid");
+        wave_t4::BoundaryConfig boundary;
+        boundary.guard_cells = 0;
+        boundary.absorber_cells = absorber_cells;
+        boundary.absorber_strength = absorber_strength;
+        wave_t4::Progress progress{};
+        if (!wave_t4::apply_absorbing_border(
+                n_bands, w, h, boundary, step_fraction,
+                static_cast<float*>(re.ptr), static_cast<float*>(im.ptr),
+                &progress))
+            throw std::runtime_error("T4 absorbing border rejected input");
+        py::dict result;
+        result["field_power"] = progress.field_power;
+        result["border_power"] = progress.border_power;
+        result["absorbed_power"] = progress.absorbed_power;
+        result["absorber_cells"] = absorber_cells;
+        result["absorber_strength"] = absorber_strength;
+        return result;
+    }
+
     /* ── Stateful scheduler ─────────────────────────────────────────────── */
 
     void spawn(
@@ -7329,6 +7367,23 @@ Apply the production T4 finite complex-index aperture operator in place.
 The fixed payload is emitted by LivePhysicalAperture. This calibration entry
 uses the same exact-lane material implementation as a persistent wave arena;
 it is not an ideal mask or a separate propagation solver.
+)doc")
+        .def("t4_apply_absorbing_border",
+             &PyRayTracer::t4_apply_absorbing_border,
+             py::arg("n_bands"),
+             py::arg("w"),
+             py::arg("h"),
+             py::arg("absorber_cells"),
+             py::arg("absorber_strength"),
+             py::arg("step_fraction"),
+             py::arg("re"),
+             py::arg("im"),
+             R"doc(
+Apply the production T4 open-boundary absorber and return power telemetry.
+
+This exposes the same exact-lane numerical exterior used after persistent
+wave-arena propagation steps. It is intended for calibration and preview
+clients that call the production propagation kernel directly.
 )doc")
         .def("spawn", &PyRayTracer::spawn,
              py::arg("src_pos"),

@@ -177,11 +177,16 @@ authorized by this contract.
 Run:
 
 ```powershell
-python wave_transform_visual_demo.py --aperture-live --aperture-polarization radial
+python wave_transform_visual_demo.py --aperture-live --aperture-polarization radial --aperture-quality balanced
 ```
 
 The live view uses the real finite-thickness blade material and production
-native T4 kernels. `J` cycles source states; `[` and `]` rotate the source
+native T4 kernels. The visible field is a central crop of a hidden padded
+open-boundary domain rather than the periodic FFT rectangle. `balanced`,
+`high`, and `bake` invest respectively 4x, 16x, and 64x as many field samples
+as the visible crop, use 4, 8, and 16 homogeneous propagation substeps, and
+apply the production exact-lane absorber after every substep. `J` cycles
+source states; `K` cycles solve quality; `[` and `]` rotate the source
 orientation; Left/Right rotate the analyzer; `V` switches between Stokes and
 coherent-component phase pages; `P` switches relative and absolute phase;
 Space pauses.
@@ -193,3 +198,9 @@ coherence mode. Partial and unpolarized sources are never summed as complex
 amplitudes. Because the current blade material is isotropic, it correctly
 does not manufacture polarization conversion; radial and azimuthal inputs
 still expose spatially varying vector diffraction.
+
+The raw calibration FFT remains available for transform qualification, but it
+must not be mistaken for an open experiment: without padding it is periodic.
+The aperture client deliberately uses `PaddedWaveDomain` and
+`JonesFieldState.propagate_open_native`, which expose the same absorber as the
+persistent arena rather than reproducing a Python edge window.

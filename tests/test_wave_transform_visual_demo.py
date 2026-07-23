@@ -39,6 +39,8 @@ def test_live_mode_validates_before_opening_a_context():
         run_aperture_live(size=15)
     with pytest.raises(ValueError, match="polarization"):
         run_aperture_live(size=16, polarization_mode="invented")
+    with pytest.raises(ValueError, match="quality"):
+        run_aperture_live(size=16, quality="reckless")
 
 
 def test_relative_phase_gauge_removes_only_global_piston():

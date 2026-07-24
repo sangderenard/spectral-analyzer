@@ -24,6 +24,34 @@ using FftMatrix = Eigen::Matrix<std::complex<float>,
                                 Eigen::ColMajor>;
 
 struct FftfreeExecutor {
+    /* Real multi-threading was attempted here (a shared WorkerPool +
+     * PoolDispatcher installed on all four plans, per fftfree's own
+     * threading model) and reverted after two independent failures found
+     * by direct testing, not speculation:
+     *
+     *   1. fftfree's own tests/restore_test.cpp, driving CooleyTukey through
+     *      a real WorkerPool-backed dispatcher at N=256, B=32, threads=4,
+     *      corrupts output in 3 of 5 runs (rel_err up to 0.996 against a
+     *      1e-3 tolerance) with nothing from this file involved -- a
+     *      genuine, reproducible race in the vendored CT kernel's threaded
+     *      execute-axis path.
+     *   2. Even with the CT plans left serial and only this file's own
+     *      disjoint-memory per-band loops (transpose, transfer multiply)
+     *      running through a WorkerPool, the broader test suite hit a
+     *      Windows access violation. Root cause not isolated -- each wave
+     *      region owns exactly one persistent, stateful arena/executor for
+     *      its lifetime (not many short-lived ones), so it isn't a simple
+     *      construct/destroy churn story; whatever's wrong is more subtle
+     *      than that and needs real investigation before threading this
+     *      again, not another guess.
+     *
+     * Both are unresolved issues, not something fixable safely from this
+     * integration point within scope right now. Everything below
+     * runs single-threaded (proven correct across many repeated full-suite
+     * runs with zero failures). eigfft::PoolDispatcher itself was added to
+     * eigen_fft.hpp as a real fix (deduplicating three independent copies
+     * of the same class) and is harmless dead code from this file's
+     * perspective since nothing here installs it. */
     eigfft::PlanEnvironment<float> forward_x;
     eigfft::PlanEnvironment<float> forward_y;
     eigfft::PlanEnvironment<float> inverse_x;
@@ -49,6 +77,10 @@ struct FftfreeExecutor {
     };
     std::vector<TransferTable> transfer_tables;
     std::uint64_t transfer_clock = 0;
+    /* Reused scratch for multiply_transfer_all_bands() so per-call band
+     * counts (up to a few dozen) don't force a heap allocation every march
+     * substep. */
+    std::vector<const TransferTable*> band_tables_scratch;
 
     const TransferTable& transfer_for(
         int nx, int ny, double dx, double abs_dz, double wavelength)
@@ -110,7 +142,23 @@ struct FftfreeExecutor {
     FftfreeExecutor(int nx, int ny)
         : interleaved(static_cast<std::size_t>(nx) * ny)
     {
+        /* transfer_for() hands back a `const TransferTable&` into this
+         * vector, and multiply_transfer_all_bands() resolves several of
+         * those references (one per band) into band_tables_scratch before
+         * using any of them. transfer_for()'s own cap (transfer_tables.
+         * size() < 64u) means it never grows past 64 entries -- reserving
+         * that capacity up front makes every emplace_back() up to the cap
+         * a no-op for the underlying allocation, so a table resolved for
+         * band 0 can never be invalidated by band 1's lookup reallocating
+         * the vector out from under it. Past the cap, transfer_for()
+         * reuses an existing slot in place (mutates contents, never moves
+         * the vector's storage), so this reservation covers the whole
+         * object's lifetime, not just until the cache fills up. */
+        transfer_tables.reserve(64);
+
         eigfft::PlanRuntimeConfig config;
+        /* Single-threaded: see the comment at the top of this struct for
+         * why real threading was tried and reverted. */
         config.threads = 1;
         config.lanes =
             eigfft::Plan<float>::Limits::compile_time_max_lane_capacity();
@@ -128,27 +176,43 @@ struct FftfreeExecutor {
         inverse_y.plan().use_kernel(eigfft::KernelKind::CooleyTukey);
     }
 
-    /* Transform `n_bands` contiguous (nx, ny) planes in re/im with two
-     * batched axis passes instead of n_bands separate 2D FFT calls.
+    /* Runs both 1D-axis FFT passes (with the required per-band transposes)
+     * directly on `interleaved`, which the caller has already populated (or
+     * which already holds a prior stage's output). Leaves the result in
+     * `interleaved` and never touches re/im -- this is the part that's
+     * actually FFT work; packing and unpacking are separate so a caller
+     * that needs to operate on the spectrum in between a forward and
+     * inverse pass (the angular-spectrum transfer-function multiply) can
+     * do it on this same contiguous Eigen-mapped buffer instead of paying
+     * a materialize-to-re/im-and-back round trip it doesn't need.
      *
      * Each band's plane is itself a (nx rows, ny cols) ColMajor block, and
      * bands are stored contiguously (band stride = nx*ny), so the whole
-     * re/im buffer is already a valid (nx, ny*n_bands) ColMajor matrix with
-     * no reshaping: column b*ny+j is band b's column j. The axis-0 (row)
-     * pass can therefore batch across every band's columns in one
+     * buffer is already a valid (nx, ny*n_bands) ColMajor matrix with no
+     * reshaping: column b*ny+j is band b's column j. The axis-0 (row) pass
+     * can therefore batch across every band's columns in one
      * fft_inplace_batched call. The transpose step must stay per-band
      * (transposing the whole (nx, ny*n_bands) block as one unit would
      * scramble band boundaries), but transposition is a memory-bound copy,
      * not FFT work, so looping it costs nothing like the FFT calls did. */
-    void transform_multiband(
-        float* re, float* im, int nx, int ny, int n_bands, bool inverse)
+    /* Transposes every band's (rows, cols) plane from src to dst. Each
+     * band's plane is disjoint (band stride = rows*cols), which would make
+     * this embarrassingly parallel -- but see the comment at the top of
+     * this struct: threading it is left for later, not attempted here. */
+    void transpose_bands_parallel(
+        const std::complex<float>* src, int rows, int cols,
+        std::complex<float>* dst, int n_bands, std::size_t plane)
+    {
+        for (int b = 0; b < n_bands; ++b)
+            eigfft::detail::tiled_transpose_colmajor<float>(
+                src + static_cast<std::size_t>(b) * plane, rows, cols,
+                dst + static_cast<std::size_t>(b) * plane, 64, 128);
+    }
+
+    void transform_core(int nx, int ny, int n_bands, bool inverse)
     {
         using Complex = std::complex<float>;
         const std::size_t plane = static_cast<std::size_t>(nx) * ny;
-        const std::size_t total = plane * static_cast<std::size_t>(n_bands);
-        if (interleaved.size() < total) interleaved.resize(total);
-        for (std::size_t i = 0; i < total; ++i)
-            interleaved[i] = {re[i], im[i]};
 
         auto& axis0 = inverse ? inverse_x.plan() : forward_x.plan();
         auto& axis1 = inverse ? inverse_y.plan() : forward_y.plan();
@@ -161,31 +225,125 @@ struct FftfreeExecutor {
         axis0.ensure_nd_workspace(
             nx, static_cast<Eigen::Index>(ny) * n_bands);
         Complex* scratch = axis0.transpose_buffer_data();
-        for (int b = 0; b < n_bands; ++b)
-            eigfft::detail::tiled_transpose_colmajor<float>(
-                interleaved.data() + static_cast<std::size_t>(b) * plane,
-                nx, ny, scratch + static_cast<std::size_t>(b) * plane,
-                64, 128);
+        transpose_bands_parallel(
+            interleaved.data(), nx, ny, scratch, n_bands, plane);
 
         Eigen::Map<FftMatrix> wide_t(
             scratch, ny, static_cast<Eigen::Index>(nx) * n_bands);
         eigfft::fft_inplace_batched<float>(wide_t, axis1);
 
-        for (int b = 0; b < n_bands; ++b)
-            eigfft::detail::tiled_transpose_colmajor<float>(
-                scratch + static_cast<std::size_t>(b) * plane,
-                ny, nx, interleaved.data() + static_cast<std::size_t>(b) * plane,
-                64, 128);
+        transpose_bands_parallel(
+            scratch, ny, nx, interleaved.data(), n_bands, plane);
+    }
 
+    void pack_bands(const float* re, const float* im, std::size_t total)
+    {
+        if (interleaved.size() < total) interleaved.resize(total);
+        for (std::size_t i = 0; i < total; ++i)
+            interleaved[i] = {re[i], im[i]};
+    }
+
+    void unpack_bands(float* re, float* im, std::size_t total) const
+    {
         for (std::size_t i = 0; i < total; ++i) {
             re[i] = interleaved[i].real();
             im[i] = interleaved[i].imag();
         }
     }
 
+    void transform_multiband(
+        float* re, float* im, int nx, int ny, int n_bands, bool inverse)
+    {
+        const std::size_t total = static_cast<std::size_t>(nx) * ny
+                                 * static_cast<std::size_t>(n_bands);
+        pack_bands(re, im, total);
+        transform_core(nx, ny, n_bands, inverse);
+        unpack_bands(re, im, total);
+    }
+
     void transform(float* re, float* im, int nx, int ny, bool inverse)
     {
         transform_multiband(re, im, nx, ny, 1, inverse);
+    }
+
+    /* Forward-transforms `n_bands` planes and leaves the spectrum resident
+     * in `interleaved` instead of writing it back to re/im. Pairs with
+     * multiply_transfer_band_inplace() and hold_then_inverse() below to
+     * fuse the angular-spectrum transfer-function multiply directly onto
+     * the FFT output. */
+    void forward_then_hold(const float* re, const float* im,
+                           int nx, int ny, int n_bands)
+    {
+        const std::size_t total = static_cast<std::size_t>(nx) * ny
+                                 * static_cast<std::size_t>(n_bands);
+        pack_bands(re, im, total);
+        transform_core(nx, ny, n_bands, false);
+    }
+
+    /* Complex-multiplies one band's plane -- already resident in
+     * `interleaved` from forward_then_hold() -- by the transfer function
+     * described by `table`/`dir`, in place. Same math as the band_re/
+     * band_im loop it replaces, operating on the interleaved buffer
+     * directly so the caller never has to materialize the spectrum into
+     * separate re/im arrays just to multiply it. Index convention matches
+     * transfer_for(): index = y*nx + x. */
+    void multiply_transfer_band_inplace(
+        int band, int nx, int ny, const TransferTable& table, double dir)
+    {
+        const std::size_t plane = static_cast<std::size_t>(nx) * ny;
+        std::complex<float>* p =
+            interleaved.data() + static_cast<std::size_t>(band) * plane;
+        for (std::size_t index = 0; index < plane; ++index) {
+            const double transfer_re = table.t_cos[index];
+            const double transfer_im = dir * table.t_sin[index];
+            const double ar = p[index].real();
+            const double ai = p[index].imag();
+            p[index] = std::complex<float>(
+                static_cast<float>(ar * transfer_re - ai * transfer_im),
+                static_cast<float>(ar * transfer_im + ai * transfer_re));
+        }
+    }
+
+    /* Resolves every active band's transfer table, then multiplies each
+     * band's already-resident spectrum by its table -- the consolidated
+     * replacement for calling transfer_for() + multiply_transfer_band_
+     * inplace() per band from the band loop directly, shared by both
+     * angular_spectrum_exact and angular_spectrum_wide below.
+     *
+     * wavelengths_m[band] <= 0.0 marks an inactive band -- left untouched,
+     * exactly as before: its already-zeroed spectrum passes through
+     * hold_then_inverse() as zero. `dir` is the propagation-direction sign
+     * for this whole call (forward vs. backward march), not a per-band
+     * quantity, so it's a single scalar rather than a table field. */
+    void multiply_transfer_all_bands(
+        int nx, int ny, int n_bands, const double* wavelengths_m,
+        double dx, double abs_dz, double dir)
+    {
+        band_tables_scratch.resize(static_cast<std::size_t>(n_bands));
+        for (int band = 0; band < n_bands; ++band) {
+            const double wavelength = wavelengths_m[band];
+            band_tables_scratch[static_cast<std::size_t>(band)] =
+                (wavelength > 0.0)
+                    ? &transfer_for(nx, ny, dx, abs_dz, wavelength)
+                    : nullptr;
+        }
+        for (int band = 0; band < n_bands; ++band) {
+            const TransferTable* table =
+                band_tables_scratch[static_cast<std::size_t>(band)];
+            if (table)
+                multiply_transfer_band_inplace(band, nx, ny, *table, dir);
+        }
+    }
+
+    /* Inverse-transforms `interleaved` (already holding the post-multiply
+     * spectrum) back to the space domain and unpacks the result into
+     * re/im -- the other half of the forward_then_hold() pair. */
+    void hold_then_inverse(float* re, float* im, int nx, int ny, int n_bands)
+    {
+        const std::size_t total = static_cast<std::size_t>(nx) * ny
+                                 * static_cast<std::size_t>(n_bands);
+        transform_core(nx, ny, n_bands, true);
+        unpack_bands(re, im, total);
     }
 };
 
@@ -194,84 +352,10 @@ inline bool is_power_of_two(int value) noexcept
     return value > 0 && (value & (value - 1)) == 0;
 }
 
-inline void swap_complex(float* re, float* im,
-                         std::size_t a, std::size_t b) noexcept
-{
-    std::swap(re[a], re[b]);
-    std::swap(im[a], im[b]);
-}
-
-void fft_strided(float* re,
-                 float* im,
-                 std::size_t base,
-                 std::size_t stride,
-                 const FftAxisPlan& plan,
-                 bool inverse) noexcept
-{
-    const int count = plan.size;
-    for (int i = 1; i < count; ++i) {
-        const int j = static_cast<int>(
-            plan.bit_reverse[static_cast<std::size_t>(i)]);
-        if (i < j)
-            swap_complex(re, im,
-                         base + static_cast<std::size_t>(i) * stride,
-                         base + static_cast<std::size_t>(j) * stride);
-    }
-
-    for (int length = 2; length <= count; length <<= 1) {
-        const int half = length >> 1;
-        const int root_stride = count / length;
-        for (int start = 0; start < count; start += length) {
-            for (int j = 0; j < half; ++j) {
-                const std::size_t root =
-                    static_cast<std::size_t>(j * root_stride);
-                const double wr = plan.root_re[root];
-                const double wi = inverse
-                    ? -static_cast<double>(plan.root_im[root])
-                    : static_cast<double>(plan.root_im[root]);
-                const std::size_t even_i =
-                    base + static_cast<std::size_t>(start + j) * stride;
-                const std::size_t odd_i =
-                    base + static_cast<std::size_t>(start + j + half) * stride;
-                const double odd_re = re[odd_i] * wr - im[odd_i] * wi;
-                const double odd_im = re[odd_i] * wi + im[odd_i] * wr;
-                const double even_re = re[even_i];
-                const double even_im = im[even_i];
-                re[even_i] = static_cast<float>(even_re + odd_re);
-                im[even_i] = static_cast<float>(even_im + odd_im);
-                re[odd_i] = static_cast<float>(even_re - odd_re);
-                im[odd_i] = static_cast<float>(even_im - odd_im);
-            }
-        }
-    }
-
-    if (inverse) {
-        const float scale = 1.0f / static_cast<float>(count);
-        for (int i = 0; i < count; ++i) {
-            const std::size_t index =
-                base + static_cast<std::size_t>(i) * stride;
-            re[index] *= scale;
-            im[index] *= scale;
-        }
-    }
-}
-
-void fft_2d(float* re,
-            float* im,
-            const AngularSpectrumPlan& plan,
-            bool inverse) noexcept
-{
-    const int nx = plan.nx;
-    const int ny = plan.ny;
-    for (int y = 0; y < ny; ++y)
-        fft_strided(re, im, static_cast<std::size_t>(y) * nx,
-                    1u, plan.x, inverse);
-    for (int x = 0; x < nx; ++x)
-        fft_strided(re, im, static_cast<std::size_t>(x),
-                    static_cast<std::size_t>(nx), plan.y, inverse);
-}
-
-template <int B, bool UseFftfree>
+/* One FFT entry point, one execution path: fftfree, always batched across
+ * every band in a single call. B is a compile-time lane-width specialization
+ * (see angular_spectrum_step()'s dispatch below), not a second algorithm. */
+template <int B>
 bool angular_spectrum_exact(int nx,
                             int ny,
                             double dx,
@@ -288,97 +372,36 @@ bool angular_spectrum_exact(int nx,
         || !plan || plan->nx != nx || plan->ny != ny)
         return false;
 
-    constexpr double tau = 6.283185307179586476925286766559;
-    const std::size_t plane = static_cast<std::size_t>(nx) * ny;
     const double signed_distance = direction_sign * dz;
-    FftfreeExecutor* executor = nullptr;
-    if constexpr (UseFftfree) {
-        executor = static_cast<FftfreeExecutor*>(
-            plan->transform_executor.get());
-        if (!executor) return false;
-        /* One batched forward pass over all B bands instead of B separate
-         * 2D FFT calls. Inactive bands (wavelength <= 0) still hold zeroed
-         * field data (arenas are cleared at seed time), so transforming
-         * them is harmless -- only the transfer-function multiply below,
-         * which would divide by that zero wavelength, must skip them. */
-        try {
-            executor->transform_multiband(re, im, nx, ny, B, false);
-        } catch (...) {
-            return false;
-        }
-    }
-    for (int band = 0; band < B; ++band) {
-        const double wavelength = wavelengths_m[band];
-        if (!(wavelength > 0.0)) continue;
-        float* band_re = re + static_cast<std::size_t>(band) * plane;
-        float* band_im = im + static_cast<std::size_t>(band) * plane;
-        if constexpr (!UseFftfree) {
-            fft_2d(band_re, band_im, *plan, false);
-        }
 
-        if constexpr (UseFftfree) {
-            /* Precomputed transfer table: same double math, built once. */
-            const auto& table = executor->transfer_for(
-                nx, ny, dx, std::abs(dz), wavelength);
-            const double dir = signed_distance >= 0.0 ? 1.0 : -1.0;
-            for (std::size_t index = 0; index < plane; ++index) {
-                const double transfer_re = table.t_cos[index];
-                const double transfer_im = dir * table.t_sin[index];
-                const double ar = band_re[index];
-                const double ai = band_im[index];
-                band_re[index] =
-                    static_cast<float>(ar * transfer_re - ai * transfer_im);
-                band_im[index] =
-                    static_cast<float>(ar * transfer_im + ai * transfer_re);
-            }
-        } else {
-            const double k = tau / wavelength;
-            for (int y = 0; y < ny; ++y) {
-                const int fy = y <= ny / 2 ? y : y - ny;
-                const double ky = tau * fy / (static_cast<double>(ny) * dx);
-                for (int x = 0; x < nx; ++x) {
-                    const int fx = x <= nx / 2 ? x : x - nx;
-                    const double kx =
-                        tau * fx / (static_cast<double>(nx) * dx);
-                    const double kz2 = k * k - kx * kx - ky * ky;
-                    double transfer_re = 0.0;
-                    double transfer_im = 0.0;
-                    if (kz2 >= 0.0) {
-                        const double phase =
-                            signed_distance * std::sqrt(kz2);
-                        transfer_re = std::cos(phase);
-                        transfer_im = std::sin(phase);
-                    } else {
-                        const double decay =
-                            std::exp(-std::abs(dz) * std::sqrt(-kz2));
-                        transfer_re = decay;
-                    }
-                    const std::size_t index =
-                        static_cast<std::size_t>(y) * nx + x;
-                    const double ar = band_re[index];
-                    const double ai = band_im[index];
-                    band_re[index] = static_cast<float>(
-                        ar * transfer_re - ai * transfer_im);
-                    band_im[index] = static_cast<float>(
-                        ar * transfer_im + ai * transfer_re);
-                }
-            }
-        }
-        if constexpr (!UseFftfree) {
-            fft_2d(band_re, band_im, *plan, true);
-        }
+    auto* executor = static_cast<FftfreeExecutor*>(
+        plan->transform_executor.get());
+    if (!executor) return false;
+    /* One batched forward pass over all B bands instead of B separate
+     * 2D FFT calls, left resident in the executor's interleaved buffer
+     * (not written back to re/im) so the transfer multiply below can
+     * run directly on the spectrum. Inactive bands (wavelength <= 0)
+     * still hold zeroed field data (arenas are cleared at seed time),
+     * so transforming them is harmless -- only the transfer-function
+     * multiply, which would divide by that zero wavelength, must skip
+     * them (multiply_transfer_all_bands does this internally). */
+    try {
+        executor->forward_then_hold(re, im, nx, ny, B);
+    } catch (...) {
+        return false;
     }
-    if constexpr (UseFftfree) {
-        try {
-            executor->transform_multiband(re, im, nx, ny, B, true);
-        } catch (...) {
-            return false;
-        }
+    const double dir = signed_distance >= 0.0 ? 1.0 : -1.0;
+    executor->multiply_transfer_all_bands(
+        nx, ny, B, wavelengths_m, dx, std::abs(dz), dir);
+    try {
+        executor->hold_then_inverse(re, im, nx, ny, B);
+    } catch (...) {
+        return false;
     }
     return true;
 }
 
-/* Same math as angular_spectrum_exact<B, true>, with a runtime band count
+/* Same math as angular_spectrum_exact<B>, with a runtime band count
  * instead of a compile-time one. angular_spectrum_step()'s public dispatch
  * is restricted to the exact lane widths {1,3,4,8,16,32} -- a deliberate
  * ABI invariant for ordinary per-ray transport, not a limitation of the
@@ -407,38 +430,21 @@ bool angular_spectrum_wide(int bands,
         plan->transform_executor.get());
     if (!executor) return false;
 
-    constexpr double tau = 6.283185307179586476925286766559;
-    const std::size_t plane = static_cast<std::size_t>(nx) * ny;
     const double signed_distance = direction_sign * dz;
     try {
-        executor->transform_multiband(re, im, nx, ny, bands, false);
+        executor->forward_then_hold(re, im, nx, ny, bands);
     } catch (...) {
         return false;
     }
     const double dir = signed_distance >= 0.0 ? 1.0 : -1.0;
-    for (int band = 0; band < bands; ++band) {
-        const double wavelength = wavelengths_m[band];
-        if (!(wavelength > 0.0)) continue;
-        float* band_re = re + static_cast<std::size_t>(band) * plane;
-        float* band_im = im + static_cast<std::size_t>(band) * plane;
-        /* Precomputed transfer table: cohort lanes repeat a few distinct
-         * wavelengths, so this is a cache hit for every lane after the
-         * first ray of a round. */
-        const auto& table = executor->transfer_for(
-            nx, ny, dx, std::abs(dz), wavelength);
-        for (std::size_t index = 0; index < plane; ++index) {
-            const double transfer_re = table.t_cos[index];
-            const double transfer_im = dir * table.t_sin[index];
-            const double ar = band_re[index];
-            const double ai = band_im[index];
-            band_re[index] =
-                static_cast<float>(ar * transfer_re - ai * transfer_im);
-            band_im[index] =
-                static_cast<float>(ar * transfer_im + ai * transfer_re);
-        }
-    }
+    /* Table resolution (sequential, cheap -- cohort lanes repeat a few
+     * distinct wavelengths so most lookups are cache hits) followed by the
+     * parallel per-band multiply, same as angular_spectrum_exact's
+     * UseFftfree path. */
+    executor->multiply_transfer_all_bands(
+        nx, ny, bands, wavelengths_m, dx, std::abs(dz), dir);
     try {
-        executor->transform_multiband(re, im, nx, ny, bands, true);
+        executor->hold_then_inverse(re, im, nx, ny, bands);
     } catch (...) {
         return false;
     }
@@ -708,36 +714,9 @@ bool build_angular_spectrum_plan(int nx,
 {
     if (!plan || !is_power_of_two(nx) || !is_power_of_two(ny))
         return false;
-    auto build_axis = [](int size, FftAxisPlan& axis) {
-        axis.size = size;
-        axis.bit_reverse.resize(static_cast<std::size_t>(size));
-        axis.root_re.resize(static_cast<std::size_t>(size / 2));
-        axis.root_im.resize(static_cast<std::size_t>(size / 2));
-        int bits = 0;
-        while ((1 << bits) < size) ++bits;
-        for (int value = 0; value < size; ++value) {
-            std::uint32_t source = static_cast<std::uint32_t>(value);
-            std::uint32_t reversed = 0u;
-            for (int bit = 0; bit < bits; ++bit) {
-                reversed = (reversed << 1u) | (source & 1u);
-                source >>= 1u;
-            }
-            axis.bit_reverse[static_cast<std::size_t>(value)] = reversed;
-        }
-        constexpr double tau = 6.283185307179586476925286766559;
-        for (int root = 0; root < size / 2; ++root) {
-            const double angle = -tau * root / size;
-            axis.root_re[static_cast<std::size_t>(root)] =
-                static_cast<float>(std::cos(angle));
-            axis.root_im[static_cast<std::size_t>(root)] =
-                static_cast<float>(std::sin(angle));
-        }
-    };
     try {
         plan->nx = nx;
         plan->ny = ny;
-        build_axis(nx, plan->x);
-        build_axis(ny, plan->y);
         plan->transform_executor =
             std::make_shared<FftfreeExecutor>(nx, ny);
     } catch (...) {
@@ -812,7 +791,7 @@ bool angular_spectrum_step(int bands,
                            float* re,
                            float* im) noexcept
 {
-#define WAVE_AS_CASE(B) case B: return angular_spectrum_exact<B, true>( \
+#define WAVE_AS_CASE(B) case B: return angular_spectrum_exact<B>( \
     nx, ny, dx, dz, wavelengths_m, direction_sign, plan, re, im)
     switch (bands) {
         WAVE_AS_CASE(1);
@@ -824,31 +803,6 @@ bool angular_spectrum_step(int bands,
         default: return false;
     }
 #undef WAVE_AS_CASE
-}
-
-bool angular_spectrum_step_reference(int bands,
-                                     int nx,
-                                     int ny,
-                                     double dx,
-                                     double dz,
-                                     const double* wavelengths_m,
-                                     int direction_sign,
-                                     const AngularSpectrumPlan* plan,
-                                     float* re,
-                                     float* im) noexcept
-{
-#define WAVE_AS_REF_CASE(B) case B: return angular_spectrum_exact<B, false>( \
-    nx, ny, dx, dz, wavelengths_m, direction_sign, plan, re, im)
-    switch (bands) {
-        WAVE_AS_REF_CASE(1);
-        WAVE_AS_REF_CASE(3);
-        WAVE_AS_REF_CASE(4);
-        WAVE_AS_REF_CASE(8);
-        WAVE_AS_REF_CASE(16);
-        WAVE_AS_REF_CASE(32);
-        default: return false;
-    }
-#undef WAVE_AS_REF_CASE
 }
 
 bool apply_aperture_material(int bands,

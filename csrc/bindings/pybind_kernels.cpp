@@ -1946,7 +1946,8 @@ struct PyRayTracer
         int                  seed          = 42,
         bool                 use_gpu_compute = false,
         bool                 gpu_all_stages  = false,
-        std::string          shader_dir      = "")
+        std::string          shader_dir      = "",
+        py::object           launch_times    = py::none())
     {
         auto io = origins   .request();
         auto id = directions.request();
@@ -1984,6 +1985,13 @@ struct PyRayTracer
             if (cflag_arr.request().size != n_rays)
                 throw std::invalid_argument("color_flags length must match origins");
         }
+        py::array_t<double> ltime_arr;
+        bool has_ltime = !launch_times.is_none();
+        if (has_ltime) {
+            ltime_arr = launch_times.cast<py::array_t<double>>();
+            if (ltime_arr.request().size != n_rays)
+                throw std::invalid_argument("launch_times length must match origins");
+        }
 
         const double* op = static_cast<const double*>(io.ptr);
         const double* dp = static_cast<const double*>(id.ptr);
@@ -1997,6 +2005,8 @@ struct PyRayTracer
             ? static_cast<const uint64_t*>(tag_arr.request().ptr) : nullptr;
         const uint8_t*  cp = has_cflag
             ? static_cast<const uint8_t*>(cflag_arr.request().ptr) : nullptr;
+        const double*   ltp = has_ltime
+            ? static_cast<const double*>(ltime_arr.request().ptr) : nullptr;
 
         std::vector<RayIntent> intents(n_rays);
         for (int i = 0; i < n_rays; ++i) {
@@ -2013,6 +2023,7 @@ struct PyRayTracer
             ri.src_id        = sp ? sp[i] : i;
             ri.tag           = tp ? tp[i] : static_cast<uint64_t>(i);
             ri.color_flag    = cp ? cp[i] : 0u;
+            ri.launch_time   = ltp ? ltp[i] : 0.0;
             const uint8_t film_channel = static_cast<uint8_t>((ri.tag >> 60) & 0x3u);
             if (((ri.color_flag & 1u) != 0u) && film_channel == 1u)
                 ri.priority = 1.0e9f;
@@ -2160,6 +2171,7 @@ struct PyRayTracer
         py::array_t<float>    normal_arr   ({(py::ssize_t)N, (py::ssize_t)3});
         py::array_t<float>    path_len_arr(N);
         py::array_t<float>    path_seg_arr(N);
+        py::array_t<float>    launch_time_arr(N);
         py::array_t<int32_t>  hit_tri_arr(N);
         py::array_t<int32_t>  mat_idx_arr(N);
         py::array_t<int32_t>  arena_id_arr(N);
@@ -2184,6 +2196,7 @@ struct PyRayTracer
             auto* no  = normal_arr    .mutable_data();
             auto* pl  = path_len_arr  .mutable_data();
             auto* ps_ = path_seg_arr  .mutable_data();
+            auto* lt  = launch_time_arr.mutable_data();
             auto* ht  = hit_tri_arr   .mutable_data();
             auto* mi  = mat_idx_arr   .mutable_data();
             auto* ai  = arena_id_arr  .mutable_data();
@@ -2209,6 +2222,7 @@ struct PyRayTracer
                 no[i*3+0] = r.normal[0];    no[i*3+1] = r.normal[1];    no[i*3+2] = r.normal[2];
                 pl[i]  = r.path_len;
                 ps_[i] = r.path_at_seg_start;
+                lt[i]  = r.launch_time;
                 ht[i]  = r.hit_tri;
                 mi[i]  = r.mat_idx;
                 ai[i]  = r.arena_id;
@@ -2242,6 +2256,7 @@ struct PyRayTracer
         out["normal"]     = normal_arr;
         out["path_len"]   = path_len_arr;
         out["path_at_seg"] = path_seg_arr;
+        out["launch_time"] = launch_time_arr;
         out["hit_tri"]    = hit_tri_arr;
         out["mat_idx"]    = mat_idx_arr;
         out["arena_id"]   = arena_id_arr;
@@ -4771,43 +4786,6 @@ struct PyRayTracer
                 "T4 angular-spectrum step rejected its dimensions or lane count");
     }
 
-    void t4_angular_spectrum_step_reference(
-        int n_bands,
-        int w,
-        int h,
-        double dx,
-        double dz,
-        int direction_sign,
-        py::array_t<double, py::array::c_style> wavelengths_arr,
-        py::array_t<float, py::array::c_style> re_arr,
-        py::array_t<float, py::array::c_style> im_arr)
-    {
-        auto wavelengths = wavelengths_arr.request();
-        auto re = re_arr.request();
-        auto im = im_arr.request();
-        const py::ssize_t expected =
-            static_cast<py::ssize_t>(n_bands) * w * h;
-        if (wavelengths.size != n_bands
-            || re.size != expected || im.size != expected)
-            throw std::invalid_argument(
-                "T4 reference buffers do not match band/grid dimensions");
-        std::lock_guard<std::mutex> lock(_t4_calibration_plan_mu);
-        if ((_t4_calibration_plan_w != w || _t4_calibration_plan_h != h)
-            && !wave_t4::build_angular_spectrum_plan(
-                w, h, &_t4_calibration_plan))
-            throw std::runtime_error("failed to build T4 calibration plan");
-        _t4_calibration_plan_w = w;
-        _t4_calibration_plan_h = h;
-        if (!wave_t4::angular_spectrum_step_reference(
-                n_bands, w, h, dx, dz,
-                static_cast<const double*>(wavelengths.ptr),
-                direction_sign, &_t4_calibration_plan,
-                static_cast<float*>(re.ptr),
-                static_cast<float*>(im.ptr)))
-            throw std::runtime_error(
-                "T4 reference step rejected its dimensions or lane count");
-    }
-
     py::tuple t4_apply_rigid_field_interface(
         int n_bands,
         int w,
@@ -6990,8 +6968,12 @@ Returns dict with:
              py::arg("use_gpu_compute") = false,
              py::arg("gpu_all_stages")  = false,
              py::arg("shader_dir")      = "",
+             py::arg("launch_times")    = py::none(),
 R"doc(Non-blocking submit: push ray intents into the persistent pipeline.
 Returns immediately; the pipeline processes them concurrently.
+launch_times: optional per-ray launch time in seconds (float64, shape (N,)).
+Defaults to 0.0 for every ray. Propagated unchanged through every child
+bounce; local_time at any later crossing = launch_time + path_len/speed_m_s.
 Call drain_records() to collect output records.)doc")
         .def("submit_emissive_triangles", &PyRayTracer::submit_emissive_triangles,
              py::arg("tri_ids"),
@@ -7742,18 +7724,6 @@ This is a calibration aperture into the same native implementation used by
 wave arenas, not a separate solver. Width and height must be powers of two.
 The buffers are band-major float32 complex planes and are modified in place.
 )doc")
-        .def("t4_angular_spectrum_step_reference",
-             &PyRayTracer::t4_angular_spectrum_step_reference,
-             py::arg("n_bands"),
-             py::arg("w"),
-             py::arg("h"),
-             py::arg("dx"),
-             py::arg("dz"),
-             py::arg("direction_sign"),
-             py::arg("wavelengths_m"),
-             py::arg("re"),
-             py::arg("im"),
-             "Diagnostic split-complex reference transform for parity tests.")
         .def("t4_apply_rigid_field_interface",
              &PyRayTracer::t4_apply_rigid_field_interface,
              py::arg("n_bands"),

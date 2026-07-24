@@ -52,6 +52,13 @@ struct RayIntent {
     Eigen::Vector3d  pos, dir;
     Eigen::VectorXcd amp;
     double           path_len          = 0.0;
+    /* Wall/sim-clock time this ray's root was launched (seconds), assigned
+     * once at submission and propagated unchanged into every child intent --
+     * same pattern as spectral_frequency_hz/bdpt_subpath_id below. The local
+     * time at any later crossing is launch_time + path_len / speed_m_s
+     * (RayTracerState::speed_m_s); path_len is the optical path length
+     * (index-weighted), not raw geometric distance. */
+    double           launch_time       = 0.0;
     int              medium_mat_idx    = -1;
     uint32_t         interaction_flags = 0u;
     int              src_id            = 0;
@@ -288,6 +295,11 @@ struct RayRecord {
     float         normal[3]         = {};  /* surface normal at hit (STRIKE)    */
     float         path_len          = 0.f; /* cumulative path length at hit     */
     float         path_at_seg_start = 0.f;
+    /* Root ray's launch time (seconds). Local time at this record =
+     * launch_time + path_len / speed_m_s. 0 for GPU-compute-path records
+     * (the GPU hit buffer does not carry launch_time through its SSBO
+     * layout yet). */
+    float         launch_time       = 0.f;
     int32_t       hit_tri           = -1;
     int32_t       hit_group_id      = -1;  /* tri_param_group_of_tri[hit_tri], or -1 */
     int32_t       mat_idx           = -1;
@@ -829,6 +841,16 @@ struct WaveArena {
      * and propagated by arena-to-arena transfer). Slices beyond this hold
      * zeros and are skipped by material/border/measure accounting. */
     int              active_lanes = 0;
+    /* Per-lane-slice z-step progress (index by lane0/n_bands, i.e. one entry
+     * per cohort ray-slice, not per raw lane). -1 = slot empty/inactive.
+     * Lets a slice reach nz and retire independently of every other slice's
+     * progress, so a freed slot can be re-seeded with a newly queued ray
+     * without waiting for slower slices in the same cohort to finish their
+     * own march. Populated and consumed by the per-tick march path; unused
+     * (left at -1) by the legacy whole-cohort wave_arena_march() path. */
+    std::array<int, 32> lane_step = []{
+        std::array<int, 32> a{}; a.fill(-1); return a;
+    }();
     int              band_specialization = -1;
     wave_t4::SpectralMode spectral_mode = wave_t4::SpectralMode::FixedBands;
     wave_t4::BackendKind backend = wave_t4::BackendKind::AngularSpectrum;

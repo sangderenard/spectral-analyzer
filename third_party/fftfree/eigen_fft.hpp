@@ -1423,6 +1423,57 @@ class WorkerPool {
 // include them at namespace scope to avoid nested `eigfft::detail::eigfft::detail`.
 } // namespace detail
 using detail::WorkerPool;
+
+// Pool-backed JobDispatcher: forwards algorithm work to a caller-owned
+// WorkerPool, falling back to inline execution when no pool is attached
+// (or the pool pointer hasn't been set yet). This is the "outer WorkerPool"
+// half of the threading model described in README.md: install one of these,
+// bound to a single shared WorkerPool, via Plan::set_dispatcher() on every
+// Plan that should share that pool's thread budget.
+//
+// fftfree does not reconcile pool sizing against arena sizing on its own --
+// the caller must keep the WorkerPool's thread count consistent with the
+// PlanRuntimeConfig::threads used to build each Plan (with
+// allow_outer_parallel=true). A pool larger than the arena's thread
+// capacity can hand a kernel a worker_id past the end of its per-thread
+// scratch buffers.
+//
+// This was previously duplicated ad hoc in fft_cffi.cpp, main.cpp, and
+// tests/restore_test.cpp; this is the one canonical implementation.
+class PoolDispatcher : public JobDispatcher {
+ public:
+  PoolDispatcher() = default;
+  explicit PoolDispatcher(WorkerPool* pool) : pool_(pool) {}
+
+  void set_pool(WorkerPool* pool) { pool_ = pool; }
+  WorkerPool* pool() const { return pool_; }
+
+  void parallel_for(size_t total, size_t chunk, const Fn& fn) override {
+    if (!pool_ || total == 0) {
+      InlineDispatcher::instance().parallel_for(total, chunk, fn);
+      return;
+    }
+    pool_->parallel_for(total, chunk == 0 ? 1 : chunk, fn);
+  }
+
+  void parallel_for_with_restore(size_t total,
+                                 size_t chunk,
+                                 const Fn& fn,
+                                 std::function<void(size_t,size_t)> restore_fn,
+                                 RecoveryOps ops,
+                                 void* job_ctx) override {
+    if (!pool_ || total == 0) {
+      InlineDispatcher::instance().parallel_for_with_restore(
+          total, chunk, fn, std::move(restore_fn), ops, job_ctx);
+      return;
+    }
+    pool_->parallel_for_with_restore_ex(
+        total, chunk == 0 ? 1 : chunk, fn, std::move(restore_fn), ops, job_ctx);
+  }
+
+ private:
+  WorkerPool* pool_ = nullptr;
+};
 } // namespace eigfft
 
 // Force the core to use the external butterfly types (compat header with

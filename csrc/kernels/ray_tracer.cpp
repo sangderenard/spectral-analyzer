@@ -15731,7 +15731,31 @@ static void wave_arena_seed_fixed_cohort(
 }
 
 /* March both transverse components in the active propagation direction. */
-static bool wave_arena_march(WaveArena& arena)
+/* Advances every active lane by exactly one z-step, using each n_bands-wide
+ * slice's own arena.lane_step[] entry (indexed by lane0/n_bands) for its
+ * material-crossing position -- NOT one shared step for the whole arena.
+ * Slices seeded at different times sit at different physical depths
+ * simultaneously; each one's crossing state depends only on its own
+ * history, never on when any other slice joined.
+ *
+ * Propagation itself only depends on distance travelled, not absolute
+ * position, so every active lane always shares one batched propagate()
+ * call per half/full step regardless of whether all of them need the
+ * material split this tick: for the phase-linear angular-spectrum formula
+ * used here, composing two half-dz propagates is exactly (not
+ * approximately) equal to one full-dz propagate, so splitting the whole
+ * batch whenever *any* slice needs material this tick costs nothing for
+ * the slices that don't -- their zero-distance apply_aperture_material
+ * call is skipped, and their two half-steps recombine to precisely the
+ * same result a single full step would have given them.
+ *
+ * Split out of wave_arena_march() so a per-tick scheduler can call this
+ * directly instead of the whole-cohort nz-step loop. lane_step entries for
+ * inactive slices (lane_step < 0) are skipped for material purposes; a
+ * caller doing per-tick lane fill/drain scheduling is responsible for
+ * setting each newly-filled slice's lane_step to 0 and leaving freed
+ * slices at -1. */
+static bool wave_arena_tick(WaveArena& arena)
 {
     const float step_fraction = 1.0f / static_cast<float>(std::max(1, arena.nz));
     /* One tick advances EVERY active lane -- all bands of all cohort rays --
@@ -15743,86 +15767,112 @@ static bool wave_arena_march(WaveArena& arena)
     const int active = std::max(arena.n_bands, arena.active_lanes);
     const bool wide = active > arena.n_bands;
     const size_t npix = static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
-    for (int step = 0; step < arena.nz; ++step) {
-        for (int direction = 0;
-             direction < wave_t4::kDirectionCount; ++direction) {
-            for (int component = 0;
-                 component < wave_t4::kTransverseComponentCount; ++component) {
-                const auto d = static_cast<wave_t4::Direction>(direction);
-                const auto c =
-                    static_cast<wave_t4::TransverseComponent>(component);
-                const int field = wave_t4::field_index(d, c);
-                if (!arena.field_active[static_cast<size_t>(field)]) continue;
-                const int sign =
-                    d == wave_t4::Direction::Forward ? 1 : -1;
-                float* re = arena.field_re(d, c);
-                float* im = arena.field_im(d, c);
-                auto propagate = [&](double distance) -> bool {
-                    if (wide)
-                        return wave_t4::angular_spectrum_step_wide(
-                            active, arena.fft_nx, arena.fft_ny,
-                            arena.dx, distance, arena.wavelengths_m,
-                            sign, &arena.angular_plan, re, im);
-                    return wave_t4::angular_spectrum_step(
-                        arena.n_bands, arena.fft_nx, arena.fft_ny,
+    for (int direction = 0;
+         direction < wave_t4::kDirectionCount; ++direction) {
+        for (int component = 0;
+             component < wave_t4::kTransverseComponentCount; ++component) {
+            const auto d = static_cast<wave_t4::Direction>(direction);
+            const auto c =
+                static_cast<wave_t4::TransverseComponent>(component);
+            const int field = wave_t4::field_index(d, c);
+            if (!arena.field_active[static_cast<size_t>(field)]) continue;
+            const int sign =
+                d == wave_t4::Direction::Forward ? 1 : -1;
+            float* re = arena.field_re(d, c);
+            float* im = arena.field_im(d, c);
+            auto propagate = [&](double distance) -> bool {
+                if (wide)
+                    return wave_t4::angular_spectrum_step_wide(
+                        active, arena.fft_nx, arena.fft_ny,
                         arena.dx, distance, arena.wavelengths_m,
                         sign, &arena.angular_plan, re, im);
-                };
-                double material_distance = 0.0;
-                if (arena.has_aperture_material) {
+                return wave_t4::angular_spectrum_step(
+                    arena.n_bands, arena.fft_nx, arena.fft_ny,
+                    arena.dx, distance, arena.wavelengths_m,
+                    sign, &arena.angular_plan, re, im);
+            };
+            std::array<double, 32> slice_material_distance{};
+            bool any_material = false;
+            if (arena.has_aperture_material) {
+                for (int lane0 = 0; lane0 < active; lane0 += arena.n_bands) {
+                    const int slice = lane0 / arena.n_bands;
+                    const int lstep = arena.lane_step[static_cast<size_t>(slice)];
+                    if (lstep < 0) continue;
                     const double segment_center = sign > 0
-                        ? -arena.half_depth + (step+0.5)*arena.dz
-                        :  arena.half_depth - (step+0.5)*arena.dz;
+                        ? -arena.half_depth + (lstep+0.5)*arena.dz
+                        :  arena.half_depth - (lstep+0.5)*arena.dz;
                     const double segment_lo = segment_center-0.5*arena.dz;
                     const double segment_hi = segment_center+0.5*arena.dz;
                     const double material_lo = arena.aperture_center_z_m
                         - 0.5*arena.aperture_material.thickness_m;
                     const double material_hi = arena.aperture_center_z_m
                         + 0.5*arena.aperture_material.thickness_m;
-                    material_distance = std::max(
+                    const double dist = std::max(
                         0.0, std::min(segment_hi, material_hi)
                            - std::max(segment_lo, material_lo));
-                }
-                if (material_distance > 0.0) {
-                    if (!propagate(0.5*arena.dz))
-                        return false;
-                    for (int lane0 = 0; lane0 < active;
-                         lane0 += arena.n_bands) {
-                        wave_t4::Progress material_progress{};
-                        if (!wave_t4::apply_aperture_material(
-                                arena.n_bands, arena.fft_nx, arena.fft_ny,
-                                arena.dx, arena.wavelengths_m + lane0, sign,
-                                arena.aperture_material, material_distance,
-                                re + static_cast<size_t>(lane0) * npix,
-                                im + static_cast<size_t>(lane0) * npix,
-                                &material_progress))
-                            return false;
-                        arena.progress.absorbed_power +=
-                            material_progress.absorbed_power;
-                    }
-                    if (!propagate(0.5*arena.dz))
-                        return false;
-                } else {
-                    if (!propagate(arena.dz))
-                        return false;
-                }
-                for (int lane0 = 0; lane0 < active;
-                     lane0 += arena.n_bands) {
-                    wave_t4::Progress field_progress{};
-                    wave_t4::apply_absorbing_border(
-                        arena.n_bands, arena.fft_nx, arena.fft_ny,
-                        arena.boundary, step_fraction,
-                        re + static_cast<size_t>(lane0) * npix,
-                        im + static_cast<size_t>(lane0) * npix,
-                        &field_progress);
-                    arena.progress.absorbed_power +=
-                        field_progress.absorbed_power;
+                    slice_material_distance[static_cast<size_t>(slice)] = dist;
+                    if (dist > 0.0) any_material = true;
                 }
             }
+            if (any_material) {
+                if (!propagate(0.5*arena.dz))
+                    return false;
+                for (int lane0 = 0; lane0 < active;
+                     lane0 += arena.n_bands) {
+                    const int slice = lane0 / arena.n_bands;
+                    const double dist =
+                        slice_material_distance[static_cast<size_t>(slice)];
+                    if (!(dist > 0.0)) continue;
+                    wave_t4::Progress material_progress{};
+                    if (!wave_t4::apply_aperture_material(
+                            arena.n_bands, arena.fft_nx, arena.fft_ny,
+                            arena.dx, arena.wavelengths_m + lane0, sign,
+                            arena.aperture_material, dist,
+                            re + static_cast<size_t>(lane0) * npix,
+                            im + static_cast<size_t>(lane0) * npix,
+                            &material_progress))
+                        return false;
+                    arena.progress.absorbed_power +=
+                        material_progress.absorbed_power;
+                }
+                if (!propagate(0.5*arena.dz))
+                    return false;
+            } else {
+                if (!propagate(arena.dz))
+                    return false;
+            }
+            for (int lane0 = 0; lane0 < active;
+                 lane0 += arena.n_bands) {
+                wave_t4::Progress field_progress{};
+                wave_t4::apply_absorbing_border(
+                    arena.n_bands, arena.fft_nx, arena.fft_ny,
+                    arena.boundary, step_fraction,
+                    re + static_cast<size_t>(lane0) * npix,
+                    im + static_cast<size_t>(lane0) * npix,
+                    &field_progress);
+                arena.progress.absorbed_power +=
+                    field_progress.absorbed_power;
+            }
         }
+    }
+    return true;
+}
+
+static bool wave_arena_march(WaveArena& arena)
+{
+    const int active = std::max(arena.n_bands, arena.active_lanes);
+    for (int lane0 = 0; lane0 < active; lane0 += arena.n_bands)
+        arena.lane_step[static_cast<size_t>(lane0 / arena.n_bands)] = 0;
+    for (int step = 0; step < arena.nz; ++step) {
+        if (!wave_arena_tick(arena))
+            return false;
+        for (int lane0 = 0; lane0 < active; lane0 += arena.n_bands)
+            ++arena.lane_step[static_cast<size_t>(lane0 / arena.n_bands)];
         ++arena.progress.completed_steps;
         wave_arena_measure_all(arena);
     }
+    for (int lane0 = 0; lane0 < active; lane0 += arena.n_bands)
+        arena.lane_step[static_cast<size_t>(lane0 / arena.n_bands)] = -1;
     ++arena.progress.generation;
     return true;
 }
@@ -16053,12 +16103,12 @@ static ChildRay wave_arena_extract(
                 ? spectral.frequency_hz
                 : arena.speed_m_s/std::max(
                     arena.wavelengths_m[b]*arena.n_real, 1.0e-30);
-            /* RayIntent currently accumulates geometric distance, not OPL.
-             * Do not manufacture an optical path by multiplying the complete
-             * lineage by this terminal arena's index: earlier segments may
-             * have crossed different media.  A later lineage accumulator can
-             * set OpticalPathValid without changing this record ABI. */
-            lane.meta.optical_path_m = 0.0;
+            /* child.intent.path_len is the lineage OPL accumulator (index-
+             * weighted inside exact parametric-lens traversal, geometric
+             * distance elsewhere -- see RayIntent::launch_time comment in
+             * ray_pipeline.h). Local time at this crossing is
+             * child.intent.launch_time + child.intent.path_len / arena.speed_m_s. */
+            lane.meta.optical_path_m = child.intent.path_len;
             lane.meta.spectral_pdf =
                 std::max(static_cast<double>(spectral.pdf), 1.0e-30);
             lane.meta.transport_jacobian = 1.0;
@@ -16071,7 +16121,8 @@ static ChildRay wave_arena_extract(
                 complex_transport::LaneActive
               | complex_transport::JonesValid
               | complex_transport::FieldReduction
-              | complex_transport::WaveExit;
+              | complex_transport::WaveExit
+              | complex_transport::OpticalPathValid;
             if (spectral.coherence_id != 0u)
                 lane.meta.flags |= complex_transport::Coherent;
             if (arena.spectral_mode
@@ -16298,6 +16349,7 @@ static void wave_arena_publish_terminal(
     rec.dir[2]   = static_cast<float>(child.intent.dir.z());
     rec.path_at_seg_start = static_cast<float>(wi.ray.path_len);
     rec.path_len = static_cast<float>(child.intent.path_len);
+    rec.launch_time = static_cast<float>(child.intent.launch_time);
     const int nb = std::min(
         static_cast<int>(child.intent.amp.size()), RAY_RECORD_MAX_BANDS);
     rec.n_bands = nb;
@@ -16557,6 +16609,7 @@ static void pipeline_intersector(RayPipelineState& ps)
                 rec.dir[1]    = static_cast<float>(dir.y());
                 rec.dir[2]    = static_cast<float>(dir.z());
                 rec.path_len  = static_cast<float>(intent.path_len);
+                rec.launch_time = static_cast<float>(intent.launch_time);
                 rec.color_flag = intent.color_flag;
                 rec.sensor_origin_y = intent.sensor_origin_y;
                 rec.sensor_origin_z = intent.sensor_origin_z;
@@ -16667,6 +16720,7 @@ static void pipeline_intersector(RayPipelineState& ps)
                 rec.normal[2]         = static_cast<float>(hr.hit_n.z());
                 rec.path_len          = static_cast<float>(tot_len);
                 rec.path_at_seg_start = static_cast<float>(intent.path_len);
+                rec.launch_time       = static_cast<float>(intent.launch_time);
                 rec.hit_tri           = hit_tri;
                 rec.hit_group_id      = (hit_tri >= 0 && (size_t)hit_tri < st.tri_param_group_of_tri.size())
                                         ? st.tri_param_group_of_tri[(size_t)hit_tri] : -1;
@@ -17001,6 +17055,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
         rec.normal[2]         = static_cast<float>(h.hit_n.z());
         rec.path_len          = static_cast<float>(h.ray.path_len);
         rec.path_at_seg_start = static_cast<float>(h.path_at_seg_start);
+        rec.launch_time       = static_cast<float>(h.ray.launch_time);
         rec.hit_tri           = h.hit_tri;
         rec.mat_idx           = (h.hit_tri >= 0)
             ? st.tris[static_cast<size_t>(h.hit_tri)].mat_idx : -1;
@@ -17590,23 +17645,29 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
 
 /* ── T4: wave solver ──────────────────────────────────────────────────────── */
 
-static void pipeline_wave_solver(RayPipelineState& ps)
+/* Processes one popped batch of WaveIntents to completion: claim arena(s),
+ * seed/march/complete whatever cohorts form, requeue anything owned
+ * elsewhere. Returns the number of intents popped (0 = queue was empty,
+ * nothing to do). Split out of pipeline_wave_solver() so a Nodus-scheduled
+ * ITool::tick() can drive exactly one unit of this work per tick instead of
+ * only the dedicated thread's own blocking while(true) loop -- both callers
+ * share this same body, not two implementations of the same logic. */
+static int pipeline_wave_solver_process_one_batch(RayPipelineState& ps,
+                                                   std::vector<WaveIntent>& batch)
 {
     using Clock = std::chrono::high_resolution_clock;
-    std::vector<WaveIntent> batch;
-
-    while (true) {
-        batch.clear();
-        /* Pop at least a full cohort's worth so queued same-arena rays can
-         * share one march instead of trickling through one at a time. */
-        int bsz = std::max(
-            32, ps.stats[3].batch_sz.load(std::memory_order_relaxed));
-        int n   = ps.Q_wave.pop_batch_exclusive_priority(
-            batch,
-            bsz,
-            [](const WaveIntent& wi) { return wi.ray.priority; },
-            1.0f);
-        if (n == 0) break;
+    batch.clear();
+    /* Pop at least a full cohort's worth so queued same-arena rays can
+     * share one march instead of trickling through one at a time. */
+    int bsz = std::max(
+        32, ps.stats[3].batch_sz.load(std::memory_order_relaxed));
+    int n   = ps.Q_wave.pop_batch_exclusive_priority(
+        batch,
+        bsz,
+        [](const WaveIntent& wi) { return wi.ray.priority; },
+        1.0f);
+    if (n == 0) return 0;
+    {
         auto t0 = Clock::now();
 
         std::vector<uint8_t> handled(static_cast<size_t>(n), 0u);
@@ -17715,6 +17776,46 @@ static void pipeline_wave_solver(RayPipelineState& ps)
             static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
             ps.Q_wave.size());
     }
+    return n;
+}
+
+static void pipeline_wave_solver(RayPipelineState& ps)
+{
+    std::vector<WaveIntent> batch;
+    while (pipeline_wave_solver_process_one_batch(ps, batch) != 0) {
+        /* keep draining until the queue is empty; the dedicated thread has
+         * nothing else to do, unlike the Nodus-scheduled tick path below. */
+    }
+}
+
+/* ── Stable C ABI boundary for a Nodus plugin DLL ────────────────────────────
+ * canvas_tables.def exports a plain C ABI only -- no C++ classes
+ * (ThreadManager, ToolRegistry, ITool) are exported from canvas_tables.dll,
+ * and _spectral_kernels.pyd must not link canvas_tables directly either
+ * (confirmed: ToolRegistrar::ToolRegistrar is absent from canvas_tables.lib's
+ * export table even though it compiles fine -- the .def file curates exports
+ * on purpose, the same "stable C ABI at the DLL boundary" pattern the
+ * extracted nodus_runtime.dll uses).
+ *
+ * So the wave solver becomes a real, schedulable Nodus module the same way:
+ * a *separate* plugin DLL, registered into Nodus's own tool registry (not a
+ * standalone LoadLibrary smoke test and not a privately-owned FIFO), implements
+ * ITool and calls back into this exported function through GetProcAddress to
+ * drive the referenced solver. That plugin must be handed a real Nodus-owned
+ * graph edge -- it must not fabricate its own inbox/outbox FIFO to stay
+ * "runnable in isolation". See NODUS_TOOL_BRIEF.md, NODUS_OPTICAL_KPN_INTEGRATION.md,
+ * and COHERENT_RECEPTION_POOL_HANDOFF.md.
+ *
+ * `pipeline` is the opaque RayPipelineState* handle (never a C++ reference
+ * across the DLL boundary). Returns the number of WaveIntents processed
+ * this call (0 = queue was empty). */
+extern "C" __declspec(dllexport)
+int spectral_wave_t4_tick(void* pipeline)
+{
+    if (!pipeline) return 0;
+    static thread_local std::vector<WaveIntent> batch;
+    return pipeline_wave_solver_process_one_batch(
+        *static_cast<RayPipelineState*>(pipeline), batch);
 }
 
 /* ── Public API ───────────────────────────────────────────────────────────── */

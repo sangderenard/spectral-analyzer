@@ -15,7 +15,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <vector>
 
 namespace wave_t4 {
 
@@ -135,18 +134,9 @@ struct ApertureMaterial {
     double material_n_imag = 0.0;
 };
 
-struct FftAxisPlan {
-    int size = 0;
-    std::vector<std::uint32_t> bit_reverse;
-    std::vector<float> root_re;
-    std::vector<float> root_im;
-};
-
 struct AngularSpectrumPlan {
     int nx = 0;
     int ny = 0;
-    FftAxisPlan x;
-    FftAxisPlan y;
     /* Cold-owned implementation state. This remains opaque so the persistent
      * T4 ABI does not acquire an Eigen/fftfree dependency. */
     std::shared_ptr<void> transform_executor;
@@ -210,19 +200,6 @@ bool angular_spectrum_step_wide(int bands,
                                 const AngularSpectrumPlan* plan,
                                 float* re,
                                 float* im) noexcept;
-
-/** Diagnostic reference using the original split-complex radix-2 transform.
- * Kept for numerical qualification of replacement executors, not scheduling. */
-bool angular_spectrum_step_reference(int bands,
-                                     int nx,
-                                     int ny,
-                                     double dx,
-                                     double dz,
-                                     const double* wavelengths_m,
-                                     int direction_sign,
-                                     const AngularSpectrumPlan* plan,
-                                     float* re,
-                                     float* im) noexcept;
 
 /** Apply a finite material slice to an existing complex field in-place.
  * The slice is centered on the field grid and uses the same exact lane

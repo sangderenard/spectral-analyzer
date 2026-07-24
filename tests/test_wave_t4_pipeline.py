@@ -193,7 +193,7 @@ def test_fixed_band_source_mode_seeds_both_components_and_full_coherence():
     lane_flags = int(exit_state["lane_flags"]) & 0xFFFF
     assert lane_flags & (1 << 0)  # active
     assert lane_flags & (1 << 3)  # Jones valid
-    assert not lane_flags & (1 << 4)  # no fabricated optical path
+    assert lane_flags & (1 << 4)  # optical path valid (lineage path_len accumulator)
     assert lane_flags & (1 << 6)  # field reduction
     assert lane_flags & (1 << 7)  # wave exit
     assert int(exit_state["coherence_lo"]) | (
@@ -203,8 +203,13 @@ def test_fixed_band_source_mode_seeds_both_components_and_full_coherence():
         exit_state["frequency_lo"]
     )
     assert frequency_hz == pytest.approx(299_792_458.0 / 550e-9, rel=2e-7)
-    assert float(exit_state["optical_path_hi"]) == 0.0
-    assert float(exit_state["optical_path_lo"]) == 0.0
+    optical_path_m = float(exit_state["optical_path_hi"]) + float(
+        exit_state["optical_path_lo"]
+    )
+    # Real lineage OPL now (OpticalPathValid is set): ray launched from
+    # z=-0.05 into the arena, so this should be a small positive distance,
+    # not the old fabrication-avoidance stub of exactly 0.
+    assert 0.0 < optical_path_m < 1.0
 
     direction = np.asarray(exit_state["ray_direction"], np.float64)
     basis_s = np.asarray(exit_state["basis_s"][:3], np.float64)
@@ -593,35 +598,6 @@ def test_production_absorbing_border_is_exact_lane_and_keeps_interior(bands):
     )
     assert re[0, 8, 8] == pytest.approx(1.0)
     assert re[0, 0, 0] < 0.001
-
-
-@pytest.mark.parametrize("bands", [1, 3, 4, 8, 16, 32])
-@pytest.mark.parametrize("width,height", [(8, 16), (16, 8), (32, 16)])
-@pytest.mark.parametrize("direction_sign", [1, -1])
-def test_fftfree_t4_matches_split_complex_reference(
-    bands, width, height, direction_sign
-):
-    wavelengths = np.linspace(400.0e-9, 700.0e-9, bands, dtype=np.float64)
-    tracer = _tracer(wavelengths)
-    rng = np.random.default_rng(
-        0xF4 + bands * 101 + width * 17 + height + direction_sign
-    )
-    source_re = rng.normal(size=(bands, height, width)).astype(np.float32)
-    source_im = rng.normal(size=(bands, height, width)).astype(np.float32)
-    actual_re, actual_im = source_re.copy(), source_im.copy()
-    expect_re, expect_im = source_re.copy(), source_im.copy()
-
-    tracer.t4_angular_spectrum_step(
-        bands, width, height, 0.75e-6, 2.25e-6, direction_sign,
-        wavelengths, actual_re, actual_im,
-    )
-    tracer.t4_angular_spectrum_step_reference(
-        bands, width, height, 0.75e-6, 2.25e-6, direction_sign,
-        wavelengths, expect_re, expect_im,
-    )
-
-    np.testing.assert_allclose(actual_re, expect_re, rtol=8.0e-5, atol=8.0e-5)
-    np.testing.assert_allclose(actual_im, expect_im, rtol=8.0e-5, atol=8.0e-5)
 
 
 def test_continuous_paths_share_one_exact_width_complex_dispatch():

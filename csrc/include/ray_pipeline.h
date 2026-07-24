@@ -821,6 +821,14 @@ struct WaveArena {
     double           dx = 0.0;
     double           dz = 0.0;
     int              n_bands = 0;
+    /* Total lane planes allocated per field (multiple of n_bands; >= n_bands;
+     * <= 32). Lanes are grouped into n_bands-wide per-ray slices so one march
+     * advances a whole cohort of independent rays in one batched FFT pass. */
+    int              cohort_lanes = 0;
+    /* Lanes carrying live field data for the current march (set by seeding
+     * and propagated by arena-to-arena transfer). Slices beyond this hold
+     * zeros and are skipped by material/border/measure accounting. */
+    int              active_lanes = 0;
     int              band_specialization = -1;
     wave_t4::SpectralMode spectral_mode = wave_t4::SpectralMode::FixedBands;
     wave_t4::BackendKind backend = wave_t4::BackendKind::AngularSpectrum;
@@ -883,7 +891,13 @@ struct WaveArena {
              + im_offsets[static_cast<size_t>(
                  wave_t4::field_index(direction, component))];
     }
-    mutable std::mutex mu;
+    /* Lock-free single-owner claim word (0 = unowned). One CAS claims the
+     * arena's whole linked component; workers that lose the race requeue
+     * their wave intents and move on to other work instead of blocking (KPN
+     * node semantics -- the work stays queued until the owner releases).
+     * Cold readers (snapshots, checkpoints, display taps) spin-yield, which
+     * is no longer than they previously blocked on the mutex this replaces. */
+    mutable std::atomic<uint32_t> claim{0};
 };
 
 /* ── T5 GPU connection pass types ────────────────────────────────────────── */
@@ -1007,6 +1021,15 @@ enum class FlashModifierType : int {
 
 struct RayPipelineConfig {
     double wave_grid_dx_m   = 2e-6;
+    /* T4 cohort lane budget per arena. Fixed-band rays queued for the same
+     * arena and direction are seeded side by side into disjoint n_bands-wide
+     * lane slices of one shared state block and advanced by ONE batched
+     * angular-spectrum march per round, instead of one full march per ray.
+     * The buffer holds floor(wave_cohort_lanes / n_bands) rays per round
+     * (ABI ceiling: 32 lanes). n_bands (or less) disables cohort growth and
+     * restores the historical one-ray state size. Cold-allocated at arena
+     * build; never grown in hot dispatch. */
+    int    wave_cohort_lanes = 32;
     int    max_children     = 2;
     int    seed             = 42;
     /* Pipeline-wide amplitude floor. */
@@ -1225,6 +1248,7 @@ struct WaveArenaSnapshot {
     int backward_link_count;
     uint64_t linked_transfers;
     int bands;
+    int cohort_lanes;
     int band_specialization;
     int spectral_mode;
     int backend;

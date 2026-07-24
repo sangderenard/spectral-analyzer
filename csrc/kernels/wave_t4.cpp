@@ -8,6 +8,7 @@
 #include "plan_support.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <complex>
 #include <cstddef>
@@ -28,6 +29,83 @@ struct FftfreeExecutor {
     eigfft::PlanEnvironment<float> inverse_x;
     eigfft::PlanEnvironment<float> inverse_y;
     std::vector<std::complex<float>> interleaved;
+
+    /* Angular-spectrum transfer function H(kx,ky) for one (|dz|, wavelength)
+     * pair. H never changes for a given arena geometry, yet the previous
+     * implementation recomputed sqrt+cos+sin for every pixel of every band
+     * on every substep of every march (~tens of millions of libm calls per
+     * traversal -- the measured T4 hot spot). Built once here with the
+     * identical double-precision formula, each step becomes FFT + one
+     * elementwise complex multiply. Backward propagation is the conjugate:
+     * the sign multiplies t_sin at apply time. Evanescent components decay
+     * by exp(-|dz|sqrt(-kz2)) regardless of direction, stored in t_cos with
+     * t_sin = 0, exactly as the analytic loop produced. */
+    struct TransferTable {
+        double distance = -1.0;
+        double wavelength = -1.0;
+        std::uint64_t last_use = 0;
+        std::vector<double> t_cos;
+        std::vector<double> t_sin;
+    };
+    std::vector<TransferTable> transfer_tables;
+    std::uint64_t transfer_clock = 0;
+
+    const TransferTable& transfer_for(
+        int nx, int ny, double dx, double abs_dz, double wavelength)
+    {
+        ++transfer_clock;
+        for (auto& table : transfer_tables) {
+            if (table.distance == abs_dz
+                && table.wavelength == wavelength) {
+                table.last_use = transfer_clock;
+                return table;
+            }
+        }
+        TransferTable* slot;
+        /* Fixed-band arenas use a handful of (distance, wavelength) pairs;
+         * continuous cohorts resolve fresh wavelengths per round, so the
+         * cache is bounded and recycles its least-recently-used entry. */
+        if (transfer_tables.size() < 64u) {
+            transfer_tables.emplace_back();
+            slot = &transfer_tables.back();
+        } else {
+            slot = &*std::min_element(
+                transfer_tables.begin(), transfer_tables.end(),
+                [](const TransferTable& a, const TransferTable& b) {
+                    return a.last_use < b.last_use;
+                });
+        }
+        constexpr double tau = 6.283185307179586476925286766559;
+        const std::size_t plane =
+            static_cast<std::size_t>(nx) * ny;
+        slot->distance = abs_dz;
+        slot->wavelength = wavelength;
+        slot->last_use = transfer_clock;
+        slot->t_cos.resize(plane);
+        slot->t_sin.resize(plane);
+        const double k = tau / wavelength;
+        for (int y = 0; y < ny; ++y) {
+            const int fy = y <= ny / 2 ? y : y - ny;
+            const double ky = tau * fy / (static_cast<double>(ny) * dx);
+            for (int x = 0; x < nx; ++x) {
+                const int fx = x <= nx / 2 ? x : x - nx;
+                const double kx = tau * fx / (static_cast<double>(nx) * dx);
+                const double kz2 = k * k - kx * kx - ky * ky;
+                const std::size_t index =
+                    static_cast<std::size_t>(y) * nx + x;
+                if (kz2 >= 0.0) {
+                    const double phase = abs_dz * std::sqrt(kz2);
+                    slot->t_cos[index] = std::cos(phase);
+                    slot->t_sin[index] = std::sin(phase);
+                } else {
+                    slot->t_cos[index] =
+                        std::exp(-abs_dz * std::sqrt(-kz2));
+                    slot->t_sin[index] = 0.0;
+                }
+            }
+        }
+        return *slot;
+    }
 
     FftfreeExecutor(int nx, int ny)
         : interleaved(static_cast<std::size_t>(nx) * ny)
@@ -50,22 +128,64 @@ struct FftfreeExecutor {
         inverse_y.plan().use_kernel(eigfft::KernelKind::CooleyTukey);
     }
 
-    void transform(float* re, float* im, int nx, int ny, bool inverse)
+    /* Transform `n_bands` contiguous (nx, ny) planes in re/im with two
+     * batched axis passes instead of n_bands separate 2D FFT calls.
+     *
+     * Each band's plane is itself a (nx rows, ny cols) ColMajor block, and
+     * bands are stored contiguously (band stride = nx*ny), so the whole
+     * re/im buffer is already a valid (nx, ny*n_bands) ColMajor matrix with
+     * no reshaping: column b*ny+j is band b's column j. The axis-0 (row)
+     * pass can therefore batch across every band's columns in one
+     * fft_inplace_batched call. The transpose step must stay per-band
+     * (transposing the whole (nx, ny*n_bands) block as one unit would
+     * scramble band boundaries), but transposition is a memory-bound copy,
+     * not FFT work, so looping it costs nothing like the FFT calls did. */
+    void transform_multiband(
+        float* re, float* im, int nx, int ny, int n_bands, bool inverse)
     {
-        const std::size_t count = static_cast<std::size_t>(nx) * ny;
-        for (std::size_t i = 0; i < count; ++i)
+        using Complex = std::complex<float>;
+        const std::size_t plane = static_cast<std::size_t>(nx) * ny;
+        const std::size_t total = plane * static_cast<std::size_t>(n_bands);
+        if (interleaved.size() < total) interleaved.resize(total);
+        for (std::size_t i = 0; i < total; ++i)
             interleaved[i] = {re[i], im[i]};
-        Eigen::Map<FftMatrix> matrix(interleaved.data(), nx, ny);
-        if (inverse)
-            eigfft::fft_inplace_2d<float>(
-                matrix, inverse_x.plan(), inverse_y.plan());
-        else
-            eigfft::fft_inplace_2d<float>(
-                matrix, forward_x.plan(), forward_y.plan());
-        for (std::size_t i = 0; i < count; ++i) {
+
+        auto& axis0 = inverse ? inverse_x.plan() : forward_x.plan();
+        auto& axis1 = inverse ? inverse_y.plan() : forward_y.plan();
+
+        Eigen::Map<FftMatrix> wide(
+            interleaved.data(), nx,
+            static_cast<Eigen::Index>(ny) * n_bands);
+        eigfft::fft_inplace_batched<float>(wide, axis0);
+
+        axis0.ensure_nd_workspace(
+            nx, static_cast<Eigen::Index>(ny) * n_bands);
+        Complex* scratch = axis0.transpose_buffer_data();
+        for (int b = 0; b < n_bands; ++b)
+            eigfft::detail::tiled_transpose_colmajor<float>(
+                interleaved.data() + static_cast<std::size_t>(b) * plane,
+                nx, ny, scratch + static_cast<std::size_t>(b) * plane,
+                64, 128);
+
+        Eigen::Map<FftMatrix> wide_t(
+            scratch, ny, static_cast<Eigen::Index>(nx) * n_bands);
+        eigfft::fft_inplace_batched<float>(wide_t, axis1);
+
+        for (int b = 0; b < n_bands; ++b)
+            eigfft::detail::tiled_transpose_colmajor<float>(
+                scratch + static_cast<std::size_t>(b) * plane,
+                ny, nx, interleaved.data() + static_cast<std::size_t>(b) * plane,
+                64, 128);
+
+        for (std::size_t i = 0; i < total; ++i) {
             re[i] = interleaved[i].real();
             im[i] = interleaved[i].imag();
         }
+    }
+
+    void transform(float* re, float* im, int nx, int ny, bool inverse)
+    {
+        transform_multiband(re, im, nx, ny, 1, inverse);
     }
 };
 
@@ -176,43 +296,34 @@ bool angular_spectrum_exact(int nx,
         executor = static_cast<FftfreeExecutor*>(
             plan->transform_executor.get());
         if (!executor) return false;
+        /* One batched forward pass over all B bands instead of B separate
+         * 2D FFT calls. Inactive bands (wavelength <= 0) still hold zeroed
+         * field data (arenas are cleared at seed time), so transforming
+         * them is harmless -- only the transfer-function multiply below,
+         * which would divide by that zero wavelength, must skip them. */
+        try {
+            executor->transform_multiband(re, im, nx, ny, B, false);
+        } catch (...) {
+            return false;
+        }
     }
     for (int band = 0; band < B; ++band) {
         const double wavelength = wavelengths_m[band];
         if (!(wavelength > 0.0)) continue;
         float* band_re = re + static_cast<std::size_t>(band) * plane;
         float* band_im = im + static_cast<std::size_t>(band) * plane;
-        if constexpr (UseFftfree) {
-            try {
-                executor->transform(band_re, band_im, nx, ny, false);
-            } catch (...) {
-                return false;
-            }
-        } else {
+        if constexpr (!UseFftfree) {
             fft_2d(band_re, band_im, *plan, false);
         }
 
-        const double k = tau / wavelength;
-        for (int y = 0; y < ny; ++y) {
-            const int fy = y <= ny / 2 ? y : y - ny;
-            const double ky = tau * fy / (static_cast<double>(ny) * dx);
-            for (int x = 0; x < nx; ++x) {
-                const int fx = x <= nx / 2 ? x : x - nx;
-                const double kx = tau * fx / (static_cast<double>(nx) * dx);
-                const double kz2 = k * k - kx * kx - ky * ky;
-                double transfer_re = 0.0;
-                double transfer_im = 0.0;
-                if (kz2 >= 0.0) {
-                    const double phase = signed_distance * std::sqrt(kz2);
-                    transfer_re = std::cos(phase);
-                    transfer_im = std::sin(phase);
-                } else {
-                    const double decay =
-                        std::exp(-std::abs(dz) * std::sqrt(-kz2));
-                    transfer_re = decay;
-                }
-                const std::size_t index =
-                    static_cast<std::size_t>(y) * nx + x;
+        if constexpr (UseFftfree) {
+            /* Precomputed transfer table: same double math, built once. */
+            const auto& table = executor->transfer_for(
+                nx, ny, dx, std::abs(dz), wavelength);
+            const double dir = signed_distance >= 0.0 ? 1.0 : -1.0;
+            for (std::size_t index = 0; index < plane; ++index) {
+                const double transfer_re = table.t_cos[index];
+                const double transfer_im = dir * table.t_sin[index];
                 const double ar = band_re[index];
                 const double ai = band_im[index];
                 band_re[index] =
@@ -220,16 +331,116 @@ bool angular_spectrum_exact(int nx,
                 band_im[index] =
                     static_cast<float>(ar * transfer_im + ai * transfer_re);
             }
-        }
-        if constexpr (UseFftfree) {
-            try {
-                executor->transform(band_re, band_im, nx, ny, true);
-            } catch (...) {
-                return false;
-            }
         } else {
+            const double k = tau / wavelength;
+            for (int y = 0; y < ny; ++y) {
+                const int fy = y <= ny / 2 ? y : y - ny;
+                const double ky = tau * fy / (static_cast<double>(ny) * dx);
+                for (int x = 0; x < nx; ++x) {
+                    const int fx = x <= nx / 2 ? x : x - nx;
+                    const double kx =
+                        tau * fx / (static_cast<double>(nx) * dx);
+                    const double kz2 = k * k - kx * kx - ky * ky;
+                    double transfer_re = 0.0;
+                    double transfer_im = 0.0;
+                    if (kz2 >= 0.0) {
+                        const double phase =
+                            signed_distance * std::sqrt(kz2);
+                        transfer_re = std::cos(phase);
+                        transfer_im = std::sin(phase);
+                    } else {
+                        const double decay =
+                            std::exp(-std::abs(dz) * std::sqrt(-kz2));
+                        transfer_re = decay;
+                    }
+                    const std::size_t index =
+                        static_cast<std::size_t>(y) * nx + x;
+                    const double ar = band_re[index];
+                    const double ai = band_im[index];
+                    band_re[index] = static_cast<float>(
+                        ar * transfer_re - ai * transfer_im);
+                    band_im[index] = static_cast<float>(
+                        ar * transfer_im + ai * transfer_re);
+                }
+            }
+        }
+        if constexpr (!UseFftfree) {
             fft_2d(band_re, band_im, *plan, true);
         }
+    }
+    if constexpr (UseFftfree) {
+        try {
+            executor->transform_multiband(re, im, nx, ny, B, true);
+        } catch (...) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Same math as angular_spectrum_exact<B, true>, with a runtime band count
+ * instead of a compile-time one. angular_spectrum_step()'s public dispatch
+ * is restricted to the exact lane widths {1,3,4,8,16,32} -- a deliberate
+ * ABI invariant for ordinary per-ray transport, not a limitation of the
+ * math itself. A ray cohort's *combined* lane count (n_bands * ray count)
+ * is not one ray's transport width and has no reason to obey that same
+ * per-ray specialization set, so this is a separate entry point rather
+ * than a relaxation of angular_spectrum_step's contract. Every lane still
+ * gets exactly the same FFT + transfer-function math either way. */
+bool angular_spectrum_wide(int bands,
+                           int nx,
+                           int ny,
+                           double dx,
+                           double dz,
+                           const double* wavelengths_m,
+                           int direction_sign,
+                           const AngularSpectrumPlan* plan,
+                           float* re,
+                           float* im) noexcept
+{
+    if (!re || !im || !wavelengths_m || bands <= 0 || !is_power_of_two(nx)
+        || !is_power_of_two(ny) || !(dx > 0.0) || dz == 0.0
+        || (direction_sign != 1 && direction_sign != -1)
+        || !plan || plan->nx != nx || plan->ny != ny)
+        return false;
+    auto* executor = static_cast<FftfreeExecutor*>(
+        plan->transform_executor.get());
+    if (!executor) return false;
+
+    constexpr double tau = 6.283185307179586476925286766559;
+    const std::size_t plane = static_cast<std::size_t>(nx) * ny;
+    const double signed_distance = direction_sign * dz;
+    try {
+        executor->transform_multiband(re, im, nx, ny, bands, false);
+    } catch (...) {
+        return false;
+    }
+    const double dir = signed_distance >= 0.0 ? 1.0 : -1.0;
+    for (int band = 0; band < bands; ++band) {
+        const double wavelength = wavelengths_m[band];
+        if (!(wavelength > 0.0)) continue;
+        float* band_re = re + static_cast<std::size_t>(band) * plane;
+        float* band_im = im + static_cast<std::size_t>(band) * plane;
+        /* Precomputed transfer table: cohort lanes repeat a few distinct
+         * wavelengths, so this is a cache hit for every lane after the
+         * first ray of a round. */
+        const auto& table = executor->transfer_for(
+            nx, ny, dx, std::abs(dz), wavelength);
+        for (std::size_t index = 0; index < plane; ++index) {
+            const double transfer_re = table.t_cos[index];
+            const double transfer_im = dir * table.t_sin[index];
+            const double ar = band_re[index];
+            const double ai = band_im[index];
+            band_re[index] =
+                static_cast<float>(ar * transfer_re - ai * transfer_im);
+            band_im[index] =
+                static_cast<float>(ar * transfer_im + ai * transfer_re);
+        }
+    }
+    try {
+        executor->transform_multiband(re, im, nx, ny, bands, true);
+    } catch (...) {
+        return false;
     }
     return true;
 }
@@ -313,66 +524,113 @@ bool absorb_exact(int nx,
     return measure_exact<B>(nx, ny, config, re, im, progress);
 }
 
-inline bool aperture_open(const ApertureMaterial& material,
-                          double x,
-                          double y) noexcept
+/* Per-pixel aperture test with everything that is constant across an entire
+ * aperture_material_exact() call precomputed once. IrisPolygon in particular
+ * was calling cos/sin ~4 times per edge inside aperture_open() for *every
+ * pixel* (28 trig calls/pixel at element_count=7, ~1.8M total for a 256x256
+ * grid, repeated for every active direction/component/substep) even though
+ * the polygon vertices and rotation only depend on the material, not the
+ * pixel. Precomputing the vertices (and the shared edge between consecutive
+ * blades, computed once instead of twice) makes the per-pixel test pure
+ * arithmetic. Vertex values are bit-identical to aperture_open()'s per-pixel
+ * computation: same formula (2*pi*edge/n), same inputs, deterministic FP. */
+struct AperturePixelTest {
+    static constexpr int kMaxEdges = 64;
+    double cos_rot = 1.0;
+    double sin_rot = 0.0;
+    AperturePattern pattern = AperturePattern::None;
+    std::array<double, kMaxEdges> edge_x0{};
+    std::array<double, kMaxEdges> edge_y0{};
+    std::array<double, kMaxEdges> edge_x1{};
+    std::array<double, kMaxEdges> edge_y1{};
+    int edge_count = 0;
+    double pitch_x_m = 0.0, pitch_y_m = 0.0;
+    double opening_x_m = 0.0, opening_y_m = 0.0;
+};
+
+inline AperturePixelTest build_aperture_pixel_test(
+    const ApertureMaterial& material) noexcept
 {
-    const double c = std::cos(material.rotation_rad);
-    const double s = std::sin(material.rotation_rad);
-    const double u = c*x + s*y;
-    const double v = -s*x + c*y;
-    switch (material.pattern) {
+    AperturePixelTest test;
+    test.cos_rot = std::cos(material.rotation_rad);
+    test.sin_rot = std::sin(material.rotation_rad);
+    test.pattern = material.pattern;
+    test.pitch_x_m = material.pitch_x_m;
+    test.pitch_y_m = material.pitch_y_m;
+    test.opening_x_m = material.opening_x_m;
+    test.opening_y_m = material.opening_y_m;
+    if (material.pattern == AperturePattern::IrisPolygon
+        && material.element_count >= 3 && material.opening_x_m > 0.0
+        && material.element_count <= AperturePixelTest::kMaxEdges) {
+        const double radius = material.opening_x_m;
+        const int n = material.element_count;
+        test.edge_count = n;
+        double prev_x = radius * std::cos(0.0);
+        double prev_y = radius * std::sin(0.0);
+        for (int edge = 0; edge < n; ++edge) {
+            const double a1 =
+                6.2831853071795864769 * (edge + 1) / n;
+            const double x1 = radius * std::cos(a1);
+            const double y1 = radius * std::sin(a1);
+            test.edge_x0[static_cast<std::size_t>(edge)] = prev_x;
+            test.edge_y0[static_cast<std::size_t>(edge)] = prev_y;
+            test.edge_x1[static_cast<std::size_t>(edge)] = x1;
+            test.edge_y1[static_cast<std::size_t>(edge)] = y1;
+            prev_x = x1;
+            prev_y = y1;
+        }
+    }
+    return test;
+}
+
+inline bool aperture_open_fast(
+    const AperturePixelTest& test, double x, double y) noexcept
+{
+    const double u = test.cos_rot*x + test.sin_rot*y;
+    const double v = -test.sin_rot*x + test.cos_rot*y;
+    switch (test.pattern) {
         case AperturePattern::IrisPolygon: {
-            if (material.element_count < 3 || material.opening_x_m <= 0.0)
-                return false;
-            const double radius = material.opening_x_m;
-            for (int edge = 0; edge < material.element_count; ++edge) {
-                const double a0 =
-                    6.2831853071795864769 * edge / material.element_count;
-                const double a1 =
-                    6.2831853071795864769 * (edge + 1)
-                    / material.element_count;
-                const double x0 = radius * std::cos(a0);
-                const double y0 = radius * std::sin(a0);
-                const double x1 = radius * std::cos(a1);
-                const double y1 = radius * std::sin(a1);
-                if ((x1-x0)*(v-y0) - (y1-y0)*(u-x0) < 0.0)
+            if (test.edge_count < 3) return false;
+            for (int edge = 0; edge < test.edge_count; ++edge) {
+                const std::size_t e = static_cast<std::size_t>(edge);
+                if ((test.edge_x1[e]-test.edge_x0[e])*(v-test.edge_y0[e])
+                    - (test.edge_y1[e]-test.edge_y0[e])*(u-test.edge_x0[e])
+                    < 0.0)
                     return false;
             }
             return true;
         }
         case AperturePattern::ShadowMask: {
-            if (material.pitch_x_m <= 0.0 || material.pitch_y_m <= 0.0
-                || material.opening_x_m <= 0.0
-                || material.opening_y_m <= 0.0)
+            if (test.pitch_x_m <= 0.0 || test.pitch_y_m <= 0.0
+                || test.opening_x_m <= 0.0 || test.opening_y_m <= 0.0)
                 return false;
             const double cell_x =
-                u - std::round(u/material.pitch_x_m)*material.pitch_x_m;
+                u - std::round(u/test.pitch_x_m)*test.pitch_x_m;
             const double cell_y =
-                v - std::round(v/material.pitch_y_m)*material.pitch_y_m;
-            const double ex = cell_x/material.opening_x_m;
-            const double ey = cell_y/material.opening_y_m;
+                v - std::round(v/test.pitch_y_m)*test.pitch_y_m;
+            const double ex = cell_x/test.opening_x_m;
+            const double ey = cell_y/test.opening_y_m;
             return ex*ex + ey*ey <= 1.0;
         }
         case AperturePattern::SlotMask: {
-            if (material.pitch_x_m <= 0.0 || material.pitch_y_m <= 0.0)
+            if (test.pitch_x_m <= 0.0 || test.pitch_y_m <= 0.0)
                 return false;
             const double cell_x =
-                u - std::round(u/material.pitch_x_m)*material.pitch_x_m;
+                u - std::round(u/test.pitch_x_m)*test.pitch_x_m;
             const double cell_y =
-                v - std::round(v/material.pitch_y_m)*material.pitch_y_m;
-            return std::abs(cell_x) <= material.opening_x_m
-                && std::abs(cell_y) <= material.opening_y_m;
+                v - std::round(v/test.pitch_y_m)*test.pitch_y_m;
+            return std::abs(cell_x) <= test.opening_x_m
+                && std::abs(cell_y) <= test.opening_y_m;
         }
         case AperturePattern::ApertureGrille: {
-            if (material.pitch_x_m <= 0.0) return false;
+            if (test.pitch_x_m <= 0.0) return false;
             const double cell_x =
-                u - std::round(u/material.pitch_x_m)*material.pitch_x_m;
-            return std::abs(cell_x) <= material.opening_x_m;
+                u - std::round(u/test.pitch_x_m)*test.pitch_x_m;
+            return std::abs(cell_x) <= test.opening_x_m;
         }
         case AperturePattern::CircularHole:
-            return material.opening_x_m > 0.0
-                && u*u + v*v <= material.opening_x_m*material.opening_x_m;
+            return test.opening_x_m > 0.0
+                && u*u + v*v <= test.opening_x_m*test.opening_x_m;
         case AperturePattern::None:
         default:
             return true;
@@ -404,13 +662,14 @@ bool aperture_material_exact(int nx,
     const double origin_y = 0.5 * static_cast<double>(ny - 1) * dx;
     const double assembly_r2 =
         material.assembly_radius_m * material.assembly_radius_m;
+    const AperturePixelTest pixel_test = build_aperture_pixel_test(material);
     double removed = 0.0;
     for (int y = 0; y < ny; ++y) {
         const double ym = y*dx - origin_y;
         for (int x = 0; x < nx; ++x) {
             const double xm = x*dx - origin_x;
             if (xm*xm + ym*ym > assembly_r2
-                || aperture_open(material, xm, ym))
+                || aperture_open_fast(pixel_test, xm, ym))
                 continue;
             const std::size_t pixel = static_cast<std::size_t>(y)*nx + x;
             for (int band = 0; band < B; ++band) {
@@ -525,6 +784,21 @@ bool measure(int bands,
         case 32: return measure_exact<32>(nx, ny, config, re, im, progress);
         default: return false;
     }
+}
+
+bool angular_spectrum_step_wide(int bands,
+                                int nx,
+                                int ny,
+                                double dx,
+                                double dz,
+                                const double* wavelengths_m,
+                                int direction_sign,
+                                const AngularSpectrumPlan* plan,
+                                float* re,
+                                float* im) noexcept
+{
+    return angular_spectrum_wide(
+        bands, nx, ny, dx, dz, wavelengths_m, direction_sign, plan, re, im);
 }
 
 bool angular_spectrum_step(int bands,

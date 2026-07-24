@@ -3670,6 +3670,7 @@ struct PyRayTracer
             d["linked_transfers"] =
                 static_cast<unsigned long long>(s.linked_transfers);
             d["bands"] = s.bands;
+            d["cohort_lanes"] = s.cohort_lanes;
             d["band_specialization"] = s.band_specialization;
             d["spectral_mode"] = s.spectral_mode;
             d["backend"] = s.backend;

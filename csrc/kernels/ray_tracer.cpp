@@ -7995,12 +7995,13 @@ struct RayPipelineState {
     std::atomic<uint64_t>     gpu_hit_readback_bytes{0};
     std::atomic<uint64_t>     gpu_hit_readback_count{0};
 
-    std::deque<WaveArena>     arenas;   /* deque: never moves elements, safe with mutex */
-    /* Every connected field graph shares one cold component lock. Traversal
-     * may hold a source arena while transferring into a destination; the
-     * component lock prevents opposite-direction lock inversion without
-     * serialising unrelated wave components. Null means an unlinked arena. */
-    std::vector<std::shared_ptr<std::mutex>> wave_component_locks;
+    std::deque<WaveArena>     arenas;   /* deque: never moves elements, claim words stay stable */
+    /* Every connected field graph shares one claim word: the component root
+     * arena's WaveArena::claim. One CAS owns the whole component, so linked
+     * traversal needs no inner locks and opposite-direction lock inversion
+     * cannot exist. Unlinked arenas point at their own claim word -- every
+     * arena is claimable through this one uniform lock-free path. */
+    std::vector<std::atomic<uint32_t>*> wave_component_claims;
     std::vector<std::thread>  workers;
 
     /* ── Sensor image accumulator ─────────────────────────────────────────
@@ -8244,9 +8245,72 @@ static ResolvedSourceJones pipeline_source_jones(
     return result;
 }
 
+/* Lock-free component ownership. Workers use try/release: a failed claim
+ * means another worker owns the node right now, so the caller requeues its
+ * wave intents and does other work -- it never blocks. Spin-claim is for
+ * cold observers only (snapshots, checkpoints, display taps). */
+static inline bool wave_component_try_claim(
+    RayPipelineState& ps, int arena_id)
+{
+    uint32_t expected = 0u;
+    return ps.wave_component_claims[static_cast<size_t>(arena_id)]
+        ->compare_exchange_strong(
+            expected, 1u, std::memory_order_acquire);
+}
+
+static inline void wave_component_release(
+    RayPipelineState& ps, int arena_id)
+{
+    ps.wave_component_claims[static_cast<size_t>(arena_id)]
+        ->store(0u, std::memory_order_release);
+}
+
+static inline void wave_claim_spin(std::atomic<uint32_t>* claim)
+{
+    uint32_t expected = 0u;
+    while (!claim->compare_exchange_weak(
+               expected, 1u, std::memory_order_acquire)) {
+        expected = 0u;
+        std::this_thread::yield();
+    }
+}
+
+static inline void wave_claim_release(std::atomic<uint32_t>* claim)
+{
+    claim->store(0u, std::memory_order_release);
+}
+
+/* RAII spin-claim for cold observers; also collects multiple distinct claim
+ * words (checkpoint loops share one word per linked component and must not
+ * claim it twice against themselves). */
+struct WaveClaimGuard {
+    std::vector<std::atomic<uint32_t>*> held;
+    explicit WaveClaimGuard(std::atomic<uint32_t>* claim = nullptr)
+    {
+        if (claim) acquire(claim);
+    }
+    void acquire(std::atomic<uint32_t>* claim)
+    {
+        for (std::atomic<uint32_t>* existing : held)
+            if (existing == claim) return;
+        wave_claim_spin(claim);
+        held.push_back(claim);
+    }
+    ~WaveClaimGuard()
+    {
+        for (auto it = held.rbegin(); it != held.rend(); ++it)
+            wave_claim_release(*it);
+    }
+};
+
 static void wave_arena_seed(
     const RayPipelineState& ps, WaveArena& arena, const RayIntent& ray);
 static void wave_arena_seed_continuous_cohort(
+    const RayPipelineState& ps,
+    WaveArena& arena,
+    const std::array<WaveIntent*, 32>& cohort,
+    int count);
+static void wave_arena_seed_fixed_cohort(
     const RayPipelineState& ps,
     WaveArena& arena,
     const std::array<WaveIntent*, 32>& cohort,
@@ -8262,18 +8326,26 @@ static bool wave_arena_transfer(
     const float* jones_im = nullptr);
 static bool wave_arena_follow_link(
     RayPipelineState& ps, WaveArena& arena, RayIntent& lineage,
-    int state_lane, ChildRay& out, int& terminal_arena, int depth,
+    int state_lane, int lane_count, ChildRay& out, int& terminal_arena,
+    int depth,
     std::array<WaveExitStateRecord, 32>* exit_records,
     int* exit_record_count);
+/* Lane-range semantics shared by extract/complete/follow/visit:
+ *   state_lane <  0                 -> bands [0, n_bands)      (single fixed ray)
+ *   state_lane >= 0, continuous     -> the single lane state_lane
+ *   state_lane >= 0, lane_count > 0 -> lanes [state_lane, state_lane+lane_count)
+ *                                      (one ray's slice of a fixed cohort) */
 static ChildRay wave_arena_extract(WaveArena& arena, const RayIntent& src,
                                    int state_lane = -1,
+                                   int lane_count = 0,
                                    std::array<WaveExitStateRecord, 32>*
                                        exit_records = nullptr,
                                    int* exit_record_count = nullptr);
 static void wave_arena_complete(RayPipelineState& ps,
                                 WaveIntent& wi,
                                 WaveArena& arena,
-                                int state_lane = -1);
+                                int state_lane = -1,
+                                int lane_count = 0);
 static void pipeline_finish_ray(RayPipelineState& ps, uint8_t color_flag = 255);
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -14337,15 +14409,16 @@ public:
                     continue;
                 }
                 WaveArena& arena = ps.arenas[static_cast<size_t>(wi.arena_id)];
-                std::unique_lock<std::mutex> component_lock;
-                if (static_cast<size_t>(wi.arena_id)
-                        < ps.wave_component_locks.size()
-                    && ps.wave_component_locks[
-                        static_cast<size_t>(wi.arena_id)])
-                    component_lock = std::unique_lock<std::mutex>(
-                        *ps.wave_component_locks[
-                            static_cast<size_t>(wi.arena_id)]);
-                std::lock_guard<std::mutex> lk(arena.mu);
+                if (!wave_component_try_claim(ps, wi.arena_id)) {
+                    /* Node owned elsewhere: requeue and move on (KPN). */
+                    wave_handled[wi_index] = 1u;
+                    ps.Q_wave.push(std::move(wi));
+                    continue;
+                }
+                struct ComponentClaimGuard {
+                    RayPipelineState& ps; int id;
+                    ~ComponentClaimGuard() { wave_component_release(ps, id); }
+                } component_claim_guard{ps, wi.arena_id};
                 if (wi.ray.spectral_resolved && wi.ray.spectral_frequency_hz > 0.0) {
                     std::array<WaveIntent*, 32> cohort{};
                     int cohort_count = 0;
@@ -14373,11 +14446,46 @@ public:
                             pipeline_finish_ray(ps, completed.ray.color_flag);
                     }
                 } else {
-                    wave_handled[wi_index] = 1u;
-                    if (dispatch_t4_march(ps, arena, wi.ray))
-                        wave_arena_complete(ps, wi, arena);
-                    else
-                        pipeline_finish_ray(ps, wi.ray.color_flag);
+                    /* Fixed-band round: every queued ray bound for this arena
+                     * and direction is seeded into its own lane slice and the
+                     * whole round advances through ONE march. */
+                    std::array<WaveIntent*, 32> cohort{};
+                    int cohort_count = 0;
+                    const int max_rays = std::max(
+                        1, std::max(arena.n_bands, arena.cohort_lanes)
+                            / arena.n_bands);
+                    const bool forward =
+                        wi.ray.dir.dot(arena.axis_z) >= 0.0;
+                    for (size_t j = wi_index;
+                         j < wave_batch.size() && cohort_count < max_rays;
+                         ++j) {
+                        WaveIntent& candidate = wave_batch[j];
+                        if (wave_handled[j]
+                            || candidate.arena_id != wi.arena_id
+                            || (candidate.ray.spectral_resolved
+                                && candidate.ray.spectral_frequency_hz > 0.0)
+                            || (candidate.ray.dir.dot(arena.axis_z) >= 0.0)
+                                != forward)
+                            continue;
+                        wave_handled[j] = 1u;
+                        cohort[static_cast<size_t>(cohort_count++)] =
+                            &candidate;
+                    }
+                    wave_arena_seed_fixed_cohort(
+                        ps, arena, cohort, cohort_count);
+                    const bool marched = dispatch_t4_march(
+                        ps, arena, wi.ray, /*state_preseeded=*/true);
+                    for (int r = 0; r < cohort_count; ++r) {
+                        WaveIntent& completed =
+                            *cohort[static_cast<size_t>(r)];
+                        if (marched)
+                            wave_arena_complete(
+                                ps, completed, arena,
+                                r * arena.n_bands, arena.n_bands);
+                        else
+                            pipeline_finish_ray(
+                                ps, completed.ray.color_flag);
+                    }
                 }
             }
 
@@ -15054,7 +15162,22 @@ static void wave_arena_build(
                 arena.fft_nx, arena.fft_ny);
         fflush(stderr);
     }
-    arena.plane_size = static_cast<size_t>(arena.n_bands)
+    /* Cohort lane budget: room for floor(cohort_lanes / n_bands) independent
+     * rays per march, each owning a contiguous n_bands-wide slice. Clamped to
+     * the 32-lane ABI ceiling, floored to a whole number of slices, and
+     * memory-capped so one arena's state block cannot silently exceed 512 MB. */
+    int cohort_lanes = std::max(arena.n_bands, cfg.wave_cohort_lanes);
+    cohort_lanes = std::min(cohort_lanes, 32);
+    cohort_lanes -= cohort_lanes % arena.n_bands;
+    const size_t bytes_per_lane = 2ull * wave_t4::kFieldCount
+        * arena.fft_ny * arena.fft_nx * sizeof(float);
+    while (cohort_lanes > arena.n_bands
+           && static_cast<size_t>(cohort_lanes) * bytes_per_lane
+              > (512ull << 20))
+        cohort_lanes -= arena.n_bands;
+    arena.cohort_lanes = cohort_lanes;
+    arena.active_lanes = arena.n_bands;
+    arena.plane_size = static_cast<size_t>(arena.cohort_lanes)
                      * arena.fft_ny * arena.fft_nx;
     size_t cursor = 0;
     for (int field = 0; field < wave_t4::kFieldCount; ++field) {
@@ -15118,33 +15241,44 @@ static bool wave_arena_transfer(
     dst.field_active.fill(0u);
     dst.spectral_mode = src.spectral_mode;
     dst.spectral_lanes = src.spectral_lanes;
-    for (int band = 0; band < dst.n_bands; ++band) {
-        auto& lane = dst.spectral_lanes[static_cast<size_t>(band)];
+    dst.active_lanes = std::max(src.n_bands, src.active_lanes);
+    const int lanes_to_fix = std::min(
+        32, std::max(dst.n_bands, dst.active_lanes));
+    for (int l = 0; l < lanes_to_fix; ++l) {
+        const int band = l % dst.n_bands;
+        auto& lane = dst.spectral_lanes[static_cast<size_t>(l)];
         const double frequency = lane.frequency_hz > 0.0
             ? lane.frequency_hz
             : dst.speed_m_s/(
                 dst.fixed_wavelengths_m[band]*dst.n_real_by_lane[band]
             );
-        dst.wavelengths_m[band] =
+        dst.wavelengths_m[l] =
             (dst.speed_m_s/frequency)/dst.n_real_by_lane[band];
         lane.frequency_hz = frequency;
-        lane.wavelength_m = dst.wavelengths_m[band];
+        lane.wavelength_m = dst.wavelengths_m[l];
     }
     if (rigid_interface) {
-        if (!jones_re || !jones_im
-            || !wave_t4::apply_rigid_field_interface(
-                dst.n_bands, dst.fft_nx, dst.fft_ny,
-                static_cast<wave_t4::RigidFieldMap>(coordinate_map),
-                jones_re, jones_im,
-                src.field_re(direction, wave_t4::TransverseComponent::S),
-                src.field_im(direction, wave_t4::TransverseComponent::S),
-                src.field_re(direction, wave_t4::TransverseComponent::P),
-                src.field_im(direction, wave_t4::TransverseComponent::P),
-                dst.field_re(direction, wave_t4::TransverseComponent::S),
-                dst.field_im(direction, wave_t4::TransverseComponent::S),
-                dst.field_re(direction, wave_t4::TransverseComponent::P),
-                dst.field_im(direction, wave_t4::TransverseComponent::P)))
+        if (!jones_re || !jones_im)
             return false;
+        const size_t npix =
+            static_cast<size_t>(dst.fft_nx) * dst.fft_ny;
+        for (int lane0 = 0; lane0 < dst.active_lanes;
+             lane0 += dst.n_bands) {
+            const size_t off = static_cast<size_t>(lane0) * npix;
+            if (!wave_t4::apply_rigid_field_interface(
+                    dst.n_bands, dst.fft_nx, dst.fft_ny,
+                    static_cast<wave_t4::RigidFieldMap>(coordinate_map),
+                    jones_re, jones_im,
+                    src.field_re(direction, wave_t4::TransverseComponent::S) + off,
+                    src.field_im(direction, wave_t4::TransverseComponent::S) + off,
+                    src.field_re(direction, wave_t4::TransverseComponent::P) + off,
+                    src.field_im(direction, wave_t4::TransverseComponent::P) + off,
+                    dst.field_re(direction, wave_t4::TransverseComponent::S) + off,
+                    dst.field_im(direction, wave_t4::TransverseComponent::S) + off,
+                    dst.field_re(direction, wave_t4::TransverseComponent::P) + off,
+                    dst.field_im(direction, wave_t4::TransverseComponent::P) + off))
+                return false;
+        }
         dst.field_active[static_cast<size_t>(wave_t4::field_index(
             direction, wave_t4::TransverseComponent::S))] = 1u;
         dst.field_active[static_cast<size_t>(wave_t4::field_index(
@@ -15225,6 +15359,8 @@ static wave_t4::Direction wave_arena_direction(
 
 static void wave_arena_measure_all(WaveArena& arena)
 {
+    const int active = std::max(arena.n_bands, arena.active_lanes);
+    const size_t npix = static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
     double field_power = 0.0;
     double border_power = 0.0;
     for (int direction = 0; direction < wave_t4::kDirectionCount; ++direction) {
@@ -15234,12 +15370,19 @@ static void wave_arena_measure_all(WaveArena& arena)
             const auto c = static_cast<wave_t4::TransverseComponent>(component);
             const int field = wave_t4::field_index(d, c);
             if (!arena.field_active[static_cast<size_t>(field)]) continue;
-            wave_t4::Progress measured{};
-            if (wave_t4::measure(
-                    arena.n_bands, arena.fft_nx, arena.fft_ny, arena.boundary,
-                    arena.field_re(d, c), arena.field_im(d, c), &measured)) {
-                field_power += measured.field_power;
-                border_power += measured.border_power;
+            for (int lane0 = 0; lane0 < active; lane0 += arena.n_bands) {
+                wave_t4::Progress measured{};
+                if (wave_t4::measure(
+                        arena.n_bands, arena.fft_nx, arena.fft_ny,
+                        arena.boundary,
+                        arena.field_re(d, c)
+                            + static_cast<size_t>(lane0) * npix,
+                        arena.field_im(d, c)
+                            + static_cast<size_t>(lane0) * npix,
+                        &measured)) {
+                    field_power += measured.field_power;
+                    border_power += measured.border_power;
+                }
             }
         }
     }
@@ -15306,6 +15449,7 @@ static void wave_arena_seed(
 {
     std::fill(arena.state_block.begin(), arena.state_block.end(), 0.0f);
     arena.field_active.fill(0u);
+    arena.active_lanes = arena.n_bands;
     const auto direction = wave_arena_direction(arena, ray);
     const auto source_state =
         std::atomic_load_explicit(
@@ -15408,6 +15552,7 @@ static void wave_arena_seed_continuous_cohort(
 {
     std::fill(arena.state_block.begin(), arena.state_block.end(), 0.0f);
     arena.field_active.fill(0u);
+    arena.active_lanes = arena.n_bands;
     arena.spectral_mode = wave_t4::SpectralMode::ContinuousCohort;
     for (int b = 0; b < arena.n_bands; ++b)
         arena.spectral_lanes[static_cast<size_t>(b)].active = 0u;
@@ -15485,10 +15630,119 @@ static void wave_arena_seed_continuous_cohort(
         arena.progress.field_power;
 }
 
+/* Seed a round of independent fixed-band rays side by side. Ray r owns lanes
+ * [r*n_bands, (r+1)*n_bands): its own complete fixed spectral slice of the
+ * shared state block. The rays never share a lane, so nothing here sums
+ * fields of physically non-interacting rays -- they only share the single
+ * batched march that advances every slice at once. */
+static void wave_arena_seed_fixed_cohort(
+    const RayPipelineState& ps,
+    WaveArena& arena,
+    const std::array<WaveIntent*, 32>& cohort,
+    int count)
+{
+    std::fill(arena.state_block.begin(), arena.state_block.end(), 0.0f);
+    arena.field_active.fill(0u);
+    arena.spectral_mode = wave_t4::SpectralMode::FixedBands;
+    const int max_rays =
+        std::max(1, std::max(arena.n_bands, arena.cohort_lanes)
+                     / arena.n_bands);
+    const int used = std::min(count, max_rays);
+    arena.active_lanes = std::max(arena.n_bands, used * arena.n_bands);
+    for (int l = 0; l < 32; ++l)
+        arena.spectral_lanes[static_cast<size_t>(l)].active = 0u;
+
+    const size_t npix = static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
+    const auto direction = wave_arena_direction(arena, cohort[0]->ray);
+    const auto source_state =
+        std::atomic_load_explicit(
+            &ps.complex_source_state, std::memory_order_acquire);
+    float* state_s_re =
+        arena.field_re(direction, wave_t4::TransverseComponent::S);
+    float* state_s_im =
+        arena.field_im(direction, wave_t4::TransverseComponent::S);
+    float* state_p_re =
+        arena.field_re(direction, wave_t4::TransverseComponent::P);
+    float* state_p_im =
+        arena.field_im(direction, wave_t4::TransverseComponent::P);
+    double input_power = 0.0;
+    for (int r = 0; r < used; ++r) {
+        const RayIntent& ray = cohort[static_cast<size_t>(r)]->ray;
+        const ResolvedSourceJones source_jones =
+            pipeline_source_jones(*source_state, arena, direction, ray);
+        const V3d local = wave_arena_to_local(arena, ray.pos);
+        const int lane0 = r * arena.n_bands;
+        for (int b = 0; b < arena.n_bands; ++b) {
+            const int l = lane0 + b;
+            arena.wavelengths_m[l] = arena.fixed_wavelengths_m[b];
+            auto& lane = arena.spectral_lanes[static_cast<size_t>(l)];
+            lane.wavelength_m = arena.fixed_wavelengths_m[b];
+            lane.frequency_hz = arena.speed_m_s
+                              / (
+                                  arena.fixed_wavelengths_m[b]
+                                  * arena.n_real_by_lane[b]
+                              );
+            lane.pdf = 1.0f;
+            lane.coherence_id = source_jones.configured
+                ? source_jones.coherence_id
+                : static_cast<uint64_t>(b);
+            lane.active = 1u;
+
+            const cd source_amp = b < static_cast<int>(ray.amp.size())
+                ? ray.amp[b] : cd(0.0, 0.0);
+            const cd amplitude_s = source_amp * source_jones.s;
+            const cd amplitude_p = source_amp * source_jones.p;
+            input_power += std::norm(amplitude_s) + std::norm(amplitude_p);
+            if (std::norm(amplitude_s) > 0.0) {
+                arena.field_active[static_cast<size_t>(
+                    wave_t4::field_index(
+                        direction, wave_t4::TransverseComponent::S))] = 1u;
+                wave_arena_deposit_lane(
+                    arena, ray, local, arena.fixed_wavelengths_m[b],
+                    amplitude_s,
+                    state_s_re + static_cast<size_t>(l) * npix,
+                    state_s_im + static_cast<size_t>(l) * npix);
+            }
+            if (std::norm(amplitude_p) > 0.0) {
+                arena.field_active[static_cast<size_t>(
+                    wave_t4::field_index(
+                        direction, wave_t4::TransverseComponent::P))] = 1u;
+                wave_arena_deposit_lane(
+                    arena, ray, local, arena.fixed_wavelengths_m[b],
+                    amplitude_p,
+                    state_p_re + static_cast<size_t>(l) * npix,
+                    state_p_im + static_cast<size_t>(l) * npix);
+            }
+        }
+    }
+    arena.progress = {};
+    wave_arena_measure_all(arena);
+    arena.progress.input_power = arena.progress.field_power;
+    arena.boundary_telemetry = {};
+    arena.boundary_telemetry.state_lane = arena.active_lanes - 1;
+    arena.boundary_telemetry.direction = static_cast<int>(direction);
+    arena.boundary_telemetry.entry_world = cohort[0]->ray.pos;
+    arena.boundary_telemetry.entry_local =
+        wave_arena_to_local(arena, cohort[0]->ray.pos);
+    arena.boundary_telemetry.entry_direction = cohort[0]->ray.dir;
+    arena.boundary_telemetry.input_ray_power = input_power;
+    arena.boundary_telemetry.seeded_field_power =
+        arena.progress.field_power;
+}
+
 /* March both transverse components in the active propagation direction. */
 static bool wave_arena_march(WaveArena& arena)
 {
     const float step_fraction = 1.0f / static_cast<float>(std::max(1, arena.nz));
+    /* One tick advances EVERY active lane -- all bands of all cohort rays --
+     * through a single wide batched FFT pass per field. Cost per tick is one
+     * batched propagation regardless of how many rays share the round.
+     * Material/border physics stay per n_bands-wide ray slice: they are
+     * elementwise (no cross-lane coupling), so per-slice exact-width calls
+     * are identical math at trivial cost. */
+    const int active = std::max(arena.n_bands, arena.active_lanes);
+    const bool wide = active > arena.n_bands;
+    const size_t npix = static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
     for (int step = 0; step < arena.nz; ++step) {
         for (int direction = 0;
              direction < wave_t4::kDirectionCount; ++direction) {
@@ -15503,6 +15757,17 @@ static bool wave_arena_march(WaveArena& arena)
                     d == wave_t4::Direction::Forward ? 1 : -1;
                 float* re = arena.field_re(d, c);
                 float* im = arena.field_im(d, c);
+                auto propagate = [&](double distance) -> bool {
+                    if (wide)
+                        return wave_t4::angular_spectrum_step_wide(
+                            active, arena.fft_nx, arena.fft_ny,
+                            arena.dx, distance, arena.wavelengths_m,
+                            sign, &arena.angular_plan, re, im);
+                    return wave_t4::angular_spectrum_step(
+                        arena.n_bands, arena.fft_nx, arena.fft_ny,
+                        arena.dx, distance, arena.wavelengths_m,
+                        sign, &arena.angular_plan, re, im);
+                };
                 double material_distance = 0.0;
                 if (arena.has_aperture_material) {
                     const double segment_center = sign > 0
@@ -15519,39 +15784,40 @@ static bool wave_arena_march(WaveArena& arena)
                            - std::max(segment_lo, material_lo));
                 }
                 if (material_distance > 0.0) {
-                    if (!wave_t4::angular_spectrum_step(
-                            arena.n_bands, arena.fft_nx, arena.fft_ny,
-                            arena.dx, 0.5*arena.dz, arena.wavelengths_m,
-                            sign, &arena.angular_plan, re, im))
+                    if (!propagate(0.5*arena.dz))
                         return false;
-                    wave_t4::Progress material_progress{};
-                    if (!wave_t4::apply_aperture_material(
-                            arena.n_bands, arena.fft_nx, arena.fft_ny,
-                            arena.dx, arena.wavelengths_m, sign,
-                            arena.aperture_material, material_distance,
-                            re, im, &material_progress))
-                        return false;
-                    arena.progress.absorbed_power +=
-                        material_progress.absorbed_power;
-                    if (!wave_t4::angular_spectrum_step(
-                            arena.n_bands, arena.fft_nx, arena.fft_ny,
-                            arena.dx, 0.5*arena.dz, arena.wavelengths_m,
-                            sign, &arena.angular_plan, re, im))
+                    for (int lane0 = 0; lane0 < active;
+                         lane0 += arena.n_bands) {
+                        wave_t4::Progress material_progress{};
+                        if (!wave_t4::apply_aperture_material(
+                                arena.n_bands, arena.fft_nx, arena.fft_ny,
+                                arena.dx, arena.wavelengths_m + lane0, sign,
+                                arena.aperture_material, material_distance,
+                                re + static_cast<size_t>(lane0) * npix,
+                                im + static_cast<size_t>(lane0) * npix,
+                                &material_progress))
+                            return false;
+                        arena.progress.absorbed_power +=
+                            material_progress.absorbed_power;
+                    }
+                    if (!propagate(0.5*arena.dz))
                         return false;
                 } else {
-                    if (!wave_t4::angular_spectrum_step(
-                            arena.n_bands, arena.fft_nx, arena.fft_ny,
-                            arena.dx, arena.dz, arena.wavelengths_m,
-                            sign, &arena.angular_plan, re, im))
+                    if (!propagate(arena.dz))
                         return false;
                 }
-                wave_t4::Progress field_progress{};
-                wave_t4::apply_absorbing_border(
-                    arena.n_bands, arena.fft_nx, arena.fft_ny,
-                    arena.boundary, step_fraction, re, im,
-                    &field_progress);
-                arena.progress.absorbed_power +=
-                    field_progress.absorbed_power;
+                for (int lane0 = 0; lane0 < active;
+                     lane0 += arena.n_bands) {
+                    wave_t4::Progress field_progress{};
+                    wave_t4::apply_absorbing_border(
+                        arena.n_bands, arena.fft_nx, arena.fft_ny,
+                        arena.boundary, step_fraction,
+                        re + static_cast<size_t>(lane0) * npix,
+                        im + static_cast<size_t>(lane0) * npix,
+                        &field_progress);
+                    arena.progress.absorbed_power +=
+                        field_progress.absorbed_power;
+                }
             }
         }
         ++arena.progress.completed_steps;
@@ -15569,6 +15835,7 @@ static ChildRay wave_arena_extract(
     WaveArena& arena,
     const RayIntent& src,
     int state_lane,
+    int lane_count,
     std::array<WaveExitStateRecord, 32>* exit_records,
     int* exit_record_count)
 {
@@ -15576,8 +15843,17 @@ static ChildRay wave_arena_extract(
     const int nx = arena.nx, ny = arena.ny;
     const size_t npix =
         static_cast<size_t>(arena.fft_nx) * arena.fft_ny;
+    /* continuous_single: one stochastically resolved lane whose amplitude
+     * returns to the ray's own source lane. Otherwise the range is one
+     * ray's fixed spectral slice ([state_lane, +lane_count) for a cohort
+     * member, [0, n_bands) for a lone fixed ray) and amplitudes map to
+     * slice-relative band positions. */
+    const bool continuous_single = state_lane >= 0
+        && arena.spectral_mode == wave_t4::SpectralMode::ContinuousCohort;
     const int band_begin = state_lane >= 0 ? state_lane : 0;
-    const int band_end = state_lane >= 0 ? state_lane + 1 : nb;
+    const int band_end = continuous_single
+        ? state_lane + 1
+        : (state_lane >= 0 ? state_lane + std::max(1, lane_count) : nb);
     const auto direction = wave_arena_direction(arena, src);
     auto padded_index = [&](int ix, int iy) -> size_t {
         return static_cast<size_t>(iy + arena.pad_y) * arena.fft_nx
@@ -15682,9 +15958,9 @@ static ChildRay wave_arena_extract(
         + arena.axis_y*(ic_y*arena.dx - oy);
     const V3d exit_pos = physical_exit + exit_dir*(EPS*200.0);
 
-    VXcd exit_amp = state_lane >= 0
+    VXcd exit_amp = continuous_single
         ? VXcd::Zero(std::max<int>(static_cast<int>(src.amp.size()), nb))
-        : VXcd(nb);
+        : VXcd::Zero(band_end - band_begin);
     const size_t sample = padded_index(ic_x, ic_y);
     for (int b = band_begin; b < band_end; ++b) {
         const float* s_re = arena.field_re(
@@ -15705,10 +15981,10 @@ static ChildRay wave_arena_extract(
             std::norm(p_value) > std::norm(s_value) ? p_value : s_value;
         const double phase = std::abs(phase_source) > 0.0
             ? std::arg(phase_source) : 0.0;
-        const int destination = state_lane >= 0
+        const int destination = continuous_single
             ? std::min<int>(
                 src.spectral_lane_id, static_cast<int>(exit_amp.size()) - 1)
-            : b;
+            : b - band_begin;
         exit_amp[destination] = std::polar(
             std::sqrt(band_power[static_cast<size_t>(b)]), phase);
     }
@@ -15743,8 +16019,15 @@ static ChildRay wave_arena_extract(
             record.stream = child.intent.bdpt_stream;
             record.direction = static_cast<std::uint8_t>(direction);
             record.arena_id = arena.id;
-            record.state_lane = state_lane;
-            record.band_id = static_cast<std::uint32_t>(b);
+            /* Record ABI convention: state_lane >= 0 identifies a resolved
+             * continuous sample lane; fixed-band transport reports -1. A
+             * fixed cohort slice is still fixed-band transport -- which
+             * slice of the shared march carried it is internal scheduling,
+             * not wire identity -- so band_id stays ray-relative and the
+             * fixed sentinel is preserved. */
+            record.state_lane = continuous_single ? state_lane : -1;
+            record.band_id = static_cast<std::uint32_t>(
+                continuous_single ? b : b - band_begin);
             record.flags =
                 WAVE_EXIT_REPRESENTATIVE_RAY | WAVE_EXIT_JONES_VALID;
             if (arena.spectral_mode
@@ -15782,7 +16065,8 @@ static ChildRay wave_arena_extract(
             lane.meta.coherence_id = spectral.coherence_id;
             lane.meta.sample_id = child.intent.bdpt_subpath_id;
             lane.meta.source_lane = static_cast<std::uint16_t>(
-                state_lane >= 0 ? child.intent.spectral_lane_id : b);
+                continuous_single
+                    ? child.intent.spectral_lane_id : b - band_begin);
             lane.meta.flags =
                 complex_transport::LaneActive
               | complex_transport::JonesValid
@@ -15920,7 +16204,8 @@ static void pipeline_spawn_child(RayPipelineState& ps, RayIntent child)
  * native client from turning a cycle into unbounded recursion. */
 static bool wave_arena_follow_link(
     RayPipelineState& ps, WaveArena& arena, RayIntent& lineage,
-    int state_lane, ChildRay& out, int& terminal_arena, int depth,
+    int state_lane, int lane_count, ChildRay& out, int& terminal_arena,
+    int depth,
     std::array<WaveExitStateRecord, 32>* exit_records,
     int* exit_record_count)
 {
@@ -15941,7 +16226,8 @@ static bool wave_arena_follow_link(
             : arena.next_backward_jones_im.data());
     if (next < 0) {
         out = wave_arena_extract(
-            arena, lineage, state_lane, exit_records, exit_record_count);
+            arena, lineage, state_lane, lane_count,
+            exit_records, exit_record_count);
         terminal_arena = arena.id;
         return true;
     }
@@ -15959,8 +16245,9 @@ static bool wave_arena_follow_link(
     lineage.path_len += (port - lineage.pos).norm();
     lineage.pos = port;
 
+    /* No inner lock: linked destinations always share the caller's claimed
+     * component, so the component claim already grants exclusive access. */
     WaveArena& destination = ps.arenas[static_cast<size_t>(next)];
-    std::lock_guard<std::mutex> destination_lock(destination.mu);
     if (!wave_arena_transfer(
             arena, destination, direction,
             coordinate_map, jones_re, jones_im))
@@ -15976,7 +16263,7 @@ static bool wave_arena_follow_link(
     destination.boundary_telemetry.entry_direction = lineage.dir;
     if (!wave_arena_march(destination)) return false;
     return wave_arena_follow_link(
-        ps, destination, lineage, state_lane,
+        ps, destination, lineage, state_lane, lane_count,
         out, terminal_arena, depth + 1,
         exit_records, exit_record_count);
 }
@@ -16032,7 +16319,7 @@ static void wave_arena_publish_terminal(
 template <class PublishTerminal>
 static int wave_arena_visit_branches(
     RayPipelineState& ps, WaveArena& arena, const RayIntent& incoming_lineage,
-    int state_lane, int depth, PublishTerminal& publish)
+    int state_lane, int lane_count, int depth, PublishTerminal& publish)
 {
     if (depth >= static_cast<int>(ps.arenas.size())) return 0;
     const auto direction = wave_arena_direction(arena, incoming_lineage);
@@ -16048,7 +16335,7 @@ static int wave_arena_visit_branches(
         }
         int exit_record_count = 0;
         ChildRay child = wave_arena_extract(
-            arena, terminal_lineage, state_lane,
+            arena, terminal_lineage, state_lane, lane_count,
             exit_records, &exit_record_count);
         publish(
             child, arena.id, exit_records, exit_record_count);
@@ -16073,9 +16360,9 @@ static int wave_arena_visit_branches(
         RayIntent lineage = incoming_lineage;
         lineage.path_len += (port-lineage.pos).norm();
         lineage.pos = port;
+        /* No inner lock: branch destinations share the claimed component. */
         WaveArena& destination =
             ps.arenas[static_cast<size_t>(link.destination)];
-        std::lock_guard<std::mutex> destination_lock(destination.mu);
         const float* jones_re = link.coordinate_map < 0
             ? nullptr : link.jones_re.data();
         const float* jones_im = link.coordinate_map < 0
@@ -16093,7 +16380,8 @@ static int wave_arena_visit_branches(
         destination.boundary_telemetry.entry_direction = lineage.dir;
         if (!wave_arena_march(destination)) continue;
         terminal_count += wave_arena_visit_branches(
-            ps, destination, lineage, state_lane, depth+1, publish);
+            ps, destination, lineage, state_lane, lane_count,
+            depth+1, publish);
     }
     return terminal_count;
 }
@@ -16104,7 +16392,8 @@ static int wave_arena_visit_branches(
 static void wave_arena_complete(RayPipelineState& ps,
                                 WaveIntent& wi,
                                 WaveArena& arena,
-                                int state_lane)
+                                int state_lane,
+                                int lane_count)
 {
     ChildRay cr;
     std::array<WaveExitStateRecord, 32>* exit_records = nullptr;
@@ -16129,7 +16418,7 @@ static void wave_arena_complete(RayPipelineState& ps,
                 terminal_records, terminal_record_count);
         };
         wave_arena_visit_branches(
-            ps, arena, lineage, state_lane, 0, publish);
+            ps, arena, lineage, state_lane, lane_count, 0, publish);
         pipeline_finish_ray(ps, wi.ray.color_flag);
         return;
     }
@@ -16167,13 +16456,14 @@ static void wave_arena_complete(RayPipelineState& ps,
             pipeline_finish_ray(ps, wi.ray.color_flag);
             return;
         }
-        std::lock_guard<std::mutex> terminal_lock(cursor->mu);
+        /* No inner lock: the cached terminal is in the claimed component. */
         cr = wave_arena_extract(
-            *cursor, lineage, state_lane,
+            *cursor, lineage, state_lane, lane_count,
             exit_records, &exit_record_count);
     } else {
         if (!wave_arena_follow_link(
-                ps, arena, lineage, state_lane, cr, terminal_arena, 0,
+                ps, arena, lineage, state_lane, lane_count,
+                cr, terminal_arena, 0,
                 exit_records, &exit_record_count)) {
             pipeline_finish_ray(ps, wi.ray.color_flag);
             return;
@@ -17307,7 +17597,10 @@ static void pipeline_wave_solver(RayPipelineState& ps)
 
     while (true) {
         batch.clear();
-        int bsz = ps.stats[3].batch_sz.load(std::memory_order_relaxed);
+        /* Pop at least a full cohort's worth so queued same-arena rays can
+         * share one march instead of trickling through one at a time. */
+        int bsz = std::max(
+            32, ps.stats[3].batch_sz.load(std::memory_order_relaxed));
         int n   = ps.Q_wave.pop_batch_exclusive_priority(
             batch,
             bsz,
@@ -17317,25 +17610,30 @@ static void pipeline_wave_solver(RayPipelineState& ps)
         auto t0 = Clock::now();
 
         std::vector<uint8_t> handled(static_cast<size_t>(n), 0u);
+        bool any_claimed = false;
         for (int wi_index = 0; wi_index < n; ++wi_index) {
             if (handled[static_cast<size_t>(wi_index)]) continue;
             WaveIntent& wi = batch[static_cast<size_t>(wi_index)];
             if (wi.arena_id < 0 || wi.arena_id >= (int)ps.arenas.size()) {
                 pipeline_finish_ray(ps, wi.ray.color_flag);
                 handled[static_cast<size_t>(wi_index)] = 1u;
+                any_claimed = true;
                 continue;
             }
             WaveArena& arena = ps.arenas[static_cast<size_t>(wi.arena_id)];
-            std::unique_lock<std::mutex> component_lock;
-            if (static_cast<size_t>(wi.arena_id)
-                    < ps.wave_component_locks.size()
-                && ps.wave_component_locks[
-                    static_cast<size_t>(wi.arena_id)])
-                component_lock = std::unique_lock<std::mutex>(
-                    *ps.wave_component_locks[
-                        static_cast<size_t>(wi.arena_id)]);
+            if (!wave_component_try_claim(ps, wi.arena_id)) {
+                /* Node owned by another worker: KPN semantics -- requeue
+                 * (the ray stays in flight) and do other work; never block. */
+                handled[static_cast<size_t>(wi_index)] = 1u;
+                ps.Q_wave.push(std::move(wi));
+                continue;
+            }
+            any_claimed = true;
+            struct ComponentClaimGuard {
+                RayPipelineState& ps; int id;
+                ~ComponentClaimGuard() { wave_component_release(ps, id); }
+            } component_claim_guard{ps, wi.arena_id};
             {
-                std::lock_guard<std::mutex> lk(arena.mu);
                 if (wi.ray.spectral_resolved && wi.ray.spectral_frequency_hz > 0.0) {
                     std::array<WaveIntent*, 32> cohort{};
                     int cohort_count = 0;
@@ -17362,15 +17660,55 @@ static void pipeline_wave_solver(RayPipelineState& ps)
                             pipeline_finish_ray(ps, completed.ray.color_flag);
                     }
                 } else {
-                    handled[static_cast<size_t>(wi_index)] = 1u;
-                    wave_arena_seed(ps, arena, wi.ray);
-                    if (wave_arena_march(arena))
-                        wave_arena_complete(ps, wi, arena);
-                    else
-                        pipeline_finish_ray(ps, wi.ray.color_flag);
+                    /* Fixed-band round: seed every queued ray bound for this
+                     * arena and direction side by side, advance the whole
+                     * round with ONE batched march, then extract each ray's
+                     * own lane slice. Cost per round is one march regardless
+                     * of how many rays share it. */
+                    std::array<WaveIntent*, 32> cohort{};
+                    int cohort_count = 0;
+                    const int max_rays = std::max(
+                        1, std::max(arena.n_bands, arena.cohort_lanes)
+                            / arena.n_bands);
+                    const bool forward =
+                        wi.ray.dir.dot(arena.axis_z) >= 0.0;
+                    for (int j = wi_index;
+                         j < n && cohort_count < max_rays; ++j) {
+                        WaveIntent& candidate =
+                            batch[static_cast<size_t>(j)];
+                        if (handled[static_cast<size_t>(j)]
+                            || candidate.arena_id != wi.arena_id
+                            || (candidate.ray.spectral_resolved
+                                && candidate.ray.spectral_frequency_hz > 0.0)
+                            || (candidate.ray.dir.dot(arena.axis_z) >= 0.0)
+                                != forward)
+                            continue;
+                        handled[static_cast<size_t>(j)] = 1u;
+                        cohort[static_cast<size_t>(cohort_count++)] =
+                            &candidate;
+                    }
+                    wave_arena_seed_fixed_cohort(
+                        ps, arena, cohort, cohort_count);
+                    const bool marched = wave_arena_march(arena);
+                    for (int r = 0; r < cohort_count; ++r) {
+                        WaveIntent& completed =
+                            *cohort[static_cast<size_t>(r)];
+                        if (marched)
+                            wave_arena_complete(
+                                ps, completed, arena,
+                                r * arena.n_bands, arena.n_bands);
+                        else
+                            pipeline_finish_ray(
+                                ps, completed.ray.color_flag);
+                    }
                 }
             }
         }
+        /* Every popped intent belonged to nodes owned elsewhere: everything
+         * went straight back to the queue. Yield so this thread does not
+         * hot-spin repopping the same busy-node work. */
+        if (!any_claimed)
+            std::this_thread::yield();
 
         auto t1 = Clock::now();
         ps.stats[3].record(n,
@@ -17551,7 +17889,7 @@ RayPipelineState* ray_pipeline_create(
             return nullptr;
         }
     }
-    ps->wave_component_locks.resize(ps->arenas.size());
+    ps->wave_component_claims.resize(ps->arenas.size());
     std::vector<uint8_t> wave_component_seen(ps->arenas.size(), 0u);
     for (int start = 0;
          start < static_cast<int>(ps->arenas.size()); ++start) {
@@ -17560,9 +17898,11 @@ RayPipelineState* ray_pipeline_create(
         const WaveArena& root = ps->arenas[static_cast<size_t>(start)];
         if (root.forward_links.empty() && root.backward_links.empty()) {
             wave_component_seen[static_cast<size_t>(start)] = 1u;
+            ps->wave_component_claims[static_cast<size_t>(start)] =
+                &root.claim;
             continue;
         }
-        auto component_lock = std::make_shared<std::mutex>();
+        std::atomic<uint32_t>* component_claim = &root.claim;
         std::vector<int> component_stack{start};
         std::vector<int> component_members;
         while (!component_stack.empty()) {
@@ -17574,8 +17914,8 @@ RayPipelineState* ray_pipeline_create(
                 continue;
             wave_component_seen[static_cast<size_t>(arena_id)] = 1u;
             component_members.push_back(arena_id);
-            ps->wave_component_locks[static_cast<size_t>(arena_id)] =
-                component_lock;
+            ps->wave_component_claims[static_cast<size_t>(arena_id)] =
+                component_claim;
             const WaveArena& arena =
                 ps->arenas[static_cast<size_t>(arena_id)];
             for (const WaveFieldLink& edge : arena.forward_links)
@@ -19978,13 +20318,14 @@ RayPipelineWaveCheckpoint* ray_pipeline_wave_checkpoint_create(
     try {
         checkpoint = std::make_unique<RayPipelineWaveCheckpoint>();
         checkpoint->arenas.resize(ps->arenas.size());
+        WaveClaimGuard claims;
         for (size_t i = 0; i < ps->arenas.size(); ++i) {
             auto& saved = checkpoint->arenas[i];
             if (ray_pipeline_get_wave_arena_snapshot(
                     ps, static_cast<int>(i), &saved.descriptor) != SK_OK)
                 return nullptr;
             const WaveArena& arena = ps->arenas[i];
-            std::lock_guard<std::mutex> lock(arena.mu);
+            claims.acquire(ps->wave_component_claims[i]);
             saved.linked_generation = arena.linked_generation;
             saved.linked_terminal_arena = arena.linked_terminal_arena;
             std::copy(
@@ -20012,10 +20353,11 @@ int ray_pipeline_wave_checkpoint_restore(
         return SK_ERR_DIM_MISMATCH;
 
     // Validate every cold identity before mutating the first arena.
+    WaveClaimGuard claims;
     for (size_t i = 0; i < ps->arenas.size(); ++i) {
         const WaveArena& arena = ps->arenas[i];
         const auto& saved = checkpoint->arenas[i];
-        std::lock_guard<std::mutex> lock(arena.mu);
+        claims.acquire(ps->wave_component_claims[i]);
         const auto& descriptor = saved.descriptor;
         if (descriptor.arena_id != arena.id
             || descriptor.context_id != arena.context_id
@@ -20036,7 +20378,6 @@ int ray_pipeline_wave_checkpoint_restore(
         WaveArena& arena = ps->arenas[i];
         const auto& saved = checkpoint->arenas[i];
         const auto& descriptor = saved.descriptor;
-        std::lock_guard<std::mutex> lock(arena.mu);
         arena.linked_transfers = descriptor.linked_transfers;
         arena.linked_generation = saved.linked_generation;
         arena.linked_terminal_arena = saved.linked_terminal_arena;
@@ -20208,7 +20549,8 @@ int ray_pipeline_get_wave_arena_snapshot(const RayPipelineState* ps,
     if (arena_id < 0 || arena_id >= static_cast<int>(ps->arenas.size()))
         return SK_ERR_DIM_MISMATCH;
     const WaveArena& arena = ps->arenas[static_cast<size_t>(arena_id)];
-    std::lock_guard<std::mutex> lk(arena.mu);
+    WaveClaimGuard claim(
+        ps->wave_component_claims[static_cast<size_t>(arena_id)]);
     out->arena_id = arena.id;
     out->context_id = arena.context_id;
     out->next_forward = arena.next_forward;
@@ -20219,6 +20561,7 @@ int ray_pipeline_get_wave_arena_snapshot(const RayPipelineState* ps,
         static_cast<int>(arena.backward_links.size());
     out->linked_transfers = arena.linked_transfers;
     out->bands = arena.n_bands;
+    out->cohort_lanes = arena.cohort_lanes;
     out->band_specialization = arena.band_specialization;
     out->spectral_mode = static_cast<int>(arena.spectral_mode);
     out->backend = static_cast<int>(arena.backend);
@@ -20314,7 +20657,8 @@ int ray_pipeline_copy_wave_arena_field(const RayPipelineState* ps,
         || component >= wave_t4::kTransverseComponentCount)
         return SK_ERR_DIM_MISMATCH;
     const WaveArena& arena = ps->arenas[static_cast<size_t>(arena_id)];
-    std::lock_guard<std::mutex> lk(arena.mu);
+    WaveClaimGuard claim(
+        ps->wave_component_claims[static_cast<size_t>(arena_id)]);
     if (band < 0 || band >= arena.n_bands)
         return SK_ERR_DIM_MISMATCH;
     *out_nx = arena.nx;

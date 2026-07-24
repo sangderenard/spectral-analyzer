@@ -279,8 +279,13 @@ def test_compiled_optical_graph_installs_and_drives_native_t4():
     assert arena["bands"] == 1
     assert arena["backend"] == 0  # AngularSpectrum
     assert arena["field_count"] == 4
+    # The state block is cohort-sized: a whole number of n_bands-wide ray
+    # slices share one batched march, so lane capacity, not bands alone,
+    # sets the allocation.
+    assert arena["cohort_lanes"] % arena["bands"] == 0
+    assert arena["cohort_lanes"] >= arena["bands"]
     assert arena["state_float_count"] == (
-        arena["bands"] * arena["fft_nx"] * arena["fft_ny"] * 8
+        arena["cohort_lanes"] * arena["fft_nx"] * arena["fft_ny"] * 8
     )
     assert sum(arena["field_active"]) == 1
 

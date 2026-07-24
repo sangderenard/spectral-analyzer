@@ -196,6 +196,21 @@ bool angular_spectrum_step(int bands,
                            float* re,
                            float* im) noexcept;
 
+/** Same as angular_spectrum_step, but for an arbitrary runtime band count
+ * instead of the exact per-ray lane widths {1,3,4,8,16,32}. For a ray
+ * cohort's combined lane count (n_bands per ray times however many rays
+ * share this march), not for ordinary single-ray transport. */
+bool angular_spectrum_step_wide(int bands,
+                                int nx,
+                                int ny,
+                                double dx,
+                                double dz,
+                                const double* wavelengths_m,
+                                int direction_sign,
+                                const AngularSpectrumPlan* plan,
+                                float* re,
+                                float* im) noexcept;
+
 /** Diagnostic reference using the original split-complex radix-2 transform.
  * Kept for numerical qualification of replacement executors, not scheduling. */
 bool angular_spectrum_step_reference(int bands,

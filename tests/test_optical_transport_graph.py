@@ -24,6 +24,13 @@ from camera_software.optical_transport_graph import (
     install_optical_graph,
     wave_context_nodes,
 )
+from camera_software.optical_transport_contracts import (
+    OpticalAccuracySpec,
+    OpticalProductKind,
+    OpticalScatteringProductSpec,
+    OpticalSolveReport,
+    OpticalTimingSpec,
+)
 
 
 def _lens(lane_count: int) -> CompoundLens:
@@ -230,6 +237,163 @@ def test_graph_solver_preserves_branching_optical_topology():
     assert {link["semantic_role"] for link in contract["links"]} == {
         "transmitted", "reflected",
     }
+    assert contract["schedule"]["branch_node_keys"] == ["splitter"]
+    assert contract["schedule"]["maximum_fanout"] == 2
+    assert contract["schedule"]["requires_branch_frontier"] is True
+    assert contract["schedule"]["requires_timed_worklist"] is False
+
+
+def test_optical_schedule_preserves_continuous_product_timing():
+    source = OpticalNodeSpec(
+        "source", "source", OpticalExecutionDomain.PIPELINE_PORT,
+        OpticalRepresentation.COMPLEX_RAY,
+        OpticalRepresentation.COMPLEX_RAY, 4,
+    )
+    product = OpticalNodeSpec(
+        "product", "product", OpticalExecutionDomain.PIPELINE_PORT,
+        OpticalRepresentation.COMPLEX_RAY,
+        OpticalRepresentation.COMPLEX_RAY, 4,
+    )
+    timing = OpticalTimingSpec.homogeneous(
+        0.125, phase_index=1.51, group_index=1.53,
+    )
+    link = OpticalLinkSpec(
+        source.key, product.key, "transmitted", product=
+        OpticalScatteringProductSpec(
+            "plate.transmitted",
+            OpticalProductKind.TRANSMITTED,
+            timing=timing,
+            power_upper_bound=0.96,
+        ),
+    )
+    compiled = compile_optical_graph(OpticalTransportGraphSpec(
+        (source, product), (link,), (source.key,), (product.key,),
+    ))
+    contract = compiled.contract()
+
+    assert contract["links"][0]["product"]["key"] == "plate.transmitted"
+    assert contract["links"][0]["product"]["timing"]["optical_path_m"] == pytest.approx(
+        0.125 * 1.51
+    )
+    assert contract["schedule"]["has_timestamped_edges"] is True
+    assert contract["schedule"]["requires_timed_worklist"] is False
+    assert contract["schedule"]["clock_policy"] == (
+        "lcm-commensurate-event-timestamp-otherwise"
+    )
+
+
+def test_optical_schedule_detects_delayed_cycles_without_quantizing_them():
+    a = OpticalNodeSpec(
+        "a", "field", OpticalExecutionDomain.T4_WAVE_ARENA,
+        OpticalRepresentation.TRANSVERSE_FIELD,
+        OpticalRepresentation.TRANSVERSE_FIELD, 4,
+        persistent_state=True,
+    )
+    b = OpticalNodeSpec(
+        "b", "field", OpticalExecutionDomain.T4_WAVE_ARENA,
+        OpticalRepresentation.TRANSVERSE_FIELD,
+        OpticalRepresentation.TRANSVERSE_FIELD, 4,
+        persistent_state=True,
+    )
+    sink = OpticalNodeSpec(
+        "sink", "detector", OpticalExecutionDomain.PIPELINE_PORT,
+        OpticalRepresentation.TRANSVERSE_FIELD,
+        OpticalRepresentation.COMPLEX_RAY, 4,
+    )
+    delay = OpticalTimingSpec.homogeneous(0.01)
+    compiled = compile_optical_graph(OpticalTransportGraphSpec(
+        (a, b, sink),
+        (
+            OpticalLinkSpec(
+                "a", "b", product=OpticalScatteringProductSpec(
+                    "a-to-b", timing=delay,
+                ),
+            ),
+            OpticalLinkSpec(
+                "b", "a", product=OpticalScatteringProductSpec(
+                    "b-to-a", timing=delay,
+                ),
+            ),
+            # This zero-delay edge leaves the SCC and must not contaminate its
+            # internal-delay telemetry.
+            OpticalLinkSpec("b", "sink"),
+        ),
+        ("a",), ("sink",),
+    ))
+
+    assert len(compiled.schedule.cyclic_region_ids) == 1
+    region = compiled.schedule.regions[compiled.schedule.cyclic_region_ids[0]]
+    assert set(region.node_keys) == {"a", "b"}
+    assert region.minimum_internal_group_delay_s == pytest.approx(
+        delay.group_delay_s
+    )
+    assert region.has_positive_delay_edge is True
+    assert region.contains_zero_delay_cycle is False
+    assert compiled.schedule.requires_cycle_solver is True
+    assert compiled.schedule.requires_timed_worklist is True
+
+
+def test_optical_schedule_separates_zero_delay_scc_from_timed_work():
+    node = OpticalNodeSpec(
+        "feedback", "field", OpticalExecutionDomain.T4_WAVE_ARENA,
+        OpticalRepresentation.TRANSVERSE_FIELD,
+        OpticalRepresentation.TRANSVERSE_FIELD, 4,
+        persistent_state=True,
+    )
+    compiled = compile_optical_graph(OpticalTransportGraphSpec(
+        (node,), (OpticalLinkSpec(node.key, node.key),),
+        (node.key,), (node.key,),
+    ))
+
+    region = compiled.schedule.regions[0]
+    assert region.cyclic is True
+    assert region.contains_zero_delay_cycle is True
+    assert compiled.schedule.zero_delay_cycle_region_ids == (0,)
+    assert compiled.schedule.requires_cycle_solver is True
+    assert compiled.schedule.requires_timed_worklist is False
+
+
+def test_stochastic_product_and_final_report_contracts_fail_loudly():
+    with pytest.raises(ValueError, match="require a selection PDF"):
+        OpticalScatteringProductSpec(
+            "sampled.reflection", deterministic=False,
+        ).validate()
+    with pytest.raises(ValueError, match="must not carry"):
+        OpticalScatteringProductSpec(
+            "deterministic.reflection", selection_pdf=0.5,
+        ).validate()
+
+    accuracy = OpticalAccuracySpec(residual_power=1.0e-3)
+    with pytest.raises(RuntimeError, match="residual-power"):
+        OpticalSolveReport(
+            input_power=1.0, residual_power=2.0e-3,
+        ).validate(accuracy)
+    with pytest.raises(RuntimeError, match="dropped"):
+        OpticalSolveReport(
+            input_power=1.0, dropped_power=1.0e-6,
+        ).validate(accuracy)
+
+
+def test_optical_graph_uses_lcm_clock_for_commensurate_component_rates():
+    a = OpticalNodeSpec(
+        "a", "component", OpticalExecutionDomain.T2_PARAMETRIC,
+        OpticalRepresentation.COMPLEX_RAY,
+        OpticalRepresentation.COMPLEX_RAY, 4,
+        parameters={"refresh_rate_hz": 120.0},
+    )
+    b = OpticalNodeSpec(
+        "b", "component", OpticalExecutionDomain.T2_PARAMETRIC,
+        OpticalRepresentation.COMPLEX_RAY,
+        OpticalRepresentation.COMPLEX_RAY, 4,
+        parameters={"refresh_rate_hz": 90.0},
+    )
+    compiled = compile_optical_graph(OpticalTransportGraphSpec(
+        (a, b), (OpticalLinkSpec("a", "b"),), ("a",), ("b",),
+    ))
+
+    assert compiled.schedule.clock_rate_hz == pytest.approx(360.0)
+    assert compiled.topology_solver.sample_rate == pytest.approx(360.0)
+    assert compiled.topology_solver.network_clock.dt == pytest.approx(1.0/360.0)
 
 
 class _RecordingTracer:
@@ -328,6 +492,132 @@ def test_installer_lowers_field_to_field_edge_to_native_persistent_link():
         "persistent-full-field"
     )
     assert receipt.contract()["wave_links"][0]["resampling"] == "forbidden"
+
+
+def test_installer_lowers_wave_fanout_as_two_cold_native_products():
+    def arena(key: str, center_z: float) -> OpticalNodeSpec:
+        return OpticalNodeSpec(
+            key, "wave-propagation", OpticalExecutionDomain.T4_WAVE_ARENA,
+            OpticalRepresentation.TRANSVERSE_FIELD,
+            OpticalRepresentation.TRANSVERSE_FIELD, 4,
+            persistent_state=True,
+            parameters={
+                "propagation": WavePropagationStyle.ANGULAR_SPECTRUM_FFT.value,
+                "boundary": WaveBoundaryStyle.PADDED_ABSORBING.value,
+                "center_m": (0.0, 0.0, center_z),
+                "axis": (0.0, 0.0, 1.0),
+                "radius_m": 64.0e-6,
+                "longitudinal_step_m": 2.0e-6,
+                "longitudinal_steps": 8,
+            },
+        )
+
+    source = arena("split.source", 0.0)
+    reflected = arena("split.reflected", 16.0e-6)
+    transmitted = arena("split.transmitted", 16.0e-6)
+    compiled = compile_optical_graph(OpticalTransportGraphSpec(
+        (source, reflected, transmitted),
+        (
+            OpticalLinkSpec(
+                source.key, reflected.key, "reflected",
+                product=OpticalScatteringProductSpec(
+                    "split.reflected", OpticalProductKind.REFLECTED,
+                ),
+            ),
+            OpticalLinkSpec(
+                source.key, transmitted.key, "transmitted",
+                product=OpticalScatteringProductSpec(
+                    "split.transmitted", OpticalProductKind.TRANSMITTED,
+                ),
+            ),
+        ),
+        (source.key,), (reflected.key, transmitted.key),
+    ))
+    tracer = _RecordingTracer()
+
+    receipt = install_optical_graph(
+        tracer, compiled, exact_t2_registered=False,
+    )
+
+    assert compiled.schedule.branch_node_keys == (source.key,)
+    assert tracer.wave_links == [(0, 1), (0, 2)]
+    assert len(receipt.wave_links) == 2
+
+
+def test_installer_refuses_wave_fanin_until_coherent_accumulator_exists():
+    def arena(key: str) -> OpticalNodeSpec:
+        return OpticalNodeSpec(
+            key, "wave-propagation", OpticalExecutionDomain.T4_WAVE_ARENA,
+            OpticalRepresentation.TRANSVERSE_FIELD,
+            OpticalRepresentation.TRANSVERSE_FIELD, 4,
+            persistent_state=True,
+            parameters={
+                "propagation": WavePropagationStyle.ANGULAR_SPECTRUM_FFT.value,
+                "center_m": (0.0, 0.0, 0.0),
+                "radius_m": 1.0e-3,
+                "longitudinal_step_m": 1.0e-5,
+                "longitudinal_steps": 1,
+            },
+        )
+
+    a, b, joined = arena("a"), arena("b"), arena("joined")
+    compiled = compile_optical_graph(OpticalTransportGraphSpec(
+        (a, b, joined),
+        (OpticalLinkSpec("a", "joined"), OpticalLinkSpec("b", "joined")),
+        ("a", "b"), ("joined",),
+    ))
+
+    reception = compiled.schedule.receptions[0]
+    assert reception.pool_id == 0
+    assert reception.destination_node == "joined"
+    assert tuple(
+        predecessor.product_id for predecessor in reception.predecessors
+    ) == (0, 1)
+    assert compiled.contract()["schedule"]["receptions"][0]["policy"] == (
+        "deterministic-coherent"
+    )
+
+    with pytest.raises(RuntimeError, match="coherent fan-in"):
+        install_optical_graph(
+            _RecordingTracer(), compiled, exact_t2_registered=False,
+        )
+
+
+def test_join_compiler_rejects_mixed_coherence_policy():
+    a = OpticalNodeSpec(
+        "a", "source", OpticalExecutionDomain.PIPELINE_PORT,
+        OpticalRepresentation.COMPLEX_RAY,
+        OpticalRepresentation.COMPLEX_RAY, 1,
+    )
+    b = OpticalNodeSpec(
+        "b", "source", OpticalExecutionDomain.PIPELINE_PORT,
+        OpticalRepresentation.COMPLEX_RAY,
+        OpticalRepresentation.COMPLEX_RAY, 1,
+    )
+    joined = OpticalNodeSpec(
+        "joined", "join", OpticalExecutionDomain.PIPELINE_PORT,
+        OpticalRepresentation.COMPLEX_RAY,
+        OpticalRepresentation.COMPLEX_RAY, 1,
+    )
+    spec = OpticalTransportGraphSpec(
+        (a, b, joined),
+        (
+            OpticalLinkSpec(
+                "a", "joined", product=OpticalScatteringProductSpec(
+                    "a-product", coherent=True,
+                ),
+            ),
+            OpticalLinkSpec(
+                "b", "joined", product=OpticalScatteringProductSpec(
+                    "b-product", coherent=False,
+                ),
+            ),
+        ),
+        ("a", "b"), ("joined",),
+    )
+
+    with pytest.raises(ValueError, match="mixes unsupported coherence"):
+        compile_optical_graph(spec)
 
 
 def test_installer_refuses_unsupported_split_step_substitution():

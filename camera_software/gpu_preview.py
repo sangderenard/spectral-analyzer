@@ -21,7 +21,11 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Generic, Iterable, Mapping, TypeVar
+
+
+_RequestT = TypeVar("_RequestT")
+_ProductT = TypeVar("_ProductT")
 
 
 class PreviewProductKind(str, Enum):
@@ -123,6 +127,115 @@ class PreviewProductRegistry:
     def products_for_group(self, group_id: str) -> tuple[PreviewTextureProduct, ...]:
         wanted = str(group_id)
         return tuple(item for item in self.snapshot() if item.group_id == wanted)
+
+
+@dataclass(frozen=True, slots=True)
+class LatestProductionResult(Generic[_ProductT]):
+    """One completed asynchronous production attempt."""
+
+    request_id: int
+    payload: _ProductT | None
+    started_at_s: float
+    finished_at_s: float
+    error: BaseException | None = None
+
+    @property
+    def elapsed_s(self) -> float:
+        return max(0.0, float(self.finished_at_s) - float(self.started_at_s))
+
+
+class LatestOnlyProducer(Generic[_RequestT, _ProductT]):
+    """Run expensive production off-thread with a one-item latest-wins inbox.
+
+    UI/control code may request freely without building an unbounded queue of
+    obsolete frames. The worker completes its current request, then consumes
+    only the newest pending state. Polling never waits.
+    """
+
+    def __init__(
+        self,
+        produce: Callable[[_RequestT], _ProductT],
+        *,
+        name: str = "LatestOnlyProducer",
+    ) -> None:
+        self._produce = produce
+        self._condition = threading.Condition()
+        self._pending: tuple[int, _RequestT] | None = None
+        self._latest: LatestProductionResult[_ProductT] | None = None
+        self._next_request_id = 0
+        self._busy = False
+        self._stopping = False
+        self._thread = threading.Thread(
+            target=self._run, name=str(name), daemon=True
+        )
+        self._thread.start()
+
+    @property
+    def busy(self) -> bool:
+        with self._condition:
+            return self._busy
+
+    def request(self, value: _RequestT) -> int:
+        with self._condition:
+            if self._stopping:
+                raise RuntimeError("latest-only producer is closed")
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            self._pending = (request_id, value)
+            self._condition.notify()
+            return request_id
+
+    def poll(
+        self, *, after_request_id: int = -1
+    ) -> LatestProductionResult[_ProductT] | None:
+        with self._condition:
+            if (
+                self._latest is None
+                or self._latest.request_id <= int(after_request_id)
+            ):
+                return None
+            return self._latest
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None and not self._stopping:
+                    self._condition.wait()
+                if self._stopping:
+                    self._busy = False
+                    self._condition.notify_all()
+                    return
+                request_id, value = self._pending
+                self._pending = None
+                self._busy = True
+            started = time.monotonic()
+            payload: _ProductT | None = None
+            error: BaseException | None = None
+            try:
+                payload = self._produce(value)
+            except BaseException as exc:
+                error = exc
+            finished = time.monotonic()
+            with self._condition:
+                self._latest = LatestProductionResult(
+                    request_id=request_id,
+                    payload=payload,
+                    started_at_s=started,
+                    finished_at_s=finished,
+                    error=error,
+                )
+                self._busy = False
+                self._condition.notify_all()
+
+    def close(self, *, timeout_s: float = 5.0) -> bool:
+        """Stop accepting work and wait briefly for current production."""
+
+        with self._condition:
+            self._stopping = True
+            self._pending = None
+            self._condition.notify_all()
+        self._thread.join(timeout=max(0.0, float(timeout_s)))
+        return not self._thread.is_alive()
 
 
 @dataclass(frozen=True, slots=True)
@@ -673,4 +786,5 @@ __all__ = [
     "PreviewProductKind", "PreviewTextureProduct", "PreviewProductRegistry",
     "OpenGLShareGroup", "PreviewProductPublisher", "GLPreviewCompositor",
     "RayPipelinePreviewBridge", "AsyncTextureCapture",
+    "LatestProductionResult", "LatestOnlyProducer",
 ]

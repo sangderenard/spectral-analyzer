@@ -1,13 +1,71 @@
 """Deterministic simulated-time exposure slicing for camera software.
 
 This module is intentionally small: it gives camera code a stable frame/slice
-identity and shutter/flash timing contract before the ray pipeline grows more
-complete per-slice completion barriers.
+identity, authored shutter/emitter/sensor states, and exact per-slice
+completion accounting without borrowing time from the display loop.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import asdict, dataclass, field
+import hashlib
+import json
+import math
+import threading
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    TypeVar,
+)
+
+
+_UINT64_MAX = (1 << 64) - 1
+_ResultT = TypeVar("_ResultT")
+CAMERA_SLICE_JOB_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True, order=True)
+class CameraCausalityKey:
+    """Portable identity for one camera-authored unit of physical time.
+
+    ``causality_id`` is monotonic within the camera namespace.  Program
+    generation is separate so a reset/reprogram can invalidate old work
+    without pretending that an integer counter is itself simulated time.
+    """
+
+    camera_id: str
+    program_generation: int
+    causality_id: int
+
+    def __post_init__(self) -> None:
+        if not self.camera_id:
+            raise ValueError("camera causality keys require a non-empty camera_id")
+        for name, value in (
+            ("program_generation", self.program_generation),
+            ("causality_id", self.causality_id),
+        ):
+            if not 0 <= int(value) <= _UINT64_MAX:
+                raise ValueError(f"{name} must fit an unsigned 64-bit integer")
+
+    def to_wire(self) -> Dict[str, str | int]:
+        return {
+            "camera_id": self.camera_id,
+            "program_generation": int(self.program_generation),
+            "causality_id": int(self.causality_id),
+        }
+
+    @staticmethod
+    def from_wire(value: Mapping[str, Any]) -> "CameraCausalityKey":
+        return CameraCausalityKey(
+            camera_id=str(value["camera_id"]),
+            program_generation=int(value["program_generation"]),
+            causality_id=int(value["causality_id"]),
+        )
 
 
 def _clamp01(v: Any, default: float = 0.0) -> float:
@@ -59,10 +117,23 @@ class ExposureSlice:
     sensor_weight: float
     profile: str = "steady"
     scene_version_id: Optional[int] = None
+    flash_active: bool = True
+    sensor_integrating: bool = True
+    camera_id: str = "camera"
+    program_generation: int = 0
+    causality_id: int = 0
 
     @property
     def dt(self) -> float:
         return max(0.0, float(self.t1) - float(self.t0))
+
+    @property
+    def causality_key(self) -> CameraCausalityKey:
+        return CameraCausalityKey(
+            camera_id=str(self.camera_id),
+            program_generation=int(self.program_generation),
+            causality_id=int(self.causality_id),
+        )
 
     def sensor_submit_args(self) -> Dict[str, float | int]:
         """Arguments accepted by ray_pipeline_submit_sensor_sweep."""
@@ -83,20 +154,42 @@ class ExposureFrame:
     frame_id: int
     t0: float
     t1: float
-    slices: List[ExposureSlice] = field(default_factory=list)
+    slices: tuple[ExposureSlice, ...] = ()
+    camera_id: str = "camera"
+    program_generation: int = 0
 
     @property
     def dt(self) -> float:
         return max(0.0, float(self.t1) - float(self.t0))
 
+    @property
+    def causality_keys(self) -> tuple[CameraCausalityKey, ...]:
+        return tuple(item.causality_key for item in self.slices)
+
 
 class CameraExposureScheduler:
     """Builds and owns deterministic exposure slices for the active frame."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        camera_id: str = "camera",
+        program_generation: int = 0,
+        next_causality_id: int = 0,
+    ) -> None:
+        if not camera_id:
+            raise ValueError("camera_id must be non-empty")
+        if not 0 <= int(program_generation) <= _UINT64_MAX:
+            raise ValueError("program_generation must fit uint64")
+        if not 0 <= int(next_causality_id) <= _UINT64_MAX:
+            raise ValueError("next_causality_id must fit uint64")
+        self.camera_id = str(camera_id)
+        self.program_generation = int(program_generation)
+        self.next_causality_id = int(next_causality_id)
         self.scene_time_s: float = 0.0
         self.next_frame_id: int = 0
         self.active_frame: Optional[ExposureFrame] = None
+        self._authoring_lock = threading.RLock()
 
     def begin_frame(self,
                     scene: Any,
@@ -104,12 +197,13 @@ class CameraExposureScheduler:
                     *,
                     t0_s: Optional[float] = None) -> ExposureFrame:
         """Start a new exposure frame from the current camera/scene settings."""
-        if t0_s is not None:
-            self.scene_time_s = float(t0_s)
-        frame = self._build_frame(scene, dt_s)
-        self.active_frame = frame
-        self.next_frame_id = int(frame.frame_id) + 1
-        return frame
+        with self._authoring_lock:
+            if t0_s is not None:
+                self.scene_time_s = float(t0_s)
+            frame = self._build_frame(scene, dt_s)
+            self.active_frame = frame
+            self.next_frame_id = int(frame.frame_id) + 1
+            return frame
 
     def ensure_frame(self,
                      scene: Any,
@@ -122,14 +216,35 @@ class CameraExposureScheduler:
 
     def finish_frame(self) -> None:
         """Advance simulated time to the end of the active frame."""
-        if self.active_frame is not None:
-            self.scene_time_s = max(self.scene_time_s, float(self.active_frame.t1))
-        self.active_frame = None
+        with self._authoring_lock:
+            if self.active_frame is not None:
+                self.scene_time_s = max(
+                    self.scene_time_s, float(self.active_frame.t1)
+                )
+            self.active_frame = None
 
-    def reset(self, scene_time_s: float = 0.0) -> None:
-        self.scene_time_s = float(scene_time_s)
-        self.next_frame_id = 0
-        self.active_frame = None
+    def reset(self, scene_time_s: float = 0.0, *, new_program: bool = True) -> None:
+        """Reset camera time without ever reusing a causality id.
+
+        By default this begins a new program generation, so results still in
+        flight from the old program are unambiguously stale.
+        """
+
+        with self._authoring_lock:
+            if new_program:
+                if self.program_generation >= _UINT64_MAX:
+                    raise OverflowError("camera program generation exhausted uint64")
+                self.program_generation += 1
+            self.scene_time_s = float(scene_time_s)
+            self.next_frame_id = 0
+            self.active_frame = None
+
+    def _allocate_causality_id(self) -> int:
+        if self.next_causality_id > _UINT64_MAX:
+            raise OverflowError("camera causality id exhausted uint64")
+        result = self.next_causality_id
+        self.next_causality_id += 1
+        return result
 
     def _build_frame(self, scene: Any, dt_s: Optional[float]) -> ExposureFrame:
         burst = getattr(scene, "camera_light_burst", None)
@@ -150,10 +265,22 @@ class CameraExposureScheduler:
         energy = max(0.0, float(getattr(burst, "energy_scale", 1.0)))
         enabled = bool(getattr(burst, "enabled", True))
         profile = str(getattr(burst, "profile", "steady") or "steady")
-        per_slice_energy = (energy * duty / float(stages)) if enabled else 0.0
+        active_flash_slices = (
+            min(stages, max(1, int(math.ceil(stages * duty))))
+            if enabled and energy > 0.0 and duty > 0.0
+            else 0
+        )
+        total_flash_weight = energy * duty if active_flash_slices else 0.0
+        active_flash_weight = (
+            total_flash_weight / float(active_flash_slices)
+            if active_flash_slices
+            else 0.0
+        )
 
         mode = _shutter_mode_code(getattr(plate, "shutter_mode", "open"))
         open_f = _clamp01(getattr(plate, "shutter_open", 1.0), 1.0)
+        sensor_integrating = mode != 1 and open_f > 0.0
+        sensor_weight = (1.0 / float(stages)) if sensor_integrating else 0.0
         cu_base = _clamp01(getattr(plate, "shutter_center_u", 0.5), 0.5)
         cv_base = _clamp01(getattr(plate, "shutter_center_v", 0.5), 0.5)
         softness = max(0.0, float(getattr(plate, "shutter_softness", 0.0)))
@@ -163,6 +290,7 @@ class CameraExposureScheduler:
         slice_dt = exposure_time / float(stages)
         slices: List[ExposureSlice] = []
         for slice_id in range(stages):
+            flash_active = slice_id < active_flash_slices
             cu = cu_base
             cv = cv_base
             if stages > 1 and mode == 3:
@@ -190,18 +318,408 @@ class CameraExposureScheduler:
                 shutter_center_u=cu,
                 shutter_center_v=cv,
                 shutter_softness=softness,
-                exposure_weight=per_slice_energy,
-                flash_weight=per_slice_energy,
-                sensor_weight=per_slice_energy,
+                exposure_weight=sensor_weight,
+                flash_weight=active_flash_weight if flash_active else 0.0,
+                sensor_weight=sensor_weight,
                 profile=profile,
+                flash_active=flash_active,
+                sensor_integrating=sensor_integrating,
+                camera_id=self.camera_id,
+                program_generation=self.program_generation,
+                causality_id=self._allocate_causality_id(),
             ))
 
         return ExposureFrame(
             frame_id=frame_id,
             t0=t0,
             t1=t0 + exposure_time,
-            slices=slices,
+            slices=tuple(slices),
+            camera_id=self.camera_id,
+            program_generation=self.program_generation,
         )
+
+
+@dataclass(frozen=True)
+class CameraSliceJob:
+    """Order-independent work envelope suitable for a local or remote worker.
+
+    The scene itself may live in a content-addressed cache; ``scene_version_id``
+    names the exact state a worker must resolve before executing this slice.
+    """
+
+    exposure_slice: ExposureSlice
+    scene_version_id: Optional[int] = None
+    solver_revision: str = ""
+
+    def __post_init__(self) -> None:
+        embedded = self.exposure_slice.scene_version_id
+        if (
+            embedded is not None
+            and self.scene_version_id is not None
+            and int(embedded) != int(self.scene_version_id)
+        ):
+            raise ValueError(
+                "job scene version conflicts with its exposure slice"
+            )
+
+    @property
+    def key(self) -> CameraCausalityKey:
+        return self.exposure_slice.causality_key
+
+    @staticmethod
+    def from_slice(
+        exposure_slice: ExposureSlice, *, solver_revision: str = ""
+    ) -> "CameraSliceJob":
+        return CameraSliceJob(
+            exposure_slice=exposure_slice,
+            scene_version_id=exposure_slice.scene_version_id,
+            solver_revision=str(solver_revision),
+        )
+
+    def to_wire(self) -> Dict[str, Any]:
+        """Return a canonical JSON-compatible network job descriptor."""
+
+        return {
+            "schema_version": CAMERA_SLICE_JOB_SCHEMA_VERSION,
+            "exposure_slice": asdict(self.exposure_slice),
+            "scene_version_id": self.scene_version_id,
+            "solver_revision": self.solver_revision,
+        }
+
+    @staticmethod
+    def from_wire(value: Mapping[str, Any]) -> "CameraSliceJob":
+        version = int(value.get("schema_version", -1))
+        if version != CAMERA_SLICE_JOB_SCHEMA_VERSION:
+            raise ValueError(f"unsupported camera slice job schema {version}")
+        slice_value = value.get("exposure_slice")
+        if not isinstance(slice_value, Mapping):
+            raise ValueError("camera slice job is missing exposure_slice")
+        scene_version = value.get("scene_version_id")
+        return CameraSliceJob(
+            exposure_slice=ExposureSlice(**dict(slice_value)),
+            scene_version_id=(
+                None if scene_version is None else int(scene_version)
+            ),
+            solver_revision=str(value.get("solver_revision", "")),
+        )
+
+    @property
+    def descriptor_digest(self) -> str:
+        """SHA-256 of the canonical work descriptor, excluding scene payload."""
+
+        encoded = json.dumps(
+            self.to_wire(),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
+class CameraSliceResult(Generic[_ResultT]):
+    """One attempt's immutable, content-identified result for a slice job."""
+
+    key: CameraCausalityKey
+    payload_digest: str
+    payload: _ResultT
+    job_digest: str = ""
+    worker_id: str = ""
+    attempt_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.payload_digest:
+            raise ValueError("slice results require a content digest")
+
+
+class CameraResultCollector(Generic[_ResultT]):
+    """Accept arbitrary completion order and release canonical camera order.
+
+    Retried network jobs are idempotent when their digest matches. A conflicting
+    result for the same causality key is rejected instead of silently changing
+    the exposure. In the ordinary one-worker ordered path every submit releases
+    immediately and the pending map never grows beyond one entry.
+    """
+
+    def __init__(
+        self,
+        expected: (
+            ExposureFrame
+            | Iterable[CameraCausalityKey]
+            | Iterable[CameraSliceJob]
+        ),
+        *,
+        max_pending: Optional[int] = None,
+        on_commit: Optional[
+            Callable[[CameraSliceResult[_ResultT]], None]
+        ] = None,
+    ) -> None:
+        expected_job_digests: Dict[CameraCausalityKey, str] = {}
+        if isinstance(expected, ExposureFrame):
+            keys = expected.causality_keys
+        else:
+            expected_items = tuple(expected)
+            if all(isinstance(item, CameraSliceJob) for item in expected_items):
+                jobs = tuple(expected_items)
+                keys = tuple(job.key for job in jobs)
+                expected_job_digests = {
+                    job.key: job.descriptor_digest for job in jobs
+                }
+            elif all(
+                isinstance(item, CameraCausalityKey)
+                for item in expected_items
+            ):
+                keys = tuple(expected_items)
+            else:
+                raise TypeError(
+                    "expected must contain only causality keys or slice jobs"
+                )
+        if len(set(keys)) != len(keys):
+            raise ValueError("expected camera causality keys must be unique")
+        if max_pending is not None and int(max_pending) < 1:
+            raise ValueError("max_pending must be positive")
+        self._expected = tuple(keys)
+        self._expected_set = set(keys)
+        self._expected_job_digests = expected_job_digests
+        self._max_pending = (
+            None if max_pending is None else int(max_pending)
+        )
+        self._on_commit = on_commit
+        self._next_commit = 0
+        self._pending: Dict[
+            CameraCausalityKey, CameraSliceResult[_ResultT]
+        ] = {}
+        self._accepted_digests: Dict[CameraCausalityKey, str] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def complete(self) -> bool:
+        with self._lock:
+            return self._next_commit == len(self._expected)
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    @property
+    def committed_count(self) -> int:
+        with self._lock:
+            return self._next_commit
+
+    def submit(
+        self, result: CameraSliceResult[_ResultT]
+    ) -> tuple[CameraSliceResult[_ResultT], ...]:
+        """Accept one result and return the newly contiguous commit sequence."""
+
+        key = result.key
+        with self._lock:
+            if key not in self._expected_set:
+                raise ValueError("result does not belong to this camera exposure")
+            expected_job_digest = self._expected_job_digests.get(key)
+            if (
+                expected_job_digest is not None
+                and result.job_digest != expected_job_digest
+            ):
+                raise ValueError(
+                    "result was not produced from the authored slice job"
+                )
+            prior_digest = self._accepted_digests.get(key)
+            if prior_digest is not None:
+                if prior_digest != result.payload_digest:
+                    raise RuntimeError(
+                        "conflicting results received for one causality key"
+                    )
+                return ()
+            if (
+                self._max_pending is not None
+                and len(self._pending) >= self._max_pending
+            ):
+                raise BufferError("camera result reorder window is full")
+
+            self._pending[key] = result
+            self._accepted_digests[key] = result.payload_digest
+            ready: List[CameraSliceResult[_ResultT]] = []
+            while self._next_commit < len(self._expected):
+                next_key = self._expected[self._next_commit]
+                next_result = self._pending.get(next_key)
+                if next_result is None:
+                    break
+                # Run the optional reducer while holding the collector's
+                # ordering lock. A concurrent submit can therefore never make
+                # detector commits observable in a different order.
+                if self._on_commit is not None:
+                    self._on_commit(next_result)
+                self._pending.pop(next_key)
+                ready.append(next_result)
+                self._next_commit += 1
+            return tuple(ready)
+
+
+class CausalMultireaderQueue(Generic[_ResultT]):
+    """Retain each committed slice until every registered system releases it.
+
+    Registration is prospective: a newly registered reader participates in
+    slices published after registration, but cannot retroactively hold a slice
+    it never observed. Readers may acknowledge different slices in any order;
+    retirement (and therefore camera/dt advance) remains a contiguous prefix.
+
+    Connect this to :class:`CameraResultCollector` with
+    ``on_commit=queue.publish``. This deliberately separates unordered solver
+    completion from the stronger statement that every dependent system has
+    consumed the resulting causal state.
+    """
+
+    def __init__(
+        self,
+        expected: ExposureFrame | Iterable[CameraCausalityKey],
+        *,
+        on_retire: Optional[
+            Callable[[CameraSliceResult[_ResultT]], None]
+        ] = None,
+    ) -> None:
+        keys = (
+            expected.causality_keys
+            if isinstance(expected, ExposureFrame)
+            else tuple(expected)
+        )
+        if len(set(keys)) != len(keys):
+            raise ValueError("expected camera causality keys must be unique")
+        self._expected = tuple(keys)
+        self._published_count = 0
+        self._retired_count = 0
+        self._readers: set[str] = set()
+        self._entries: Dict[
+            CameraCausalityKey, CameraSliceResult[_ResultT]
+        ] = {}
+        self._holds: Dict[CameraCausalityKey, set[str]] = {}
+        self._on_retire = on_retire
+        self._lock = threading.Lock()
+
+    @property
+    def published_count(self) -> int:
+        with self._lock:
+            return self._published_count
+
+    @property
+    def retired_count(self) -> int:
+        with self._lock:
+            return self._retired_count
+
+    @property
+    def advance_complete(self) -> bool:
+        with self._lock:
+            return self._retired_count == len(self._expected)
+
+    def is_retired(self, key: CameraCausalityKey) -> bool:
+        """Return whether ``key`` belongs to the contiguous retired prefix."""
+
+        with self._lock:
+            try:
+                index = self._expected.index(key)
+            except ValueError as exc:
+                raise ValueError(
+                    "causal key does not belong to this queue"
+                ) from exc
+            return index < self._retired_count
+
+    def register(self, reader_id: str) -> None:
+        reader = str(reader_id)
+        if not reader:
+            raise ValueError("reader_id must be non-empty")
+        with self._lock:
+            if reader in self._readers:
+                raise ValueError("causal reader is already registered")
+            self._readers.add(reader)
+
+    def unregister(self, reader_id: str, *, release_holds: bool = False) -> None:
+        """Remove a reader, requiring an explicit policy for outstanding holds."""
+
+        reader = str(reader_id)
+        with self._lock:
+            if reader not in self._readers:
+                raise ValueError("causal reader is not registered")
+            held_keys = tuple(
+                key for key, readers in self._holds.items()
+                if reader in readers
+            )
+            if held_keys and not release_holds:
+                raise RuntimeError(
+                    "reader still holds causal slices; acknowledge them or "
+                    "explicitly release_holds"
+                )
+            self._readers.remove(reader)
+            if release_holds:
+                for key in held_keys:
+                    self._holds[key].discard(reader)
+                self._retire_ready_locked()
+
+    def publish(self, result: CameraSliceResult[_ResultT]) -> None:
+        """Publish exactly the next camera-ordered result to all current readers."""
+
+        with self._lock:
+            if self._published_count >= len(self._expected):
+                raise ValueError("all expected causal slices are already published")
+            expected_key = self._expected[self._published_count]
+            if result.key != expected_key:
+                raise ValueError("causal queue publication must follow camera order")
+            self._entries[result.key] = result
+            self._holds[result.key] = set(self._readers)
+            self._published_count += 1
+            self._retire_ready_locked()
+
+    def pending_for(
+        self, reader_id: str
+    ) -> tuple[CameraSliceResult[_ResultT], ...]:
+        """Return retained published results this reader has not acknowledged."""
+
+        reader = str(reader_id)
+        with self._lock:
+            if reader not in self._readers:
+                raise ValueError("causal reader is not registered")
+            return tuple(
+                self._entries[key]
+                for key in self._expected[
+                    self._retired_count:self._published_count
+                ]
+                if reader in self._holds.get(key, ())
+            )
+
+    def acknowledge(
+        self, reader_id: str, key: CameraCausalityKey
+    ) -> tuple[CameraSliceResult[_ResultT], ...]:
+        """Release one reader hold and return newly retired prefix entries."""
+
+        reader = str(reader_id)
+        with self._lock:
+            if reader not in self._readers:
+                raise ValueError("causal reader is not registered")
+            if key not in self._entries:
+                if key in self._expected[:self._retired_count]:
+                    return ()
+                raise ValueError("causal slice has not been published")
+            holds = self._holds[key]
+            if reader not in holds:
+                return ()
+            holds.remove(reader)
+            return self._retire_ready_locked()
+
+    def _retire_ready_locked(
+        self,
+    ) -> tuple[CameraSliceResult[_ResultT], ...]:
+        retired: List[CameraSliceResult[_ResultT]] = []
+        while self._retired_count < self._published_count:
+            key = self._expected[self._retired_count]
+            if self._holds.get(key):
+                break
+            result = self._entries[key]
+            if self._on_retire is not None:
+                self._on_retire(result)
+            retired.append(result)
+            self._entries.pop(key)
+            self._holds.pop(key)
+            self._retired_count += 1
+        return tuple(retired)
 
 
 @dataclass(frozen=True)
@@ -423,8 +941,8 @@ class CameraTimeline:
 
     prerequisite_flash_slice_for_sensor maps each sensor slice_id to the
     flash slice_id whose records must have materialized before that sensor
-    slice may be submitted.  With flash_duty_cycle=1.0 (the default) this
-    is a same-slice dependency: sensor S waits for flash S.
+    slice may be admitted. Emitter activity comes from the scheduler-authored
+    ExposureSlice; the timeline does not reinterpret duty cycle.
     """
 
     frame_id: int
@@ -434,9 +952,9 @@ class CameraTimeline:
     slices: tuple                # tuple[CameraTimelineSlice, ...]
 
     @staticmethod
-    def from_exposure_frame(frame: "ExposureFrame",
-                             flash_duty_cycle: float = 1.0) -> "CameraTimeline":
-        import math as _math
+    def from_exposure_frame(frame: "ExposureFrame") -> "CameraTimeline":
+        """Compile the scheduler-authored frame without reinterpreting it."""
+
         n = len(frame.slices)
         if n == 0:
             return CameraTimeline(
@@ -446,10 +964,23 @@ class CameraTimeline:
                 prerequisite_flash_slice_for_sensor={},
                 slices=(),
             )
-        n_flash = max(1, int(_math.ceil(n * max(0.0, min(1.0, float(flash_duty_cycle))))))
-        flash_slice_ids = tuple(range(n_flash))
-        sensor_slice_ids = tuple(range(n))
-        prereqs: Dict[int, int] = {s: min(s, n_flash - 1) for s in sensor_slice_ids}
+        flash_slice_ids = tuple(
+            i for i, exposure_slice in enumerate(frame.slices)
+            if bool(getattr(exposure_slice, "flash_active", True))
+        )
+        sensor_slice_ids = tuple(
+            i for i, exposure_slice in enumerate(frame.slices)
+            if bool(getattr(exposure_slice, "sensor_integrating", True))
+        )
+        prereqs: Dict[int, int] = {}
+        for sensor_slice_id in sensor_slice_ids:
+            eligible = tuple(
+                flash_slice_id for flash_slice_id in flash_slice_ids
+                if flash_slice_id <= sensor_slice_id
+            )
+            prereqs[sensor_slice_id] = eligible[-1] if eligible else -1
+        flash_slice_set = set(flash_slice_ids)
+        sensor_slice_set = set(sensor_slice_ids)
         timeline_slices = []
         for i, es in enumerate(frame.slices):
             timeline_slices.append(CameraTimelineSlice(
@@ -457,9 +988,9 @@ class CameraTimeline:
                 slice_id=i,
                 t0=es.t0,
                 t1=es.t1,
-                flash_active=(i < n_flash),
+                flash_active=(i in flash_slice_set),
                 shutter_open_fraction=float(es.shutter_open),
-                sensor_integrating=True,
+                sensor_integrating=(i in sensor_slice_set),
                 exposure_slice=es,
             ))
         return CameraTimeline(
@@ -471,15 +1002,29 @@ class CameraTimeline:
         )
 
 
+@dataclass(frozen=True)
+class CameraSliceState:
+    """Observable lifecycle of one camera slice.
+
+    Work-dispatch flags describe estimator/runtime progress. The remaining
+    flags describe increasingly strong physical commit boundaries.
+    """
+
+    emission_work_dispatched: bool = False
+    sensor_probe_work_dispatched: bool = False
+    transport_products_materialized: bool = False
+    reception_closed: bool = False
+    detector_integration_committed: bool = False
+
+
 class ExposureBarrier:
-    """Tracks flash/sensor submission ordering for one camera exposure.
+    """Tracks computational work and physical commit for one exposure.
 
-    Two-phase lifecycle per flash slice:
-      dispatched  — trace_forward() was called (C++ async, results pending)
-      materialized — drain loop confirmed records in _bdpt_endpoints
+    Emission and sensor-probe work may be dispatched in either order. Neither
+    dispatch is itself a physical sensor event. A detector commit becomes
+    eligible only after transport materialization and reception closure.
 
-    sensor_may_submit(slice_id) is the gate: returns True only when the
-    prerequisite flash slice has been confirmed materialized.
+    The legacy flash/sensor method names remain narrow compatibility aliases.
     """
 
     def __init__(self, timeline: CameraTimeline) -> None:
@@ -487,43 +1032,220 @@ class ExposureBarrier:
         self._flash_dispatched_through: int = -1
         self.flash_submitted_through: int = -1   # confirmed materialized
         self.sensor_submitted_through: int = -1
-        self.on_flash_materialized = None  # callable(slice_id) — camera software fires sensor
+        self._flash_dispatched: set[int] = set()
+        self._flash_materialized: set[int] = set()
+        self._sensor_submitted: set[int] = set()
+        self._emission_work_dispatched: set[int] = set()
+        self._transport_materialized: set[int] = set()
+        self._sensor_probe_work_dispatched: set[int] = set()
+        self._reception_closed: set[int] = set()
+        self._detector_committed: set[int] = set()
+        self.on_flash_materialized = None
+        self.on_transport_materialized = None
+        self.on_reception_closed = None
+        self.on_detector_committed = None
+
+    def _slice(self, slice_id: int) -> CameraTimelineSlice:
+        slice_id = int(slice_id)
+        if not 0 <= slice_id < len(self.timeline.slices):
+            raise ValueError("camera slice id is outside the authored timeline")
+        result = self.timeline.slices[slice_id]
+        if int(result.slice_id) != slice_id:
+            raise RuntimeError("camera timeline slice ids are not dense and stable")
+        return result
+
+    @staticmethod
+    def _contiguous_through(expected: tuple, completed: set[int]) -> int:
+        through = -1
+        for slice_id in expected:
+            if slice_id not in completed:
+                break
+            through = int(slice_id)
+        return through
+
+    def state(self, slice_id: int) -> CameraSliceState:
+        slice_id = int(self._slice(slice_id).slice_id)
+        return CameraSliceState(
+            emission_work_dispatched=(
+                slice_id in self._emission_work_dispatched
+            ),
+            sensor_probe_work_dispatched=(
+                slice_id in self._sensor_probe_work_dispatched
+            ),
+            transport_products_materialized=(
+                slice_id in self._transport_materialized
+            ),
+            reception_closed=slice_id in self._reception_closed,
+            detector_integration_committed=(
+                slice_id in self._detector_committed
+            ),
+        )
+
+    def record_emission_work_dispatched(
+        self, slice_id: int, submitted: int = 1
+    ) -> None:
+        """Record light-side estimator dispatch, including a zero-ray marker."""
+
+        slice_id = int(self._slice(slice_id).slice_id)
+        if int(submitted) < 0:
+            raise ValueError("submitted emission count must be non-negative")
+        self._emission_work_dispatched.add(slice_id)
+        if slice_id in self.timeline.flash_slices:
+            self._flash_dispatched.add(slice_id)
+            self._flash_dispatched_through = self._contiguous_through(
+                self.timeline.flash_slices, self._flash_dispatched
+            )
+
+    def record_sensor_probe_work_dispatched(
+        self, slice_id: int, submitted: int = 1
+    ) -> None:
+        """Record nonphysical sensor-side importance-query dispatch."""
+
+        timeline_slice = self._slice(slice_id)
+        slice_id = int(timeline_slice.slice_id)
+        if not timeline_slice.sensor_integrating:
+            if int(submitted) == 0:
+                return
+            raise ValueError(
+                "cannot dispatch sensor probes for a non-integrating slice"
+            )
+        if int(submitted) < 0:
+            raise ValueError("submitted sensor-probe count must be non-negative")
+        self._sensor_probe_work_dispatched.add(slice_id)
+        self._sensor_submitted.add(slice_id)
+        self.sensor_submitted_through = self._contiguous_through(
+            self.timeline.sensor_slices, self._sensor_submitted
+        )
+
+    def confirm_transport_products_materialized(self, slice_id: int) -> None:
+        """Confirm all admitted transport work for the slice terminated."""
+
+        slice_id = int(self._slice(slice_id).slice_id)
+        if slice_id not in self._emission_work_dispatched:
+            raise RuntimeError(
+                "cannot materialize transport before emission work is declared"
+            )
+        newly_materialized = slice_id not in self._transport_materialized
+        self._transport_materialized.add(slice_id)
+        if slice_id in self.timeline.flash_slices:
+            self._flash_materialized.add(slice_id)
+            self.flash_submitted_through = self._contiguous_through(
+                self.timeline.flash_slices, self._flash_materialized
+            )
+        if newly_materialized:
+            if self.on_transport_materialized is not None:
+                self.on_transport_materialized(slice_id)
+            if (
+                slice_id in self.timeline.flash_slices
+                and self.on_flash_materialized is not None
+            ):
+                self.on_flash_materialized(slice_id)
+
+    def reception_may_close(self, slice_id: int) -> bool:
+        timeline_slice = self._slice(slice_id)
+        slice_id = int(timeline_slice.slice_id)
+        if slice_id not in self._transport_materialized:
+            return False
+        return (
+            not timeline_slice.sensor_integrating
+            or slice_id in self._sensor_probe_work_dispatched
+        )
+
+    def confirm_reception_closed(self, slice_id: int) -> None:
+        """Confirm coherent/stochastic reduction completed for the slice."""
+
+        slice_id = int(self._slice(slice_id).slice_id)
+        if not self.reception_may_close(slice_id):
+            raise RuntimeError(
+                "cannot close reception before transport and sensor probes"
+            )
+        newly_closed = slice_id not in self._reception_closed
+        self._reception_closed.add(slice_id)
+        if newly_closed and self.on_reception_closed is not None:
+            self.on_reception_closed(slice_id)
+
+    def confirm_detector_integration_committed(self, slice_id: int) -> None:
+        """Commit the physical detector contribution for one integrating slice."""
+
+        timeline_slice = self._slice(slice_id)
+        slice_id = int(timeline_slice.slice_id)
+        if not timeline_slice.sensor_integrating:
+            raise ValueError(
+                "cannot commit detector integration for a non-integrating slice"
+            )
+        if slice_id not in self._reception_closed:
+            raise RuntimeError(
+                "cannot commit detector integration before reception closes"
+            )
+        newly_committed = slice_id not in self._detector_committed
+        self._detector_committed.add(slice_id)
+        if newly_committed and self.on_detector_committed is not None:
+            self.on_detector_committed(slice_id)
 
     def record_flash_dispatched(self, slice_id: int, submitted: int = 1) -> None:
-        self._flash_dispatched_through = max(self._flash_dispatched_through, slice_id)
+        """Compatibility alias for camera-flash emission work."""
+
+        slice_id = int(slice_id)
+        if int(submitted) < 0:
+            raise ValueError("submitted flash count must be non-negative")
+        if slice_id not in self.timeline.flash_slices:
+            if submitted == 0:
+                return
+            raise ValueError("cannot dispatch flash for a non-flash camera slice")
+        self.record_emission_work_dispatched(slice_id, submitted)
         if submitted == 0:
             # Nothing was emitted; nothing to wait for — confirm immediately.
-            self.flash_submitted_through = max(self.flash_submitted_through, slice_id)
+            self.confirm_transport_products_materialized(slice_id)
 
     def confirm_flash_materialized(self, slice_id: int) -> None:
-        self.flash_submitted_through = max(self.flash_submitted_through, slice_id)
-        if self.on_flash_materialized is not None:
-            self.on_flash_materialized(slice_id)
+        """Compatibility alias for transport materialization."""
+
+        slice_id = int(self._slice(slice_id).slice_id)
+        if slice_id not in self.timeline.flash_slices:
+            raise ValueError("cannot materialize flash for a non-flash camera slice")
+        self.confirm_transport_products_materialized(slice_id)
 
     def sensor_may_submit(self, slice_id: int) -> bool:
+        """Legacy materialization gate; sensor-probe dispatch need not use it."""
+
         prereq = self.timeline.prerequisite_flash_slice_for_sensor.get(slice_id, -1)
         if prereq < 0:
             return True
-        return self.flash_submitted_through >= prereq
+        return prereq in self._flash_materialized
 
     def record_sensor_submitted(self, slice_id: int) -> None:
-        self.sensor_submitted_through = max(self.sensor_submitted_through, slice_id)
+        """Compatibility alias for sensor-probe work dispatch."""
+
+        self.record_sensor_probe_work_dispatched(slice_id)
 
     @property
     def all_flash_dispatched(self) -> bool:
         if not self.timeline.flash_slices:
             return True
-        return self._flash_dispatched_through >= max(self.timeline.flash_slices)
+        return all(
+            slice_id in self._flash_dispatched
+            for slice_id in self.timeline.flash_slices
+        )
 
     @property
     def all_sensor_submitted(self) -> bool:
         if not self.timeline.sensor_slices:
             return True
-        return self.sensor_submitted_through >= max(self.timeline.sensor_slices)
+        return all(
+            slice_id in self._sensor_submitted
+            for slice_id in self.timeline.sensor_slices
+        )
 
     @property
     def exposure_complete(self) -> bool:
-        return self.all_flash_dispatched and self.all_sensor_submitted
+        for timeline_slice in self.timeline.slices:
+            slice_id = int(timeline_slice.slice_id)
+            if timeline_slice.sensor_integrating:
+                if slice_id not in self._detector_committed:
+                    return False
+            elif slice_id not in self._transport_materialized:
+                return False
+        return True
 
 
 class SceneCameraClock:

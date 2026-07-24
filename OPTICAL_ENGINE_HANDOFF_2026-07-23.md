@@ -1,5 +1,12 @@
 # Optical engine handoff — 2026-07-23
 
+> Historical checkpoint: the commit list and "next" steps below describe the
+> state at the time this handoff was written, not the current branch frontier.
+> For current repository ownership, Nodus process-loop integration, graph
+> scheduling semantics, and return-to-bench gates, use
+> `OPTICAL_ENGINE_REPOSITORY_INTEGRATION.md` and
+> `NODUS_OPTICAL_KPN_INTEGRATION.md`.
+
 ## Current committed frontier
 
 The branch is `nogodsnomasters`. The two most recent implementation commits

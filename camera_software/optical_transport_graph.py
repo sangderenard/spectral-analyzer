@@ -27,6 +27,16 @@ from .complex_optical_operators import (
     TransverseBasis,
     canonical_operator_contract,
 )
+from .optical_transport_contracts import (
+    OpticalProductKind,
+    OpticalScatteringProductSpec,
+    OpticalTimingSpec,
+    commensurate_refresh_rate_hz,
+)
+from .coherent_reception import (
+    CompiledOpticalReception,
+    OpticalPredecessorDeclaration,
+)
 
 
 OPTICAL_GRAPH_SCHEMA = "optical-transport-graph-v1"
@@ -96,6 +106,10 @@ class OpticalNodeSpec:
             and self.polarization_components != 2
         ):
             raise ValueError("transverse field nodes require two components")
+        if "refresh_rate_hz" in self.parameters:
+            refresh_rate = float(self.parameters["refresh_rate_hz"])
+            if not np.isfinite(refresh_rate) or refresh_rate <= 0.0:
+                raise ValueError("optical component refresh rate must be positive")
 
 
 @dataclass(frozen=True)
@@ -105,6 +119,91 @@ class OpticalLinkSpec:
     semantic_role: str = "optical-transport"
     adapter: str = ""
     parameters: Mapping[str, Any] = field(default_factory=dict)
+    product: OpticalScatteringProductSpec | None = None
+
+    def resolved_product(self) -> OpticalScatteringProductSpec:
+        if self.product is not None:
+            self.product.validate()
+            return self.product
+        role = self.semantic_role.strip() or "optical-transport"
+        kind = OpticalProductKind.TRANSPORT
+        for candidate in OpticalProductKind:
+            if candidate.value in role:
+                kind = candidate
+                break
+        return OpticalScatteringProductSpec(
+            key=f"{self.src_key}:{role}:{self.dst_key}",
+            kind=kind,
+        )
+
+
+@dataclass(frozen=True)
+class OpticalScheduleRegion:
+    """One all-edge strongly connected region in the physical graph."""
+
+    region_id: int
+    node_keys: tuple[str, ...]
+    cyclic: bool
+    minimum_internal_group_delay_s: float
+    has_positive_delay_edge: bool
+    contains_zero_delay_cycle: bool
+    contains_branch: bool
+    contains_join: bool
+
+
+@dataclass(frozen=True)
+class CompiledOpticalSchedule:
+    """Cold branch/timing plan consumed by specialized optical executors."""
+
+    regions: tuple[OpticalScheduleRegion, ...]
+    region_order: tuple[int, ...]
+    outgoing_link_indices: Mapping[str, tuple[int, ...]]
+    incoming_link_indices: Mapping[str, tuple[int, ...]]
+    branch_node_keys: tuple[str, ...]
+    join_node_keys: tuple[str, ...]
+    cyclic_region_ids: tuple[int, ...]
+    zero_delay_cycle_region_ids: tuple[int, ...]
+    requires_branch_frontier: bool
+    requires_cycle_solver: bool
+    requires_timed_worklist: bool
+    has_timestamped_edges: bool
+    maximum_fanout: int
+    receptions: tuple[CompiledOpticalReception, ...] = ()
+    clock_policy: str = "lcm-commensurate-event-timestamp-otherwise"
+    component_rates_hz: tuple[float, ...] = ()
+    clock_rate_hz: float | None = None
+
+    def contract(self) -> dict[str, Any]:
+        return {
+            "regions": [{
+                "region_id": region.region_id,
+                "node_keys": list(region.node_keys),
+                "cyclic": region.cyclic,
+                "minimum_internal_group_delay_s":
+                    region.minimum_internal_group_delay_s,
+                "has_positive_delay_edge": region.has_positive_delay_edge,
+                "contains_zero_delay_cycle": region.contains_zero_delay_cycle,
+                "contains_branch": region.contains_branch,
+                "contains_join": region.contains_join,
+            } for region in self.regions],
+            "region_order": list(self.region_order),
+            "branch_node_keys": list(self.branch_node_keys),
+            "join_node_keys": list(self.join_node_keys),
+            "cyclic_region_ids": list(self.cyclic_region_ids),
+            "zero_delay_cycle_region_ids":
+                list(self.zero_delay_cycle_region_ids),
+            "requires_branch_frontier": self.requires_branch_frontier,
+            "requires_cycle_solver": self.requires_cycle_solver,
+            "requires_timed_worklist": self.requires_timed_worklist,
+            "has_timestamped_edges": self.has_timestamped_edges,
+            "maximum_fanout": self.maximum_fanout,
+            "receptions": [
+                reception.contract() for reception in self.receptions
+            ],
+            "clock_policy": self.clock_policy,
+            "component_rates_hz": list(self.component_rates_hz),
+            "clock_rate_hz": self.clock_rate_hz,
+        }
 
 
 @dataclass(frozen=True)
@@ -127,9 +226,18 @@ class OpticalTransportGraphSpec:
         for key in self.entry_keys + self.product_keys:
             if key not in by_key:
                 raise ValueError(f"optical graph references unknown endpoint {key!r}")
+        product_keys_by_source: dict[str, set[str]] = {}
         for link in self.links:
             if link.src_key not in by_key or link.dst_key not in by_key:
                 raise ValueError("optical link references an unknown node")
+            product = link.resolved_product()
+            source_products = product_keys_by_source.setdefault(link.src_key, set())
+            if product.key in source_products:
+                raise ValueError(
+                    f"duplicate scattering product {product.key!r} "
+                    f"from optical node {link.src_key!r}"
+                )
+            source_products.add(product.key)
             src = by_key[link.src_key]
             dst = by_key[link.dst_key]
             if src.lane_count != dst.lane_count:
@@ -155,6 +263,7 @@ class CompiledOpticalTransportGraph:
     t4_descriptors: dict[str, dict[str, Any]]
     operator_state_block: dict[str, Any]
     field_interfaces: dict[tuple[str, str], RigidFieldInterface]
+    schedule: CompiledOpticalSchedule
 
     def contract(self) -> dict[str, Any]:
         stats = self.topology_solver.graph_stats()
@@ -203,6 +312,7 @@ class CompiledOpticalTransportGraph:
                 "semantic_role": link.semantic_role,
                 "adapter": link.adapter,
                 "parameters": dict(link.parameters),
+                "product": link.resolved_product().contract(),
             } for link in self.spec.links],
             "t2_payload_keys": sorted(self.t2_payloads),
             "t4_descriptor_keys": sorted(self.t4_descriptors),
@@ -210,6 +320,7 @@ class CompiledOpticalTransportGraph:
                 f"{src}->{dst}" for src, dst in sorted(self.field_interfaces)
             ],
             "graph_stats": dict(stats),
+            "schedule": self.schedule.contract(),
         }
 
 
@@ -322,6 +433,7 @@ def wave_context_nodes(
     longitudinal_steps: int | None = None,
     medium_n_real: float = 1.0,
     medium_n_imag: float = 0.0,
+    medium_n_by_lane: Sequence[float] | None = None,
     aperture_material: Any | None = None,
 ) -> tuple[tuple[OpticalNodeSpec, ...], tuple[OpticalLinkSpec, ...]]:
     """Return explicit complex-ray→field→complex-ray T4 boundary modules."""
@@ -367,6 +479,19 @@ def wave_context_nodes(
         raise ValueError("wave arena medium_n_real must be positive")
     if not np.isfinite(medium_n_imag) or medium_n_imag < 0.0:
         raise ValueError("wave arena medium_n_imag must be non-negative")
+    if medium_n_by_lane is not None:
+        lane_indices = np.asarray(medium_n_by_lane, np.float64).reshape(-1)
+        if (
+            lane_indices.size != lane_count
+            or np.any(~np.isfinite(lane_indices))
+            or np.any(lane_indices <= 0.0)
+        ):
+            raise ValueError(
+                "wave arena medium_n_by_lane must match exact positive lanes"
+            )
+        physical["medium_n_by_lane"] = tuple(
+            float(value) for value in lane_indices
+        )
     if aperture_material is not None:
         graph_parameters = getattr(aperture_material, "graph_parameters", None)
         wave_payload = getattr(aperture_material, "wave_payload", None)
@@ -453,6 +578,31 @@ def install_optical_graph(
             "compiled graph contains exact T2 artifacts but the camera builder "
             "did not confirm their native registration"
         )
+    wave_keys = {
+        node.key for node in compiled.spec.nodes
+        if node.domain is OpticalExecutionDomain.T4_WAVE_ARENA
+    }
+    cyclic_wave_regions = [
+        region.region_id for region in compiled.schedule.regions
+        if region.cyclic and any(key in wave_keys for key in region.node_keys)
+    ]
+    if cyclic_wave_regions:
+        raise RuntimeError(
+            "native T4 delayed/resonant cycle execution is not installed yet; "
+            f"cyclic regions={cyclic_wave_regions}"
+        )
+    wave_incoming = {key: 0 for key in wave_keys}
+    for link in compiled.spec.links:
+        if link.src_key in wave_keys and link.dst_key in wave_keys:
+            wave_incoming[link.dst_key] += 1
+    wave_joins = [
+        key for key, count in wave_incoming.items() if count > 1
+    ]
+    if wave_joins:
+        raise RuntimeError(
+            "native T4 coherent fan-in accumulation is not installed yet; "
+            f"join nodes={wave_joins}"
+        )
     add_context = getattr(tracer, "add_scale_context", None)
     clear_contexts = getattr(tracer, "clear_scale_contexts", None)
     if not callable(add_context):
@@ -501,6 +651,15 @@ def install_optical_graph(
             payload = np.ascontiguousarray(
                 descriptor["aperture_payload"], np.float64
             )
+        elif "medium_n_by_lane" in descriptor:
+            lane_indices = np.asarray(
+                descriptor["medium_n_by_lane"], np.float64
+            ).reshape(-1)
+            payload = np.ascontiguousarray([
+                0.0, 0.0, 0.0, axis[0], axis[1], axis[2],
+                57_415_645.0, 1.0, float(len(lane_indices)),
+                *lane_indices,
+            ], np.float64)
         else:
             payload = np.ascontiguousarray(
                 [0.0, 0.0, 0.0, axis[0], axis[1], axis[2]],
@@ -591,6 +750,220 @@ def install_optical_graph(
     )
 
 
+def _compile_optical_schedule(
+    spec: OpticalTransportGraphSpec,
+) -> CompiledOpticalSchedule:
+    """Compile all-edge SCC and fan-out metadata without interpreting nodes.
+
+    Signal ``GraphSolver`` continues to validate the complex network surface
+    and may use an LCM-derived clock for commensurate component-rate bands.
+    This optical schedule remains separate because carrier OPL and arbitrary
+    event timestamps must not be quantized onto any finite global tick clock.
+    """
+
+    node_keys = [node.key for node in spec.nodes]
+    node_index = {key: index for index, key in enumerate(node_keys)}
+    outgoing: dict[str, list[int]] = {key: [] for key in node_keys}
+    incoming: dict[str, list[int]] = {key: [] for key in node_keys}
+    adjacency: list[list[int]] = [[] for _ in node_keys]
+    for link_index, link in enumerate(spec.links):
+        outgoing[link.src_key].append(link_index)
+        incoming[link.dst_key].append(link_index)
+        adjacency[node_index[link.src_key]].append(node_index[link.dst_key])
+
+    next_index = 0
+    indices = [-1] * len(node_keys)
+    low = [-1] * len(node_keys)
+    stack: list[int] = []
+    on_stack = [False] * len(node_keys)
+    components: list[list[int]] = []
+
+    def visit(vertex: int) -> None:
+        nonlocal next_index
+        indices[vertex] = low[vertex] = next_index
+        next_index += 1
+        stack.append(vertex)
+        on_stack[vertex] = True
+        for destination in adjacency[vertex]:
+            if indices[destination] < 0:
+                visit(destination)
+                low[vertex] = min(low[vertex], low[destination])
+            elif on_stack[destination]:
+                low[vertex] = min(low[vertex], indices[destination])
+        if low[vertex] != indices[vertex]:
+            return
+        component: list[int] = []
+        while True:
+            member = stack.pop()
+            on_stack[member] = False
+            component.append(member)
+            if member == vertex:
+                break
+        components.append(sorted(component))
+
+    for index in range(len(node_keys)):
+        if indices[index] < 0:
+            visit(index)
+
+    component_by_node: dict[int, int] = {}
+    for component_id, component in enumerate(components):
+        for index in component:
+            component_by_node[index] = component_id
+
+    component_edges: dict[int, set[int]] = {
+        component_id: set() for component_id in range(len(components))
+    }
+    indegree = [0] * len(components)
+    for link in spec.links:
+        source = component_by_node[node_index[link.src_key]]
+        destination = component_by_node[node_index[link.dst_key]]
+        if source == destination or destination in component_edges[source]:
+            continue
+        component_edges[source].add(destination)
+        indegree[destination] += 1
+    ready = sorted(index for index, degree in enumerate(indegree) if degree == 0)
+    component_order: list[int] = []
+    while ready:
+        component_id = ready.pop(0)
+        component_order.append(component_id)
+        for destination in sorted(component_edges[component_id]):
+            indegree[destination] -= 1
+            if indegree[destination] == 0:
+                ready.append(destination)
+                ready.sort()
+    if len(component_order) != len(components):
+        raise RuntimeError("optical SCC condensation unexpectedly contains a cycle")
+
+    regions: list[OpticalScheduleRegion] = []
+    for component_id, component in enumerate(components):
+        keys = tuple(node_keys[index] for index in component)
+        key_set = set(keys)
+        self_loop = any(
+            link.src_key == link.dst_key and link.src_key in key_set
+            for link in spec.links
+        )
+        internal_links = [
+            link for link in spec.links
+            if link.src_key in key_set and link.dst_key in key_set
+        ]
+        delays = [
+            link.resolved_product().timing.group_delay_s
+            for link in internal_links
+        ]
+        zero_delay_adjacency = {key: [] for key in keys}
+        for link, delay in zip(internal_links, delays):
+            if delay == 0.0:
+                zero_delay_adjacency[link.src_key].append(link.dst_key)
+        zero_visit = {key: 0 for key in keys}
+
+        def zero_delay_cycle(key: str) -> bool:
+            state = zero_visit[key]
+            if state == 1:
+                return True
+            if state == 2:
+                return False
+            zero_visit[key] = 1
+            for destination in zero_delay_adjacency[key]:
+                if zero_delay_cycle(destination):
+                    return True
+            zero_visit[key] = 2
+            return False
+
+        has_zero_delay_cycle = any(
+            zero_delay_cycle(key) for key in keys if zero_visit[key] == 0
+        )
+        regions.append(OpticalScheduleRegion(
+            region_id=component_id,
+            node_keys=keys,
+            cyclic=len(component) > 1 or self_loop,
+            minimum_internal_group_delay_s=min(delays, default=0.0),
+            has_positive_delay_edge=any(delay > 0.0 for delay in delays),
+            contains_zero_delay_cycle=has_zero_delay_cycle,
+            contains_branch=any(len(outgoing[key]) > 1 for key in keys),
+            contains_join=any(len(incoming[key]) > 1 for key in keys),
+        ))
+
+    branch_keys = tuple(key for key in node_keys if len(outgoing[key]) > 1)
+    join_keys = tuple(key for key in node_keys if len(incoming[key]) > 1)
+    cyclic_ids = tuple(region.region_id for region in regions if region.cyclic)
+    zero_delay_cycle_ids = tuple(
+        region.region_id for region in regions
+        if region.contains_zero_delay_cycle
+    )
+    has_delay = any(
+        link.resolved_product().timing.group_delay_s > 0.0
+        for link in spec.links
+    )
+    has_delayed_cycle = any(
+        region.cyclic and region.has_positive_delay_edge
+        for region in regions
+    )
+    component_rates = tuple(sorted({
+        float(node.parameters["refresh_rate_hz"])
+        for node in spec.nodes
+        if float(node.parameters.get("refresh_rate_hz", 0.0)) > 0.0
+    }))
+    clock_rate = commensurate_refresh_rate_hz(component_rates)
+    receptions: list[CompiledOpticalReception] = []
+    for pool_id, key in enumerate(join_keys):
+        link_indices = tuple(incoming[key])
+        products = tuple(
+            spec.links[index].resolved_product() for index in link_indices
+        )
+        policies = {
+            (product.coherent, product.deterministic) for product in products
+        }
+        if policies != {(True, True)}:
+            raise ValueError(
+                f"optical join {key!r} mixes unsupported coherence or "
+                "stochastic policies"
+            )
+        destination = spec.nodes[node_index[key]]
+        receptions.append(CompiledOpticalReception(
+            pool_id=pool_id,
+            destination_node=key,
+            destination_port=str(
+                destination.parameters.get("reception_port", "input")
+            ),
+            predecessors=tuple(
+                OpticalPredecessorDeclaration(
+                    slot=slot,
+                    product_id=link_index,
+                    product_key=product.key,
+                )
+                for slot, (link_index, product) in enumerate(
+                    zip(link_indices, products)
+                )
+            ),
+            lane_count=destination.lane_count,
+            representation=destination.input_representation.value,
+            grid_id=int(destination.parameters.get("grid_id", 0)),
+            capacity=int(destination.parameters.get("reception_capacity", 64)),
+        ))
+    return CompiledOpticalSchedule(
+        regions=tuple(regions),
+        region_order=tuple(component_order),
+        outgoing_link_indices={
+            key: tuple(indices) for key, indices in outgoing.items()
+        },
+        incoming_link_indices={
+            key: tuple(indices) for key, indices in incoming.items()
+        },
+        branch_node_keys=branch_keys,
+        join_node_keys=join_keys,
+        cyclic_region_ids=cyclic_ids,
+        zero_delay_cycle_region_ids=zero_delay_cycle_ids,
+        requires_branch_frontier=bool(branch_keys or join_keys),
+        requires_cycle_solver=bool(cyclic_ids),
+        requires_timed_worklist=has_delayed_cycle,
+        has_timestamped_edges=has_delay,
+        maximum_fanout=max((len(value) for value in outgoing.values()), default=0),
+        receptions=tuple(receptions),
+        component_rates_hz=component_rates,
+        clock_rate_hz=clock_rate,
+    )
+
+
 def compile_optical_graph(
     spec: OpticalTransportGraphSpec,
     *,
@@ -602,13 +975,15 @@ def compile_optical_graph(
     """Validate with GraphSolver and lower nodes to T2/T4 artifacts."""
 
     spec.validate()
-    from graph_solver import GraphSolver, TensorEdge, TensorNode
+    schedule = _compile_optical_schedule(spec)
+    from graph_solver import GraphSolver, NetworkClock, TensorEdge, TensorNode
 
     graph_nodes = [
         TensorNode(
             key=node.key,
             layer="master" if node.key in spec.product_keys else node.domain.value,
             transform=None,
+            natural_rate_hz=float(node.parameters.get("refresh_rate_hz", 0.0)),
             subscription_ports=("optical_contract",),
             subscription_contracts={"optical_contract": {
                 "operation": node.operation,
@@ -632,7 +1007,13 @@ def compile_optical_graph(
         )
         for link in spec.links
     ]
-    solver = GraphSolver(graph_nodes, graph_edges)
+    graph_clock_rate = schedule.clock_rate_hz or 48_000.0
+    solver = GraphSolver(
+        graph_nodes,
+        graph_edges,
+        sample_rate=graph_clock_rate,
+        network_clock=NetworkClock(dt=1.0/graph_clock_rate),
+    )
     payload_map = {
         str(key): np.ascontiguousarray(value, np.float32)
         for key, value in dict(t2_payloads or {}).items()
@@ -695,7 +1076,7 @@ def compile_optical_graph(
             ))
     operator_state = operator_builder.freeze()
     return CompiledOpticalTransportGraph(
-        spec, solver, payload_map, t4, operator_state, interfaces
+        spec, solver, payload_map, t4, operator_state, interfaces, schedule
     )
 
 

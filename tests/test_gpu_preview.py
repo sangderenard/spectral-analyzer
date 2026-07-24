@@ -1,4 +1,7 @@
+import threading
+
 from camera_software.gpu_preview import (
+    LatestOnlyProducer,
     PreviewProductKind,
     PreviewProductRegistry,
     PreviewProductPublisher,
@@ -109,3 +112,64 @@ def test_native_pipeline_bridge_publishes_surface_and_field_generations():
     assert wave.metadata["arena_id"] == 2
     assert registry.get("camera.geometry").kind is PreviewProductKind.CAMERA_GEOMETRY
     assert registry.get("camera.light-field").kind is PreviewProductKind.LIGHT_FIELD
+
+
+def test_latest_only_producer_drops_obsolete_pending_requests():
+    first_started = threading.Event()
+    release_first = threading.Event()
+    latest_started = threading.Event()
+    release_latest = threading.Event()
+    calls = []
+
+    def produce(value):
+        calls.append(value)
+        if value == 0:
+            first_started.set()
+            assert release_first.wait(2.0)
+        if value == 3:
+            latest_started.set()
+            assert release_latest.wait(2.0)
+        return value * 10
+
+    worker = LatestOnlyProducer(produce, name="test-latest-producer")
+    try:
+        first_id = worker.request(0)
+        assert first_started.wait(2.0)
+        worker.request(1)
+        worker.request(2)
+        latest_id = worker.request(3)
+        release_first.set()
+        assert latest_started.wait(2.0)
+        assert calls == [0, 3]
+        release_latest.set()
+
+        # close waits for the active latest request and never runs 1 or 2.
+        assert worker.close(timeout_s=2.0)
+        result = worker.poll(after_request_id=first_id)
+        assert result is not None
+        assert result.request_id == latest_id
+        assert result.payload == 30
+        assert result.error is None
+    finally:
+        release_first.set()
+        release_latest.set()
+        worker.close(timeout_s=2.0)
+
+
+def test_latest_only_producer_reports_failure_without_blocking_poll():
+    worker = LatestOnlyProducer(
+        lambda _value: (_ for _ in ()).throw(ValueError("bad frame"))
+    )
+    try:
+        request_id = worker.request("frame")
+        result = None
+        for _ in range(1000):
+            result = worker.poll()
+            if result is not None:
+                break
+            threading.Event().wait(0.001)
+        assert result is not None
+        assert result.request_id == request_id
+        assert isinstance(result.error, ValueError)
+    finally:
+        worker.close()

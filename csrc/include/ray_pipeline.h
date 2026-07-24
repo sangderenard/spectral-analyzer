@@ -31,6 +31,7 @@
 #include <array>
 #include "sensor_mipmap.h"
 #include "wave_t4.h"
+#include "optical_branch_abi.h"
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
@@ -308,6 +309,12 @@ struct RayRecord {
 template<typename T>
 class PipelineQueue {
 public:
+    struct TransactionSnapshot {
+        std::deque<T> items;
+        bool done = false;
+        int high_priority_count = 0;
+    };
+
     bool push(T item) {
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -713,6 +720,37 @@ public:
         return done_;
     }
 
+    /* Exact queue checkpoint for a scheduler-held quiescent frontier.
+     * Copying is non-destructive: readers and writers see no cursor change.
+     * Restore keeps the checkpoint reusable and atomically swaps a fully
+     * copied replacement under the queue lock. The owning process coordinator
+     * must ensure no worker is concurrently executing an item. */
+    TransactionSnapshot copy_transaction_state() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return TransactionSnapshot{q_, done_, n_high_priority_};
+    }
+
+    void restore_transaction_state(const TransactionSnapshot& snapshot) {
+        std::deque<T> replacement = snapshot.items;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            q_.swap(replacement);
+            done_ = snapshot.done;
+            n_high_priority_ = snapshot.high_priority_count;
+        }
+        cv_.notify_all();
+    }
+
+    void restore_transaction_state(TransactionSnapshot&& snapshot) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            q_.swap(snapshot.items);
+            done_ = snapshot.done;
+            n_high_priority_ = snapshot.high_priority_count;
+        }
+        cv_.notify_all();
+    }
+
     /* Signal that no new items will be pushed.  Unblocks blocked pops/pop_batch
      * calls so workers can drain and exit.  Does NOT clear the queue: items
      * pushed before set_done() remain available for drain() callers.  This is
@@ -738,6 +776,13 @@ private:
 
 /* ─── Wave solver arena ─────────────────────────────────────────────────── */
 
+struct WaveFieldLink {
+    int destination = -1;
+    int coordinate_map = -1;
+    std::array<float, 32 * 4> jones_re = {};
+    std::array<float, 32 * 4> jones_im = {};
+};
+
 struct WaveArena {
     int              id      = -1;
     int              context_id = -1;
@@ -749,6 +794,12 @@ struct WaveArena {
     std::array<float, 32 * 4> next_forward_jones_im = {};
     std::array<float, 32 * 4> next_backward_jones_re = {};
     std::array<float, 32 * 4> next_backward_jones_im = {};
+    /* Cold-allocated branch products. The singular fields above retain the
+     * linear-chain fast path and ABI telemetry; hot T4 dispatch never grows
+     * either vector. */
+    std::vector<WaveFieldLink> forward_links;
+    std::vector<WaveFieldLink> backward_links;
+    bool             graph_component_has_branching = false;
     uint64_t         linked_transfers = 0;
     uint64_t         linked_generation = 0;
     int              linked_terminal_arena = -1;
@@ -782,6 +833,7 @@ struct WaveArena {
     wave_t4::AngularSpectrumPlan angular_plan;
     double           wavelengths_m[32] = {};
     double           fixed_wavelengths_m[32] = {};
+    double           n_real_by_lane[32] = {};
     /* Persistent T4 numerical state buffer. T4 remains pipeline-scheduled:
      * WaveIntent enters the stage, this state is updated in place, and a
      * continuation returns to T1. */
@@ -1169,6 +1221,8 @@ struct WaveArenaSnapshot {
     int context_id;
     int next_forward;
     int next_backward;
+    int forward_link_count;
+    int backward_link_count;
     uint64_t linked_transfers;
     int bands;
     int band_specialization;
@@ -1226,6 +1280,34 @@ struct WaveArenaSnapshot {
     int boundary_linked_from_arena;
     int boundary_linked_to_arena;
 };
+
+/* Same-process managed-time checkpoint for mutable T4 wave state.
+ *
+ * This deliberately does not claim to checkpoint the complete ray pipeline:
+ * queues, sensor/BDPT accumulators, and GPU-resident state require separate
+ * participants. Creation and restore require an idle CPU-visible pipeline and
+ * reject arena topology/configuration drift. The opaque object owns copies of
+ * field blocks, active lanes, progress, link telemetry, and boundary telemetry.
+ */
+struct RayPipelineWaveCheckpoint;
+RayPipelineWaveCheckpoint* ray_pipeline_wave_checkpoint_create(
+    const RayPipelineState* ps);
+int ray_pipeline_wave_checkpoint_restore(
+    RayPipelineState* ps, const RayPipelineWaveCheckpoint* checkpoint);
+void ray_pipeline_wave_checkpoint_destroy(
+    RayPipelineWaveCheckpoint* checkpoint);
+
+/* Same-process checkpoint for every CPU PipelineQueue owned by T1-T5,
+ * including output, wave-exit, and BDPT side-data queues. Creation/restore
+ * require an idle frontier with no queued/running T5 connection. This does not
+ * include sensor/BDPT accumulator vectors or GPU-resident buffers. */
+struct RayPipelineQueueCheckpoint;
+RayPipelineQueueCheckpoint* ray_pipeline_queue_checkpoint_create(
+    const RayPipelineState* ps);
+int ray_pipeline_queue_checkpoint_restore(
+    RayPipelineState* ps, const RayPipelineQueueCheckpoint* checkpoint);
+void ray_pipeline_queue_checkpoint_destroy(
+    RayPipelineQueueCheckpoint* checkpoint);
 
 int ray_pipeline_wave_arena_count(const RayPipelineState* ps);
 int ray_pipeline_get_wave_arena_snapshot(const RayPipelineState* ps,
@@ -1386,20 +1468,21 @@ void ray_pipeline_get_bdpt_overflow(const RayPipelineState* ps,
  * Call once per sensor sweep after ray_pipeline_wait_idle(). */
 void ray_pipeline_run_bdpt_connection(RayPipelineState* ps);
 
-/* Signal that the camera has finished dispatching emissive-triangle (flash)
- * rays for the current exposure substage.  T5 fires once both
- * signal_flash_dispatched and signal_sensor_dispatched have been called for
- * the same substage — firing is serialised on a dedicated T5 thread. */
+/* Declare the light-side estimator family for the current exposure substage.
+ * This is a work-dispatch marker, not evidence that transport completed.
+ * T5 becomes eligible only after both family markers exist and the native
+ * pipeline observes in_flight == 0 for every resulting path generation. */
 void ray_pipeline_signal_flash_dispatched(RayPipelineState* ps);
 
-/* Signal that the camera has finished dispatching sensor-sweep rays for the
- * current exposure substage.  Mirrors signal_flash_dispatched. */
+/* Declare the sensor-side importance-query family for the current exposure
+ * substage. These probes are computational work, not physical sensor emission.
+ * Completion remains governed by the T5 zero-in-flight latch above. */
 void ray_pipeline_signal_sensor_dispatched(RayPipelineState* ps);
 
-/* Block until the T5 worker thread has finished.  Call after signalling both
- * flash and sensor to ensure ch2 of sensor_accum is fully written before
- * reading the sensor image. */
-void ray_pipeline_join_t5(RayPipelineState* ps);
+/* Block until the T5 worker has connected/reduced the declared work families
+ * and finished writing ch2 of sensor_accum. Returning from this function is a
+ * valid reception/detector-commit boundary for the current BDPT substage. */
+bool ray_pipeline_join_t5(RayPipelineState* ps);
 
 /* GPU dispatch health state (safe to call from any thread / Python):
  *   0 = disabled (use_gpu_compute=false)

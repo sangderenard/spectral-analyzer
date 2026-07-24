@@ -29,9 +29,11 @@ def test_default_registry_compiles_every_component_at_exact_lane_width(
     registry = default_optical_component_registry()
     assert registry.keys() == (
         "aperture.iris",
+        "emitter.laser-532nm",
         "lens.default-camera",
         "mirror.plane",
         "pentaprism.finder",
+        "sensor.fullframe",
     )
     for key in registry.keys():
         compiled = registry.compile(key, lane_count)
@@ -102,7 +104,7 @@ def test_plane_mirror_uses_canonical_material_and_exact_reflection() -> None:
 def test_pentaprism_is_a_material_bound_composite_graph() -> None:
     component = PentaprismComponent(
         PentaprismSpec((0.0, 0.0, 0.0))
-    ).compile(4)
+    ).compile(4, OpticalEngine.RAY)
     contract = component.contract()
     operations = [node["operation"] for node in contract["graph"]["nodes"]]
 
@@ -130,8 +132,11 @@ def test_engine_selection_is_explicit_and_never_falls_back() -> None:
     assert aperture.metadata["selected_engine"] == "wave"
     lens = registry.compile("lens.default-camera", 4, "parametric")
     assert lens.metadata["selected_engine"] == "parametric"
+    wave_prism = registry.compile("pentaprism.finder", 4, "wave")
+    assert wave_prism.metadata["selected_engine"] == "wave"
+    assert len(wave_prism.graph.field_interfaces) == 4
     with pytest.raises(RuntimeError, match="Refusing fallback"):
-        registry.compile("pentaprism.finder", 4, "wave")
+        registry.compile("pentaprism.finder", 4, "maxwell")
     with pytest.raises(RuntimeError, match="Refusing fallback"):
         registry.compile("lens.default-camera", 4, "ray")
 

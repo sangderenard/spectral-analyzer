@@ -56,6 +56,8 @@ def test_live_mode_validates_before_opening_a_context():
         run_aperture_live(size=16, aperture_pattern="ideal-mask")
     with pytest.raises(ValueError, match="size/fps"):
         run_component_arena_live("mirror.plane", size=32)
+    with pytest.raises(ValueError, match="solve_hz"):
+        run_component_arena_live("mirror.plane", solve_hz=0.0)
 
 
 @pytest.mark.parametrize(

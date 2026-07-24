@@ -356,6 +356,58 @@ def compile_planar_reflection_interface(
     )
 
 
+def compile_normal_transmission_interface(
+    source_basis: TransverseBasis,
+    destination_basis: TransverseBasis,
+    interface_normal: Sequence[float],
+    wavelengths_m: Sequence[float],
+    *,
+    incident_material: str = "air",
+    transmitted_material: str = "BK7",
+) -> RigidFieldInterface:
+    """Compile a normal-incidence dispersive dielectric field boundary."""
+
+    from camera_designer.optical_material import MATERIAL_CATALOG
+
+    try:
+        material_in = MATERIAL_CATALOG[str(incident_material)]
+        material_out = MATERIAL_CATALOG[str(transmitted_material)]
+    except KeyError as exc:
+        raise ValueError(f"unknown dielectric material {exc.args[0]!r}") from exc
+    normal = _unit(interface_normal, name="interface normal")
+    if abs(float(np.dot(source_basis.k, normal))) < 1.0-1.0e-8:
+        raise ValueError(
+            "normal transmission interface refuses oblique field resampling"
+        )
+    if float(np.dot(source_basis.k, destination_basis.k)) < 1.0-1.0e-8:
+        raise ValueError("normal transmission must preserve propagation axis")
+    coordinate_map = _rigid_field_map(
+        source_basis, destination_basis, np.eye(3)
+    )
+    source_to_destination = _basis_matrix(
+        source_basis, destination_basis
+    )
+    matrices = []
+    for wavelength in np.asarray(wavelengths_m, np.float64).reshape(-1):
+        if not np.isfinite(wavelength) or wavelength <= 0.0:
+            raise ValueError("interface wavelengths must be finite and positive")
+        n_in = material_in.n_at(float(wavelength)*1.0e6)
+        n_out = material_out.n_at(float(wavelength)*1.0e6)
+        boundary = dielectric_interface(
+            source_basis.k, normal, n_in, n_out
+        )
+        if boundary.transmission is None:
+            raise ValueError("normal dielectric boundary unexpectedly produced TIR")
+        matrices.append(
+            source_to_destination@boundary.transmission.matrix
+        )
+    return RigidFieldInterface(
+        coordinate_map, np.stack(matrices), source_basis, destination_basis,
+        "dielectric-transmission",
+        f"{incident_material}->{transmitted_material}",
+    )
+
+
 def basis_change(
     source: TransverseBasis,
     destination: TransverseBasis,
@@ -887,6 +939,7 @@ __all__ = [
     "RigidFieldMap",
     "RigidFieldInterface",
     "compile_planar_reflection_interface",
+    "compile_normal_transmission_interface",
     "DielectricInterfaceResult",
     "dielectric_interface",
     "basis_change",

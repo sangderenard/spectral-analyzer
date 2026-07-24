@@ -194,9 +194,33 @@ This equivalence is a regression gate.
   `wave_arena_stats()` as the transition-telemetry authority.
 - direct T4-field-to-T4-field graph edges lower to native persistent field
   links. Forward transport follows source to destination and backward
-  transport follows the reciprocal edge. Cold pipeline construction rejects
-  branching, cycles, lane/grid mismatch, basis/index mismatch, or
-  noncoincident planes; it never inserts an implicit resampler.
+  transport follows the reciprocal edge. Multiple outgoing field products
+  lower into cold-allocated per-arena adjacency vectors; the original singular
+  neighbor fields remain the linear-chain fast path. Cold pipeline construction
+  still rejects cycles, coherent field joins, lane/grid mismatch,
+  basis/index mismatch, or noncoincident planes; it never inserts an implicit
+  resampler.
+
+Every graph link now resolves to a typed scattering-product contract. Products
+name their physical role, coherence behavior, stochastic-selection PDF when
+applicable, conservative power bound, and separate geometric length, carrier
+OPL, and group delay. The cold optical schedule performs all-edge SCC
+decomposition and records branches, joins, cycles, and continuous timing
+without quantizing carrier phase onto a global tick.
+
+Commensurate component/control rates may still use `GraphSolver` with an
+LCM-derived clock. Free or incommensurate arrivals remain event timestamps.
+Nodus is the eventual host authority for this optical pillar. If general
+branch-frontier execution outgrows the pipeline queues, the integration
+boundary is the existing Nodus KPN/tensor project rather than a second manager.
+The standalone optical frontend remains a focused host of the same API. See
+`NODUS_OPTICAL_KPN_INTEGRATION.md` and the fixed-stride handle sidecar in
+`csrc/include/optical_branch_abi.h`.
+
+Repository ownership, the current Pluck `submit()`/`poll()` path, the target
+Nodus-driven cold/hot process loops, GL publication boundary, and
+return-to-optics-bench acceptance gates are specified in
+`OPTICAL_ENGINE_REPOSITORY_INTEGRATION.md`.
 
 The installed production code identifies itself as `AngularSpectrum`.
 `angular-spectrum-fft` graph nodes lower directly to the exact-lane native
@@ -256,12 +280,15 @@ The next transport step is a cold-allocated contiguous state block plus compact
 handle semantics; a per-ray heap payload or hot unordered lookup is not an
 acceptable substitute.
 
-That complete-field connection now exists for identity-compatible ports. It
+That complete-field connection now exists for compatible ports. It
 copies active S/P complex planes directly between already-allocated contiguous
 state blocks and marches the destination before any ray extraction. There is
-no hot allocation, and only the terminal field port emits a representative
-ray. `linked_transfers`, `next_forward`, `next_backward`, and boundary
-`linked_from_arena`/`linked_to_arena` telemetry make the route observable.
+no hot allocation. A field fan-out copies the same source field through every
+declared Jones/coordinate product and each terminal field port emits its own
+representative continuation. `linked_transfers`, `next_forward`,
+`next_backward`, and boundary `linked_from_arena`/`linked_to_arena` telemetry
+make the linear fast route observable; typed graph products are the authority
+for general adjacency.
 
 `wave_arena_stats()` exposes entry/exit world and local coordinates,
 directions, input/seeded/propagated/output power, adapter identity, and the
@@ -305,6 +332,8 @@ and illumination-optics modules are the next source-optics layer.
 
 1. **Contract scaffold**
    - typed nodes, links, domains, representations, lanes, FFT/border policies;
+   - typed scattering products, continuous timing, accuracy, and solve reports;
+   - all-edge branch/join/cycle schedule;
    - exact payload equivalence;
    - branching and invalid-transition tests.
 2. **Native graph installation** *(first vertical slice complete)*
@@ -323,6 +352,8 @@ and illumination-optics modules are the next source-optics layer.
    - compatible full-field arena links are complete on the native CPU
      executor; replace readback-steered arena routing with GPU-resident cohort
      assembly.
+   - cold-allocated native fan-out is complete; coherent fan-in and cyclic
+     resonator execution remain explicit gates.
    - bounded raw field snapshots and an opt-in shared display texture are
      complete; direct GPU FFT state-to-display resolution remains.
 6. **Scientific equivalence**
@@ -341,9 +372,10 @@ and illumination-optics modules are the next source-optics layer.
   multi-operation graph schedule.
 - T4 descriptors construct the vector angular-spectrum arena, but the native
   GPU FFT executor is not implemented; the production CPU kernel is used.
-- Persistent field links currently support identity-compatible ports only.
-  Basis rotations, refractive interfaces, grid changes, and branch operators
-  require explicit compiled field operators and remain intentionally rejected.
+- Persistent field links support compatible grids plus exact signed rigid
+  coordinate maps and per-lane Jones operators. Cold-allocated field fan-out
+  is supported. Coherent fan-in, resampling, and cyclic resonator execution are
+  still rejected until their accumulation/convergence contracts are installed.
 - The live T4 texture is currently staged from CPU-resident production state.
   It is never generated unless requested, but will become a direct GPU resolve
   when the GLSL FFT executor owns the arena state.

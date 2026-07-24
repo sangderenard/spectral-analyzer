@@ -36,6 +36,11 @@ from .optical_transport_graph import (
     compile_optical_graph,
     wave_context_nodes,
 )
+from .complex_optical_operators import (
+    TransverseBasis,
+    compile_normal_transmission_interface,
+    compile_planar_reflection_interface,
+)
 from .physical_aperture import LivePhysicalAperture
 from .specialty_optics import OpticalTriangleAssembly, PentaprismSpec
 
@@ -83,6 +88,13 @@ class OpticalPortSpec:
     representation: OpticalRepresentation
     axis: tuple[float, float, float]
     center_m: tuple[float, float, float]
+    medium: str = "air"
+    spectral_mode: str = "fixed-or-continuous"
+    polarization_basis: str = "right-handed-local-s-p"
+    normalization: str = "power-normalized-complex-amplitude"
+    coherence_policy: str = "preserve"
+    permits_fanout: bool = False
+    permits_fanin: bool = False
 
     def validate(self) -> None:
         if not self.key.strip():
@@ -95,6 +107,16 @@ class OpticalPortSpec:
             raise ValueError("optical component port coordinates must be finite")
         if float(np.linalg.norm(axis)) <= 1.0e-12:
             raise ValueError("optical component port axis must be non-zero")
+        if not self.medium.strip():
+            raise ValueError("optical component ports require a medium")
+        if self.spectral_mode not in {
+            "fixed", "continuous", "fixed-or-continuous",
+        }:
+            raise ValueError("unsupported optical port spectral mode")
+        if self.coherence_policy not in {
+            "preserve", "coherent-accumulate", "incoherent-accumulate",
+        }:
+            raise ValueError("unsupported optical port coherence policy")
 
 
 @dataclass(frozen=True)
@@ -176,6 +198,13 @@ class CompiledOpticalComponent:
                 "representation": port.representation.value,
                 "axis": list(port.axis),
                 "center_m": list(port.center_m),
+                "medium": port.medium,
+                "spectral_mode": port.spectral_mode,
+                "polarization_basis": port.polarization_basis,
+                "normalization": port.normalization,
+                "coherence_policy": port.coherence_policy,
+                "permits_fanout": port.permits_fanout,
+                "permits_fanin": port.permits_fanin,
             } for port in self.ports],
             "controls": [{
                 "key": control.key,
@@ -460,11 +489,26 @@ class PhysicalApertureComponent:
         ))
         transport = None
         try:
-            triangles, _normals = self.aperture.triangle_mesh(
-                z_center_m=float(self.center_m[2])
+            triangles, _local_normals = self.aperture.triangle_mesh(
+                z_center_m=0.0
+            )
+            local_vertices = triangles.reshape(-1, 3)
+            reference = np.asarray((0.0, 0.0, 1.0), np.float64)
+            if abs(float(np.dot(reference, axis))) > 0.9:
+                reference = np.asarray((0.0, 1.0, 0.0), np.float64)
+            tangent_u = _unit(
+                np.cross(reference, axis), "aperture tangent"
+            )
+            tangent_v = _unit(
+                np.cross(axis, tangent_u), "aperture tangent"
+            )
+            local_to_world = np.stack((tangent_u, tangent_v, axis), axis=1)
+            world_vertices = (
+                local_vertices @ local_to_world.T
+                + np.asarray(self.center_m, np.float64)
             )
             transport = OpticalTriangleAssembly(
-                triangles.reshape(-1, 3, 3),
+                world_vertices.reshape(-1, 3, 3),
                 ("aperture_material",)*(triangles.shape[0]),
             )
         except NotImplementedError:
@@ -678,13 +722,155 @@ class PentaprismComponent:
     spec: PentaprismSpec
     key: str = "pentaprism.finder"
 
+    def _compile_wave_graph(
+        self, lane_count: int
+    ) -> CompiledOpticalTransportGraph:
+        from .transport_contract import perceptual_visible_wavelengths
+
+        assembly = self.spec.build()
+        chief = [np.asarray(value, np.float64) for value in assembly.primary_path]
+        directions = [
+            _unit(chief[index+1]-chief[index], "pentaprism wave leg")
+            for index in range(3)
+        ]
+        lead = 0.10*float(self.spec.clear_size_m)
+        endpoints = [
+            (chief[0]-directions[0]*lead, chief[0], "air"),
+            (chief[0], chief[1], "BK7"),
+            (chief[1], chief[2], "BK7"),
+            (chief[2], chief[3], "BK7"),
+            (chief[3], chief[3]+directions[2]*lead, "air"),
+        ]
+        axes = [
+            directions[0], directions[0], directions[1],
+            directions[2], directions[2],
+        ]
+        wavelengths = np.asarray(
+            perceptual_visible_wavelengths(lane_count), np.float64
+        )*1.0e-9
+        radius = min(
+            96.0e-6,
+            0.20*float(self.spec.depth_m),
+            0.10*float(self.spec.clear_size_m),
+        )
+        nodes: list[OpticalNodeSpec] = [
+            OpticalNodeSpec(
+                f"{self.key}.wave-entry",
+                "complex-ray-to-transverse-field",
+                OpticalExecutionDomain.PIPELINE_PORT,
+                OpticalRepresentation.COMPLEX_RAY,
+                OpticalRepresentation.TRANSVERSE_FIELD,
+                lane_count,
+            )
+        ]
+        arena_nodes: list[OpticalNodeSpec] = []
+        for index, ((start, end, medium_name), axis) in enumerate(
+            zip(endpoints, axes)
+        ):
+            length = float(np.linalg.norm(end-start))
+            material = MATERIAL_CATALOG[medium_name]
+            n_by_lane = tuple(
+                material.n_at(float(value)*1.0e6) for value in wavelengths
+            )
+            arena_nodes.append(OpticalNodeSpec(
+                f"{self.key}.wave-leg-{index}",
+                "wave-propagation",
+                OpticalExecutionDomain.T4_WAVE_ARENA,
+                OpticalRepresentation.TRANSVERSE_FIELD,
+                OpticalRepresentation.TRANSVERSE_FIELD,
+                lane_count,
+                persistent_state=True,
+                parameters={
+                    "propagation": WavePropagationStyle.ANGULAR_SPECTRUM_FFT.value,
+                    "boundary": WaveBoundaryStyle.PADDED_ABSORBING.value,
+                    "state_layout": "solid-contiguous-state-block",
+                    "allocation": "cold-only",
+                    "center_m": tuple(float(v) for v in 0.5*(start+end)),
+                    "axis": tuple(float(v) for v in axis),
+                    "radius_m": radius,
+                    "longitudinal_step_m": length/8.0,
+                    "longitudinal_steps": 8,
+                    "medium_n_real": float(material.n_d),
+                    "medium_n_imag": float(material.k),
+                    "medium_n_by_lane": n_by_lane,
+                    "medium": medium_name,
+                },
+            ))
+        nodes.extend(arena_nodes)
+        output = OpticalNodeSpec(
+            f"{self.key}.wave-exit",
+            "transverse-field-to-complex-ray",
+            OpticalExecutionDomain.PIPELINE_PORT,
+            OpticalRepresentation.TRANSVERSE_FIELD,
+            OpticalRepresentation.COMPLEX_RAY,
+            lane_count,
+        )
+        nodes.append(output)
+        links: list[OpticalLinkSpec] = [
+            OpticalLinkSpec(nodes[0].key, arena_nodes[0].key, "wave-entry")
+        ]
+        interfaces: dict[tuple[str, str], Any] = {}
+
+        def connect(
+            source_index: int,
+            destination_index: int,
+            interface,
+            role: str,
+        ) -> None:
+            source = arena_nodes[source_index]
+            destination = arena_nodes[destination_index]
+            links.append(OpticalLinkSpec(
+                source.key, destination.key, role,
+                "rigid-complex-field-interface",
+                interface.graph_parameters(),
+            ))
+            interfaces[(source.key, destination.key)] = interface
+
+        bases = [TransverseBasis.from_direction(value) for value in axes]
+        connect(0, 1, compile_normal_transmission_interface(
+            bases[0], bases[1], -directions[0], wavelengths,
+            incident_material="air", transmitted_material="BK7",
+        ), "entrance-transmission")
+        first_normal = _unit(
+            directions[0]-directions[1], "first reflector normal"
+        )
+        connect(1, 2, compile_planar_reflection_interface(
+            bases[1], bases[2], first_normal, wavelengths,
+            material_name="aluminum_mirror",
+            n_incident=MATERIAL_CATALOG["BK7"].n_d,
+        ), "silvered-reflection-1")
+        second_normal = _unit(
+            directions[1]-directions[2], "second reflector normal"
+        )
+        connect(2, 3, compile_planar_reflection_interface(
+            bases[2], bases[3], second_normal, wavelengths,
+            material_name="aluminum_mirror",
+            n_incident=MATERIAL_CATALOG["BK7"].n_d,
+        ), "silvered-reflection-2")
+        connect(3, 4, compile_normal_transmission_interface(
+            bases[3], bases[4], directions[2], wavelengths,
+            incident_material="BK7", transmitted_material="air",
+        ), "exit-transmission")
+        links.append(OpticalLinkSpec(
+            arena_nodes[-1].key, output.key, "wave-product"
+        ))
+        return compile_optical_graph(
+            OpticalTransportGraphSpec(
+                tuple(nodes), tuple(links),
+                (nodes[0].key,), (output.key,),
+            ),
+            field_interfaces=interfaces,
+        )
+
     def compile(
         self,
         lane_count: int,
         engine: OpticalEngine | str = OpticalEngine.AUTO,
     ) -> CompiledOpticalComponent:
         selected_engine = _select_engine(
-            self.key, engine, (OpticalEngine.RAY,), OpticalEngine.RAY
+            self.key, engine,
+            (OpticalEngine.RAY, OpticalEngine.WAVE, OpticalEngine.HYBRID),
+            OpticalEngine.HYBRID,
         )
         assembly = self.spec.build()
         operations = (
@@ -703,8 +889,12 @@ class PentaprismComponent:
                 "role": "exit_glass", "material": "BK7",
             }),
         )
-        graph = _compile_linear_material_graph(
-            prefix=self.key, lane_count=lane_count, operations=operations
+        graph = (
+            self._compile_wave_graph(lane_count)
+            if selected_engine in (OpticalEngine.WAVE, OpticalEngine.HYBRID)
+            else _compile_linear_material_graph(
+                prefix=self.key, lane_count=lane_count, operations=operations
+            )
         )
         roles = (
             OpticalMaterialRole(
@@ -762,7 +952,7 @@ class PentaprismComponent:
                 ],
                 "constant_deviation_rad": 0.5*math.pi,
                 "selected_engine": selected_engine.value,
-                "supported_engines": ("ray",),
+                "supported_engines": ("ray", "wave", "hybrid"),
             },
         )
         component.validate()
@@ -833,6 +1023,30 @@ def default_optical_component_registry() -> OpticalComponentRegistry:
         "pentaprism.finder",
         lambda _lanes: PentaprismComponent(
             PentaprismSpec((0.0, 0.0, 0.0))
+        ),
+    )
+    # Endpoint components live in the chain module to keep sensor/emitter
+    # profile dependencies out of the ordinary material component boundary.
+    from camera_designer.camera_preset import EmitterSpec
+    from .optical_chain import EmitterEndpointComponent, SensorEndpointComponent
+    from .sensor_back import SensorBackProfile
+
+    registry.register(
+        "emitter.laser-532nm",
+        lambda _lanes: EmitterEndpointComponent(EmitterSpec(
+            pos=(-0.10, 0.0, 0.0),
+            normal=(1.0, 0.0, 0.0),
+            radius=0.010,
+            spatial_samples=64,
+            profile_name="laser_532nm_green",
+            label="532 nm coherent table source",
+        ), key="emitter.laser-532nm"),
+    )
+    registry.register(
+        "sensor.fullframe",
+        lambda _lanes: SensorEndpointComponent(
+            SensorBackProfile.fullframe_35mm(),
+            key="sensor.fullframe",
         ),
     )
     return registry

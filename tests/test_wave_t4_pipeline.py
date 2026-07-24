@@ -84,6 +84,47 @@ def test_empty_space_crossing_routes_through_t4():
     assert tracer.drain_wave_exit_states(16).shape == (0, 160)
 
 
+def test_wave_transaction_checkpoint_restores_and_replays_native_field_state():
+    tracer = _tracer(np.array([550e-9]))
+    _add_arena(tracer)
+    tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+    wave_checkpoint = tracer.copy_wave_transaction_state()
+    queue_checkpoint = tracer.copy_queue_transaction_state()
+
+    def run_once():
+        tracer.submit_rays(
+            np.array([[0.0, 0.0, -0.05]]),
+            np.array([[0.0, 0.0, 1.0]]),
+            np.array([[1.0 + 0.0j]]),
+            max_bounces=1,
+            min_amplitude=1e-12,
+        )
+        _wait(tracer)
+        field = tracer.wave_arena_field_snapshot(0, 0, 0, 0)
+        return (
+            tracer.wave_arena_stats()[0],
+            np.asarray(field["re"]).copy(),
+            np.asarray(field["im"]).copy(),
+        )
+
+    first_stats, first_re, first_im = run_once()
+    assert first_stats["generation"] == 1
+    assert tracer.pipeline_stats()["output_queue_depth"] == 1
+    tracer.restore_queue_transaction_state(queue_checkpoint)
+    tracer.restore_wave_transaction_state(wave_checkpoint)
+    restored = tracer.wave_arena_stats()[0]
+    assert restored["generation"] == 0
+    assert restored["completed_steps"] == 0
+    assert tracer.pipeline_stats()["output_queue_depth"] == 0
+
+    second_stats, second_re, second_im = run_once()
+    assert second_stats["generation"] == 1
+    assert second_stats["completed_steps"] == first_stats["completed_steps"]
+    np.testing.assert_array_equal(second_re, first_re)
+    np.testing.assert_array_equal(second_im, first_im)
+    assert np.asarray(tracer.drain_records(16)["kind"]).tolist() == [3]
+
+
 def test_fixed_band_source_mode_seeds_both_components_and_full_coherence():
     from camera_software.complex_optical_operators import (
         ComplexOpticalOperator,
@@ -343,6 +384,113 @@ def test_compatible_wave_contexts_chain_without_intermediate_ray_collapse():
     assert int(np.asarray(records["arena_id"])[field_records[0]]) == (
         second["arena_id"]
     )
+
+
+def test_native_wave_fanout_conserves_power_and_is_link_order_invariant():
+    def run(link_order):
+        tracer = _tracer(np.array([550e-9]))
+        radius = 64.0e-6
+        dz = 2.0e-6
+        steps = 8
+        payload = np.asarray(
+            [0.0, 0.0, 0.0, 0.0, 0.0, 1.0], np.float64
+        )
+        context_ids = [
+            tracer.add_scale_context(
+                np.asarray([0.0, 0.0, center_z]),
+                radius, 1, dz, steps, 1.0, 0.0, 1, payload.copy(),
+            )
+            for center_z in (-8.0e-6, 8.0e-6, 8.0e-6)
+        ]
+        amplitudes = (0.6, 0.8)
+        for destination_index in link_order:
+            amplitude = amplitudes[destination_index]
+            jones = np.asarray(
+                [[[amplitude, 0.0], [0.0, amplitude]]], np.complex64
+            )
+            tracer.add_wave_context_interface_link(
+                context_ids[0],
+                context_ids[destination_index + 1],
+                0,
+                jones.real,
+                jones.imag,
+            )
+        tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+        tracer.submit_rays(
+            np.asarray([[7.0e-6, -5.0e-6, -0.001]]),
+            np.asarray([[0.0, 0.0, 1.0]]),
+            np.asarray([[1.0 + 0.0j]]),
+            max_bounces=1,
+            min_amplitude=1e-12,
+        )
+        _wait(tracer)
+
+        by_context = {
+            arena["context_id"]: arena for arena in tracer.wave_arena_stats()
+        }
+        source = by_context[context_ids[0]]
+        destinations = [
+            by_context[context_ids[index]] for index in (1, 2)
+        ]
+        records = tracer.drain_records(16)
+        field_mask = np.asarray(records["kind"]) == 3
+        return source, destinations, records, field_mask
+
+    forward = run((0, 1))
+    reverse = run((1, 0))
+    for source, destinations, records, field_mask in (forward, reverse):
+        assert source["forward_link_count"] == 2
+        assert source["linked_transfers"] == 2
+        assert [item["backward_link_count"] for item in destinations] == [1, 1]
+        assert [item["generation"] for item in destinations] == [1, 1]
+        branch_powers = [
+            item["boundary"]["seeded_field_power"] for item in destinations
+        ]
+        assert branch_powers[0] == pytest.approx(
+            0.6**2 * source["field_power"], rel=4.0e-6
+        )
+        assert branch_powers[1] == pytest.approx(
+            0.8**2 * source["field_power"], rel=4.0e-6
+        )
+        assert sum(branch_powers) == pytest.approx(
+            source["field_power"], rel=4.0e-6
+        )
+        assert int(np.count_nonzero(field_mask)) == 2
+        assert set(np.asarray(records["arena_id"])[field_mask].tolist()) == {
+            item["arena_id"] for item in destinations
+        }
+
+    np.testing.assert_allclose(
+        [
+            item["boundary"]["seeded_field_power"]
+            for item in forward[1]
+        ],
+        [
+            item["boundary"]["seeded_field_power"]
+            for item in reverse[1]
+        ],
+        rtol=4.0e-6,
+    )
+
+
+def test_native_wave_link_api_rejects_fanin_and_cycles_before_pipeline_build():
+    tracer = _tracer(np.array([550e-9]))
+    payload = np.asarray(
+        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0], np.float64
+    )
+    contexts = [
+        tracer.add_scale_context(
+            np.asarray([0.0, 0.0, center_z]),
+            64.0e-6, 1, 2.0e-6, 8, 1.0, 0.0, 1, payload.copy(),
+        )
+        for center_z in (-16.0e-6, 0.0, 16.0e-6)
+    ]
+
+    tracer.add_wave_context_link(contexts[0], contexts[2])
+    with pytest.raises(ValueError, match="single-producer"):
+        tracer.add_wave_context_link(contexts[1], contexts[2])
+    with pytest.raises(ValueError, match="acyclic"):
+        tracer.add_wave_context_link(contexts[2], contexts[0])
 
 
 def test_rigid_interface_link_turns_and_attenuates_persistent_field():

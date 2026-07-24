@@ -43,18 +43,38 @@ Open one without retaining frames:
 
 ```powershell
 python wave_transform_visual_demo.py --component-live `
-  --component aperture.iris --component-lanes 16 --size 384
+  --component aperture.iris
 
 python wave_transform_visual_demo.py --component-live `
-  --component lens.default-camera --component-lanes 16 --size 384
+  --component lens.default-camera
 
 python wave_transform_visual_demo.py --component-live `
-  --component mirror.plane --component-lanes 16 --size 384
+  --component mirror.plane
 
 python wave_transform_visual_demo.py --component-live `
   --component pentaprism.finder --component-lanes 16 `
-  --component-engine ray --component-size 512
+  --component-engine ray --component-size 384
 ```
+
+`--component-size`, rather than the unrelated sequence-render `--size`, controls
+the arena's source texture and wave crop. Live defaults are one spectral lane,
+a 128-pixel crop, and at most eight asynchronously produced texture generations
+per second. Override them explicitly with `--component-lanes`,
+`--component-size`, and `--component-solve-hz`.
+
+The OpenGL event/control loop is independent of texture production. It keeps
+presenting the last completed immutable generation while the solver builds the
+next one, and obsolete queued control states collapse to the newest request.
+Only a completed generation uploads its six panels.
+
+This distinction matters most for `aperture.iris`: balanced open-boundary
+quality pads each visible dimension by two and performs four propagation
+substeps for every Jones component and spectral lane. The old implicit
+512-pixel/four-lane live request therefore solved a 1024-by-1024 hidden field
+on every display frame. That was not the named `bake` quality mode, but it was
+an inappropriate interactive workload. High-investment lane counts and sizes
+remain available explicitly, and named ultra-bakes remain the retained-output
+path.
 
 One square product owns the viewport; this is not a six-up contact sheet.
 Use `1` through `6`, arrow keys, or Tab to select products. The six products
@@ -152,3 +172,104 @@ ninth channel.
 
 That work is the next mixed ray/wave transport slice. It is separate from,
 and now cleanly enabled by, the component API completed here.
+
+## Emitter-to-sensor light tables
+
+Emitters and sensors are first-class components, not viewer decorations.
+`EmitterEndpointComponent` retains the complete `EmitterProfile` contract
+(spectrum, phase, coherence, polarization, directionality, and optional
+texture), while `SensorEndpointComponent` retains physical geometry, quantum
+efficiency, CFA/readout, film, color-science, exposure, and output stages.
+The default registry exposes these as `emitter.laser-532nm` and
+`sensor.fullframe`.
+
+`compile_optical_chain` compiles each component independently, namespaces its
+nodes, preserves its native T2 payloads and T4 descriptors, and authors
+checked free-space links between typed ports. Named instances make a mounted
+part replaceable without rebuilding or flattening neighboring component
+contracts:
+
+```python
+import numpy as np
+
+from camera_software import (
+    LivePhysicalAperture,
+    compile_optical_chain,
+    default_optical_component_registry,
+    light_table_chain,
+    mount_aperture_at_lens_stop,
+    run_geometric_light_table,
+)
+
+registry = default_optical_component_registry()
+lens = registry.create("lens.default-camera", 1)
+iris = LivePhysicalAperture.iris(
+    "demo.iris",
+    blade_count=7,
+    opening_radius_m=30e-6,
+    assembly_radius_m=52e-6,
+    thickness_m=3e-6,
+)
+mounted = mount_aperture_at_lens_stop(iris, lens.lens)
+spec = light_table_chain(lens, mounted, lane_count=1)
+chain = compile_optical_chain(spec)
+
+content = np.zeros((32, 32, 3), np.float32)
+content[8:24, 14:18] = (1.0, 0.2, 0.05)
+projection = run_geometric_light_table(chain, content, ray_count=20_000)
+rgba = projection.preview_rgba
+```
+
+Replace the named `aperture` element with another mounted iris, grating, slit,
+or custom canonical physical aperture via `spec.replace_component(...)`. The
+exact compound-lens T2 payload does not change.
+
+The compiled chain is the durable arbitrary emitter-to-sensor description.
+The first executable output path is deliberately narrower: it currently
+supports one textured emitter, one canonical physical aperture, one exact
+`CompoundLens`, and one sensor. It uses `CompoundLens.trace`, applies the real
+aperture opening geometrically, and produces linear, developed, and preview
+sensor arrays. It is suitable for projection, focus, vignetting, and geometric
+bokeh experiments. Its metadata explicitly reports that diffraction and
+finite-material loss are not yet included.
+
+Universal mixed T1/T2/T3/T4 dispatch, branch/fan-out execution, and coherent
+sensor reduction remain follow-on executor work. The component graph now
+retains the endpoint physics and native artifacts required for that work
+instead of hiding them in a demo-specific scene.
+
+### Mechanical assembly is authoritative
+
+Inside the light-table environment, component coordinates should not be typed
+directly into the transport graph. `LightTableAssemblySpec` is the mechanical
+source of truth. It contains physical holders (post stands, rail carriages,
+tube cells, cage plates, sensor backs, and emitter panels), their rail/tube
+station, transverse placement, optical axis, and receiver interface. Each
+mounted optic declares its own interface and datum.
+
+Mount interfaces have a named standard, circular/square/rectangular face
+shape, outer size, clear opening, and clocking policy. A swap is accepted only
+when the optic mates with the holder. The clear opening remains explicit
+apparatus geometry. Lowering holder-edge geometry into T1/T3 so that it
+physically vignettes transport is a remaining step; the contract no longer
+loses the dimensions needed to do it.
+
+Resolution is deterministic:
+
+1. validate holder/optic mechanical compatibility;
+2. sort mounts by axial station, insertion sequence, and holder key;
+3. resolve emitter, aperture, lens, and sensor poses from mounting datums;
+4. lower that ordered physical assembly to `OpticalChainSpec`;
+5. compile the typed optical transport graph.
+
+An aperture tube cell and its lens holder may share a station; insertion
+sequence gives their unambiguous optical order. `ResolvedLightTableAssembly`
+also supplies `scene_manifest()` for `BellJarWorkspace`, so displayed stands
+and holders and the optical job share the same assembly identity.
+
+The first resolver supports the common collinear +X light-table rail. Emitters,
+apertures, and sensor planes are positioned directly. Exact compound lenses
+can be translated by front, back, center, or aperture-stop datum. An off-axis
+or rotated exact lens currently fails explicitly because that requires a
+rigidly transformed compound-lens parametric contract, not merely transformed
+display geometry.

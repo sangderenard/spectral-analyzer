@@ -7052,6 +7052,15 @@ class ForwardCppLensBench:
         idx = int(np.clip(self._camera_exposure_forward_stage, 0, max(0, len(frame.slices) - 1)))
         return float(frame.slices[idx].flash_weight if frame.slices else 0.0)
 
+    def _exposure_sensor_weight(self) -> float:
+        frame = self._ensure_exposure_frame()
+        idx = int(np.clip(
+            self._camera_exposure_forward_stage,
+            0,
+            max(0, len(frame.slices) - 1),
+        ))
+        return float(frame.slices[idx].sensor_weight if frame.slices else 0.0)
+
     def _ensure_exposure_frame(self, dt_s: Optional[float] = None) -> ExposureFrame:
         if self._active_exposure_frame is None:
             raise RuntimeError("camera exposure frame requested before camera coordinator began a frame")
@@ -7104,9 +7113,9 @@ class ForwardCppLensBench:
         if self._camera_timeline is None or self._camera_timeline.frame_id != frame.frame_id:
             self._camera_timeline = CameraTimeline.from_exposure_frame(frame)
             self._exposure_barrier = ExposureBarrier(self._camera_timeline)
-            # Camera software owns the gate: wire whatever render callback was
-            # registered on the bench so confirm_flash_materialized fires the
-            # sensor sweep directly — the harness never polls sensor_may_submit.
+            # Optional presentation hook only. Sensor-side importance probes
+            # may run concurrently with light-side work; native T5, followed by
+            # the camera barrier's reception/detector commit, owns closure.
             self._exposure_barrier.on_flash_materialized = getattr(
                 self, "_on_flash_materialized_cb", None
             )
@@ -7561,6 +7570,8 @@ class ForwardCppLensBench:
         bake_origins: Optional[np.ndarray] = None,
         bake_directions: Optional[np.ndarray] = None,
         exposure_weight: float = 1.0,
+        flash_exposure_weight: Optional[float] = None,
+        natural_exposure_weight: Optional[float] = None,
     ):
         """Forward trace via the persistent T1/T2/T3/T4 pipeline.
 
@@ -7584,6 +7595,18 @@ class ForwardCppLensBench:
 
         if bake_origins is None:
             n_rays = int(max(1, self._uv_emitter_ray_count() or rays_per_emitter))
+            flash_weight = float(max(
+                0.0,
+                exposure_weight
+                if flash_exposure_weight is None
+                else flash_exposure_weight,
+            ))
+            natural_weight = float(max(
+                0.0,
+                exposure_weight
+                if natural_exposure_weight is None
+                else natural_exposure_weight,
+            ))
             _mod = getattr(self.scene, "flash_modifier", None)
             if _mod is not None:
                 _mode_map = {"none": 0, "snoot": 1, "grid": 2, "scrim": 3}
@@ -7605,7 +7628,7 @@ class ForwardCppLensBench:
                 submitted += int(self.tracer.submit_emissive_triangles(
                     np.ascontiguousarray(flash_ids, dtype=np.int32),
                     n_rays,
-                    float(max(0.0, exposure_weight)),
+                    flash_weight,
                     float(self.emitter_amp_gain),
                     int(max_bounces),
                     float(self._min_amplitude),
@@ -7620,7 +7643,7 @@ class ForwardCppLensBench:
                 submitted += int(self.tracer.submit_emissive_triangles(
                     np.ascontiguousarray(natural_ids, dtype=np.int32),
                     n_rays,
-                    float(max(0.0, exposure_weight)),
+                    natural_weight,
                     float(self.emitter_amp_gain),
                     int(max_bounces),
                     float(self._min_amplitude),
@@ -9160,7 +9183,11 @@ class ForwardCppLensBench:
                 _wait_ms = (time.perf_counter() - _t0_wait) * 1e3
                 print(f"[py-profile sensor]  in_flight_wait={_wait_ms:.2f}ms", flush=True)
             _t0_t5 = time.perf_counter() if self._py_profile else 0.0
-            self.tracer.join_t5()
+            joined = self.tracer.join_t5()
+            if joined is False:
+                raise RuntimeError(
+                    "native T5 failed to reach its reception closure boundary"
+                )
             if self._py_profile:
                 print(f"[py-profile sensor]  join_t5={( time.perf_counter() - _t0_t5)*1e3:.2f}ms", flush=True)
             try:
@@ -9271,6 +9298,24 @@ class ForwardCppLensBench:
                         f" launched zero rays (args={_ss['stage_args']})",
                         flush=True,
                     )
+                barrier = self._exposure_barrier
+                stage_idx = int(_ss["stage_idx"])
+                if barrier is not None:
+                    barrier.record_sensor_probe_work_dispatched(
+                        stage_idx, submitted=int(max(0, _launched))
+                    )
+                    if _launched > 0:
+                        # run_sensor_batches returns only after the native T5
+                        # latch observed both work families, all path
+                        # generations terminated, the connection/reduction
+                        # pass completed, and sensor_accum was written.
+                        if not barrier.state(
+                            stage_idx
+                        ).emission_work_dispatched:
+                            barrier.record_emission_work_dispatched(stage_idx, 0)
+                        barrier.confirm_transport_products_materialized(stage_idx)
+                        barrier.confirm_reception_closed(stage_idx)
+                        barrier.confirm_detector_integration_committed(stage_idx)
                 self.bdpt_last_launched_rays = _launched
                 self._bdpt_native_sensor_sweep_started = _launched > 0
                 self._bdpt_camera_sweep_stage += 1
@@ -13943,7 +13988,8 @@ def run(
         _flash_active = True   # False → non-flash slice; skip submit_emissive_triangles
         _slice_idx = 0
         _submit_rpe = 0
-        _exposure_weight = 1.0
+        _flash_weight = 0.0
+        _natural_weight = 0.0
         _barrier = None
         with bench._trace_lock:
             if bench._active_exposure_frame is None:
@@ -13974,15 +14020,13 @@ def run(
                 # light with duty_cycle < 1.0).  Pre-confirm the barrier so the sensor
                 # pipeline is not gated on an emission that was never scheduled.
                 _flash_active    = bool(getattr(_tl_slice, "flash_active", True))
-                _exposure_weight = bench._exposure_stage_weight()
+                _flash_weight = bench._exposure_stage_weight()
+                _natural_weight = bench._exposure_sensor_weight()
                 _submit_rpe      = bench._exposure_rays_per_emitter(rpe)
                 # Claim this stage slot now so concurrent _trace calls see
                 # fwd > sensor and skip rather than double-submitting.
                 bench._camera_exposure_forward_stage += 1
                 _do_flash = True
-                if not _flash_active and _barrier is not None:
-                    # Auto-confirm: no light was fired, nothing to materialize.
-                    _barrier.record_flash_dispatched(_slice_idx, submitted=0)
                 # Fire sensor sweep NOW, while still holding _trace_lock, so the
                 # sensor thread starts at t=0 of the shutter — not after flash
                 # submission completes (which can take 100ms–2s).  The thread
@@ -13997,25 +14041,30 @@ def run(
         # Step 2: submit flash rays WITHOUT holding _trace_lock.
         # Sensor sweep is already running (fired at end of step 1) so flash and
         # sensor enter the C++ pipeline as true temporal cohorts.
-        # For non-flash slices (pulsed/strobe with flash_active=False), skip
-        # the C++ call entirely — the barrier was already pre-confirmed above.
-        submitted = 0
-        if _flash_active:
-            import time as _bp_t
-            while (not closing.is_set() and not _rebuild_in_progress.is_set()
-                   and int(bench.tracer.in_flight_count()) > _MAX_IN_FLIGHT):
-                _bp_t.sleep(0.002)
-            if closing.is_set() or _rebuild_in_progress.is_set():
-                return
-            submitted = bench.trace_forward(_submit_rpe, sd,
-                                            max_bounces=mb,
-                                            exposure_weight=_exposure_weight)
+        # Natural scene emitters remain active even when the camera-mounted
+        # flash is disabled. Both light-side jobs share one native T5 family
+        # marker but retain independent physical weights.
+        import time as _bp_t
+        while (not closing.is_set() and not _rebuild_in_progress.is_set()
+               and int(bench.tracer.in_flight_count()) > _MAX_IN_FLIGHT):
+            _bp_t.sleep(0.002)
+        if closing.is_set() or _rebuild_in_progress.is_set():
+            return
+        submitted = bench.trace_forward(
+            _submit_rpe,
+            sd,
+            max_bounces=mb,
+            exposure_weight=0.0,
+            flash_exposure_weight=(_flash_weight if _flash_active else 0.0),
+            natural_exposure_weight=_natural_weight,
+        )
 
         # Step 3: brief re-lock for bookkeeping and pipeline-camera trigger.
         with bench._trace_lock:
-            if _barrier is not None and _flash_active:
-                _barrier.record_flash_dispatched(_slice_idx,
-                                                 submitted=int(submitted or 0))
+            if _barrier is not None:
+                _barrier.record_emission_work_dispatched(
+                    _slice_idx, submitted=int(submitted or 0)
+                )
             if _slice_idx == 0:
                 print(
                     f"[pipeline-trace] slice={_slice_idx}/{stage_count}"
@@ -14026,8 +14075,6 @@ def run(
             # Submit sensor for the same slice immediately so both enter
             # T1 together.  C++ T5 latch gates the connection; Python does
             # not need to wait for drain output before sensor submission.
-            if _barrier is not None:
-                _barrier.record_sensor_submitted(_slice_idx)
 
     def _refresh_current_bdpt_plate(label: str = "live") -> int:
         """Pull the current full-color BDPT sensor accumulator into the green PIP."""
@@ -14135,7 +14182,10 @@ def run(
                 return
             try:
                 print("[exposure] joining T5 thread…", flush=True)
-                bench.tracer.join_t5()
+                if bench.tracer.join_t5() is False:
+                    raise RuntimeError(
+                        "native T5 did not complete the exposure reception pass"
+                    )
                 print("[exposure] T5 join done", flush=True)
             except Exception as _t5exc:
                 print(f"[exposure] T5 join failed: {_t5exc}", flush=True)

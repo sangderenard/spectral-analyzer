@@ -578,6 +578,32 @@ extern int ray_pipeline_trace_sync(
     int                      n_intents,
     std::vector<RayRecord>&  out);
 
+struct PyWaveTransactionCheckpoint {
+    RayPipelineWaveCheckpoint* handle = nullptr;
+
+    explicit PyWaveTransactionCheckpoint(
+        RayPipelineWaveCheckpoint* checkpoint) : handle(checkpoint) {}
+    ~PyWaveTransactionCheckpoint() {
+        ray_pipeline_wave_checkpoint_destroy(handle);
+    }
+    PyWaveTransactionCheckpoint(const PyWaveTransactionCheckpoint&) = delete;
+    PyWaveTransactionCheckpoint& operator=(
+        const PyWaveTransactionCheckpoint&) = delete;
+};
+
+struct PyQueueTransactionCheckpoint {
+    RayPipelineQueueCheckpoint* handle = nullptr;
+
+    explicit PyQueueTransactionCheckpoint(
+        RayPipelineQueueCheckpoint* checkpoint) : handle(checkpoint) {}
+    ~PyQueueTransactionCheckpoint() {
+        ray_pipeline_queue_checkpoint_destroy(handle);
+    }
+    PyQueueTransactionCheckpoint(const PyQueueTransactionCheckpoint&) = delete;
+    PyQueueTransactionCheckpoint& operator=(
+        const PyQueueTransactionCheckpoint&) = delete;
+};
+
 struct PyRayTracer
 {
     RayTracerState*   handle   = nullptr;
@@ -3347,11 +3373,12 @@ struct PyRayTracer
         if (_pipeline) ray_pipeline_signal_sensor_dispatched(_pipeline);
     }
 
-    void join_t5() {
+    bool join_t5() {
         if (_pipeline) {
             py::gil_scoped_release release;
-            ray_pipeline_join_t5(_pipeline);
+            return ray_pipeline_join_t5(_pipeline);
         }
+        return false;
     }
 
     void set_t5_min_geom(float v) {
@@ -3442,6 +3469,62 @@ struct PyRayTracer
     int in_flight_count() const
     {
         return _pipeline ? ray_pipeline_in_flight(_pipeline) : 0;
+    }
+
+    std::shared_ptr<PyWaveTransactionCheckpoint>
+    copy_wave_transaction_state()
+    {
+        std::lock_guard<std::mutex> lock(_pipeline_mu);
+        if (!_pipeline)
+            throw std::runtime_error(
+                "wave transaction checkpoint requires a live pipeline");
+        RayPipelineWaveCheckpoint* checkpoint =
+            ray_pipeline_wave_checkpoint_create(_pipeline);
+        if (!checkpoint)
+            throw std::runtime_error(
+                "wave transaction checkpoint requires an idle pipeline");
+        return std::make_shared<PyWaveTransactionCheckpoint>(checkpoint);
+    }
+
+    void restore_wave_transaction_state(
+        const std::shared_ptr<PyWaveTransactionCheckpoint>& checkpoint)
+    {
+        std::lock_guard<std::mutex> lock(_pipeline_mu);
+        if (!_pipeline || !checkpoint || !checkpoint->handle)
+            throw std::runtime_error("invalid wave transaction checkpoint");
+        const int rc = ray_pipeline_wave_checkpoint_restore(
+            _pipeline, checkpoint->handle);
+        if (rc != SK_OK)
+            throw std::runtime_error(
+                "wave transaction restore failed: rc=" + std::to_string(rc));
+    }
+
+    std::shared_ptr<PyQueueTransactionCheckpoint>
+    copy_queue_transaction_state()
+    {
+        std::lock_guard<std::mutex> lock(_pipeline_mu);
+        if (!_pipeline)
+            throw std::runtime_error(
+                "queue transaction checkpoint requires a live pipeline");
+        RayPipelineQueueCheckpoint* checkpoint =
+            ray_pipeline_queue_checkpoint_create(_pipeline);
+        if (!checkpoint)
+            throw std::runtime_error(
+                "queue transaction checkpoint requires an idle CPU pipeline");
+        return std::make_shared<PyQueueTransactionCheckpoint>(checkpoint);
+    }
+
+    void restore_queue_transaction_state(
+        const std::shared_ptr<PyQueueTransactionCheckpoint>& checkpoint)
+    {
+        std::lock_guard<std::mutex> lock(_pipeline_mu);
+        if (!_pipeline || !checkpoint || !checkpoint->handle)
+            throw std::runtime_error("invalid queue transaction checkpoint");
+        const int rc = ray_pipeline_queue_checkpoint_restore(
+            _pipeline, checkpoint->handle);
+        if (rc != SK_OK)
+            throw std::runtime_error(
+                "queue transaction restore failed: rc=" + std::to_string(rc));
     }
 
     int submit_surface_scan(float min_amplitude = 1.0e-8f, int seed = 42)
@@ -3582,6 +3665,8 @@ struct PyRayTracer
             d["context_id"] = s.context_id;
             d["next_forward"] = s.next_forward;
             d["next_backward"] = s.next_backward;
+            d["forward_link_count"] = s.forward_link_count;
+            d["backward_link_count"] = s.backward_link_count;
             d["linked_transfers"] =
                 static_cast<unsigned long long>(s.linked_transfers);
             d["bands"] = s.bands;
@@ -4386,7 +4471,8 @@ struct PyRayTracer
             handle, src_context_id, dst_context_id);
         if (rc != SK_OK)
             throw std::invalid_argument(
-                "wave context link requires two distinct registered wave contexts");
+                "wave context link requires distinct registered compatible "
+                "wave contexts in an acyclic single-producer field graph");
     }
 
     void add_wave_context_interface_link(
@@ -4411,7 +4497,8 @@ struct PyRayTracer
         if (rc != SK_OK)
             throw std::invalid_argument(
                 "wave interface link requires distinct compatible contexts, "
-                "an exact rigid map, and the tracer's exact lane width");
+                "an exact rigid map, the tracer's exact lane width, and an "
+                "acyclic single-producer field graph");
     }
 
     /* Trace multiscale, write into caller-owned (capacity, 14) float32 buffer.
@@ -6449,6 +6536,15 @@ convergence_tol : float
         .def("diagnostics", &PyPicardSCC::diagnostics)
         .def_readonly("N",  &PyPicardSCC::N);
 
+    py::class_<
+        PyWaveTransactionCheckpoint,
+        std::shared_ptr<PyWaveTransactionCheckpoint>
+    >(m, "_WaveTransactionCheckpoint");
+    py::class_<
+        PyQueueTransactionCheckpoint,
+        std::shared_ptr<PyQueueTransactionCheckpoint>
+    >(m, "_QueueTransactionCheckpoint");
+
     py::class_<PyRayTracer>(m, "RayTracer",
         R"doc(
 Complex spectral 3-D ray tracer.
@@ -6963,6 +7059,34 @@ kind: 0=STRIKE 1=TERMINAL 2=MISS 3=FIELD)doc")
         .def("in_flight_count", &PyRayTracer::in_flight_count,
 R"doc(Return the number of ray paths currently live in the persistent pipeline.
 Zero means all previously submitted rays have completed.)doc")
+        .def(
+            "copy_wave_transaction_state",
+            &PyRayTracer::copy_wave_transaction_state,
+R"doc(Copy mutable T4 wave-arena state for same-process managed-time rollback.
+
+The pipeline must be idle. This checkpoint covers wave fields, active spectral
+lanes, progress, links, and boundary telemetry. It intentionally does not
+claim to cover ray queues, sensor/BDPT accumulators, or GPU-resident state.)doc")
+        .def(
+            "restore_wave_transaction_state",
+            &PyRayTracer::restore_wave_transaction_state,
+            py::arg("checkpoint"),
+R"doc(Restore a T4 wave checkpoint after verifying idle state and unchanged
+arena topology/configuration.)doc")
+        .def(
+            "copy_queue_transaction_state",
+            &PyRayTracer::copy_queue_transaction_state,
+R"doc(Copy all CPU T1-T5 pipeline queues at an idle frontier.
+
+This includes output, wave-exit, and BDPT side-data queues so rejected-window
+products can be retracted. GPU pipelines are rejected because their resident
+queues and buffers require generation checkpoints.)doc")
+        .def(
+            "restore_queue_transaction_state",
+            &PyRayTracer::restore_queue_transaction_state,
+            py::arg("checkpoint"),
+R"doc(Restore an idle CPU pipeline's complete queue set from a reusable
+same-process checkpoint.)doc")
         .def("submit_surface_scan", &PyRayTracer::submit_surface_scan,
              py::arg("min_amplitude") = 1.0e-8f,
              py::arg("seed") = 42,
@@ -7279,17 +7403,19 @@ shutter_mode: 0=open, 1=closed, 2=iris, 3=sliding_x, 4=sliding_y.)doc")
         .def("signal_flash_dispatched",
              &PyRayTracer::signal_flash_dispatched,
 R"doc(Signal that all emissive-triangle (flash) rays for the current exposure
-substage have been submitted.  T5 fires once both signal_flash_dispatched and
-signal_sensor_dispatched have been called for the same substage.)doc")
+substage have been admitted. This is a light-side work marker, not transport
+completion. T5 waits for both work families and zero native in-flight paths.)doc")
         .def("signal_sensor_dispatched",
              &PyRayTracer::signal_sensor_dispatched,
 R"doc(Signal that all sensor-sweep rays for the current exposure substage have
-been submitted.  Mirrors signal_flash_dispatched.)doc")
+been admitted. These are backward importance probes, not physical sensor
+emission. Mirrors signal_flash_dispatched as a T5 work-family marker.)doc")
         .def("join_t5",
              &PyRayTracer::join_t5,
 R"doc(Block (releasing the GIL) until the T5 worker thread finishes.
 Call after signal_sensor_dispatched + signal_flash_dispatched to guarantee
-sensor_accum ch2 (BDPT radiance) is fully written before get_sensor_image().)doc")
+sensor_accum ch2 (BDPT radiance) is fully written before get_sensor_image().
+Returns false if native failure/watchdog state proves the pass cannot finish.)doc")
         .def("begin_sensor_batching",
              &PyRayTracer::begin_sensor_batching,
 R"doc(Enter sensor-batching mode for the current exposure.

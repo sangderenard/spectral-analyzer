@@ -2193,21 +2193,23 @@ def _component_static_panels(
 def run_component_arena_live(
     component_key: str,
     *,
-    lane_count: int = 4,
-    size: int = 384,
+    lane_count: int = 1,
+    size: int = 128,
     fps: int = 30,
+    solve_hz: float = 8.0,
     wavelength_m: float = 532.0e-9,
     engine: str = "auto",
     _max_display_frames: int | None = None,
 ) -> None:
     """Load one canonical component into the shared OpenGL inspection arena."""
 
-    if size < 64 or fps < 1:
-        raise ValueError("component arena size/fps are invalid")
+    if size < 64 or fps < 1 or not math.isfinite(solve_hz) or solve_hz <= 0.0:
+        raise ValueError("component arena size/fps/solve_hz are invalid")
     import pygame
     from OpenGL import GL as gl
     from camera_software.gpu_preview import (
-        GLPreviewCompositor, PreviewProductKind, PreviewTextureProduct,
+        GLPreviewCompositor, LatestOnlyProducer,
+        PreviewProductKind, PreviewTextureProduct,
     )
     from camera_software.optical_components import (
         PentaprismComponent,
@@ -2233,13 +2235,15 @@ def run_component_arena_live(
     textures = [int(value) for value in gl.glGenTextures(6)]
     compositor = GLPreviewCompositor()
     compositor.init_gl()
+    initial_panel = np.zeros((size, size, 4), np.uint8)
+    initial_panel[..., 3] = 255
     for texture in textures:
         gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
         gl.glTexImage2D(
             gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, size, size, 0,
-            gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, None,
+            gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, initial_panel,
         )
     tracer = (
         _calibration_tracer(wavelength_m)
@@ -2257,13 +2261,52 @@ def run_component_arena_live(
             max_children=max(2, lane_count+1),
             min_amplitude=1.0e-12,
         )
+
+    def produce_panels(request):
+        solve_generation, solve_phase, measured_paths = request
+        if isinstance(component, PhysicalApertureComponent):
+            visual = _solve_aperture_visual(
+                tracer,
+                size=size,
+                pitch_m=1.5e-6,
+                wavelength_m=wavelength_m,
+                cycle_phase=solve_phase,
+                aperture_pattern="iris",
+                polarization_mode="radial",
+                quality="balanced",
+                spectral_mode="fixed",
+                lane_count=lane_count,
+                spectral_epoch=0,
+                source_angle_deg=0.0,
+                analyzer_angle_deg=0.0,
+                vector_page=True,
+                piston_removed=True,
+                coherence_seed=int(solve_generation) << 8,
+                aperture_template=component.aperture,
+            )
+            return visual["panels"], visual["labels"]
+        return _component_static_panels(
+            component, compiled, size, solve_phase,
+            native_paths=measured_paths,
+        )
+
+    panel_producer = LatestOnlyProducer(
+        produce_panels, name=f"ComponentArena[{component_key}]"
+    )
     clock = pygame.time.Clock()
     running, paused = True, False
     selected_panel = (
         1 if isinstance(component, (PlaneMirrorComponent, PentaprismComponent))
         else 0
     )
-    generation = displayed_frames = 0
+    solve_generation = displayed_frames = 0
+    texture_generation = -1
+    latest_result_id = -1
+    latest_solve_ms = 0.0
+    phase = 0.0
+    previous_ui_s = time.monotonic()
+    next_solve_s = previous_ui_s
+    labels = ("WAITING",) * 6
     try:
         while running:
             for event in pygame.event.get():
@@ -2282,9 +2325,10 @@ def run_component_arena_live(
                         selected_panel = (selected_panel-1) % 6
                     elif pygame.K_1 <= event.key <= pygame.K_6:
                         selected_panel = int(event.key-pygame.K_1)
+            now_s = time.monotonic()
             if not paused:
-                generation += 1
-            phase = generation*0.025
+                phase += max(0.0, now_s-previous_ui_s)*0.75
+            previous_ui_s = now_s
             if (
                 native_tracer is not None
                 and native_submitted
@@ -2392,39 +2436,30 @@ def run_component_arena_live(
                     max_children=max(2, lane_count+1),
                 )
                 native_submitted = True
-            if isinstance(component, PhysicalApertureComponent):
-                visual = _solve_aperture_visual(
-                    tracer,
-                    size=size,
-                    pitch_m=1.5e-6,
-                    wavelength_m=wavelength_m,
-                    cycle_phase=phase,
-                    aperture_pattern="iris",
-                    polarization_mode="radial",
-                    quality="balanced",
-                    spectral_mode="fixed",
-                    lane_count=lane_count,
-                    spectral_epoch=0,
-                    source_angle_deg=0.0,
-                    analyzer_angle_deg=0.0,
-                    vector_page=True,
-                    piston_removed=True,
-                    coherence_seed=generation << 8,
-                    aperture_template=component.aperture,
+            if not paused and now_s >= next_solve_s:
+                solve_generation += 1
+                panel_producer.request(
+                    (solve_generation, phase, native_paths)
                 )
-                panels, labels = visual["panels"], visual["labels"]
-            else:
-                panels, labels = _component_static_panels(
-                    component, compiled, size, phase,
-                    native_paths=native_paths,
-                )
-            for texture, rgba in zip(textures, panels):
-                gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
-                gl.glTexSubImage2D(
-                    gl.GL_TEXTURE_2D, 0, 0, 0, size, size,
-                    gl.GL_RGBA, gl.GL_UNSIGNED_BYTE,
-                    np.ascontiguousarray(rgba),
-                )
+                next_solve_s = now_s + 1.0/float(solve_hz)
+
+            result = panel_producer.poll(after_request_id=latest_result_id)
+            if result is not None:
+                latest_result_id = result.request_id
+                if result.error is not None:
+                    raise RuntimeError(
+                        "component live texture producer failed"
+                    ) from result.error
+                panels, labels = result.payload
+                for texture, rgba in zip(textures, panels):
+                    gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+                    gl.glTexSubImage2D(
+                        gl.GL_TEXTURE_2D, 0, 0, 0, size, size,
+                        gl.GL_RGBA, gl.GL_UNSIGNED_BYTE,
+                        np.ascontiguousarray(rgba),
+                    )
+                texture_generation = result.request_id
+                latest_solve_ms = result.elapsed_s*1.0e3
             width, height = pygame.display.get_window_size()
             gl.glViewport(0, 0, width, height)
             gl.glClearColor(0.015, 0.022, 0.035, 1.0)
@@ -2441,7 +2476,7 @@ def run_component_arena_live(
                     texture_id=textures[index],
                     width=size,
                     height=size,
-                    generation=generation,
+                    generation=max(0, texture_generation),
                     producer="canonical-optical-component-arena",
                     internal_format=int(gl.GL_RGBA8),
                     kind=(
@@ -2470,7 +2505,8 @@ def run_component_arena_live(
                 f"[{compiled.component_kind}] lanes={lane_count} "
                 f"engine={compiled.metadata['selected_engine']} "
                 f"[{selected_panel+1}/6 {labels[selected_panel]}] "
-                f"generation={generation} "
+                f"texture={texture_generation} solve={latest_solve_ms:.1f}ms "
+                f"producer={'BUSY' if panel_producer.busy else 'READY'} "
                 f"{'PAUSED ' if paused else ''}"
                 "[1-6/Tab/Arrows select, Space pause, Esc close]"
             )
@@ -2481,6 +2517,7 @@ def run_component_arena_live(
             ):
                 running = False
     finally:
+        panel_producer.close()
         if native_tracer is not None:
             native_tracer.stop_pipeline()
         compositor.destroy()
@@ -2726,12 +2763,16 @@ def main() -> int:
         help="component registry key for --component-live",
     )
     parser.add_argument(
-        "--component-lanes", type=int, choices=_APERTURE_LANE_COUNTS, default=4,
+        "--component-lanes", type=int, choices=_APERTURE_LANE_COUNTS, default=1,
         help="exact compiled lane width for --component-live",
     )
     parser.add_argument(
-        "--component-size", type=int, default=512,
+        "--component-size", type=int, default=128,
         help="square source-texture resolution for --component-live",
+    )
+    parser.add_argument(
+        "--component-solve-hz", type=float, default=8.0,
+        help="maximum asynchronous texture generations per second",
     )
     parser.add_argument(
         "--component-engine",
@@ -2875,6 +2916,7 @@ def main() -> int:
             lane_count=args.component_lanes,
             size=max(64, args.component_size),
             fps=args.fps,
+            solve_hz=args.component_solve_hz,
             engine=args.component_engine,
         )
         return 0

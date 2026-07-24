@@ -258,7 +258,8 @@ Resolution is deterministic:
 
 1. validate holder/optic mechanical compatibility;
 2. sort mounts by axial station, insertion sequence, and holder key;
-3. resolve emitter, aperture, lens, and sensor poses from mounting datums;
+3. resolve emitter, aperture, lens, mirror, and sensor poses from mounting
+   datums;
 4. lower that ordered physical assembly to `OpticalChainSpec`;
 5. compile the typed optical transport graph.
 
@@ -273,3 +274,15 @@ can be translated by front, back, center, or aperture-stop datum. An off-axis
 or rotated exact lens currently fails explicitly because that requires a
 rigidly transformed compound-lens parametric contract, not merely transformed
 display geometry.
+
+A `PlaneMirrorComponent` may now be mounted at a holder's component-center
+datum. The resolver only authors the simple normal-incidence retroreflector
+case: the mirror's normal is set to the negative holder axis, so the incident
+and reflected ports share the holder's optical axis. Station values remain an
+authored-path ordering key, not a claim about literal Cartesian position along
+the rail; a retroreflected sensor's true position folds back toward the
+source, but `compile_optical_chain` links consecutive authored elements by
+their resolved port center/axis regardless of station order, and the native
+pipeline consumes the resulting graph as an ordinary causal (ray-tag/
+generation-keyed) KPN rather than a spatially monotonic sequence. An
+off-axis fold-mirror datum, and pentaprism mounting, remain later work.

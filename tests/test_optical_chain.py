@@ -229,6 +229,85 @@ def test_mechanical_holders_deterministically_place_and_order_optical_chain():
     )
 
 
+def test_mechanical_holders_place_a_retroreflecting_mirror_before_the_sensor():
+    registry = default_optical_component_registry()
+    emitter = registry.create("emitter.laser-532nm", 1)
+    lens, aperture = _lens_and_aperture()
+    mirror = registry.create("mirror.plane", 1)
+    sensor = registry.create("sensor.fullframe", 1)
+    tube_mount = default_circular_mount(
+        "M30-light-cell",
+        outer_diameter_m=0.030,
+        clear_diameter_m=0.024,
+    )
+    panel_mount = default_square_mount(
+        "40mm-panel",
+        outer_side_m=0.040,
+        clear_side_m=0.032,
+    )
+
+    def mounted(
+        key, component, station, sequence, mount, kind, datum
+    ):
+        holder = LightTableHolderSpec(
+            f"{key}.holder",
+            kind,
+            mount,
+            station,
+            sequence=sequence,
+        )
+        return MountedOpticalElement(
+            key, component, holder, mount, datum,
+        )
+
+    # Station values are authored in optical-path order, not literal
+    # Cartesian X: the mirror retroreflects, so the sensor's true position
+    # would fold back toward the source. Ordering the mechanical/graph
+    # description is independent of that later spatial realism -- the
+    # compiled chain only needs correct per-port center/axis metadata, which
+    # the native pipeline's own causal (ray_tag/generation) execution
+    # consumes without requiring monotonic Cartesian placement.
+    values = (
+        mounted(
+            "emitter", emitter, -0.100, 0, panel_mount,
+            HolderKind.EMITTER_PANEL, MountDatum.EMITTER_PLANE,
+        ),
+        mounted(
+            "aperture", aperture, 0.050, 0, tube_mount,
+            HolderKind.TUBE_CELL, MountDatum.APERTURE_STOP,
+        ),
+        mounted(
+            "lens", lens, 0.050, 1, tube_mount,
+            HolderKind.RAIL_CARRIAGE, MountDatum.FRONT_FACE,
+        ),
+        mounted(
+            "mirror", mirror, 0.140, 0, tube_mount,
+            HolderKind.TUBE_CELL, MountDatum.COMPONENT_CENTER,
+        ),
+        mounted(
+            "sensor", sensor, 0.200, 0, panel_mount,
+            HolderKind.SENSOR_BACK, MountDatum.SENSOR_PLANE,
+        ),
+    )
+    assembly = LightTableAssemblySpec("folded-table", 1, values)
+    resolved = assembly.resolve()
+    chain = compile_optical_chain(resolved.chain)
+
+    assert [
+        value.instance_key for value in resolved.chain.elements
+    ] == ["emitter", "aperture", "lens", "mirror", "sensor"]
+    assert chain.components[3].component_kind == "analytic-plane-mirror"
+    mirror_ports = {port.key.rsplit(".", 1)[-1]: port for port in chain.components[3].ports}
+    assert np.allclose(mirror_ports["incident"].axis, (1.0, 0.0, 0.0))
+    assert np.allclose(mirror_ports["reflected"].axis, (-1.0, 0.0, 0.0))
+    assert np.allclose(mirror_ports["incident"].center_m, (0.140, 0.0, 0.0))
+
+    mirror_to_sensor = chain.connections[3]
+    assert mirror_to_sensor.src_instance == "mirror"
+    assert mirror_to_sensor.dst_instance == "sensor"
+    assert mirror_to_sensor.distance_m == pytest.approx(0.060)
+
+
 def test_mechanical_mount_shape_mismatch_rejects_optic_swap():
     registry = default_optical_component_registry()
     emitter = registry.create("emitter.laser-532nm", 1)

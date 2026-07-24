@@ -26,6 +26,7 @@ from .optical_components import (
     CompoundLensComponent,
     OpticalComponent,
     PhysicalApertureComponent,
+    PlaneMirrorComponent,
 )
 from .optical_chain import SensorEndpointComponent
 
@@ -361,6 +362,20 @@ def _resolve_component_pose(element: MountedOpticalElement) -> OpticalComponent:
             component,
             center_m=tuple(float(value) for value in center),
             axis=tuple(float(value) for value in axis),
+        )
+
+    if isinstance(component, PlaneMirrorComponent):
+        if element.datum is not MountDatum.COMPONENT_CENTER:
+            raise ValueError("mirror holders resolve the component-center datum")
+        # Normal-incidence retroreflector: the incident port faces back along
+        # the holder's optical axis (matching the component's own default
+        # normal=(-1,0,0) for a default axis=(1,0,0) holder), so the reflected
+        # beam returns along the same axis. Off-axis fold mirrors are a later
+        # mounting datum, not this simple retroreflecting case.
+        return replace(
+            component,
+            center_m=tuple(float(value) for value in center),
+            normal=tuple(float(-value) for value in axis),
         )
 
     if isinstance(component, SensorEndpointComponent):

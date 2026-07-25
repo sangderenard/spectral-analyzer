@@ -1,44 +1,32 @@
-# Spectral Analyzer
+# Pluck / Spectral Analyzer
 
-GPU-accelerated Constant-Q Transform analyzer with 1-cent frequency resolution, stereo PIL spectrogram rendering, and interactive OpenGL viewer.
+Pluck is a graph-driven audio, instrument, acoustic, optical, camera, and real-time rendering research workspace. The repository began as a GPU-accelerated Constant-Q spectral analyzer; that analyzer remains available, but it is now one subsystem of a much larger simulation environment.
 
-## Pipeline
+## System map
 
-```
-bass_analysis.py  →  cqt_data.npz  →  bass_plot.py   →  spectrogram PNGs
-                                    →  bass_viewer.py  →  interactive playback
-```
+- Graph audio and control: analytic voices, routing, state-machine plugins, materialization, SCC-based solving, and timing.
+- Instrument simulation: playable guitar, strings, bodies, pickups, microphones, rooms, acoustic FDTD, and coupled evolution.
+- Optical transport: rasterization, ray tracing, BDPT, coherent/complex transport, apertures, lenses, sensors, films, and light-field assets.
+- Camera and rendering: camera models, exposure and calibration workflows, OpenGL viewers, stations, and image/export pipelines.
+- Spectral analysis: stereo CQT analysis, plotting, and synchronized playback.
+- Nodus integration: graph-tool contracts, optical KPN boundaries, and shared-runtime experiments.
 
-1. **`bass_analysis.py`** — Computes stereo CQT on GPU, onset enhancement, pad influence map, bass metrics. Saves compressed `.npz` with power, phase, real, imaginary per channel plus all metadata.
+[`ARCHITECTURE.md`](ARCHITECTURE.md) is a focused graph-solver reference, not a complete atlas. For broader navigation, see [`VITRUVIAN_REPOSITORY_ATLAS.md`](VITRUVIAN_REPOSITORY_ATLAS.md) and [`RAY_TRACER_INVENTORY.md`](RAY_TRACER_INVENTORY.md).
 
-2. **`bass_plot.py`** — Reads the `.npz` and renders spectrogram images (whole/bass/treble views + summary plot). Can re-render with different gamma/DPI without re-computing the CQT.
+## Common entry points
 
-3. **`bass_viewer.py`** — Loads spectrogram PNGs as OpenGL textures and plays the source audio in sync with a cursor overlay. Pan, zoom, seek, and switch views interactively.
+The repository contains many research demos rather than one canonical executable. Choose an entry point for the subsystem you are working on and read its adjacent design or handoff document.
 
-## Quick Start
-
-```bash
-pip install -e ".[all]"
-
-# Analyze
-python bass_analysis.py song.wav --composite "r:0:L:r"
-
-# Plot
-python bass_plot.py song_analysis/
-
-# View
-python bass_viewer.py song_analysis/ song.wav
-```
-
-## Launchers (Windows)
-
-```
-launchers\launch_reflect.bat song.wav      # full file, reflect padding
-launchers\launch_compare.bat song.wav      # default A/B composite
-```
+The original analyzer remains available through `bass_analysis.py`, `bass_plot.py`, and `bass_viewer.py`. For current guitar/renderer work, `demo_note_playback.py`, the camera-station scripts, and focused acceptance documents are better entry points than the legacy analyzer pipeline.
 
 ## Dependencies
 
-- **Required:** numpy, scipy, librosa, torch (CUDA), Pillow, matplotlib
-- **MP3 support:** miniaudio
-- **Viewer:** pygame, PyOpenGL
+Dependencies vary by subsystem. Python numerical/audio work commonly uses NumPy, SciPy, librosa, PyTorch, Pillow, and matplotlib; interactive views commonly use pygame and PyOpenGL. Native optical and GPU paths have additional requirements. Consult the selected subsystem documentation before installing or rebuilding dependencies.
+
+## Nodus relationship
+
+Pluck remains independently runnable. Nodus supplies graph/runtime and tool-integration surfaces; it does not own Pluck's simulation implementation.
+
+- [`../NODUS_PLUCK_HANDOFF.md`](../NODUS_PLUCK_HANDOFF.md)
+- [`NODUS_OPTICAL_KPN_INTEGRATION.md`](NODUS_OPTICAL_KPN_INTEGRATION.md)
+- [`NODUS_TOOL_BRIEF.md`](NODUS_TOOL_BRIEF.md)

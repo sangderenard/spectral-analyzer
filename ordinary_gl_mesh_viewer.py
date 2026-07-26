@@ -8,11 +8,22 @@ therefore present a triangle soup in Pluck without importing the full game.
 from __future__ import annotations
 
 import ctypes
+from dataclasses import dataclass
 import math
 from pathlib import Path
+from queue import Empty, Full, Queue
+from threading import Event, Thread
 from typing import Mapping, Sequence, Tuple
 
 import numpy as np
+
+
+@dataclass(frozen=True)
+class LiveMeshFrame:
+    triangles: np.ndarray
+    triangle_values: np.ndarray
+    panel_lines: Sequence[str]
+    time_value: float
 
 
 def rolling_profile_lines(
@@ -273,6 +284,126 @@ def _upload_mesh(
     return (vao, *buffers)
 
 
+class _OpenGLTextPanel:
+    """Small self-contained text overlay for numerical adapter windows."""
+
+    def __init__(self) -> None:
+        import pygame
+        from OpenGL.GL import (
+            GL_ARRAY_BUFFER, GL_CLAMP_TO_EDGE, GL_DYNAMIC_DRAW, GL_FALSE,
+            GL_FLOAT, GL_FRAGMENT_SHADER, GL_LINEAR, GL_RGBA, GL_TEXTURE_2D,
+            GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_WRAP_S,
+            GL_TEXTURE_WRAP_T, GL_UNSIGNED_BYTE, GL_VERTEX_SHADER,
+            glBindBuffer, glBindTexture, glBindVertexArray, glBufferData,
+            glEnableVertexAttribArray, glGenBuffers, glGenTextures,
+            glGenVertexArrays, glTexImage2D, glTexParameteri,
+            glVertexAttribPointer,
+        )
+        from OpenGL.GL.shaders import compileProgram, compileShader
+
+        self._gl = __import__("OpenGL.GL", fromlist=("*",))
+        self._program = compileProgram(
+            compileShader(
+                """#version 330 core
+                layout(location=0) in vec2 pos;
+                layout(location=1) in vec2 uv_in;
+                out vec2 uv;
+                void main(){ uv=uv_in; gl_Position=vec4(pos,0,1); }""",
+                GL_VERTEX_SHADER,
+            ),
+            compileShader(
+                """#version 330 core
+                in vec2 uv; out vec4 color; uniform sampler2D panel;
+                void main(){ color=texture(panel,uv); }""",
+                GL_FRAGMENT_SHADER,
+            ),
+        )
+        self._vao = int(glGenVertexArrays(1))
+        self._vbo = int(glGenBuffers(1))
+        self._texture = int(glGenTextures(1))
+        glBindVertexArray(self._vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._vbo)
+        glBufferData(GL_ARRAY_BUFFER, 64, None, GL_DYNAMIC_DRAW)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(8))
+        glBindTexture(GL_TEXTURE_2D, self._texture)
+        for name in (GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER):
+            glTexParameteri(GL_TEXTURE_2D, name, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        pygame.font.init()
+        self._font = pygame.font.SysFont("consolas,monospace", 15)
+        self._surface = None
+        self._texture_size = (1, 1)
+        glTexImage2D(
+            GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA,
+            GL_UNSIGNED_BYTE, bytes((0, 0, 0, 0)),
+        )
+
+    def update(self, lines: Sequence[str]) -> None:
+        import pygame
+        from OpenGL.GL import (
+            GL_RGBA, GL_TEXTURE_2D, GL_UNSIGNED_BYTE, glBindTexture,
+            glTexImage2D,
+        )
+
+        rendered = [
+            self._font.render(line or " ", True, (210, 228, 245))
+            for line in lines
+        ]
+        width = max((line.get_width() for line in rendered), default=1) + 28
+        height = sum(line.get_height() for line in rendered) + 24
+        surface = pygame.Surface((width, height), pygame.SRCALPHA)
+        surface.fill((7, 12, 24, 224))
+        y = 12
+        for line in rendered:
+            surface.blit(line, (14, y))
+            y += line.get_height()
+        raw = pygame.image.tobytes(surface, "RGBA", True)
+        glBindTexture(GL_TEXTURE_2D, self._texture)
+        glTexImage2D(
+            GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA,
+            GL_UNSIGNED_BYTE, raw,
+        )
+        self._texture_size = (width, height)
+
+    def draw(self, window_size: tuple[int, int]) -> None:
+        gl = self._gl
+        width, height = window_size
+        panel_width = min(self._texture_size[0], max(1, width - 20))
+        panel_height = min(self._texture_size[1], max(1, height - 20))
+        left = 1.0 - 2.0 * (panel_width + 12) / width
+        right = 1.0 - 24.0 / width
+        top = 1.0 - 24.0 / height
+        bottom = top - 2.0 * panel_height / height
+        vertices = np.asarray((
+            (left, bottom, 0, 0), (right, bottom, 1, 0),
+            (left, top, 0, 1), (right, top, 1, 1),
+        ), dtype=np.float32)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glUseProgram(self._program)
+        gl.glActiveTexture(gl.GL_TEXTURE0)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self._texture)
+        gl.glBindVertexArray(self._vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._vbo)
+        gl.glBufferData(
+            gl.GL_ARRAY_BUFFER, vertices.nbytes, vertices, gl.GL_DYNAMIC_DRAW
+        )
+        gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, 0, 4)
+        gl.glBindVertexArray(0)
+
+    def close(self) -> None:
+        gl = self._gl
+        gl.glDeleteTextures(1, (self._texture,))
+        gl.glDeleteBuffers(1, (self._vbo,))
+        gl.glDeleteVertexArrays(1, (self._vao,))
+        gl.glDeleteProgram(self._program)
+
+
 def view_triangle_mesh(
     triangles: np.ndarray,
     *,
@@ -400,4 +531,171 @@ def view_triangle_mesh(
     finally:
         glDeleteBuffers(len(buffers), buffers)
         glDeleteVertexArrays(1, (vao,))
+        pygame.quit()
+
+
+def view_profiled_triangle_mesh_stream(
+    solve_frame,
+    *,
+    title: str = "Pluck profiled geometry stream",
+    size: tuple[int, int] = (1280, 800),
+    period_sec: float = 8.0,
+    max_solves: int | None = None,
+    max_frames: int | None = None,
+) -> None:
+    """Display latest-result-wins solved meshes while solving off the GL thread.
+
+    ``solve_frame(index, time_value)`` returns :class:`LiveMeshFrame`. The
+    worker never calls OpenGL. If solving outruns display, stale unpublished
+    frames are dropped rather than allowing an unbounded queue.
+    """
+    import time
+    import pygame
+    from OpenGL.GL import (
+        GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_DEPTH_TEST, glClear,
+        glClearColor, glDeleteBuffers, glDeleteVertexArrays, glEnable,
+        glViewport,
+    )
+    from base_gl_renderer import BaseGLRenderer
+    from material_db import MaterialDatabase
+
+    updates: Queue = Queue(maxsize=1)
+    stopped = Event()
+
+    def publish(frame):
+        try:
+            updates.put_nowait(frame)
+        except Full:
+            try:
+                updates.get_nowait()
+            except Empty:
+                pass
+            updates.put_nowait(frame)
+
+    def worker():
+        index = 0
+        started = time.perf_counter()
+        try:
+            while not stopped.is_set() and (
+                max_solves is None or index < max_solves
+            ):
+                time_value = (
+                    (time.perf_counter() - started) / max(period_sec, 1e-9)
+                ) % 1.0
+                publish(solve_frame(index, time_value))
+                index += 1
+        except BaseException as error:
+            publish(error)
+
+    pygame.init()
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 4)
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+    pygame.display.gl_set_attribute(
+        pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE
+    )
+    pygame.display.set_mode(size, pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE)
+    pygame.display.set_caption(title)
+    database = MaterialDatabase()
+    palette_ids = []
+    for index in range(33):
+        position = 2.0 * index / 32.0 - 1.0
+        color = _diverging_color(position)
+        palette_ids.append(database.register(
+            f"live_scalar_{index:02d}",
+            {
+                "albedo_rgb": color,
+                "roughness": 0.38,
+                "metallic": 0.04,
+                "ior": 1.46,
+                "opacity": 1.0,
+                "emission_rgb": (0.12 * np.asarray(color)).tolist(),
+            },
+        ))
+    renderer = BaseGLRenderer(database, auto_drain=False)
+    renderer.init_gl()
+    renderer.set_point_lights(
+        np.asarray(((3.5, -4.0, 4.5),), np.float32),
+        np.asarray(((1.0, 0.92, 0.82),), np.float32),
+        np.asarray((16.0,), np.float32),
+    )
+    panel = _OpenGLTextPanel()
+    panel.update(("waiting for first complete solve...",))
+    resources = None
+    rows = None
+    center = np.zeros(3, dtype=np.float32)
+    radius = 1.0
+    thread = Thread(target=worker, name="profiled-mesh-solver", daemon=True)
+    thread.start()
+    clock = pygame.time.Clock()
+    angle = 0.0
+    frame_count = 0
+    running = True
+    try:
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    running = False
+            latest = None
+            while True:
+                try:
+                    latest = updates.get_nowait()
+                except Empty:
+                    break
+            if latest is not None:
+                if isinstance(latest, BaseException):
+                    raise latest
+                new_rows = triangle_mesh_vertex_rows(latest.triangles)
+                bins, limit = scalar_triangle_bins(latest.triangle_values)
+                material_ids = np.repeat(
+                    np.asarray(palette_ids, dtype=np.int32)[bins], 3
+                )
+                new_resources = _upload_mesh(new_rows, material_ids)
+                if resources is not None:
+                    glDeleteBuffers(len(resources) - 1, resources[1:])
+                    glDeleteVertexArrays(1, (resources[0],))
+                resources, rows = new_resources, new_rows
+                points = rows[:, :3]
+                center = points.mean(axis=0)
+                radius = (
+                    float(np.max(np.linalg.norm(points - center, axis=1))) or 1.0
+                )
+                panel.update(tuple(latest.panel_lines) + (
+                    "",
+                    f"color scale       +/- {limit:.5g}",
+                    "ESC closes; newest complete solve wins",
+                ))
+            width, height = pygame.display.get_surface().get_size()
+            glViewport(0, 0, width, height)
+            glEnable(GL_DEPTH_TEST)
+            glClearColor(0.012, 0.018, 0.03, 1.0)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            if resources is not None and rows is not None:
+                angle += clock.get_time() * 0.00022
+                eye = center + radius * np.asarray(
+                    (2.8 * math.cos(angle), 2.8 * math.sin(angle), 1.65),
+                    dtype=np.float32,
+                )
+                view = _look_at(eye, center)
+                projection = _perspective(
+                    math.radians(46.0), width / max(1, height),
+                    radius * 0.02, radius * 12,
+                )
+                renderer.draw_mesh(
+                    resources[0], len(rows), projection @ view, view
+                )
+            panel.draw((width, height))
+            pygame.display.flip()
+            clock.tick(60)
+            frame_count += 1
+            if max_frames is not None and frame_count >= max_frames:
+                running = False
+    finally:
+        stopped.set()
+        thread.join(timeout=2.0)
+        if resources is not None:
+            glDeleteBuffers(len(resources) - 1, resources[1:])
+            glDeleteVertexArrays(1, (resources[0],))
+        panel.close()
         pygame.quit()

@@ -2,6 +2,7 @@ import numpy as np
 
 from ordinary_gl_mesh_viewer import (
     render_triangle_mesh_image,
+    rolling_profile_lines,
     scalar_triangle_bins,
     triangle_mesh_vertex_rows,
 )
@@ -34,3 +35,24 @@ def test_headless_renderer_writes_png(tmp_path):
     )
     assert output.is_file()
     assert output.read_bytes().startswith(b"\x89PNG")
+
+
+def test_rolling_profile_lines_include_all_runs_and_p95():
+    history = ({"solve": 1.0}, {"solve": 3.0})
+    lines = rolling_profile_lines(history[-1], history, time_value=0.25)
+    text = "\n".join(lines)
+    assert "simulation t" in text
+    assert "2000.0" in text
+    assert "runs included             2" in text
+
+
+def test_headless_renderer_accepts_profile_side_panel(tmp_path):
+    triangle = np.asarray(
+        [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]
+    )
+    output = render_triangle_mesh_image(
+        triangle,
+        tmp_path / "profiled.png",
+        side_panel_lines=("honest profile", "solve 12.3 ms"),
+    )
+    assert output.is_file()

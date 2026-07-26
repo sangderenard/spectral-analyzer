@@ -10,9 +10,40 @@ from __future__ import annotations
 import ctypes
 import math
 from pathlib import Path
-from typing import Tuple
+from typing import Mapping, Sequence, Tuple
 
 import numpy as np
+
+
+def rolling_profile_lines(
+    current: Mapping[str, float],
+    history: Sequence[Mapping[str, float]],
+    *,
+    time_value: float | None = None,
+) -> list[str]:
+    """Format current and rolling timings without suppressing warm-up runs."""
+    names = list(current)
+    lines = []
+    if time_value is not None:
+        lines.append(f"simulation t       {time_value:8.4f}")
+    lines.extend(("", "stage                    now      mean       p95"))
+    for name in names:
+        values = np.asarray(
+            [row[name] for row in history if name in row], dtype=np.float64
+        )
+        p95 = float(np.quantile(values, 0.95)) if len(values) else np.nan
+        mean = float(values.mean()) if len(values) else np.nan
+        lines.append(
+            f"{name:<22} {current[name]*1e3:7.1f} "
+            f"{mean*1e3:8.1f} {p95*1e3:8.1f} ms"
+        )
+    lines.extend((
+        "",
+        f"runs included      {len(history):8d}",
+        "warm-up is included; wall clock",
+        "times cover complete stage calls",
+    ))
+    return lines
 
 
 def triangle_mesh_vertex_rows(triangles: np.ndarray) -> np.ndarray:
@@ -102,6 +133,7 @@ def render_triangle_mesh_image(
     size: tuple[int, int] = (1400, 1000),
     elevation: float = 24.0,
     azimuth: float = -58.0,
+    side_panel_lines: Sequence[str] | None = None,
 ) -> Path:
     """Software-rasterize a deterministic headless mesh snapshot."""
     import matplotlib
@@ -119,7 +151,25 @@ def render_triangle_mesh_image(
         dpi=dpi,
         facecolor=(0.012, 0.018, 0.03),
     )
-    axes = figure.add_subplot(111, projection="3d")
+    if side_panel_lines:
+        grid = figure.add_gridspec(1, 2, width_ratios=(2.45, 1.55))
+        axes = figure.add_subplot(grid[0, 0], projection="3d")
+        panel = figure.add_subplot(grid[0, 1])
+        panel.set_facecolor((0.025, 0.035, 0.055))
+        panel.set_axis_off()
+        panel.text(
+            0.06,
+            0.96,
+            "\n".join(side_panel_lines),
+            va="top",
+            ha="left",
+            color=(0.82, 0.9, 0.98),
+            family="monospace",
+            fontsize=8.5,
+            transform=panel.transAxes,
+        )
+    else:
+        axes = figure.add_subplot(111, projection="3d")
     axes.set_facecolor((0.012, 0.018, 0.03))
     if triangle_values is None:
         colors = np.repeat(
@@ -156,7 +206,7 @@ def render_triangle_mesh_image(
             f"   red +{color_limit:.3g}"
         )
     axes.set_title(caption, color="white", pad=16)
-    figure.subplots_adjust(left=0, right=1, bottom=0, top=0.92)
+    figure.subplots_adjust(left=0, right=1, bottom=0, top=0.92, wspace=0.02)
     figure.savefig(output, dpi=dpi, facecolor=figure.get_facecolor())
     plt.close(figure)
     return output.resolve()

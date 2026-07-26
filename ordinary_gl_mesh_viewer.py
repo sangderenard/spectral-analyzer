@@ -62,7 +62,38 @@ def _look_at(eye: np.ndarray, target: np.ndarray) -> np.ndarray:
     return matrix
 
 
-def _upload_mesh(rows: np.ndarray, material_id: int) -> Tuple[int, ...]:
+def scalar_triangle_bins(
+    values: np.ndarray, *, bin_count: int = 33, limit: float | None = None
+) -> tuple[np.ndarray, float]:
+    """Map signed triangle scalars to symmetric, robust palette bins."""
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 1:
+        raise ValueError("triangle values must be a vector")
+    if bin_count < 3 or bin_count % 2 == 0:
+        raise ValueError("bin_count must be an odd integer of at least 3")
+    finite = np.abs(values[np.isfinite(values)])
+    if limit is None:
+        limit = float(np.quantile(finite, 0.98)) if len(finite) else 1.0
+    limit = max(float(limit), np.finfo(np.float64).eps)
+    normalized = np.clip(values / limit, -1.0, 1.0)
+    bins = np.rint((normalized + 1.0) * 0.5 * (bin_count - 1))
+    bins = np.where(np.isfinite(bins), bins, bin_count // 2)
+    return bins.astype(np.int32), limit
+
+
+def _diverging_color(position: float) -> list[float]:
+    neutral = np.asarray((0.78, 0.80, 0.77))
+    endpoint = (
+        np.asarray((0.12, 0.38, 0.96))
+        if position < 0.0
+        else np.asarray((0.96, 0.23, 0.10))
+    )
+    return ((1.0 - abs(position)) * neutral + abs(position) * endpoint).tolist()
+
+
+def _upload_mesh(
+    rows: np.ndarray, material_id: int | np.ndarray
+) -> Tuple[int, ...]:
     from OpenGL.GL import (
         GL_ARRAY_BUFFER,
         GL_FALSE,
@@ -94,8 +125,13 @@ def _upload_mesh(rows: np.ndarray, material_id: int) -> Tuple[int, ...]:
     glEnableVertexAttribArray(3)
     glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(24))
 
+    material_ids = np.asarray(material_id, dtype=np.int32)
+    if material_ids.ndim == 0:
+        material_ids = np.full(count, int(material_ids), np.int32)
+    if material_ids.shape != (count,):
+        raise ValueError("material IDs need one value per vertex")
     integer_columns = (
-        np.full(count, material_id, np.int32),
+        material_ids,
         np.zeros(count, np.int32),
         np.ones(count, np.int32),
     )
@@ -122,8 +158,10 @@ def view_triangle_mesh(
     title: str = "Pluck ordinary OpenGL mesh viewer",
     size: tuple[int, int] = (1000, 760),
     max_frames: int | None = None,
+    triangle_values: np.ndarray | None = None,
+    value_label: str = "scalar value",
 ) -> None:
-    """Open an orbiting Pluck material-renderer view until Escape or close."""
+    """Open an orbiting view, optionally colored by signed triangle values."""
     import pygame
     from OpenGL.GL import (
         GL_COLOR_BUFFER_BIT,
@@ -154,17 +192,45 @@ def view_triangle_mesh(
     pygame.display.set_caption(title)
 
     database = MaterialDatabase()
-    material_id = database.register(
-        "youngman_surface",
-        {
-            "albedo_rgb": [0.18, 0.56, 0.92],
-            "roughness": 0.32,
-            "metallic": 0.08,
-            "ior": 1.48,
-            "opacity": 1.0,
-            "emission_rgb": [0.035, 0.10, 0.18],
-        },
-    )
+    if triangle_values is None:
+        material_ids = database.register(
+            "youngman_surface",
+            {
+                "albedo_rgb": [0.18, 0.56, 0.92],
+                "roughness": 0.32,
+                "metallic": 0.08,
+                "ior": 1.48,
+                "opacity": 1.0,
+                "emission_rgb": [0.035, 0.10, 0.18],
+            },
+        )
+    else:
+        triangle_values = np.asarray(triangle_values, dtype=np.float64)
+        triangle_count = rows.shape[0] // 3
+        if triangle_values.shape != (triangle_count,):
+            raise ValueError("triangle_values needs one scalar per triangle")
+        palette_bins, value_limit = scalar_triangle_bins(triangle_values)
+        palette_ids = []
+        for index in range(33):
+            position = 2.0 * index / 32.0 - 1.0
+            color = _diverging_color(position)
+            palette_ids.append(database.register(
+                f"scalar_{index:02d}",
+                {
+                    "albedo_rgb": color,
+                    "roughness": 0.38,
+                    "metallic": 0.04,
+                    "ior": 1.46,
+                    "opacity": 1.0,
+                    "emission_rgb": (0.12 * np.asarray(color)).tolist(),
+                },
+            ))
+        material_ids = np.repeat(
+            np.asarray(palette_ids, dtype=np.int32)[palette_bins], 3
+        )
+        pygame.display.set_caption(
+            f"{title} | {value_label}: blue -{value_limit:.3g}, red +{value_limit:.3g}"
+        )
     renderer = BaseGLRenderer(database, auto_drain=False)
     renderer.init_gl()
     renderer.set_point_lights(
@@ -172,7 +238,7 @@ def view_triangle_mesh(
         np.asarray(((1.0, 0.92, 0.82),), np.float32),
         np.asarray((16.0,), np.float32),
     )
-    resources = _upload_mesh(rows, material_id)
+    resources = _upload_mesh(rows, material_ids)
     vao, buffers = resources[0], resources[1:]
 
     points = rows[:, :3]

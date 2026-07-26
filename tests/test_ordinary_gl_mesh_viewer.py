@@ -3,6 +3,7 @@ import numpy as np
 from ordinary_gl_mesh_viewer import (
     render_triangle_mesh_image,
     rolling_profile_lines,
+    summarize_video_profile,
     scalar_triangle_bins,
     triangle_mesh_vertex_rows,
 )
@@ -56,3 +57,15 @@ def test_headless_renderer_accepts_profile_side_panel(tmp_path):
         side_panel_lines=("honest profile", "solve 12.3 ms"),
     )
     assert output.is_file()
+
+
+def test_video_summary_keeps_total_and_unforced_gpu_semantics():
+    summary = summarize_video_profile(
+        {"frame": (0.010, 0.020), "swap": (0.001, 0.003)},
+        rendered_frames=2,
+        session_elapsed_sec=0.04,
+    )
+    assert summary["session_elapsed_sec"] == 0.04
+    assert summary["stages"]["frame"]["mean_sec"] == 0.015
+    assert summary["stages"]["frame"]["max_sec"] == 0.020
+    assert summary["gpu_completion_forced"] is False

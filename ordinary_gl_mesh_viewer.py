@@ -8,11 +8,12 @@ therefore present a triangle soup in Pluck without importing the full game.
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Thread
+from time import perf_counter
 from typing import Mapping, Sequence, Tuple
 
 import numpy as np
@@ -21,9 +22,10 @@ import numpy as np
 @dataclass(frozen=True)
 class LiveMeshFrame:
     triangles: np.ndarray
-    triangle_values: np.ndarray
+    triangle_values: np.ndarray | None
     panel_lines: Sequence[str]
     time_value: float
+    published_at: float = field(default_factory=perf_counter)
 
 
 def rolling_profile_lines(
@@ -55,6 +57,31 @@ def rolling_profile_lines(
         "times cover complete stage calls",
     ))
     return lines
+
+
+def summarize_video_profile(
+    history: Mapping[str, Sequence[float]],
+    *,
+    rendered_frames: int,
+    session_elapsed_sec: float,
+) -> dict:
+    """Return serializable CPU video timing statistics."""
+    stages = {}
+    for name, values in history.items():
+        array = np.asarray(values, dtype=np.float64)
+        if len(array):
+            stages[name] = {
+                "count": int(len(array)),
+                "mean_sec": float(array.mean()),
+                "p95_sec": float(np.quantile(array, 0.95)),
+                "max_sec": float(array.max()),
+            }
+    return {
+        "rendered_frames": int(rendered_frames),
+        "session_elapsed_sec": float(session_elapsed_sec),
+        "stages": stages,
+        "gpu_completion_forced": False,
+    }
 
 
 def triangle_mesh_vertex_rows(triangles: np.ndarray) -> np.ndarray:
@@ -542,7 +569,7 @@ def view_profiled_triangle_mesh_stream(
     period_sec: float = 8.0,
     max_solves: int | None = None,
     max_frames: int | None = None,
-) -> None:
+) -> dict:
     """Display latest-result-wins solved meshes while solving off the GL thread.
 
     ``solve_frame(index, time_value)`` returns :class:`LiveMeshFrame`. The
@@ -597,6 +624,17 @@ def view_profiled_triangle_mesh_stream(
     pygame.display.set_caption(title)
     database = MaterialDatabase()
     palette_ids = []
+    geometry_material_id = database.register(
+        "live_geometry",
+        {
+            "albedo_rgb": [0.16, 0.52, 0.88],
+            "roughness": 0.3,
+            "metallic": 0.12,
+            "ior": 1.48,
+            "opacity": 1.0,
+            "emission_rgb": [0.02, 0.07, 0.13],
+        },
+    )
     for index in range(33):
         position = 2.0 * index / 32.0 - 1.0
         color = _diverging_color(position)
@@ -630,8 +668,40 @@ def view_profiled_triangle_mesh_stream(
     angle = 0.0
     frame_count = 0
     running = True
+    session_started = perf_counter()
+    video_history: dict[str, list[float]] = {
+        name: [] for name in (
+            "mesh_upload", "draw_submit", "hud", "swap", "frame", "publish_latency"
+        )
+    }
+    base_panel_lines = ("waiting for first complete solve...",)
+    last_panel_refresh = 0.0
+
+    def record_video(name: str, elapsed: float) -> None:
+        values = video_history[name]
+        values.append(float(elapsed))
+        if len(values) > 600:
+            del values[:-600]
+
+    def video_lines() -> tuple[str, ...]:
+        lines = ["", "video CPU wall profile", "stage                  mean       p95"]
+        for name, values in video_history.items():
+            if not values:
+                continue
+            array = np.asarray(values)
+            lines.append(
+                f"{name:<20} {array.mean()*1e3:7.2f} "
+                f"{np.quantile(array, .95)*1e3:8.2f} ms"
+            )
+        lines.extend((
+            f"rendered frames      {frame_count:8d}",
+            f"session total       {perf_counter()-session_started:8.2f} s",
+            "GPU completion is not forced",
+        ))
+        return tuple(lines)
     try:
         while running:
+            frame_started = perf_counter()
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -646,11 +716,18 @@ def view_profiled_triangle_mesh_stream(
             if latest is not None:
                 if isinstance(latest, BaseException):
                     raise latest
+                upload_started = perf_counter()
                 new_rows = triangle_mesh_vertex_rows(latest.triangles)
-                bins, limit = scalar_triangle_bins(latest.triangle_values)
-                material_ids = np.repeat(
-                    np.asarray(palette_ids, dtype=np.int32)[bins], 3
-                )
+                if latest.triangle_values is None:
+                    limit = None
+                    material_ids = np.full(
+                        len(new_rows), geometry_material_id, dtype=np.int32
+                    )
+                else:
+                    bins, limit = scalar_triangle_bins(latest.triangle_values)
+                    material_ids = np.repeat(
+                        np.asarray(palette_ids, dtype=np.int32)[bins], 3
+                    )
                 new_resources = _upload_mesh(new_rows, material_ids)
                 if resources is not None:
                     glDeleteBuffers(len(resources) - 1, resources[1:])
@@ -661,17 +738,25 @@ def view_profiled_triangle_mesh_stream(
                 radius = (
                     float(np.max(np.linalg.norm(points - center, axis=1))) or 1.0
                 )
-                panel.update(tuple(latest.panel_lines) + (
-                    "",
-                    f"color scale       +/- {limit:.5g}",
-                    "ESC closes; newest complete solve wins",
-                ))
+                record_video("mesh_upload", perf_counter() - upload_started)
+                record_video(
+                    "publish_latency", perf_counter() - latest.published_at
+                )
+                scale_line = (
+                    "display            geometry material"
+                    if limit is None
+                    else f"color scale       +/- {limit:.5g}"
+                )
+                base_panel_lines = tuple(latest.panel_lines) + (
+                    "", scale_line, "ESC closes; newest complete solve wins",
+                )
             width, height = pygame.display.get_surface().get_size()
             glViewport(0, 0, width, height)
             glEnable(GL_DEPTH_TEST)
             glClearColor(0.012, 0.018, 0.03, 1.0)
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             if resources is not None and rows is not None:
+                draw_started = perf_counter()
                 angle += clock.get_time() * 0.00022
                 eye = center + radius * np.asarray(
                     (2.8 * math.cos(angle), 2.8 * math.sin(angle), 1.65),
@@ -685,10 +770,20 @@ def view_profiled_triangle_mesh_stream(
                 renderer.draw_mesh(
                     resources[0], len(rows), projection @ view, view
                 )
+                record_video("draw_submit", perf_counter() - draw_started)
+            now = perf_counter()
+            if now - last_panel_refresh >= 0.5:
+                panel.update(base_panel_lines + video_lines())
+                last_panel_refresh = now
+            hud_started = perf_counter()
             panel.draw((width, height))
+            record_video("hud", perf_counter() - hud_started)
+            swap_started = perf_counter()
             pygame.display.flip()
+            record_video("swap", perf_counter() - swap_started)
             clock.tick(60)
             frame_count += 1
+            record_video("frame", perf_counter() - frame_started)
             if max_frames is not None and frame_count >= max_frames:
                 running = False
     finally:
@@ -699,3 +794,21 @@ def view_profiled_triangle_mesh_stream(
             glDeleteVertexArrays(1, (resources[0],))
         panel.close()
         pygame.quit()
+    summary = summarize_video_profile(
+        video_history,
+        rendered_frames=frame_count,
+        session_elapsed_sec=perf_counter() - session_started,
+    )
+    print(
+        f"[video stats] total={summary['session_elapsed_sec']:.3f}s "
+        f"frames={summary['rendered_frames']} gpu_finish=false",
+        flush=True,
+    )
+    for name, values in summary["stages"].items():
+        print(
+            f"  {name:<20} mean={values['mean_sec']*1e3:8.3f}ms "
+            f"p95={values['p95_sec']*1e3:8.3f}ms "
+            f"max={values['max_sec']*1e3:8.3f}ms n={values['count']}",
+            flush=True,
+        )
+    return summary

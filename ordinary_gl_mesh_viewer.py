@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+from pathlib import Path
 from typing import Tuple
 
 import numpy as np
@@ -89,6 +90,76 @@ def _diverging_color(position: float) -> list[float]:
         else np.asarray((0.96, 0.23, 0.10))
     )
     return ((1.0 - abs(position)) * neutral + abs(position) * endpoint).tolist()
+
+
+def render_triangle_mesh_image(
+    triangles: np.ndarray,
+    output_path: str | Path,
+    *,
+    triangle_values: np.ndarray | None = None,
+    value_label: str = "scalar value",
+    title: str = "Pluck triangle mesh",
+    size: tuple[int, int] = (1400, 1000),
+    elevation: float = 24.0,
+    azimuth: float = -58.0,
+) -> Path:
+    """Software-rasterize a deterministic headless mesh snapshot."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    mesh = np.asarray(triangles, dtype=np.float64)
+    triangle_mesh_vertex_rows(mesh)
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    dpi = 100
+    figure = plt.figure(
+        figsize=(size[0] / dpi, size[1] / dpi),
+        dpi=dpi,
+        facecolor=(0.012, 0.018, 0.03),
+    )
+    axes = figure.add_subplot(111, projection="3d")
+    axes.set_facecolor((0.012, 0.018, 0.03))
+    if triangle_values is None:
+        colors = np.repeat(
+            np.asarray(((0.18, 0.56, 0.92, 1.0),)), len(mesh), axis=0
+        )
+        color_limit = None
+    else:
+        bins, color_limit = scalar_triangle_bins(triangle_values)
+        colors = np.asarray(
+            [(*_diverging_color(2.0 * index / 32.0 - 1.0), 1.0) for index in bins]
+        )
+    collection = Poly3DCollection(
+        mesh,
+        facecolors=colors,
+        edgecolors=(0.02, 0.025, 0.04, 0.24),
+        linewidths=0.25,
+    )
+    axes.add_collection3d(collection)
+    flattened = mesh.reshape(-1, 3)
+    lower = flattened.min(axis=0)
+    upper = flattened.max(axis=0)
+    center = (lower + upper) * 0.5
+    radius = max(float(np.max(upper - lower)) * 0.55, 1e-6)
+    axes.set_xlim(center[0] - radius, center[0] + radius)
+    axes.set_ylim(center[1] - radius, center[1] + radius)
+    axes.set_zlim(center[2] - radius, center[2] + radius)
+    axes.set_box_aspect((1, 1, 1))
+    axes.view_init(elev=elevation, azim=azimuth)
+    axes.set_axis_off()
+    caption = title
+    if color_limit is not None:
+        caption += (
+            f"\n{value_label}  |  blue −{color_limit:.3g}   neutral 0"
+            f"   red +{color_limit:.3g}"
+        )
+    axes.set_title(caption, color="white", pad=16)
+    figure.subplots_adjust(left=0, right=1, bottom=0, top=0.92)
+    figure.savefig(output, dpi=dpi, facecolor=figure.get_facecolor())
+    plt.close(figure)
+    return output.resolve()
 
 
 def _upload_mesh(

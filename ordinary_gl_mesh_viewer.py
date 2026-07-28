@@ -431,6 +431,318 @@ class _OpenGLTextPanel:
         gl.glDeleteProgram(self._program)
 
 
+def _heatmap_rgba(
+    values: np.ndarray, lower: float, upper: float
+) -> np.ndarray:
+    """Color a scalar field with Pluck's blue/cyan/gold/red instrument palette."""
+    field = np.asarray(values, dtype=np.float32)
+    scale = max(float(upper) - float(lower), np.finfo(np.float32).eps)
+    unit = np.clip((field - float(lower)) / scale, 0.0, 1.0)
+    stops = np.asarray(
+        (
+            (0.015, 0.025, 0.12),
+            (0.06, 0.34, 0.88),
+            (0.02, 0.88, 0.88),
+            (0.98, 0.78, 0.12),
+            (0.94, 0.12, 0.045),
+        ),
+        dtype=np.float32,
+    )
+    position = unit * (len(stops) - 1)
+    index = np.minimum(position.astype(np.int32), len(stops) - 2)
+    fraction = (position - index)[..., None]
+    rgb = stops[index] * (1.0 - fraction) + stops[index + 1] * fraction
+    alpha = np.ones((*field.shape, 1), dtype=np.float32)
+    return np.asarray(np.concatenate((rgb, alpha), axis=-1) * 255, np.uint8)
+
+
+class HeatmapDashboard:
+    """Persistent Pluck-style OpenGL dashboard for three fields and one trace.
+
+    Each panel is a stateful texture.  Repeated updates use ``glTexSubImage2D``
+    when dimensions are unchanged, avoiding texture-object churn.
+    """
+
+    def __init__(
+        self,
+        *,
+        title: str = "Pluck field dashboard",
+        size: tuple[int, int] = (1280, 800),
+    ) -> None:
+        import pygame
+        from OpenGL.GL import (
+            GL_ARRAY_BUFFER, GL_CLAMP_TO_EDGE, GL_DYNAMIC_DRAW, GL_FALSE,
+            GL_FLOAT, GL_FRAGMENT_SHADER, GL_LINEAR, GL_RGBA, GL_RGBA8,
+            GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER,
+            GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_UNSIGNED_BYTE,
+            GL_VERTEX_SHADER, glBindBuffer, glBindTexture, glBindVertexArray,
+            glBufferData, glEnableVertexAttribArray, glGenBuffers,
+            glGenTextures, glGenVertexArrays, glTexImage2D, glTexParameteri,
+            glVertexAttribPointer,
+        )
+        from OpenGL.GL.shaders import compileProgram, compileShader
+
+        pygame.init()
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 4)
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+        pygame.display.gl_set_attribute(
+            pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE
+        )
+        pygame.display.set_mode(
+            size, pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
+        )
+        pygame.display.set_caption(title)
+        pygame.font.init()
+        self._pygame = pygame
+        self._gl = __import__("OpenGL.GL", fromlist=("*",))
+        self._font = pygame.font.SysFont("consolas,monospace", 17)
+        self._small_font = pygame.font.SysFont("consolas,monospace", 13)
+        self._program = compileProgram(
+            compileShader(
+                """#version 330 core
+                layout(location=0) in vec2 pos;
+                layout(location=1) in vec2 uv_in;
+                out vec2 uv;
+                void main(){ uv=uv_in; gl_Position=vec4(pos,0,1); }""",
+                GL_VERTEX_SHADER,
+            ),
+            compileShader(
+                """#version 330 core
+                in vec2 uv; out vec4 color; uniform sampler2D panel;
+                void main(){ color=texture(panel,uv); }""",
+                GL_FRAGMENT_SHADER,
+            ),
+        )
+        self._vao = int(glGenVertexArrays(1))
+        self._vbo = int(glGenBuffers(1))
+        self._textures = tuple(int(value) for value in glGenTextures(4))
+        self._texture_sizes = [(0, 0)] * 4
+        glBindVertexArray(self._vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._vbo)
+        glBufferData(GL_ARRAY_BUFFER, 64, None, GL_DYNAMIC_DRAW)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(8))
+        for texture in self._textures:
+            glBindTexture(GL_TEXTURE_2D, texture)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glTexImage2D(
+                GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA,
+                GL_UNSIGNED_BYTE, bytes((4, 7, 15, 255)),
+            )
+        self._closed = False
+        self._clock = pygame.time.Clock()
+
+    def _captioned_surface(
+        self, rgba: np.ndarray, title: str, subtitle: str = ""
+    ):
+        pygame = self._pygame
+        panel_width, field_height = 640, 360
+        band = 52
+        surface = pygame.Surface(
+            (panel_width, field_height + band), pygame.SRCALPHA
+        )
+        pixels = pygame.surfarray.make_surface(
+            np.ascontiguousarray(rgba[..., :3].swapaxes(0, 1))
+        )
+        pixels = pygame.transform.smoothscale(
+            pixels, (panel_width, field_height)
+        )
+        surface.blit(pixels, (0, band))
+        surface.fill((5, 10, 22, 255), (0, 0, panel_width, band))
+        surface.blit(self._font.render(title, True, (226, 238, 250)), (12, 6))
+        if subtitle:
+            surface.blit(
+                self._small_font.render(subtitle, True, (128, 172, 206)),
+                (12, 30),
+            )
+        return surface
+
+    def _loss_surface(
+        self,
+        losses: Sequence[float],
+        size: tuple[int, int],
+        status_lines: Sequence[str],
+    ):
+        pygame = self._pygame
+        width, height = size
+        surface = pygame.Surface(size, pygame.SRCALPHA)
+        surface.fill((5, 10, 22, 255))
+        surface.blit(
+            self._font.render("training loss", True, (226, 238, 250)), (14, 8)
+        )
+        values = np.asarray(losses, dtype=np.float64)
+        plot = pygame.Rect(54, 52, max(20, width - 72), max(30, height - 132))
+        pygame.draw.rect(surface, (11, 21, 38), plot)
+        for index in range(5):
+            y = plot.top + index * plot.height // 4
+            pygame.draw.line(
+                surface, (31, 52, 72), (plot.left, y), (plot.right, y), 1
+            )
+        finite = values[np.isfinite(values) & (values > 0)]
+        if len(finite):
+            logs = np.log10(np.maximum(values, np.finfo(np.float64).tiny))
+            lower, upper = float(logs.min()), float(logs.max())
+            if upper - lower < 1e-9:
+                upper = lower + 1.0
+            xs = np.linspace(plot.left, plot.right, len(logs))
+            ys = plot.bottom - (logs - lower) / (upper - lower) * plot.height
+            points = [(int(x), int(y)) for x, y in zip(xs, ys)]
+            if len(points) > 1:
+                pygame.draw.lines(surface, (248, 99, 38), False, points, 3)
+            elif points:
+                pygame.draw.circle(surface, (248, 99, 38), points[0], 3)
+            summary = f"{values[0]:.4g} -> {values[-1]:.4g}   n={len(values)}"
+            surface.blit(
+                self._small_font.render(summary, True, (244, 169, 111)),
+                (14, height - 70),
+            )
+        for index, line in enumerate(status_lines[:2]):
+            surface.blit(
+                self._small_font.render(str(line), True, (128, 172, 206)),
+                (14, height - 48 + index * 18),
+            )
+        return surface
+
+    def _upload_surface(self, index: int, surface) -> None:
+        gl = self._gl
+        width, height = surface.get_size()
+        raw = self._pygame.image.tobytes(surface, "RGBA", True)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self._textures[index])
+        if self._texture_sizes[index] == (width, height):
+            gl.glTexSubImage2D(
+                gl.GL_TEXTURE_2D, 0, 0, 0, width, height,
+                gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, raw,
+            )
+        else:
+            gl.glTexImage2D(
+                gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, width, height, 0,
+                gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, raw,
+            )
+            self._texture_sizes[index] = (width, height)
+
+    def update(
+        self,
+        target: np.ndarray,
+        prediction: np.ndarray,
+        error: np.ndarray,
+        losses: Sequence[float],
+        *,
+        status_lines: Sequence[str] = (),
+    ) -> None:
+        error_limit = max(0.25, float(np.nanmax(error, initial=0.0)))
+        panels = (
+            self._captioned_surface(
+                _heatmap_rgba(target, -1.0, 1.0),
+                "continuous target",
+                "independent analytic field",
+            ),
+            self._captioned_surface(
+                _heatmap_rgba(prediction, -1.0, 1.0),
+                "FusedProgram network",
+                "AbstractNN prediction",
+            ),
+            self._captioned_surface(
+                _heatmap_rgba(error, 0.0, error_limit),
+                "absolute error",
+                f"range 0 .. {error_limit:.4g}",
+            ),
+        )
+        for index, panel in enumerate(panels):
+            self._upload_surface(index, panel)
+        loss_size = panels[0].get_size()
+        self._upload_surface(
+            3, self._loss_surface(losses, loss_size, status_lines)
+        )
+
+    def _draw_texture(self, texture: int, rect: tuple[float, float, float, float]):
+        gl = self._gl
+        left, bottom, right, top = rect
+        vertices = np.asarray(
+            (
+                (left, bottom, 0, 0), (right, bottom, 1, 0),
+                (left, top, 0, 1), (right, top, 1, 1),
+            ),
+            dtype=np.float32,
+        )
+        gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._vbo)
+        gl.glBufferData(
+            gl.GL_ARRAY_BUFFER, vertices.nbytes, vertices, gl.GL_DYNAMIC_DRAW
+        )
+        gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, 0, 4)
+
+    def render(self) -> None:
+        gl = self._gl
+        width, height = self._pygame.display.get_surface().get_size()
+        gl.glViewport(0, 0, width, height)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glClearColor(0.012, 0.018, 0.03, 1.0)
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+        gl.glUseProgram(self._program)
+        gl.glActiveTexture(gl.GL_TEXTURE0)
+        gl.glBindVertexArray(self._vao)
+        margin = 0.025
+        gap = 0.018
+        half_w = (2.0 - 2 * margin - gap) * 0.5
+        half_h = (2.0 - 2 * margin - gap) * 0.5
+        x0, x1 = -1.0 + margin, -1.0 + margin + half_w
+        x2, x3 = x1 + gap, 1.0 - margin
+        y0, y1 = -1.0 + margin, -1.0 + margin + half_h
+        y2, y3 = y1 + gap, 1.0 - margin
+        for texture, rect in zip(
+            self._textures,
+            ((x0, y2, x1, y3), (x2, y2, x3, y3),
+             (x0, y0, x1, y1), (x2, y0, x3, y1)),
+        ):
+            self._draw_texture(texture, rect)
+        gl.glBindVertexArray(0)
+
+    def pump(self) -> bool:
+        for event in self._pygame.event.get():
+            if event.type == self._pygame.QUIT:
+                return False
+            if event.type == self._pygame.KEYDOWN and event.key == self._pygame.K_ESCAPE:
+                return False
+        self.render()
+        self._pygame.display.flip()
+        return True
+
+    def save(self, path: str | Path) -> Path:
+        from PIL import Image
+
+        self.render()
+        width, height = self._pygame.display.get_surface().get_size()
+        raw = self._gl.glReadPixels(
+            0, 0, width, height, self._gl.GL_RGBA, self._gl.GL_UNSIGNED_BYTE
+        )
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        Image.frombytes("RGBA", (width, height), raw).transpose(
+            Image.Transpose.FLIP_TOP_BOTTOM
+        ).convert("RGB").save(output)
+        return output.resolve()
+
+    def wait(self) -> None:
+        while self.pump():
+            self._clock.tick(60)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        gl = self._gl
+        gl.glDeleteTextures(len(self._textures), self._textures)
+        gl.glDeleteBuffers(1, (self._vbo,))
+        gl.glDeleteVertexArrays(1, (self._vao,))
+        gl.glDeleteProgram(self._program)
+        self._pygame.quit()
+        self._closed = True
+
+
 def view_triangle_mesh(
     triangles: np.ndarray,
     *,

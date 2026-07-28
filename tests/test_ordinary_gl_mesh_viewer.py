@@ -1,6 +1,7 @@
 import numpy as np
 
 from ordinary_gl_mesh_viewer import (
+    _heatmap_rgba,
     render_triangle_mesh_image,
     rolling_profile_lines,
     summarize_video_profile,
@@ -25,6 +26,14 @@ def test_scalar_triangle_bins_are_signed_symmetric_and_clipped():
     )
     assert limit == 2.0
     assert np.array_equal(bins, (0, 0, 2, 4, 4))
+
+
+def test_heatmap_texture_conversion_is_rgba_and_monotonic():
+    rgba = _heatmap_rgba(np.asarray([[0.0, 0.5, 1.0]]), 0.0, 1.0)
+    assert rgba.shape == (1, 3, 4)
+    assert rgba.dtype == np.uint8
+    assert np.all(rgba[..., 3] == 255)
+    assert len({tuple(pixel) for pixel in rgba[0]}) == 3
 
 
 def test_headless_renderer_writes_png(tmp_path):

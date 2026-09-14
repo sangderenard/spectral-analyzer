@@ -1,0 +1,103 @@
+{
+  "bindings": [],
+  "complete": true,
+  "diagnostics": [],
+  "execution_plan": {
+    "compute_sections": [],
+    "sections": [
+      {
+        "function": "main",
+        "reasons": [
+          "accesses graphics output(s) vCullImmune",
+          "accesses graphics output(s) vGroupId",
+          "accesses graphics output(s) vMatId",
+          "accesses graphics output(s) vNormV",
+          "accesses graphics output(s) vPosObj",
+          "accesses graphics output(s) vPosV",
+          "accesses graphics output(s) vUv",
+          "accesses graphics output(s) vVelocityW",
+          "reads interpolated stage input(s) aCullImmune",
+          "reads interpolated stage input(s) aGroupId",
+          "reads interpolated stage input(s) aMatId",
+          "reads interpolated stage input(s) aNorm",
+          "reads interpolated stage input(s) aPos",
+          "reads interpolated stage input(s) aUv",
+          "reads interpolated stage input(s) aVelocity",
+          "uses stage builtin(s) gl_Position",
+          "vertex graphics entry point"
+        ],
+        "source_lines": [
+          51,
+          62
+        ],
+        "stage": "vertex"
+      }
+    ],
+    "selected_graphics_backend": "webgl2-vertex"
+  },
+  "language": "webgl2-glsl-es",
+  "name": "base_material_vertex",
+  "project_ir": {
+    "diagnostics": [],
+    "functions": [
+      {
+        "calls": [],
+        "direct_graphics_reasons": [
+          "accesses graphics output(s) vCullImmune",
+          "accesses graphics output(s) vGroupId",
+          "accesses graphics output(s) vMatId",
+          "accesses graphics output(s) vNormV",
+          "accesses graphics output(s) vPosObj",
+          "accesses graphics output(s) vPosV",
+          "accesses graphics output(s) vUv",
+          "accesses graphics output(s) vVelocityW",
+          "reads interpolated stage input(s) aCullImmune",
+          "reads interpolated stage input(s) aGroupId",
+          "reads interpolated stage input(s) aMatId",
+          "reads interpolated stage input(s) aNorm",
+          "reads interpolated stage input(s) aPos",
+          "reads interpolated stage input(s) aUv",
+          "reads interpolated stage input(s) aVelocity",
+          "uses stage builtin(s) gl_Position"
+        ],
+        "name": "main",
+        "return_type": "void",
+        "source_lines": [
+          51,
+          62
+        ]
+      }
+    ],
+    "line_count": 63,
+    "schema": "turing.glsl-project-ir.v1",
+    "source_name": "base_material_vertex",
+    "source_sha256": "5a9f9ecc71393563e970ce6b37251f35a657eae3823851c7f30e0c017eedf114",
+    "stage_hint": "vertex",
+    "stage_inputs": [
+      "aPos",
+      "aNorm",
+      "aMatId",
+      "aUv",
+      "aGroupId",
+      "aCullImmune",
+      "aVelocity"
+    ],
+    "stage_outputs": [
+      "vNormV",
+      "vPosV",
+      "vPosObj",
+      "vMatId",
+      "vGroupId",
+      "vCullImmune",
+      "vUv",
+      "vVelocityW"
+    ],
+    "storage_buffers": [],
+    "uniforms": [
+      "uMVP",
+      "uMV"
+    ]
+  },
+  "schema": "turing.webgl-project-shader.v1",
+  "stage": "vertex"
+}

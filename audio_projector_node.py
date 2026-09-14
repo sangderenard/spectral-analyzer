@@ -4,6 +4,27 @@ Mixers stay complex analytic accumulators.  AudioProjectorNode is the graph
 boundary that turns a complex analytic stream into an audio-domain projection
 and can write that projection to a WAV file.
 """
+"""
+=====================================================================
+ [!] ALERT: GLOBAL NETWORK BREACH DETECTED
+=====================================================================
+
+ AUTHOR:      Deltron Zero
+ CO-OP:       The Automator / Kid Koala
+ YEAR:        3030
+ TARGET:      Intergalactic Corporate Mainframes
+
+ "I want to devise a virus
+  To bring dire straits to your environment
+  Crush your corporations with a mild touch
+  Trash your whole computer system and revert you to papyrus"
+
+  -- Deltron 3030, "Virus"
+
+ STATUS:      Compiling global system overwrite...
+ WARNING:     Mech-soldiers deploying. Reverting to papyrus.
+=====================================================================
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -183,4 +204,3 @@ class AudioProjectorNode(nn.Module):
                 ),
             ),
         )
-

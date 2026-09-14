@@ -1,0 +1,976 @@
+{
+  "bindings": [
+    {
+      "block_name": "PBRChunk",
+      "loader": "turing_ssbo_load_pbr",
+      "member_name": "pbr",
+      "readonly": true,
+      "recommended_texture_unit": 10,
+      "sampler": "turing_ssbo_pbr",
+      "scalar_type": "float",
+      "source_binding": 10,
+      "source_lines": [
+        53,
+        53
+      ],
+      "texture": {
+        "format": "RED",
+        "internal_format": "R32F",
+        "mag_filter": "NEAREST",
+        "min_filter": "NEAREST",
+        "packing": "row-major scalar; x=index%width, y=index/width",
+        "type": "FLOAT"
+      },
+      "transport": "webgl2-texture-r32"
+    },
+    {
+      "block_name": "PhongChunk",
+      "loader": "turing_ssbo_load_phong",
+      "member_name": "phong",
+      "readonly": true,
+      "recommended_texture_unit": 11,
+      "sampler": "turing_ssbo_phong",
+      "scalar_type": "float",
+      "source_binding": 11,
+      "source_lines": [
+        58,
+        58
+      ],
+      "texture": {
+        "format": "RED",
+        "internal_format": "R32F",
+        "mag_filter": "NEAREST",
+        "min_filter": "NEAREST",
+        "packing": "row-major scalar; x=index%width, y=index/width",
+        "type": "FLOAT"
+      },
+      "transport": "webgl2-texture-r32"
+    },
+    {
+      "block_name": "EnamelChunk",
+      "loader": "turing_ssbo_load_enamel",
+      "member_name": "enamel",
+      "readonly": true,
+      "recommended_texture_unit": 14,
+      "sampler": "turing_ssbo_enamel",
+      "scalar_type": "float",
+      "source_binding": 14,
+      "source_lines": [
+        63,
+        63
+      ],
+      "texture": {
+        "format": "RED",
+        "internal_format": "R32F",
+        "mag_filter": "NEAREST",
+        "min_filter": "NEAREST",
+        "packing": "row-major scalar; x=index%width, y=index/width",
+        "type": "FLOAT"
+      },
+      "transport": "webgl2-texture-r32"
+    },
+    {
+      "block_name": "TextureStackChunk",
+      "loader": "turing_ssbo_load_texstack",
+      "member_name": "texstack",
+      "readonly": true,
+      "recommended_texture_unit": 15,
+      "sampler": "turing_ssbo_texstack",
+      "scalar_type": "float",
+      "source_binding": 15,
+      "source_lines": [
+        70,
+        70
+      ],
+      "texture": {
+        "format": "RED",
+        "internal_format": "R32F",
+        "mag_filter": "NEAREST",
+        "min_filter": "NEAREST",
+        "packing": "row-major scalar; x=index%width, y=index/width",
+        "type": "FLOAT"
+      },
+      "transport": "webgl2-texture-r32"
+    }
+  ],
+  "complete": true,
+  "diagnostics": [],
+  "execution_plan": {
+    "compute_sections": [],
+    "sections": [
+      {
+        "function": "mat_albedo",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          79,
+          79
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "mat_roughness",
+        "reasons": [
+          "unreachable helper; no dispatch is warranted"
+        ],
+        "source_lines": [
+          80,
+          80
+        ],
+        "stage": "inactive"
+      },
+      {
+        "function": "mat_metallic",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          81,
+          81
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "mat_trans",
+        "reasons": [
+          "unreachable helper; no dispatch is warranted"
+        ],
+        "source_lines": [
+          82,
+          82
+        ],
+        "stage": "inactive"
+      },
+      {
+        "function": "mat_ior",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          83,
+          83
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "mat_opacity",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          84,
+          84
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "mat_emission",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          85,
+          85
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "ph_ambient",
+        "reasons": [
+          "unreachable helper; no dispatch is warranted"
+        ],
+        "source_lines": [
+          87,
+          87
+        ],
+        "stage": "inactive"
+      },
+      {
+        "function": "ph_specstr",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          88,
+          88
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "ph_shininess",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          89,
+          89
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "ph_inner",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          90,
+          90
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "en_thick",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          92,
+          92
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "en_ior",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          93,
+          93
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "en_color",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          94,
+          94
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "tx_emit_layer",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          95,
+          95
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "tx_color_layer",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          96,
+          96
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "tx_depth_layer",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          97,
+          97
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "tx_remit_layer",
+        "reasons": [
+          "unreachable helper; no dispatch is warranted"
+        ],
+        "source_lines": [
+          98,
+          98
+        ],
+        "stage": "inactive"
+      },
+      {
+        "function": "tx_depth_scale_mm",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          99,
+          99
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "tx_thickness_scale_mm",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          100,
+          100
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "tx_depth_bias_mm",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          101,
+          101
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "tx_thickness_bias_mm",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          102,
+          102
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "tx_emit_gain",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          103,
+          103
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "tx_color_blend",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          104,
+          104
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "tx_direct_lobe_power",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          105,
+          105
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "tx_model_flags",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          106,
+          106
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "tx_remit_gain",
+        "reasons": [
+          "unreachable helper; no dispatch is warranted"
+        ],
+        "source_lines": [
+          107,
+          107
+        ],
+        "stage": "inactive"
+      },
+      {
+        "function": "tx_bulb_radius_mm",
+        "reasons": [
+          "unreachable helper; no dispatch is warranted"
+        ],
+        "source_lines": [
+          108,
+          108
+        ],
+        "stage": "inactive"
+      },
+      {
+        "function": "tx_translucence_gain",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          110,
+          110
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "schlick",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          155,
+          159
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "thin_film_fringe",
+        "reasons": [
+          "called from a fragment-bound function"
+        ],
+        "source_lines": [
+          163,
+          170
+        ],
+        "stage": "fragment"
+      },
+      {
+        "function": "main",
+        "reasons": [
+          "accesses graphics output(s) FragColor",
+          "reads interpolated stage input(s) vCullImmune",
+          "reads interpolated stage input(s) vGroupId",
+          "reads interpolated stage input(s) vMatId",
+          "reads interpolated stage input(s) vNormV",
+          "reads interpolated stage input(s) vPosObj",
+          "reads interpolated stage input(s) vPosV",
+          "reads interpolated stage input(s) vUv",
+          "uses fragment discard",
+          "uses stage builtin(s) gl_FrontFacing",
+          "fragment graphics entry point"
+        ],
+        "source_lines": [
+          174,
+          359
+        ],
+        "stage": "fragment"
+      }
+    ],
+    "selected_graphics_backend": "webgl2-fragment"
+  },
+  "language": "webgl2-glsl-es",
+  "name": "base_material_fragment",
+  "project_ir": {
+    "diagnostics": [],
+    "functions": [
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "mat_albedo",
+        "return_type": "vec3",
+        "source_lines": [
+          79,
+          79
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "mat_roughness",
+        "return_type": "float",
+        "source_lines": [
+          80,
+          80
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "mat_metallic",
+        "return_type": "float",
+        "source_lines": [
+          81,
+          81
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "mat_trans",
+        "return_type": "float",
+        "source_lines": [
+          82,
+          82
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "mat_ior",
+        "return_type": "float",
+        "source_lines": [
+          83,
+          83
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "mat_opacity",
+        "return_type": "float",
+        "source_lines": [
+          84,
+          84
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "mat_emission",
+        "return_type": "vec3",
+        "source_lines": [
+          85,
+          85
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "ph_ambient",
+        "return_type": "float",
+        "source_lines": [
+          87,
+          87
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "ph_specstr",
+        "return_type": "float",
+        "source_lines": [
+          88,
+          88
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "ph_shininess",
+        "return_type": "float",
+        "source_lines": [
+          89,
+          89
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "ph_inner",
+        "return_type": "vec3",
+        "source_lines": [
+          90,
+          90
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "en_thick",
+        "return_type": "float",
+        "source_lines": [
+          92,
+          92
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "en_ior",
+        "return_type": "float",
+        "source_lines": [
+          93,
+          93
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "en_color",
+        "return_type": "vec3",
+        "source_lines": [
+          94,
+          94
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_emit_layer",
+        "return_type": "float",
+        "source_lines": [
+          95,
+          95
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_color_layer",
+        "return_type": "float",
+        "source_lines": [
+          96,
+          96
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_depth_layer",
+        "return_type": "float",
+        "source_lines": [
+          97,
+          97
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_remit_layer",
+        "return_type": "float",
+        "source_lines": [
+          98,
+          98
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_depth_scale_mm",
+        "return_type": "float",
+        "source_lines": [
+          99,
+          99
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_thickness_scale_mm",
+        "return_type": "float",
+        "source_lines": [
+          100,
+          100
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_depth_bias_mm",
+        "return_type": "float",
+        "source_lines": [
+          101,
+          101
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_thickness_bias_mm",
+        "return_type": "float",
+        "source_lines": [
+          102,
+          102
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_emit_gain",
+        "return_type": "float",
+        "source_lines": [
+          103,
+          103
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_color_blend",
+        "return_type": "float",
+        "source_lines": [
+          104,
+          104
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_direct_lobe_power",
+        "return_type": "float",
+        "source_lines": [
+          105,
+          105
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_model_flags",
+        "return_type": "float",
+        "source_lines": [
+          106,
+          106
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_remit_gain",
+        "return_type": "float",
+        "source_lines": [
+          107,
+          107
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_bulb_radius_mm",
+        "return_type": "float",
+        "source_lines": [
+          108,
+          108
+        ]
+      },
+      {
+        "calls": [],
+        "direct_graphics_reasons": [],
+        "name": "tx_translucence_gain",
+        "return_type": "float",
+        "source_lines": [
+          110,
+          110
+        ]
+      },
+      {
+        "calls": [
+          "max"
+        ],
+        "direct_graphics_reasons": [],
+        "name": "schlick",
+        "return_type": "float",
+        "source_lines": [
+          155,
+          159
+        ]
+      },
+      {
+        "calls": [
+          "cos"
+        ],
+        "direct_graphics_reasons": [],
+        "name": "thin_film_fringe",
+        "return_type": "vec3",
+        "source_lines": [
+          163,
+          170
+        ]
+      },
+      {
+        "calls": [
+          "clamp",
+          "dot",
+          "en_color",
+          "en_ior",
+          "en_thick",
+          "inversesqrt",
+          "mat_albedo",
+          "mat_emission",
+          "mat_ior",
+          "mat_metallic",
+          "mat_opacity",
+          "max",
+          "min",
+          "mix",
+          "normalize",
+          "ph_inner",
+          "ph_shininess",
+          "ph_specstr",
+          "pow",
+          "schlick",
+          "step",
+          "texture",
+          "thin_film_fringe",
+          "tx_color_blend",
+          "tx_color_layer",
+          "tx_depth_bias_mm",
+          "tx_depth_layer",
+          "tx_depth_scale_mm",
+          "tx_direct_lobe_power",
+          "tx_emit_gain",
+          "tx_emit_layer",
+          "tx_model_flags",
+          "tx_thickness_bias_mm",
+          "tx_thickness_scale_mm",
+          "tx_translucence_gain"
+        ],
+        "direct_graphics_reasons": [
+          "accesses graphics output(s) FragColor",
+          "reads interpolated stage input(s) vCullImmune",
+          "reads interpolated stage input(s) vGroupId",
+          "reads interpolated stage input(s) vMatId",
+          "reads interpolated stage input(s) vNormV",
+          "reads interpolated stage input(s) vPosObj",
+          "reads interpolated stage input(s) vPosV",
+          "reads interpolated stage input(s) vUv",
+          "uses fragment discard",
+          "uses stage builtin(s) gl_FrontFacing"
+        ],
+        "name": "main",
+        "return_type": "void",
+        "source_lines": [
+          174,
+          359
+        ]
+      }
+    ],
+    "line_count": 360,
+    "schema": "turing.glsl-project-ir.v1",
+    "source_name": "base_material_fragment",
+    "source_sha256": "d7500f2a6fe23bf95c8d962ecd5d9a910e8901f993efaa0aeff325f1fd013d33",
+    "stage_hint": "fragment",
+    "stage_inputs": [
+      "vNormV",
+      "vPosV",
+      "vPosObj",
+      "vMatId",
+      "vGroupId",
+      "vCullImmune",
+      "vUv",
+      "vVelocityW"
+    ],
+    "stage_outputs": [
+      "FragColor"
+    ],
+    "storage_buffers": [
+      {
+        "block_name": "PBRChunk",
+        "loader": "turing_ssbo_load_pbr",
+        "member_name": "pbr",
+        "readonly": true,
+        "recommended_texture_unit": 10,
+        "sampler": "turing_ssbo_pbr",
+        "scalar_type": "float",
+        "source_binding": 10,
+        "source_lines": [
+          53,
+          53
+        ],
+        "texture": {
+          "format": "RED",
+          "internal_format": "R32F",
+          "mag_filter": "NEAREST",
+          "min_filter": "NEAREST",
+          "packing": "row-major scalar; x=index%width, y=index/width",
+          "type": "FLOAT"
+        },
+        "transport": "webgl2-texture-r32"
+      },
+      {
+        "block_name": "PhongChunk",
+        "loader": "turing_ssbo_load_phong",
+        "member_name": "phong",
+        "readonly": true,
+        "recommended_texture_unit": 11,
+        "sampler": "turing_ssbo_phong",
+        "scalar_type": "float",
+        "source_binding": 11,
+        "source_lines": [
+          58,
+          58
+        ],
+        "texture": {
+          "format": "RED",
+          "internal_format": "R32F",
+          "mag_filter": "NEAREST",
+          "min_filter": "NEAREST",
+          "packing": "row-major scalar; x=index%width, y=index/width",
+          "type": "FLOAT"
+        },
+        "transport": "webgl2-texture-r32"
+      },
+      {
+        "block_name": "EnamelChunk",
+        "loader": "turing_ssbo_load_enamel",
+        "member_name": "enamel",
+        "readonly": true,
+        "recommended_texture_unit": 14,
+        "sampler": "turing_ssbo_enamel",
+        "scalar_type": "float",
+        "source_binding": 14,
+        "source_lines": [
+          63,
+          63
+        ],
+        "texture": {
+          "format": "RED",
+          "internal_format": "R32F",
+          "mag_filter": "NEAREST",
+          "min_filter": "NEAREST",
+          "packing": "row-major scalar; x=index%width, y=index/width",
+          "type": "FLOAT"
+        },
+        "transport": "webgl2-texture-r32"
+      },
+      {
+        "block_name": "TextureStackChunk",
+        "loader": "turing_ssbo_load_texstack",
+        "member_name": "texstack",
+        "readonly": true,
+        "recommended_texture_unit": 15,
+        "sampler": "turing_ssbo_texstack",
+        "scalar_type": "float",
+        "source_binding": 15,
+        "source_lines": [
+          70,
+          70
+        ],
+        "texture": {
+          "format": "RED",
+          "internal_format": "R32F",
+          "mag_filter": "NEAREST",
+          "min_filter": "NEAREST",
+          "packing": "row-major scalar; x=index%width, y=index/width",
+          "type": "FLOAT"
+        },
+        "transport": "webgl2-texture-r32"
+      }
+    ],
+    "uniforms": [
+      "uNumLights",
+      "uLightPos",
+      "uLightColor",
+      "uLightIntensity",
+      "uLightGroupId",
+      "uLightCalibration",
+      "uCatCcmMatrix",
+      "uEmitUv",
+      "uColorUv",
+      "uDepthUv",
+      "uRemitUv",
+      "uEnableSpecular",
+      "uEnableEmissionDirect",
+      "uRenderPass",
+      "uFieldVolume",
+      "uFieldGain"
+    ]
+  },
+  "schema": "turing.webgl-project-shader.v1",
+  "stage": "fragment"
+}

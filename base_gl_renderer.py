@@ -37,6 +37,7 @@ import numpy as np
 try:
     from OpenGL import GL
     from OpenGL.GL import (
+    glBufferSubData, GL_DYNAMIC_DRAW as _GL_DYNAMIC_DRAW_THERMAL,
         glCreateShader, glShaderSource, glCompileShader, glGetShaderiv,
         glGetShaderInfoLog, glCreateProgram, glAttachShader, glLinkProgram,
         glGetProgramiv, glGetProgramInfoLog, glUseProgram, glDeleteShader,
@@ -77,6 +78,7 @@ _BINDING_PBR   = 10
 _BINDING_PHONG = 11
 _BINDING_ENAMEL = 14
 _BINDING_TEXSTACK = 15
+_BINDING_THERMAL = 16      # ThermalChunk: kelvin per thermal id (aGroupId), see the fragment shader
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -143,6 +145,16 @@ class BaseGLRenderer:
         self._u_cat_ccm_matrix = -1
         self._u_enable_specular = -1
         self._u_enable_emission_direct = -1
+        self._u_thermal_emission = -1
+        self._u_thermal_gain = -1
+        self._u_thermal_ref_k = -1
+        self._u_thermal_floor_k = -1
+        self._thermal_emission = False
+        self._thermal_gain = 0.08
+        self._thermal_ref_k = 1000.0
+        self._thermal_floor_k = 720.0
+        self._thermal_buf = None
+        self._thermal_len = 0
         self._enable_specular = True
         self._enable_emission_direct = False
         self._light_calibration = 1.0
@@ -390,6 +402,10 @@ class BaseGLRenderer:
         self._u_light_calibration = glGetUniformLocation(self._prog, "uLightCalibration")
         self._u_cat_ccm_matrix = glGetUniformLocation(self._prog, "uCatCcmMatrix")
         self._u_emit_uv         = glGetUniformLocation(self._prog, "uEmitUv")
+        self._u_thermal_emission = glGetUniformLocation(self._prog, "uThermalEmission")
+        self._u_thermal_gain = glGetUniformLocation(self._prog, "uThermalGain")
+        self._u_thermal_ref_k = glGetUniformLocation(self._prog, "uThermalRefK")
+        self._u_thermal_floor_k = glGetUniformLocation(self._prog, "uThermalFloorK")
         self._u_color_uv        = glGetUniformLocation(self._prog, "uColorUv")
         self._u_depth_uv        = glGetUniformLocation(self._prog, "uDepthUv")
         self._u_remit_uv        = glGetUniformLocation(self._prog, "uRemitUv")
@@ -619,6 +635,31 @@ class BaseGLRenderer:
             np.ascontiguousarray([c[3] for c in cands], np.int32),
         )
 
+    def set_thermal_emission(self, enabled: bool, gain: float = 0.08, ref_k: float = 1000.0, floor_k: float = 720.0) -> None:
+        """Per-fragment blackbody self-emission off the ThermalChunk SSBO
+        (kelvin per aGroupId). gain: red-band radiance at ref_k in the
+        rig's own light units."""
+        self._thermal_emission = bool(enabled)
+        self._thermal_gain = float(gain); self._thermal_ref_k = float(ref_k); self._thermal_floor_k = float(floor_k)
+
+    def set_thermal_kelvins(self, kelvins: "np.ndarray") -> None:
+        """Upload the temperature table (index = thermal id, 0 unused).
+        Re-allocates only when it grows; otherwise a sub-data write."""
+        arr = np.ascontiguousarray(kelvins, dtype=np.float32).ravel()
+        if arr.size == 0:
+            arr = np.zeros(1, dtype=np.float32)
+        if self._thermal_buf is None:
+            self._thermal_buf = int(glGenBuffers(1))
+            self._ssbo[_BINDING_THERMAL] = self._thermal_buf
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, self._thermal_buf)
+        if arr.size > self._thermal_len:
+            glBufferData(GL_SHADER_STORAGE_BUFFER, arr.nbytes, arr.ctypes.data_as(ctypes.c_void_p), GL_DYNAMIC_DRAW)
+            self._thermal_len = int(arr.size)
+        else:
+            glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, arr.nbytes, arr.ctypes.data_as(ctypes.c_void_p))
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, _BINDING_THERMAL, self._thermal_buf)
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
+
     def set_specular_enabled(self, enabled: bool) -> None:
         self._enable_specular = bool(enabled)
 
@@ -642,6 +683,14 @@ class BaseGLRenderer:
             glUniform1i(self._u_enable_specular, 1 if self._enable_specular else 0)
         if self._u_enable_emission_direct != -1:
             glUniform1i(self._u_enable_emission_direct, 1 if self._enable_emission_direct else 0)
+        if self._u_thermal_emission != -1:
+            glUniform1i(self._u_thermal_emission, 1 if (self._thermal_emission and self._thermal_buf is not None) else 0)
+            if self._u_thermal_gain != -1:
+                glUniform1f(self._u_thermal_gain, self._thermal_gain)
+            if self._u_thermal_ref_k != -1:
+                glUniform1f(self._u_thermal_ref_k, self._thermal_ref_k)
+            if self._u_thermal_floor_k != -1:
+                glUniform1f(self._u_thermal_floor_k, self._thermal_floor_k)
 
     def _upload_point_lights(self, mv_mat: "np.ndarray | None" = None) -> None:
         n = int(min(100, self._light_pos.shape[0]))

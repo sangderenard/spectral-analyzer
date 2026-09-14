@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Compiled base material WebGL check</title>
+<pre id="result">checking…</pre>
+<script type="module">
+const result = document.querySelector("#result");
+const gl = document.createElement("canvas").getContext("webgl2");
+if (!gl) {
+  result.textContent = "FAIL: WebGL2 unavailable";
+  throw new Error(result.textContent);
+}
+const [vertexSource, fragmentSource] = await Promise.all([
+  fetch("../csrc/shaders/generated/base_material.webgl.vert.glsl").then(r => r.text()),
+  fetch("../csrc/shaders/generated/base_material.webgl.frag.glsl").then(r => r.text()),
+]);
+function compile(stage, source) {
+  const shader = gl.createShader(stage);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(shader));
+  }
+  return shader;
+}
+try {
+  const program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, vertexSource));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fragmentSource));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(program));
+  }
+  result.textContent = [
+    "PASS: compiled and linked in WebGL2",
+    `fragment texture units: ${gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS)}`,
+    `fragment uniform vectors: ${gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECTORS)}`,
+  ].join("\n");
+} catch (error) {
+  result.textContent = `FAIL: ${error.message}`;
+  console.error(error);
+}
+</script>

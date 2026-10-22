@@ -240,6 +240,72 @@ def test_pool_rejects_stale_frequency_grid_duplicate_and_capacity_errors():
     assert different_frequency != key
 
 
+@pytest.mark.parametrize(
+    "rejected_event",
+    [
+        "undeclared-contribution",
+        "wrong-grid",
+        "incompatible-basis",
+        "undeclared-completion",
+    ],
+)
+def test_rejected_new_key_does_not_consume_pool_capacity(rejected_event: str):
+    pool = CoherentReceptionPool(
+        _descriptor(capacity=1), state_generation=7, destination_basis=_basis()
+    )
+    rejected_key = _key(coherence=41)
+    if rejected_event == "undeclared-contribution":
+        event = _contribution(rejected_key, 99, [[1.0, 0.0]])
+        expected_error = "undeclared predecessor"
+    elif rejected_event == "wrong-grid":
+        event = _contribution(rejected_key, 11, [[1.0, 0.0]], grid_id=9)
+        expected_error = "grid"
+    elif rejected_event == "incompatible-basis":
+        event = _contribution(
+            rejected_key,
+            11,
+            [[1.0, 0.0]],
+            basis=TransverseBasis(
+                s=np.asarray((1.0, 0.0, 0.0)),
+                p=np.asarray((0.0, 0.0, 1.0)),
+                k=np.asarray((0.0, -1.0, 0.0)),
+            ),
+        )
+        expected_error = "same propagation direction"
+    else:
+        event = OpticalCompletionCredit(rejected_key, 99)
+        expected_error = "undeclared predecessor"
+
+    with pytest.raises(ValueError, match=expected_error):
+        if isinstance(event, OpticalCompletionCredit):
+            pool.complete(event)
+        else:
+            pool.accept(event)
+
+    valid_key = _key(coherence=42)
+    pool.accept(_contribution(valid_key, 11, [[1.0, 0.0]]))
+    pool.accept(_contribution(valid_key, 17, [[1.0, 0.0]]))
+    assert _close(pool, valid_key).report.accepted_contributions == 2
+
+
+def test_rejected_event_preserves_existing_key_state():
+    key = _key()
+    pool = CoherentReceptionPool(
+        _descriptor(capacity=1), state_generation=7, destination_basis=_basis()
+    )
+    pool.accept(_contribution(key, 11, [[1.0, 0.0]]))
+
+    with pytest.raises(ValueError, match="undeclared predecessor"):
+        pool.accept(_contribution(key, 99, [[9.0, 0.0]]))
+    with pytest.raises(ValueError, match="undeclared predecessor"):
+        pool.complete(OpticalCompletionCredit(key, 99))
+
+    pool.accept(_contribution(key, 17, [[1.0, 0.0]]))
+    closed = _close(pool, key)
+    assert closed.report.accepted_contributions == 2
+    np.testing.assert_array_equal(closed.reduced_field, [[2.0, 0.0]])
+
+
 @pytest.mark.parametrize("lanes", [1, 3, 4, 8, 16, 32])
 @pytest.mark.parametrize(
     "mode",

@@ -73,19 +73,24 @@ own transport algorithms.
 Nodus supplies the general process substrate. The relevant implemented code is
 not the stale preliminary FIFO document:
 
-- `include/inl/table_abi_core.inl` implements `EdgeTensorFifo`;
+- `include/edge_tensor_fifo.h` owns the extracted `EdgeTensorFifo`
+  implementation;
+- `include/edge_tensor_fifo_transaction.h` owns its versioned transaction
+  snapshot format;
+- `include/nodus_runtime_abi.h` and `src/runtime/edge_runtime_abi.cpp` expose a
+  runtime-only C ABI around one FIFO edge;
 - `include/inl/table_abi_edge_io.inl` and `include/table_abi.h` expose its
-  operations;
+  operations through the legacy table ABI;
 - `include/thread_manager.h` and `src/thread_manager.cpp` implement scheduled
   and free-spinning module execution;
 - the sparse graph, tensor abstraction, pools, scatter/gather, and dyadic
   kernels supply the broader dataflow substrate.
 
-The current Nodus build couples these facilities to canvas, SDL, typography,
-and other coordinator code. Direct optical integration should follow a
-runtime-only extraction with a narrow C/C++ ABI. The optical repository must
-not copy the manager or link the entire presentation stack merely to obtain
-one FIFO.
+The one-edge transport and transaction boundary has been extracted without a
+parallel FIFO implementation. The larger graph/process manager remains coupled
+to canvas, SDL, typography, and other coordinator code. Direct optical
+integration should widen the narrow runtime ABI instead of copying the manager
+or linking the entire presentation stack merely to obtain an edge queue.
 
 Nodus currently has substantial unrelated working-tree changes. Optical work
 must not edit, clean, reset, or vendor that tree as an incidental step.
@@ -352,7 +357,8 @@ The audit corrected four concrete boundary problems:
    unrelated components remain concurrent and unrelated linear chains retain
    their cached fast path.
 
-Validated at this cut:
+Historical validation receipt at this cut (not re-executed by later
+documentation-only reconciliations):
 
 - native extension rebuilt from `csrc_build`;
 - 94 optical graph/component/native T4 tests passed;
@@ -384,19 +390,32 @@ Not yet correctness-qualified:
 
 ### Phase B: extract Nodus runtime services
 
-- create a runtime-only Nodus library/target;
-- expose typed sparse graph, `EdgeTensorFifo`, tensor handles/pools,
-  ready-frontier scheduling, SCC policy callbacks, quiescence, and accounting;
-- add ABI/version negotiation;
+- **Landed for one edge:** the runtime-only Nodus target exposes
+  `EdgeTensorFifo`, lossless byte transport, reader-frontier quiescence, and
+  versioned transaction snapshots without the canvas/table presentation stack;
+- still extract the typed sparse graph, tensor handles/pools, domain-neutral
+  process callbacks, ready-frontier scheduling, SCC policy callbacks, and
+  process-level accounting;
+- add general ABI/version negotiation beyond the qualified one-edge contract;
 - do not pull UI or SDL dependencies into the optical engine.
 
 ### Phase C: token/FIFO qualification
 
-- round-trip `OpticalBranchToken` without reinterpretation or stride changes;
-- test full, backpressure, cancellation, restart, stale handle, and explicit
-  lossy-preview behavior;
+- **Landed for `OpticalReceptionToken` only:** the focused integration source
+  covers exact 96-byte reception-token round-trip, two-reader slowest-reader
+  backpressure, transaction-frontier restore, and extracted/legacy snapshot
+  parity;
+- still round-trip `OpticalBranchToken` without reinterpretation or stride
+  changes; the reception-token coverage is not branch-token qualification;
+- still qualify the branch path's full, cancellation, restart, stale-handle,
+  and explicit lossy-preview behavior;
 - compare ordered and shuffled acyclic execution;
 - require identical physical products within declared numerical tolerances.
+
+The focused reception tests require `NODUS_RUNTIME_LIBRARY` or the expected
+Windows `nodus_runtime.dll`; parity additionally requires the legacy
+`canvas_tables.dll`. Their presence in the source tree does not establish that
+they pass on every host or that arbitrary Nodus ABI versions are supported.
 
 ### Phase D: Nodus-driven optical process loop
 

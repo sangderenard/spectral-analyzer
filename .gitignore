@@ -39,3 +39,6 @@ csrc_build/
 
 # Runtime logs
 *.log
+
+# The native kernel build configuration is source, not a text artifact.
+!csrc/CMakeLists.txt

@@ -32,6 +32,10 @@
  *   uLightColor[N]    — linear sRGB colour per light (no clamp)
  *   uLightIntensity[N]— scalar gain per light
  *   uLightGroupId[N]  — emitting group id; matching fragments skip that light
+ *   uLightSpotDir[N]  — view-space unit direction a SPOT light faces; zero
+ *                       (the default, never set) = an omnidirectional point light
+ *   uLightSpotCone[N] — (cos inner half-angle, cos outer half-angle): full
+ *                       light inside the inner cone, smoothly none past the outer
  *
  * There is no global scene tint or hardcoded sun. The material's bounded
  * Phong ambient term is treated as an authored indirect-light floor so shadow
@@ -152,6 +156,8 @@ uniform vec3  uLightPos      [MAX_LIGHTS];   // view-space emitter position
 uniform vec3  uLightColor    [MAX_LIGHTS];   // linear sRGB
 uniform float uLightIntensity[MAX_LIGHTS];
 uniform int   uLightGroupId  [MAX_LIGHTS];
+uniform vec3  uLightSpotDir  [MAX_LIGHTS];   // view-space spot direction (zero: point light)
+uniform vec2  uLightSpotCone [MAX_LIGHTS];   // cos(inner), cos(outer) half-angles
 uniform float uLightCalibration = 1.0;
 uniform mat3  uCatCcmMatrix = mat3(1.0);
 uniform float uExposure = 0.28;
@@ -315,6 +321,12 @@ void main() {
         float emitter_r2 = max(uLightIntensity[i], 0.0) * 0.0795774715; // area / (4*pi)
         float atten_r2 = max(Lr2 + emitter_r2, 1e-8);
         vec3  Lcol  = uLightColor[i] * ((uLightIntensity[i] * uLightCalibration) / atten_r2);
+        // Spot cone: a light with a direction lights only the fragments inside
+        // its cone, fading across the edge between the inner and outer angles.
+        if (dot(uLightSpotDir[i], uLightSpotDir[i]) > 0.25) {
+            float cos_a = dot(-L, normalize(uLightSpotDir[i]));
+            Lcol *= smoothstep(uLightSpotCone[i].y, uLightSpotCone[i].x, cos_a);
+        }
         vec3  H     = normalize(L + V);
         float NdotL = max(dot(N, L), 0.0);
         float NdotH = max(dot(N, H), 0.0);

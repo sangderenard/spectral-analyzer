@@ -40,6 +40,14 @@ float turing_ssbo_load_texstack(int index) {
     return texelFetch(turing_ssbo_texstack, coordinate, 0).r;
 }
 
+uniform highp sampler2D turing_ssbo_thermal_k;
+float turing_ssbo_load_thermal_k(int index) {
+    ivec2 extent = textureSize(turing_ssbo_thermal_k, 0);
+    int safe_index = max(index, 0);
+    ivec2 coordinate = ivec2(safe_index % extent.x, safe_index / extent.x);
+    return texelFetch(turing_ssbo_thermal_k, coordinate, 0).r;
+}
+
 #line 2
 /**
  * base_material.frag.glsl
@@ -74,11 +82,14 @@ float turing_ssbo_load_texstack(int index) {
  *   uLightColor[N]    — linear sRGB colour per light (no clamp)
  *   uLightIntensity[N]— scalar gain per light
  *   uLightGroupId[N]  — emitting group id; matching fragments skip that light
+ *   uLightSpotDir[N]  — view-space unit direction a SPOT light faces; zero
+ *                       (the default, never set) = an omnidirectional point light
+ *   uLightSpotCone[N] — (cos inner half-angle, cos outer half-angle): full
+ *                       light inside the inner cone, smoothly none past the outer
  *
- * There is NO ambient, NO scene tint, NO proxy bounce, NO hardcoded sun.
- * Every photon comes from a real emitter pushed in by the host.  A non-
- * emissive surface in a scene with zero lights renders pure black — that
- * is physically correct for this engine.
+ * There is no global scene tint or hardcoded sun. The material's bounded
+ * Phong ambient term is treated as an authored indirect-light floor so shadow
+ * structure remains legible; all direct illumination comes from host emitters.
  */
 
 /* ── Material SSBOs ───────────────────────────────────────────────────────── */
@@ -110,6 +121,30 @@ float turing_ssbo_load_texstack(int index) {
 // [8] emit_gain [9] color_blend [10] direct_lobe_power [11] model_flags_or_indices
 // [12] remit_gain [13] remit_attack [14] remit_decay [15] translucence_gain
 // project IR lowered std430 binding 15 (TextureStackChunk.texstack) to turing_ssbo_texstack
+
+// ThermalChunk (1 float per thermal id): a surface temperature in kelvin,
+// indexed by the vertex's own aGroupId. When uThermalEmission is on and
+// the id is > 0, the fragment self-emits a Planck blackbody at that
+// temperature (three visible bands) -- the host uploads kelvins, nothing
+// else; colour, brightness and the visible floor are all evaluated here.
+// project IR lowered std430 binding 16 (ThermalChunk.thermal_k) to turing_ssbo_thermal_k
+uniform bool  uThermalEmission;
+uniform float uThermalGain;    // red-band radiance at uThermalRefK, in scene light units
+uniform float uThermalRefK;
+uniform float uThermalFloorK;   // below this the visible-band radiance is negligible
+
+float planck_rel(float lambda_um, float t_k) {
+    float x = 14387.77 / (lambda_um * t_k);
+    if (x > 80.0) return 0.0;
+    return 1.0 / (pow(lambda_um, 5.0) * (exp(x) - 1.0));
+}
+
+vec3 thermal_emission(float t_k) {
+    if (t_k < uThermalFloorK) return vec3(0.0);
+    float ref = planck_rel(0.610, uThermalRefK);
+    vec3 e = vec3(planck_rel(0.610, t_k), planck_rel(0.550, t_k), planck_rel(0.465, t_k)) / max(ref, 1e-30);
+    return min(e * uThermalGain, vec3(1000.0));
+}
 
 /* ── Accessors ────────────────────────────────────────────────────────────── */
 
@@ -171,8 +206,23 @@ uniform vec3  uLightPos      [MAX_LIGHTS];   // view-space emitter position
 uniform vec3  uLightColor    [MAX_LIGHTS];   // linear sRGB
 uniform float uLightIntensity[MAX_LIGHTS];
 uniform int   uLightGroupId  [MAX_LIGHTS];
+uniform vec3  uLightSpotDir  [MAX_LIGHTS];   // view-space spot direction (zero: point light)
+uniform vec2  uLightSpotCone [MAX_LIGHTS];   // cos(inner), cos(outer) half-angles
 uniform float uLightCalibration;
 uniform mat3  uCatCcmMatrix;
+uniform float uExposure;
+
+// Optional first-key depth shadow. Native hosts that do not define
+// PLUCK_SHADOW_MAP retain the original ABI; WebGL adapters can opt in and
+// provide the depth pre-pass without forking the material equations.
+#ifdef PLUCK_SHADOW_MAP
+uniform sampler2DArray uShadowMaps;
+uniform bool uShadowEnabled;
+uniform int uShadowLightCount;
+uniform mat4 uShadowMatrices[8];
+uniform vec2 uShadowTexelSize;
+uniform float uShadowBias;
+#endif
 
 // ── UV emission/depth/remit texture stack (Stage 2 of the action plan) ─────
 // Channel layout per UV_EMISSION_STACK_PLAN.md:
@@ -210,6 +260,29 @@ vec3 thin_film_fringe(float opd_nm) {
         0.5 + 0.5 * cos(f - 4.18879020)
     );
 }
+
+#ifdef PLUCK_SHADOW_MAP
+float light_shadow_visibility(int light_index, vec3 N, vec3 L) {
+    if (!uShadowEnabled || light_index >= uShadowLightCount) return 1.0;
+    vec4 shadow_coord = uShadowMatrices[light_index] * vec4(vPosObj, 1.0);
+    vec3 projected = shadow_coord.xyz / max(shadow_coord.w, 1e-6);
+    projected = projected * 0.5 + 0.5;
+    if (projected.z <= 0.0 || projected.z >= 1.0 ||
+        projected.x <= 0.0 || projected.x >= 1.0 ||
+        projected.y <= 0.0 || projected.y >= 1.0) return 1.0;
+    float bias = max(uShadowBias * (1.0 - max(dot(N, L), 0.0)), uShadowBias * 0.25);
+    float visible = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            float depth = texture(uShadowMaps, vec3(
+                projected.xy + vec2(float(x), float(y)) * uShadowTexelSize,
+                float(light_index))).r;
+            visible += projected.z - bias <= depth ? 1.0 : 0.0;
+        }
+    }
+    return 0.18 + 0.82 * visible / 9.0;
+}
+#endif
 
 /* ── Main ─────────────────────────────────────────────────────────────────── */
 
@@ -284,7 +357,7 @@ void main() {
     vec3  F_vec  = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
 
     // Direct illumination from real emitters only.
-    vec3 col = vec3(0.0);
+    vec3 col = base * clamp(ph_ambient(id), 0.0, 0.12);
     vec3 spec_col_acc = vec3(0.0);
     float spec_acc = 0.0;
     int n = min(uNumLights, MAX_LIGHTS);
@@ -298,19 +371,29 @@ void main() {
         float emitter_r2 = max(uLightIntensity[i], 0.0) * 0.0795774715; // area / (4*pi)
         float atten_r2 = max(Lr2 + emitter_r2, 1e-8);
         vec3  Lcol  = uLightColor[i] * ((uLightIntensity[i] * uLightCalibration) / atten_r2);
+        // Spot cone: a light with a direction lights only the fragments inside
+        // its cone, fading across the edge between the inner and outer angles.
+        if (dot(uLightSpotDir[i], uLightSpotDir[i]) > 0.25) {
+            float cos_a = dot(-L, normalize(uLightSpotDir[i]));
+            Lcol *= smoothstep(uLightSpotCone[i].y, uLightSpotCone[i].x, cos_a);
+        }
         vec3  H     = normalize(L + V);
         float NdotL = max(dot(N, L), 0.0);
         float NdotH = max(dot(N, H), 0.0);
         float spec  = pow(NdotH, max(shini, 1.0));
+        float visibility = 1.0;
+#ifdef PLUCK_SHADOW_MAP
+        visibility = light_shadow_visibility(i, N, L);
+#endif
 
-        col += base * Lcol * NdotL;
+        col += base * Lcol * NdotL * visibility;
 
         if (uEnableSpecular) {
-            col += Lcol * F_vec * (specstr * spec);
+            col += Lcol * F_vec * (specstr * spec) * visibility;
         }
 
-        spec_col_acc += Lcol * spec;
-        spec_acc     += spec;
+        spec_col_acc += Lcol * spec * visibility;
+        spec_acc     += spec * visibility;
     }
 
     // ── Translucence (profiles 0/1: minimal; profile 2 = SSS: 4× scale) ─
@@ -349,6 +432,11 @@ void main() {
     }
 
     col += emit_out;
+
+    // ── Thermal self-emission off the ThermalChunk SSBO ──────────────────
+    if (uThermalEmission && vGroupId > 0) {
+        col += thermal_emission(turing_ssbo_load_thermal_k(int(vGroupId)));
+    }
 
     // Profile 3: frosted scatter — add diffuse halo from emission luminance
     if (profile_id == 3 && scatter_mask > 0.001) {
@@ -393,7 +481,11 @@ void main() {
     if (uRenderPass == 1 && alpha < 0.85) discard;
     if (uRenderPass == 2 && alpha >= 0.85) discard;
 
-    vec3 lin = max(col, vec3(0.0));
+    vec3 lin = max(col, vec3(0.0)) * max(uExposure, 0.0);
+    // ACES approximation keeps energetic emitters colourful while preserving
+    // nearby surface gradients instead of clipping entire regions to white.
+    lin = clamp((lin * (2.51 * lin + 0.03)) /
+                (lin * (2.43 * lin + 0.59) + 0.14), 0.0, 1.0);
     vec3 s1 = lin * 12.92;
     vec3 s2 = 1.055 * pow(lin, vec3(1.0 / 2.4)) - 0.055;
     vec3 srgb = mix(s1, s2, step(vec3(0.0031308), lin));

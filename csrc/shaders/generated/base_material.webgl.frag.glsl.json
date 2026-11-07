@@ -523,7 +523,7 @@
         ],
         "source_lines": [
           276,
-          534
+          541
         ],
         "stage": "fragment"
       }
@@ -972,14 +972,14 @@
         "return_type": "void",
         "source_lines": [
           276,
-          534
+          541
         ]
       }
     ],
-    "line_count": 535,
+    "line_count": 542,
     "schema": "turing.glsl-project-ir.v1",
     "source_name": "base_material_fragment",
-    "source_sha256": "c3ebc4764342bb0691bb48c5cedc3475efdb86bf4a96f7e0a11cb94441c7f04d",
+    "source_sha256": "78397ec38607f0991026c9cd5878d9fb7aa751797c4e986acc35154b79642034",
     "stage_hint": "fragment",
     "stage_inputs": [
       "vNormV",

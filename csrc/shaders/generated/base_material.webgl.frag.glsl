@@ -142,7 +142,7 @@ float turing_ssbo_load_thermal_k(int index) {
 // TextureStackRecord (16 floats)
 // [0] emit_uv_layer  [1] color_uv_layer  [2] depth_uv_layer  [3] remit_uv_layer
 // [4] depth_scale_mm [5] thickness_scale_mm [6] depth_bias_mm [7] thickness_bias_mm
-// [8] emit_gain [9] color_blend [10] direct_lobe_power [11] model_flags_or_indices
+// [8] emit_gain [9] color_blend [10] direct_lobe_power [11] model_flags_or_indices (low byte: profile; bit 8: emission through the colour layer)
 // [12] remit_gain [13] remit_attack [14] remit_decay [15] translucence_gain
 // project IR lowered std430 binding 15 (TextureStackChunk.texstack) to turing_ssbo_texstack
 
@@ -356,9 +356,13 @@ void main() {
 
     // Color UV override
     float color_layer = tx_color_layer(id);
+    // the colour layer as a FILM over the emission (model flag bit 8, see below): white where no layer applies
+    vec3 film = vec3(1.0);
     if (color_layer >= 0.0) {
         vec4 c_uv = texture(uColorUv, vec3(vUv, color_layer));
-        albedo = mix(albedo, c_uv.rgb, clamp(c_uv.a * tx_color_blend(id), 0.0, 1.0));
+        float c_w = clamp(c_uv.a * tx_color_blend(id), 0.0, 1.0);
+        albedo = mix(albedo, c_uv.rgb, c_w);
+        film = mix(vec3(1.0), c_uv.rgb, c_w);
     }
 
     // Depth UV — all four channels read up-front so profile 3 can pre-modify specular
@@ -485,6 +489,9 @@ void main() {
                    ? texture(uEmitUv, vec3(vUv, emit_layer))
                    : vec4(0.0, 1.0, 0.5, 1.0);
     vec3  emit_dim = emission * (e_uv.a * tx_emit_gain(id));
+    // Model flag bit 8 (value 256, above the profile byte): EMISSION THROUGH THE FILM -- the surface's own light leaves
+    // through its colour layer, tinted by it (a backlit transparency).  Off for every material that does not set it.
+    if (((int(tx_model_flags(id)) >> 8) & 1) == 1) emit_dim *= film;
     vec3  spec_dir = (spec_acc > 0.0) ? (spec_col_acc / spec_acc) : vec3(0.0);
 
     // Profile 1: forward-emission cone shaped by NdotV^lobe_p

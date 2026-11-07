@@ -87,6 +87,30 @@ float turing_ssbo_load_thermal_k(int index) {
  *   uLightSpotCone[N] — (cos inner half-angle, cos outer half-angle): full
  *                       light inside the inner cone, smoothly none past the outer
  *
+ * Optional variant PLUCK_TRANSMISSION (a #define the host adds, compiled as a
+ * second program; without it this file is the original shader, byte for byte
+ * in behaviour). It turns on the three material fields the tables always carried
+ * but the base program never read:
+ *   transmission (PBR record, float 5) lights on the far side of the surface reach the eye
+ *                           through it: tinted by albedo^thickness (Beer-Lambert,
+ *                           albedo = per-mm transmittance, path >= 1 mm), times
+ *                           (1 - Fresnel), a diffuse part (roughness) plus a
+ *                           forward lobe (1 - roughness) at the Phong shininess.
+ *                           Alpha is capped at 1 - 0.8 * transmission (the
+ *                           pre-archive rule) so a transmissive surface never
+ *                           hides what is behind it more than that.
+ *   translucence (texstack 15)  thickness_mm * gain * mask * (0.02, profile 2: 0.08)
+ *                           is the fraction of back-lighting that scatters
+ *                           through the body (base-tinted), per light behind the
+ *                           surface, instead of a constant light-free glow.
+ *   remit (texstack 3,12,13,14) re-emission of absorbed light: steady state
+ *                           gain * mask(uRemitUv.a at layer) * albedo * absorbed
+ *                           irradiance. Attack/decay (texstack 13, 14) shape only
+ *                           the transient; the base renderers keep no per-material
+ *                           state texture, so they do not enter here.
+ * Light leaving the body this way is composited additively over what is behind
+ * (alpha is raised just enough to carry it), not scaled by the surface's alpha.
+ *
  * There is no global scene tint or hardcoded sun. The material's bounded
  * Phong ambient term is treated as an authored indirect-light floor so shadow
  * structure remains legible; all direct illumination comes from host emitters.
@@ -284,6 +308,19 @@ float light_shadow_visibility(int light_index, vec3 N, vec3 L) {
 }
 #endif
 
+#ifdef PLUCK_TRANSMISSION
+// The same exposure / ACES / sRGB encode as the end of main(), for light that
+// leaves the body and is composited on its own.
+vec3 pluck_display(vec3 c) {
+    vec3 lin = max(c, vec3(0.0)) * max(uExposure, 0.0);
+    lin = clamp((lin * (2.51 * lin + 0.03)) /
+                (lin * (2.43 * lin + 0.59) + 0.14), 0.0, 1.0);
+    vec3 s1 = lin * 12.92;
+    vec3 s2 = 1.055 * pow(lin, vec3(1.0 / 2.4)) - 0.055;
+    return mix(s1, s2, step(vec3(0.0031308), lin));
+}
+#endif
+
 /* ── Main ─────────────────────────────────────────────────────────────────── */
 
 void main() {
@@ -356,6 +393,18 @@ void main() {
     vec3 F0 = mix(vec3(ior_f0), albedo, metallic);
     vec3  F_vec  = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
 
+#ifdef PLUCK_TRANSMISSION
+    float m_trans   = clamp(mat_trans(id), 0.0, 1.0);
+    float m_rough   = clamp(mat_roughness(id), 0.0, 1.0);
+    float tl_scale  = (profile_id == 2) ? 0.08 : 0.02;
+    float tl_frac   = min(max(0.0, thickness_mm) * tx_translucence_gain(id) * translucence_mask * tl_scale, 1.0);
+    float remit_g   = max(0.0, tx_remit_gain(id));
+    bool  use_tr    = (m_trans > 0.0) || (tl_frac > 0.0) || (remit_g > 0.0);
+    vec3  tr_acc    = vec3(0.0);   // radiance from lights behind the surface, through the body
+    vec3  sss_acc   = vec3(0.0);   // back-lighting scattered by the body
+    vec3  remit_acc = vec3(0.0);   // irradiance the body absorbs and re-emits
+#endif
+
     // Direct illumination from real emitters only.
     vec3 col = base * clamp(ph_ambient(id), 0.0, 0.12);
     vec3 spec_col_acc = vec3(0.0);
@@ -394,12 +443,41 @@ void main() {
 
         spec_col_acc += Lcol * spec * visibility;
         spec_acc     += spec * visibility;
+
+#ifdef PLUCK_TRANSMISSION
+        if (use_tr) {
+            float back = max(-dot(N, L), 0.0);
+            if (back > 0.0) {
+                float fwd = pow(max(dot(-L, V), 0.0), max(shini, 1.0));
+                tr_acc  += Lcol * ((back * m_rough + fwd * (1.0 - m_rough)) * m_trans);
+                sss_acc += Lcol * back;
+            }
+            if (remit_g > 0.0) {
+                remit_acc += Lcol * abs(dot(N, L));
+            }
+        }
+#endif
     }
 
+#ifdef PLUCK_TRANSMISSION
+    // ── Light leaving the body: transmission, translucence, remit ───────────
+    vec3 col_t = vec3(0.0);
+    if (use_tr) {
+        vec3 T = pow(max(albedo, vec3(1e-3)), vec3(max(thickness_mm, 1.0)));
+        col_t = T * (vec3(1.0) - F_vec) * tr_acc;
+        col_t += base * sss_acc * tl_frac;
+        if (remit_g > 0.0) {
+            float remit_layer = tx_remit_layer(id);
+            float remit_mask = (remit_layer >= 0.0) ? texture(uRemitUv, vec3(vUv, remit_layer)).a : 1.0;
+            col_t += albedo * remit_acc * (remit_g * remit_mask);
+        }
+    }
+#else
     // ── Translucence (profiles 0/1: minimal; profile 2 = SSS: 4× scale) ─
     float t_scale = (profile_id == 2) ? 0.08 : 0.02;
     float translucence = max(0.0, thickness_mm) * tx_translucence_gain(id) * translucence_mask;
     col += base * translucence * t_scale;
+#endif
 
     // ── Self-emission via UV texture-pack ────────────────────────────────
     float emit_layer = tx_emit_layer(id);
@@ -478,6 +556,9 @@ void main() {
 
     // ── Opacity ────────────────────────────────────────────────────────────
     float alpha = opacity;
+#ifdef PLUCK_TRANSMISSION
+    if (m_trans > 0.0) alpha = min(opacity, 1.0 - 0.8 * m_trans);
+#endif
     if (uRenderPass == 1 && alpha < 0.85) discard;
     if (uRenderPass == 2 && alpha >= 0.85) discard;
 
@@ -489,5 +570,15 @@ void main() {
     vec3 s1 = lin * 12.92;
     vec3 s2 = 1.055 * pow(lin, vec3(1.0 / 2.4)) - 0.055;
     vec3 srgb = mix(s1, s2, step(vec3(0.0031308), lin));
+#ifdef PLUCK_TRANSMISSION
+    if (use_tr) {
+        // out = alpha * surface + light_t + (1 - alpha) * behind: raise alpha only
+        // as far as the body's own light needs, and fold the light into colour.
+        vec3 st = pluck_display(uCatCcmMatrix * col_t);
+        float a_t = max(alpha, min(1.0, max(st.r, max(st.g, st.b))));
+        srgb = min((srgb * alpha + st) / max(a_t, 1e-4), vec3(1.0));
+        alpha = a_t;
+    }
+#endif
     FragColor = vec4(srgb, alpha);
 }

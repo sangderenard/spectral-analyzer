@@ -2,11 +2,16 @@
 
 ## Current result
 
-The existing Spectral renderers have the required refraction and camera/light
-transport machinery. There is **no validated cheap still-image path for the
-current Meowdoku marble scene yet**. The Meowdoku designer still renders with
-its Pluck Phong shader. Do not display a synthetic or zero-valued image as a
-ray-traced preview.
+The existing Spectral GLSL sensor now has a validated **256×256 monochrome
+thin-lens glass/checker still** on the local RTX 3060. Three BK7 closed spheres
+visibly bend a checker; the same geometry made opaque leaves a dark occlusion.
+The production scene builder also accepts arbitrary saved Studio triangles
+and their exact edited PBR16 table through
+`append_saved_studio_mesh_to_gpu_scene()`. This has been GPU-tested with the
+three-sphere mesh, not yet with a full final Studio die/cat-eye mesh. The
+Meowdoku designer still renders with its Pluck Phong shader: there is no
+server endpoint, progressive client overlay, or verified caustic photo yet.
+Do not display a synthetic or zero-valued image as a ray-traced preview.
 
 ## Existing faculties and the relevant route
 
@@ -53,6 +58,46 @@ are 450/550/650 nm and BK7 486.1327/587.5618/656.2725 nm (`fixed:3`).
 The transport contract and exact frequency set belong in the scene digest.
 
 ## Bounded measurements
+
+### GLSL proof, 2026-11-07
+
+`demo_pluck_gl._ensure_worker_gl_context()` created an OpenGL 4.3 NVIDIA RTX
+3060 context in the server process. The canonical `build_gpu_scene()` packed
+the 4×4 authored emissive checker target, physical camera geometry, one fixed
+587.5618 nm material lane, and three closed BK7 spheres. The actual
+`SensorAccumulator` analytical thin-lens shader used a 5 mm aperture, 23 cm
+focus distance, 20° FOV, four bounces, and a 256×256 film. The film eye was
+placed at z=7 cm in front of the demo doublet, so the **analytical thin lens**
+formed the image while the physical demo lens stayed behind the eye. This
+avoids compounding two lens models in the preview proof.
+
+128 bounded epochs dispatched 1,048,576 forward ray jobs and 524,288 sensor
+sites in 8–9 seconds. The no-sphere target is a readable checker. The glass
+spheres show shifted and inverted bright squares within their silhouettes;
+the opaque spheres show a dark blocking shape. At equal exposure the central
+ROI mean sensor value was 8.20 through glass versus 0.223 through opaque
+(~36.8×). These are direct sensor signals, not a synthetic image blend. The
+GPU adapter path using the PBR-derived material records also completed in
+8.3 seconds with the same refracted checker. Images are local diagnostic
+artifacts under `build/marble_ray_probe/`:
+
+* `gl_lens_qr_epoch127.png` — empty checker.
+* `gl_lens_sphere_qr_epoch127.png` — three transparent spheres.
+* `gl_lens_opaque_qr_epoch127.png` — same opaque geometry.
+
+The previous forward-field-only target appeared as sparse bright clusters:
+the backward sensor shader sampled forward volume energy but did not add
+direct radiance at an authored emissive surface. `demo_pluck_gl.py` now uses
+the existing `MAT_FLAG_EMISSIVE`/`TriShade` emission contract at the sensor
+hit. `scene_builder.py` adds `checker_target` with optional `emissive` white
+squares. Both were tested on the GPU and committed as `de1cff4`.
+
+The stills prove refraction, not caustics. Existing `SensorAccumulator`
+surface emission is scalar for this one-line preview and its alpha channel
+is a presence mask, while RGB accumulates exposure. No spectral color,
+photo-calibrated exposure, or physical surface caustic measurement is implied.
+
+### Earlier native probes
 
 The probe used a single emissive quad, an optional closed octahedral glass
 solid, three optical frequency bands, a 16×16 sensor, and four bounces.
@@ -138,7 +183,7 @@ It must apply edited PBR parameters and verify their spectral mapping before
 claiming parity; directly passing the exported PBR float texture as a native
 `MatBuf` would be incorrect. A material edit must invalidate accumulation.
 
-There is a concrete glass mismatch to resolve first. `build_mat_buf()` maps
+There is a concrete glass mismatch to resolve. `build_mat_buf()` maps
 a PBR-only material's **albedo luminance** to spectral reflection and clips
 transmission to the remaining budget. Meowdoku `marble_clear_glass` has high
 PBR albedo (~0.93–1.0), so that fallback reflects nearly all rays despite
@@ -167,21 +212,37 @@ that the current BDPT job completes cheaply.
 
 ## Next gate
 
-First run the existing GLSL `SensorAccumulator` on a small **known-good**
-glass/checker scene in a server-owned OpenGL compute context, fixed at one
-587.5618 nm line, a nonzero aperture, finite focus distance, low sensor
-resolution, bounded forward `budget_ms` and backward `rows_per_frame`, and
-continuous exposure. Confirm nonzero, changing refraction behind the glass
-before adding marble geometry. The current demo does not expose a headless
-still-image service for that path; its scene SSBO builder and sensor texture
-readback must be used directly, without a new tracer.
+Use `append_saved_studio_mesh_to_gpu_scene()` on the **final saved** Studio
+`lastGeometry.interior` and `.glass` faces, not a regenerated sphere. The
+receiver takes `(triangles,3,3)` positions in normalized Studio units,
+`(triangles,)` MaterialDatabase IDs, and the exact edited `(materials,16)`
+PBR table. It scales/places these triangles in the optical scene, omits only
+zero-area faces, derives the legacy ray sink from the same
+`MaterialDatabase`, and rebuilds the canonical `MatBuf` at the fixed line.
+The current sensor has one face normal per triangle, so smooth per-vertex
+normal interpolation is not yet in this optical route. Verify the resulting
+die relief, inclusion, and shell against the Phong view.
 
-In parallel, diagnose the native BDPT stall on a small known-good scene with
+Then add a server-owned worker using the already-proven OpenGL context,
+`build_gpu_scene()`, `_build_gpu_bvh()`, `_gpu_ray_field_prebuilt()`,
+`_gpu_pump_prebuilt()`, and `SensorAccumulator.tick()`. Trigger it for an
+explicitly saved/stable design, cache scene preparation by the complete
+geometry+material+camera+light+optics digest, and accumulate for at most
+**600 seconds** on the local RTX 3060. Publish early and periodic images with
+elapsed seconds, forward ray jobs, and sensor sample sites. A digest change
+must cancel the old process and invalidate old images; the client keeps the
+Phong scene interactive and rejects stale image responses. Do not eagerly
+compile Wasm for this preview. Preparation should stay short and cached;
+the ten-minute budget is for the **photo exposure**, not a compile.
+
+The existing sampler has pupil sampling and a row/center-priority mode;
+record the ray/sample allocation and identical exposure controls for glass,
+opaque, and empty comparisons. Prefer source aiming and the authored
+emissive checker over more uniform rays that miss the useful scene. Do not
+claim caustics until a controlled lit-floor pattern or energy concentration
+appears in the photo.
+
+Separately, diagnose the native BDPT stall on a small known-good scene with
 an external process timeout and collect `get_bdpt_latch_state()`,
 `get_bdpt_overflow()`, `pipeline_stats()`, and image statistics. Fix the
 lifecycle or budget in Spectral itself before using native BDPT as preview.
-Then add the marble scene adapter and compare a clear shell, a dyed
-inclusion, and checkerboard refraction against the Phong view.
-Only after a nonzero, timely optical image is demonstrated should Meowdoku
-add background job endpoints and an overlay. Keep the Phong scene interactive
-throughout accumulation and label the ray sample count and transport mode.

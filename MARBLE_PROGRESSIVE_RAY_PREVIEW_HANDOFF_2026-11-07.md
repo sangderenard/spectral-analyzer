@@ -7,11 +7,13 @@ thin-lens glass/checker still** on the local RTX 3060. Three BK7 closed spheres
 visibly bend a checker; the same geometry made opaque leaves a dark occlusion.
 The production scene builder also accepts arbitrary saved Studio triangles
 and their exact edited PBR16 table through
-`append_saved_studio_mesh_to_gpu_scene()`. This has been GPU-tested with the
-three-sphere mesh, not yet with a full final Studio die/cat-eye mesh. The
-Meowdoku designer still renders with its Pluck Phong shader: there is no
-server endpoint, progressive client overlay, or verified caustic photo yet.
-Do not display a synthetic or zero-valued image as a ray-traced preview.
+`append_saved_studio_mesh_to_gpu_scene()`. This has been GPU-tested with both
+the three-sphere control and a final 97,280-triangle Studio cat-eye mesh.
+Meowdoku now has an explicit saved-object photo panel and a background HTTP
+worker route beside the interactive Pluck Phong view. A temporary local HTTP
+server completed the full upload/status/image path. The live site deployment,
+same-camera Phong registration, and physical caustic photo remain separate
+gates. Do not display a synthetic or zero-valued image as a ray-traced preview.
 
 ## Existing faculties and the relevant route
 
@@ -142,8 +144,34 @@ enforces at most 600 seconds of **exposure** and syncs with the GPU every
 eight epochs to keep wall-clock progress honest. It restarts the 32-bit
 forward light field every 4,096 epochs while keeping the sensor exposure,
 preventing voxel counter overflow during a ten-minute photo. The worker's
-JSON image paths are basenames for the owning server to serve; no Meowdoku
-endpoint or browser overlay is implemented here.
+JSON image paths are basenames for the owning server to serve.
+
+### Temporary saved-object HTTP proof
+
+The Meowdoku `MRP1` endpoint accepted the **actual final 97,280-triangle
+Studio mesh** in a temporary saved-object store; it did not touch the live
+library or server. Its binary request carried all face positions, all
+per-vertex normals, and material IDs. The server recomputed the saved
+object's 76-byte-per-face geometry SHA-256, loaded that object's exact PBR16
+table, wrote the worker NPZ/JSON and returned HTTP 202 with photo digest
+`6faecacbfea578a2bfefc89b1b003f4f5567e3ca73c9992cefc4afa114e189d9`.
+Repeated `GET /api/marble_photo?digest=...` advanced to `complete` without a
+worker error. The worker reported 4.015 seconds of preparation, **2.0 seconds
+of photo exposure**, 1,761,280 forward ray jobs and 3,522,560 sensor sites.
+`GET /api/marble_photo/image?digest=...&name=preview-000215.png` returned HTTP
+200 with a valid 18,708-byte PNG, preserved at
+`build/marble_ray_probe/http_actual_saved_marble.png`. The image shows the
+glass outline, dyed ribbons and checker squares bent through the shell.
+No 10-minute exposure was run. The 600-second cap is a requested exposure
+limit after preparation, not a measured quality or compile time.
+
+The first photo is fixed one-line monochrome at 587.5618 nm. Its default
+stage light is fixed unless the client sends a `lights` config. The photo
+camera is a separate thin-lens pose from Studio's WebGL Phong camera and is
+shown in a separate panel; same-pixel registration or blending over Phong is
+not claimed. The current Spectral sensor shades geometric face normals,
+while the uploaded smooth per-vertex normals only verify saved geometry.
+Caustics, color dispersion and full material/light parity are unverified.
 
 ### Earlier native probes
 
@@ -260,28 +288,20 @@ that the current BDPT job completes cheaply.
 
 ## Next gate
 
-Use `append_saved_studio_mesh_to_gpu_scene()` on the **final saved** Studio
-`lastGeometry.interior` and `.glass` faces, not a regenerated sphere. The
-receiver takes `(triangles,3,3)` positions in normalized Studio units,
-`(triangles,)` MaterialDatabase IDs, and the exact edited `(materials,16)`
-PBR table. It scales/places these triangles in the optical scene, omits only
-zero-area faces, derives the legacy ray sink from the same
-`MaterialDatabase`, and rebuilds the canonical `MatBuf` at the fixed line.
-The current sensor has one face normal per triangle, so smooth per-vertex
-normal interpolation is not yet in this optical route. Verify the resulting
-die relief, inclusion, and shell against the Phong view.
+Run the live or dev Studio page end to end after export and server restart:
+save a design, choose an explicit 30/180/600-second photo exposure, watch
+intermediate images, then edit the design and verify cancellation and digest
+invalidation. The temporary HTTP/GPU run proves the code path but does not
+prove the deployed page. Do not eagerly compile Wasm for this preview.
 
-Then add a server-owned worker using the already-proven OpenGL context,
-`build_gpu_scene()`, `_build_gpu_bvh()`, `_gpu_ray_field_prebuilt()`,
-`_gpu_pump_prebuilt()`, and `SensorAccumulator.tick()`. Trigger it for an
-explicitly saved/stable design, cache scene preparation by the complete
-geometry+material+camera+light+optics digest, and accumulate for at most
-**600 seconds** on the local RTX 3060. Publish early and periodic images with
-elapsed seconds, forward ray jobs, and sensor sample sites. A digest change
-must cancel the old process and invalidate old images; the client keeps the
-Phong scene interactive and rejects stale image responses. Do not eagerly
-compile Wasm for this preview. Preparation should stay short and cached;
-the ten-minute budget is for the **photo exposure**, not a compile.
+For optical fidelity, align the thin-lens photo camera with the Studio WebGL
+camera before offering a registered overlay, use Studio's current stage
+light controls rather than the worker's fixed default, and compare exact
+material responses at the chosen wavelength. The current sensor has one
+geometric face normal per triangle; a per-vertex normal interpolation path
+would be needed to match all Studio Phong smooth transitions. Test a saved
+die with bevel/relief and a designed inclusion, then verify its optical
+view against the Phong shape.
 
 The existing sampler has pupil sampling and a row/center-priority mode;
 record the ray/sample allocation and identical exposure controls for glass,

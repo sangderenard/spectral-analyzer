@@ -71,7 +71,7 @@ placed at z=7 cm in front of the demo doublet, so the **analytical thin lens**
 formed the image while the physical demo lens stayed behind the eye. This
 avoids compounding two lens models in the preview proof.
 
-128 bounded epochs dispatched 1,048,576 forward ray jobs and 524,288 sensor
+128 bounded epochs dispatched 1,048,576 forward ray jobs and 2,097,152 sensor
 sites in 8–9 seconds. The no-sphere target is a readable checker. The glass
 spheres show shifted and inverted bright squares within their silhouettes;
 the opaque spheres show a dark blocking shape. At equal exposure the central
@@ -96,6 +96,54 @@ The stills prove refraction, not caustics. Existing `SensorAccumulator`
 surface emission is scalar for this one-line preview and its alpha channel
 is a presence mask, while RGB accumulates exposure. No spectral color,
 photo-calibrated exposure, or physical surface caustic measurement is implied.
+
+### Saved Studio mesh and worker proof
+
+`camera_designer.marble_preview_worker` is a real separate-process CLI using
+the same scene builder, BVH builder, GPU forward field, and thin-lens backward
+sensor. The saved mesh proof came from the production
+`marble_mesh.js:catEyeMarble()` at Studio's 96 rings × 128 segments and three
+closed ribbons: 97,280 triangles (72,960 interior, 24,320 shell). It was
+serialized to a 606,652-byte NPZ and photographed by the worker with a
+2 mm aperture, 11 cm focus, 36° FOV, and a 256² sensor. The full marble,
+inclusions, and refracted checker are visible at
+`build/marble_ray_probe/worker_marble_sync/preview-000357.png`.
+Scene preparation took 2.0 seconds and 3.0 seconds of exposure dispatched
+2,924,544 forward ray jobs and 5,849,088 sensor sites. The worker published
+intermediate stills at roughly one-second intervals in this smoke. The final
+status has digest `bbeea44ec1e2d1b733f74fed09955ba074f90178d03b2e13d4f14f567283224a`.
+
+Worker input is an immutable `.npz` with `vertices` float32 `(N,3,3)` in
+Studio **radius units**, `material_ids` int32 `(N,)`, and `pbr` float32
+`(M,16)` containing the exact edited `MaterialDatabase` PBR table rows. The
+client must concatenate final `lastGeometry.interior` and `.glass` faces in
+their current winding and send each face's stable material ID. Geometric face
+normals are derived from that winding; the current Spectral sensor does not
+interpolate Studio's per-vertex normals. A JSON config supplies `scale_m`,
+`object_center_m`, `camera` (`eye_m`, `target_m`, `resolution`, `fov_degrees`,
+`aperture_radius_m`, `focus_distance_m`, optional blades/rotation), optional
+`lights`, and `checker` (`center_m`, `width_m`, `checks`). Defaults are in the
+worker source. The worker hashes the NPZ bytes plus canonical JSON into its
+scene digest. For a saved design, the server can hold the immutable NPZ/JSON
+and reuse the matching process/output until that saved revision changes.
+
+Invoke from the Spectral repository root, for example:
+
+```text
+python -m camera_designer.marble_preview_worker --payload DESIGN.npz --config DESIGN.json --out PHOTO_DIR --seconds 600 --native-module-dir C:\dev\Powershell\spectral-analyzer
+```
+
+`status.json` is atomically replaced and names the latest
+`preview-XXXXXX.png`, also written atomically. It carries digest, state,
+elapsed/preparation seconds, forward ray jobs, sensor sites, transport, and
+visible pixel count. An HTTP server should terminate the worker subprocess
+on revision change and reject any image/status with a stale digest. The CLI
+enforces at most 600 seconds of **exposure** and syncs with the GPU every
+eight epochs to keep wall-clock progress honest. It restarts the 32-bit
+forward light field every 4,096 epochs while keeping the sensor exposure,
+preventing voxel counter overflow during a ten-minute photo. The worker's
+JSON image paths are basenames for the owning server to serve; no Meowdoku
+endpoint or browser overlay is implemented here.
 
 ### Earlier native probes
 

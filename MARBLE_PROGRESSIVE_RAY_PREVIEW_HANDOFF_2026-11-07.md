@@ -99,6 +99,49 @@ surface emission is scalar for this one-line preview and its alpha channel
 is a presence mask, while RGB accumulates exposure. No spectral color,
 photo-calibrated exposure, or physical surface caustic measurement is implied.
 
+### Three-line RGB and linear HDR photo
+
+The worker also accepts `"transport": "fixed:3"` in the same JSON config;
+omission or `"fixed:1"` keeps the monochrome behavior. `fixed:3` uses the
+scene builder's established 450/550/650 nm lines and Spectral's existing
+`em_rgb` three-layer film stack in both the forward field and thin-lens
+`SensorAccumulator`. The ordered film layers are R/G/B; each has its own
+RGBA32F exposure texture. A snapshot reads one scalar exposure from each
+layer and stacks them in R/G/B order. No layer is normalized independently.
+The response is a three-line sensor approximation, not a calibrated
+continuous-spectrum or chromatic-dispersion result: the present sensor uses
+one scalar IOR per triangle, and direct emissive hits add scalar radiance to
+all three layers.
+
+For RGB, each progressive `preview-XXXXXX.png` is 8-bit sRGB with one common
+white point from the 99th percentile of Rec.709 luminance. It applies a
+shared exponential display map followed by the sRGB transfer function. The
+completed job also writes `exposure-XXXXXX.npz`, containing float32
+`linear_rgb_exposure` `(H,W,3)` with the final image orientation and
+float32 `wavelengths_nm=[650,550,450]` in channel order. These are **linear
+sensor exposure sums**, without per-channel scaling or clipping; they are
+not absolute radiometric units. `status.json` adds `hdr` and `hdr_channels`
+on completion and reports `transport="fixed:3@450,550,650nm"` throughout.
+The server must serve the named NPZ only if it wants clients to download HDR;
+the current photo image route serves PNGs only.
+
+On the actual saved 97,280-triangle Studio marble (121,746 total scene
+triangles), a 512² fixed:3 test on the RTX 3060 prepared in 1.906 seconds,
+then exposed for 30.047 seconds over 3,296 epochs: 27,000,832 forward ray
+jobs and 108,003,328 sensor sites. The resulting RGB PNG and HDR NPZ are at
+`build/marble_ray_probe/worker_rgb_512/preview-003296.png` and
+`build/marble_ray_probe/worker_rgb_512/exposure-003296.npz`. The three
+exposure means were 167.8/171.4/180.0 and spatial correlation was below
+one, confirming distinct layers. This is an optical appearance proof with
+refracted checker and dye ribbons; it does not establish caustic accuracy.
+A second 120.047-second exposure of the same 512² scene prepared in 1.937
+seconds and reached 12,992 epochs, 106,430,464 forward ray jobs and
+425,721,856 sensor sites. Its final files are
+`build/marble_ray_probe/worker_rgb_512_120s/preview-012992.png` and
+`exposure-012992.npz` in that directory. The display appeared essentially
+unchanged from 30 seconds because the direct emissive checker dominates
+this scene; more samples did not uncover new caustic structure.
+
 ### Saved Studio mesh and worker proof
 
 `camera_designer.marble_preview_worker` is a real separate-process CLI using

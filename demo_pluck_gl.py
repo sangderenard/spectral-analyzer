@@ -5037,6 +5037,18 @@ void main() {
             float cos_in   = max(0.0, dot(-rd, n));
             vec3  surf_albedo = tri.albedo.rgb;
 
+            // A camera ray can see an authored emissive surface directly.
+            // The forward field also splats emission at ray arrivals, but
+            // requiring a random forward hit here makes a lit target vanish.
+            uint surface_flags = floatBitsToUint(tri.normal.w);
+            if ((surface_flags & MAT_FLAG_EMISSIVE) != 0u && tri.albedo.w > 0.001) {
+                float source_radiance = max(tri.emissive.x,
+                                            max(tri.emissive.y, tri.emissive.z));
+                for (int i = 0; i < nl; i++)
+                    lum[i] += throughput * source_radiance * tri.albedo.w;
+                if (opacity >= 0.999) break;
+            }
+
             // Accumulate field energy at surface — only opaque/semi-opaque surfaces scatter
             // Transparent surfaces (opacity≈0) transmit, not scatter; skip accumulation.
             if (opacity > 0.001) {

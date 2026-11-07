@@ -1014,10 +1014,37 @@ def _collect_optical_geometry(
     # ── Scene object ──────────────────────────────────────────────────────
     if scene_object is not None:
         obj_type = scene_object.get("type", "sphere")
-        if obj_type == "qr_target":
-            from camera_software.qr_optical_validator import triangulate_qr_target
+        if obj_type in ("qr_target", "checker_target"):
+            from camera_software.qr_optical_validator import triangulate_qr_target, _module_triangles
 
-            for is_black, qv, qn in triangulate_qr_target(scene_object):
+            if obj_type == "qr_target":
+                target_groups = triangulate_qr_target(scene_object)
+            else:
+                checks = int(scene_object.get("checks", 4))
+                width = float(scene_object.get("width", 0.15))
+                cx, cy, z = (float(v) for v in scene_object.get("pos", [0, 0, 0.3]))
+                if checks < 2 or checks > 32 or width <= 0 or not np.isfinite([cx, cy, z, width]).all():
+                    raise ValueError("checker target requires 2..32 checks and positive width")
+                step = width / checks
+                backing = _module_triangles(cx-width/2, cy+width/2,
+                                            cx+width/2, cy-width/2, z)
+                black_tiles = []
+                for iy in range(checks):
+                    for ix in range(checks):
+                        if (ix+iy) & 1:
+                            x0 = cx-width/2 + ix*step
+                            y0 = cy+width/2 - iy*step
+                            black_tiles.extend(_module_triangles(
+                                x0, y0, x0+step, y0-step, z-1e-6))
+                normal = np.array([0, 0, -1], np.float64)
+                target_groups = [
+                    (False, np.asarray(backing, np.float64).reshape(-1, 9),
+                     np.tile(normal, (2, 1))),
+                    (True, np.asarray(black_tiles, np.float64).reshape(-1, 9),
+                     np.tile(normal, (len(black_tiles), 1))),
+                ]
+
+            for is_black, qv, qn in target_groups:
                 if len(qv) == 0:
                     continue
                 n_new = len(qv)
@@ -1029,7 +1056,10 @@ def _collect_optical_geometry(
                 all_refl_im.append(np.zeros((n_new, n_bands), np.float64))
                 all_diff.append(np.full(n_new, 0.96, np.float64))
                 mat_groups.append((
-                    _tri_cursor, n_new, rgb, rgb, rgb, 1.0, 1.0, "",
+                    _tri_cursor, n_new, rgb, rgb, rgb, 1.0, 1.0,
+                    (_GEO_FLAG_EMITTER if (obj_type == "checker_target"
+                                           and not is_black
+                                           and scene_object.get("emissive", False)) else ""),
                 ))
                 _tri_cursor += n_new
             sv = np.empty((0, 9), np.float64)

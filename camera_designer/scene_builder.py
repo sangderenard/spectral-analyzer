@@ -1702,6 +1702,135 @@ def build_gpu_scene(
     return packed_geom, packed_shade, mat_buf, bvh_tris, context_buf, ctx_map, (bmin, bmax), source_buf
 
 
+def append_saved_studio_mesh_to_gpu_scene(
+    scene: tuple,
+    vertices: np.ndarray,
+    material_ids: np.ndarray,
+    pbr_records: np.ndarray,
+    *,
+    scale_m: float,
+    center_m: Sequence[float],
+    wavelengths_um: Sequence[float] = (0.5875618,),
+) -> tuple:
+    """Append a saved Studio design to the canonical GL scene buffers.
+
+    ``vertices`` are the final, face-ordered Studio triangles (including
+    inclusions, die relief, and shell). ``material_ids`` index the exact edited
+    PBR16 table exported by the Studio, including its copied coating rows.
+    MaterialDatabase's existing PBR→ray compatibility conversion supplies the
+    TriShade record; no second authored material representation is accepted.
+    This function runs once per saved design, before BVH construction.
+    """
+    import hashlib
+    from material_db import MaterialDatabase
+    from mat_flags import MAT_FLAG_EMISSIVE, MAT_FLAG_TRANSMISSIVE
+
+    verts = np.asarray(vertices, np.float32)
+    ids = np.asarray(material_ids, np.int32).reshape(-1)
+    pbr = np.asarray(pbr_records, np.float32)
+    center = np.asarray(center_m, np.float32)
+    if verts.ndim != 3 or verts.shape[1:] != (3, 3):
+        raise ValueError("Studio vertices must have shape (triangles, 3, 3)")
+    if ids.shape != (len(verts),) or pbr.ndim != 2 or pbr.shape[1] != 16:
+        raise ValueError("Studio material IDs/table must have shapes (triangles,) and (materials, 16)")
+    if not np.isfinite(verts).all() or not np.isfinite(pbr).all() or not np.isfinite(center).all():
+        raise ValueError("Studio mesh and PBR records must be finite")
+    if center.shape != (3,) or not np.isfinite(scale_m) or scale_m <= 0:
+        raise ValueError("Studio scene scale and center must be finite and positive")
+    if len(ids) and (ids.min() < 0 or ids.max() >= len(pbr)):
+        raise ValueError("Studio material ID is outside the supplied PBR table")
+    if not len(verts):
+        return scene
+    wavelengths = np.asarray(wavelengths_um, np.float64).reshape(-1)
+    if not len(wavelengths) or not np.isfinite(wavelengths).all() or np.any(wavelengths <= 0):
+        raise ValueError("Studio optical wavelengths must be finite and positive")
+
+    (base_geom, base_shade, _base_mat_buf, base_tris, contexts, ctx_map,
+     base_bounds, sources) = scene
+    world = np.ascontiguousarray(verts * np.float32(scale_m) + center, np.float32)
+    e1 = world[:, 1] - world[:, 0]
+    e2 = world[:, 2] - world[:, 0]
+    cross = np.cross(e1, e2)
+    lengths = np.linalg.norm(cross, axis=1)
+    # Pole caps and bevel closures can contain zero-area triangles. They have
+    # no optical surface and would make the normal undefined, so omit them.
+    valid = lengths > max(float(scale_m) ** 2 * 1e-12, 1e-20)
+    if not np.any(valid):
+        raise ValueError("saved Studio mesh has no nondegenerate triangles")
+    world, ids, e1, e2, cross, lengths = (
+        value[valid] for value in (world, ids, e1, e2, cross, lengths))
+
+    db = MaterialDatabase.instance()
+    unique_ids = np.unique(ids)
+    names = {}
+    for old_id in unique_ids:
+        row = pbr[int(old_id)]
+        key = "saved_studio_pbr:" + hashlib.sha256(
+            row.tobytes() + wavelengths.tobytes()).hexdigest()
+        if key not in db:
+            material = {
+                "name": key,
+                "domain": "em_optical",
+                "albedo": row[0:3].tolist(),
+                "roughness": float(row[3]),
+                "metallic": float(row[4]),
+                "transmission": float(row[5]),
+                "ior": float(row[6]),
+                "opacity": float(row[7]),
+                "emission_rgb": row[8:11].tolist(),
+            }
+            if row[5] > 0.0 and row[7] < 0.999:
+                # Match the existing optical-lens band's Fresnel contract at
+                # the preview wavelength, while retaining edited PBR IOR.
+                n = max(1.0, float(row[6]))
+                fresnel = float(_fresnel_reflectance(1.0, n))
+                material["spectral_bands"] = [
+                    {"center_hz": float(_C_LIGHT / (wl * 1e-6)),
+                     "bandwidth_hz": float(_C_LIGHT / (wl * 1e-6) * 0.01),
+                     "reflectance": fresnel,
+                     "transmittance": float(np.clip(row[5] * (1.0 - fresnel), 0.0, 1.0)),
+                     "diffuse_frac": float(np.clip(row[3], 0.0, 1.0)),
+                     "emission": 0.0, "reemission": 0.0,
+                     "ior_real": n, "ior_imag": 0.0}
+                    for wl in wavelengths
+                ]
+            db.register(key, material)
+        names[int(old_id)] = key
+    tensors = db.build_tensors()
+    ray = tensors["raymat_compat"]
+    mapped_ids = np.array([tensors["index"][names[int(i)]] for i in ids], np.uint32)
+    ray_rows = ray[mapped_ids]
+
+    geom = np.zeros((len(world), 16), np.float32)
+    geom[:, 0:3] = world[:, 0]
+    geom[:, 4:7] = e1
+    geom[:, 8:11] = e2
+    geom[:, 12:15] = cross / lengths[:, None]
+    flags = np.zeros(len(world), np.uint32)
+    flags[pbr[ids, 5] > 0.0] |= MAT_FLAG_TRANSMISSIVE
+    flags[np.any(pbr[ids, 8:11] > 0.0, axis=1)] |= MAT_FLAG_EMISSIVE
+    geom[:, 15] = flags.view(np.float32)
+
+    shade = np.zeros((len(world), 16), np.float32)
+    shade[:, 0:3] = ray_rows[:, [0, 1, 2]]
+    shade[:, 3] = ray_rows[:, 12]
+    shade[:, 4:7] = ray_rows[:, [4, 5, 6]]
+    shade[:, 7] = ray_rows[:, 13]
+    shade[:, 8:11] = ray_rows[:, [8, 9, 10]]
+    shade[:, 11] = np.any(pbr[ids, 8:11] > 0.0, axis=1).astype(np.float32)
+    shade[:, 12] = np.max(pbr[ids, 8:11], axis=1)
+    shade[:, 14] = mapped_ids.view(np.float32)
+
+    all_tris = np.concatenate((base_tris, world), axis=0)
+    bounds = (np.minimum(base_bounds[0], world.min(axis=(0, 1))),
+              np.maximum(base_bounds[1], world.max(axis=(0, 1))))
+    freq_hz = np.asarray([_C_LIGHT / (wl * 1e-6) for wl in wavelengths], np.float64)
+    mat_buf = np.ascontiguousarray(db.build_mat_buf(freq_hz=freq_hz), np.float32)
+    return (np.concatenate((base_geom, geom)),
+            np.concatenate((base_shade, shade)), mat_buf, all_tris,
+            contexts, ctx_map, bounds, sources)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Emitter light synthesis helpers
 # ─────────────────────────────────────────────────────────────────────────────

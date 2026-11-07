@@ -4626,6 +4626,16 @@ layout(std430, binding = 2) readonly buffer TriIdBuf    { int      tri_ids[];   
 layout(std430, binding = 3) readonly buffer RayDirBuf { float ray_dirs[]; };
 layout(std430, binding = 4) readonly buffer RayOplBuf { float ray_opls[]; };
 
+Tri load_tri(int ti) {
+    TriGeom g = geom_tris[ti];
+    TriShade s = shade_tris[ti];
+    Tri t;
+    t.v0 = g.v0; t.e1 = g.e1; t.e2 = g.e2; t.normal = g.normal;
+    t.mat_in = s.mat_in; t.mat_out = s.mat_out;
+    t.albedo = s.albedo; t.emissive = s.emissive;
+    return t;
+}
+
 // ─── Forward film-layer activation fields (uint, same storage as _MARCH_FS) ──
 layout(binding = 0) uniform usampler3D uFwdLayer0;
 layout(binding = 1) uniform usampler3D uFwdLayer1;
@@ -4739,7 +4749,7 @@ vec3 cosine_dir(float u, float v, vec3 normal) {
 }
 
 // ─── Möller-Trumbore triangle intersection ────────────────────────────────────
-bool hit_tri(vec3 ro, vec3 rd, Tri t, out float hit_t) {
+bool hit_tri(vec3 ro, vec3 rd, TriGeom t, out float hit_t) {
     vec3 h = cross(rd, t.e2.xyz); float a = dot(t.e1.xyz, h);
     if (abs(a) < 1e-8) return false;
     float f = 1.0 / a; vec3 s = ro - t.v0.xyz;
@@ -7245,7 +7255,8 @@ def _gpu_ray_field_prebuilt(
 
     # ── n_layers spectral accumulation textures (one per film layer) ─────
     zero = np.array([0], np.uint32)
-    tex_bands = list(glGenTextures(n_layers))
+    _generated_tex = glGenTextures(n_layers)
+    tex_bands = [int(_generated_tex)] if n_layers == 1 else list(_generated_tex)
     for tex in tex_bands:
         glBindTexture(GL_TEXTURE_3D, tex)
         glTexImage3D(GL_TEXTURE_3D, 0, GL_R32UI,
@@ -9454,7 +9465,9 @@ class SensorAccumulator:
 
         # One RGBA32F accumulation texture per film layer — held independently in memory
         _n_out = max(1, len(tex_bands))
-        self._textures: list[int] = [int(t) for t in glGenTextures(_n_out)]
+        _generated_outputs = glGenTextures(_n_out)
+        self._textures: list[int] = ([int(_generated_outputs)] if _n_out == 1
+                                      else [int(t) for t in _generated_outputs])
         for _t in self._textures:
             glBindTexture(GL_TEXTURE_2D, _t)
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, self._w, self._h, 0,

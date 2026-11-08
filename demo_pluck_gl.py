@@ -4626,6 +4626,19 @@ layout(std430, binding = 2) readonly buffer TriIdBuf    { int      tri_ids[];   
 layout(std430, binding = 3) readonly buffer RayDirBuf { float ray_dirs[]; };
 layout(std430, binding = 4) readonly buffer RayOplBuf { float ray_opls[]; };
 
+// Binding 5 is the same bdpt_sources buffer the forward field tracer bound
+// (persists across program switches; this shader never rebinds it). Read-only
+// here: it gives the camera pass a direct, resolution-independent connection
+// to the actual lights, instead of depending solely on the coarse baked
+// volumetric field below for opaque-surface illumination.
+struct SourceRec {
+    vec4 pos_weight; // xyz=position, w=ray-budget weight
+    vec4 dir_kind;   // xyz=emission axis, w=reserved
+    vec4 packet;     // x=freq/coord, y=phase, z=energy, w=coherence/sigma
+};
+layout(std430, binding = 5) readonly buffer SourceBuf { SourceRec bdpt_sources[]; };
+uniform int uSourceCount;
+
 Tri load_tri(int ti) {
     TriGeom g = geom_tris[ti];
     TriShade s = shade_tris[ti];
@@ -4802,6 +4815,49 @@ int nearest_hit(vec3 ro, vec3 rd, out float best) {
         }
     }
     return best_tri;
+}
+
+// ─── Direct light sample (next-event estimation) ─────────────────────────────
+// Opaque surfaces previously had no analogue to the "ray keeps going until it
+// hits the actual emissive backdrop" connection that transmissive/glass
+// surfaces get for free by continuing straight through. They depended
+// entirely on sample_layer_energy() below, which reads a coarse 3D-voxel
+// bake of the forward field — fine for ambient bounce light, but far too
+// diluted to carry primary direct illumination at this shader's resolution
+// (measured ~37x dimmer than glass on identical geometry). This samples one
+// of the same light sources the forward pass emits from and tests visibility
+// directly against this shader's own BVH, independent of voxel resolution.
+float sample_direct_light(vec3 p, vec3 n, inout uint rng) {
+    if (uSourceCount <= 0) return 0.0;
+    int si = int(clamp(floor(rand01(rng) * float(uSourceCount)), 0.0, float(uSourceCount - 1)));
+    SourceRec src = bdpt_sources[si];
+    vec3  to_src = src.pos_weight.xyz - p;
+    float dist2  = max(dot(to_src, to_src), 1e-6);
+    float dist   = sqrt(dist2);
+    vec3  wi     = to_src / dist;
+    float cos_surf = max(0.0, dot(n, wi));
+    if (cos_surf <= 0.0) return 0.0;
+    float shadow_t;
+    // Offset along wi (to-light), matching connect_emitter()'s proven
+    // visible_segment() convention, not along n: offsetting along n left
+    // grazing-angle points still close enough to the sphere's own facets to
+    // self-occlude almost everywhere except a few lucky escapes, which is
+    // exactly the sparse speckle pattern seen before this fix.
+    int shadow_hit = nearest_hit(p + wi * 1e-4, wi, shadow_t);
+    if (shadow_hit >= 0 && shadow_t < dist - 3e-4) return 0.0;  // occluded
+    float energy = src.packet.z * max(src.pos_weight.w, 1e-9);
+    // Deliberately no per-sample dir_kind "lobe" term here (unlike
+    // connect_emitter() in the forward shader): each bdpt_sources entry is
+    // one pre-baked direction out of thousands sampled from the light's
+    // directional profile, and gating by alignment with an unrelated
+    // connection direction wi only pays off for a tiny fraction of random
+    // picks, which produced severe per-pixel sparsity (most of the lit
+    // hemisphere stayed black, with only sporadic bright hits) when tried.
+    // Light position/energy is shared by every entry, so any entry gives an
+    // unbiased point-light estimate without it. 1/count un-biases uniform
+    // source selection; 1/(1+dist^2) is the same bounded geometric spreading
+    // term connect_emitter() uses in the forward shader's own direct path.
+    return energy * cos_surf / (1.0 + dist2) * float(uSourceCount);
 }
 
 // ─── Read one film layer's accumulated irradiance from the forward volume ──────
@@ -5052,10 +5108,16 @@ void main() {
             // Accumulate field energy at surface — only opaque/semi-opaque surfaces scatter
             // Transparent surfaces (opacity≈0) transmit, not scatter; skip accumulation.
             if (opacity > 0.001) {
+                float direct = (uSourceCount > 0) ? sample_direct_light(hp, n, rng) : 0.0;
                 for (int i = 0; i < nl; i++) {
                     vec3  lc = get_layer_light(i);
                     float aw = dot(surf_albedo, lc) / max(dot(lc, lc), 1e-6);
                     lum[i] += throughput * sample_layer_energy(hp, i) * refl * cos_in
+                              * clamp(aw, 0.0, 1.0) * opacity;
+                    // Direct next-event sample: the resolution-independent
+                    // counterpart to the voxel-field term above. See
+                    // sample_direct_light() for why opaque surfaces need it.
+                    lum[i] += throughput * direct * refl
                               * clamp(aw, 0.0, 1.0) * opacity;
                 }
             }
@@ -9380,7 +9442,8 @@ class SensorAccumulator:
                  ray_field_scale: float = 6.0,
                  ray_field_gamma: float = 0.55,
                  vol_alpha: float = 1.0,
-                 vol_steps: int = 64):
+                 vol_steps: int = 64,
+                 n_sources: int = 0):
         import math
         from OpenGL.GL import (glGenTextures, glBindTexture, glTexImage2D,
                                glTexParameteri, GL_TEXTURE_2D, GL_RGBA32F,
@@ -9433,6 +9496,15 @@ class SensorAccumulator:
         self._va   = float(vol_alpha)
         self._vs   = int(vol_steps)
         self._max_bounces = max(1, int(max_bounces))
+        # Count of bdpt_sources entries the camera pass's direct-light NEE
+        # may index into. 0 disables it (old behavior unchanged). The buffer
+        # itself is not owned here — it stays bound at SSBO slot 5 by whatever
+        # built the forward field (e.g. _gpu_ray_field_prebuilt), which this
+        # accumulator's own dispatch never rebinds. Deliberately a distinct
+        # field from self._n_sources below: that one is reset to 0 here and
+        # only later populated by update_sources()/tick_forward(), an
+        # unrelated forward-emission path this class also owns.
+        self._nee_source_count = max(0, int(n_sources))
         # Forward emission state — populated by update_sources() after construction
         self._fwd_prog = 0
         self._ssbo_sources_fwd = 0
@@ -9819,6 +9891,7 @@ class SensorAccumulator:
 
         _u1i(b'uTriCount',        self._n_tris)
         _u1i(b'uNodeCount',       self._n_bvh_nodes)
+        _u1i(b'uSourceCount',     self._nee_source_count)
         _u1i(b'uSamplesPerPixel', max(1, int(self._samples_per_pixel)))
         _u1i(b'uMaxBounces',      self._max_bounces)
         _u1i(b'uVolSteps',        self._vs)

@@ -57,8 +57,16 @@ def _snapshot(accumulator, output: Path, digest: str, epoch: int,
               elapsed: float, preparation: float, rays: int, sensor_sites: int,
               finished: bool = False, transport: str = "fixed:1", *,
               frame_index: int = 0, total_frames: int = 1,
-              frame_elapsed: float = 0.0, completed_frames: tuple[dict, ...] = ()) -> dict:
+              frame_elapsed: float = 0.0, completed_frames: tuple[dict, ...] = (),
+              gamma: float = 1.0) -> dict:
     from OpenGL.GL import GL_TEXTURE_2D, GL_RGBA, GL_FLOAT, glBindTexture, glGetTexImage, glFinish
+
+    # Applied after each branch's own exposure/filmic tonemap, on the final
+    # [0,1] display value: gamma>1 lifts midtones (the preview looked stark
+    # because this stage previously did not exist at all for "fixed:1", and
+    # was fixed at the sRGB 1/2.4 power for "fixed:3"). gamma=1.0 reproduces
+    # the exact prior output for both transports.
+    inv_gamma = 1.0 / max(1.0e-3, float(gamma))
 
     glFinish()
     if transport == "fixed:3":
@@ -78,7 +86,8 @@ def _snapshot(accumulator, output: Path, digest: str, epoch: int,
         mapped = 1.0 - np.exp(-np.maximum(linear, 0.0) * (2.0 / white))
         display = np.where(mapped <= 0.0031308, 12.92 * mapped,
                            1.055 * np.power(mapped, 1.0 / 2.4) - 0.055)
-        display = np.uint8(np.flipud(np.clip(display, 0, 1)) * 255)
+        display = np.clip(display, 0, 1) ** inv_gamma
+        display = np.uint8(np.flipud(display) * 255)
         mode = "RGB"
         hdr_name = f"exposure-{epoch:06d}.npz" if finished else None
         if finished:
@@ -95,7 +104,8 @@ def _snapshot(accumulator, output: Path, digest: str, epoch: int,
         luma = image[:, :, :3].mean(axis=2)
         nonzero = luma[luma > 0]
         white = max(float(np.percentile(nonzero, 98)) if len(nonzero) else 0.0, 1e-6)
-        display = np.uint8(np.flipud(np.clip(luma / white, 0, 1)) * 255)
+        display = np.clip(luma / white, 0, 1) ** inv_gamma
+        display = np.uint8(np.flipud(display) * 255)
         mode = "L"
         hdr_name = None
     filename = f"preview-{epoch:06d}.png"
@@ -121,6 +131,7 @@ def _snapshot(accumulator, output: Path, digest: str, epoch: int,
         "sensor_sites": sensor_sites,
         "visible_pixels": int(np.count_nonzero(luma)),
         "display_white": white,
+        "display_gamma": gamma,
         "transport": ("fixed:3@450,550,650nm" if transport == "fixed:3"
                       else "fixed:1@587.5618nm"),
         "camera": "Spectral analytical thin lens",
@@ -152,6 +163,9 @@ def run(payload: Path, config_path: Path, output: Path, *,
     transport = str(config.get("transport", "fixed:1"))
     if transport not in ("fixed:1", "fixed:3"):
         raise ValueError("transport must be fixed:1 or fixed:3")
+    gamma = float(config.get("gamma", 1.0))
+    if not 0.2 <= gamma <= 5.0:
+        raise ValueError("gamma must be in [0.2, 5.0]")
     wavelengths = [.5875618] if transport == "fixed:1" else [.450, .550, .650]
     digest = hashlib.sha256(payload.read_bytes() +
                             json.dumps(config, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -230,6 +244,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
             n_blades=int(camera.get("aperture_blades", 0)),
             aperture_rot=float(camera.get("aperture_rotation_radians", 0)),
             vol_alpha=0.0, vol_steps=8,
+            n_sources=len(sources),
         )
         if not accumulator._active:
             accumulator.destroy()
@@ -275,7 +290,8 @@ def run(payload: Path, config_path: Path, output: Path, *,
                                        finished=done, transport=transport,
                                        frame_index=frame_index, total_frames=total_frames,
                                        frame_elapsed=now - frame_start,
-                                       completed_frames=tuple(completed_frames))
+                                       completed_frames=tuple(completed_frames),
+                                       gamma=gamma)
                     print(json.dumps(status, sort_keys=True), flush=True)
                     last_snapshot = now
                 if done:

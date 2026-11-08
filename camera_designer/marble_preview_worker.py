@@ -21,7 +21,16 @@ from PIL import Image
 def _atomic_json(path: Path, data: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
-    os.replace(temporary, path)
+    # Windows readers can briefly deny delete sharing on status.json. Keep
+    # the complete temporary file and retry the atomic publication.
+    for attempt in range(100):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt == 99:
+                raise
+            time.sleep(0.01)
 
 
 def _write_orbit_avi(output: Path, frames: list[dict], resolution: int,
@@ -287,7 +296,9 @@ def run(payload: Path, config_path: Path, output: Path, *,
                                   "encoding_elapsed_seconds": progress["encoding_elapsed_seconds"]}), flush=True)
             _write_orbit_avi(output, completed_frames, resolution, avi_writer_root,
                              on_frame=encoding_progress)
-            status = {**status, "state": "complete", "animation": "orbit.avi",
+            status = {**status, "state": "complete", "encoding_frames": total_frames,
+                      "encoding_elapsed_seconds": round(time.monotonic() - encoding_start, 3),
+                      "animation": "orbit.avi",
                       "animation_expires_at": time.time() + 24 * 3600}
             _atomic_json(output / "status.json", status)
             print(json.dumps(status, sort_keys=True), flush=True)

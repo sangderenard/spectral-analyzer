@@ -25,7 +25,7 @@ def _atomic_json(path: Path, data: dict) -> None:
 
 
 def _write_orbit_avi(output: Path, frames: list[dict], resolution: int,
-                     writer_root: Path) -> Path:
+                     writer_root: Path, on_frame=None) -> Path:
     """Use Turing's JPEG encoder and indexed MJPEG/AVI writer, one frame at a time."""
     sys.path.insert(0, str(writer_root.resolve()))
     from src.common.tensors.abstraction import AbstractTensor
@@ -35,9 +35,11 @@ def _write_orbit_avi(output: Path, frames: list[dict], resolution: int,
     target = output / "orbit.avi"
     temporary = output / "orbit.avi.tmp"
     with MJPEGAVIWriter(temporary, width=resolution, height=resolution, fps=8) as writer:
-        for frame in frames:
+        for index, frame in enumerate(frames, 1):
             pixels = np.asarray(Image.open(output / frame["image"]).convert("RGB"), dtype=np.uint8)
             writer.append_frame(encode_jfif(AbstractTensor.get_tensor(pixels)))
+            if on_frame is not None:
+                on_frame(index)
     os.replace(temporary, target)
     return target
 
@@ -275,7 +277,16 @@ def run(payload: Path, config_path: Path, output: Path, *,
         if total_frames > 1:
             if avi_writer_root is None:
                 raise ValueError("orbit animation needs the Turing AVI writer root")
-            _write_orbit_avi(output, completed_frames, resolution, avi_writer_root)
+            encoding_start = time.monotonic()
+            def encoding_progress(frame_count: int) -> None:
+                progress = {**status, "state": "encoding", "encoding_frames": frame_count,
+                            "encoding_elapsed_seconds": round(time.monotonic() - encoding_start, 3)}
+                _atomic_json(output / "status.json", progress)
+                print(json.dumps({"state": "encoding", "encoding_frames": frame_count,
+                                  "total_frames": total_frames,
+                                  "encoding_elapsed_seconds": progress["encoding_elapsed_seconds"]}), flush=True)
+            _write_orbit_avi(output, completed_frames, resolution, avi_writer_root,
+                             on_frame=encoding_progress)
             status = {**status, "state": "complete", "animation": "orbit.avi",
                       "animation_expires_at": time.time() + 24 * 3600}
             _atomic_json(output / "status.json", status)

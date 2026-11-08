@@ -1023,6 +1023,9 @@ def _collect_optical_geometry(
                 checks = int(scene_object.get("checks", 4))
                 width = float(scene_object.get("width", 0.15))
                 cx, cy, z = (float(v) for v in scene_object.get("pos", [0, 0, 0.3]))
+                normal_sign = int(scene_object.get("normal_sign", -1))
+                if normal_sign not in (-1, 1):
+                    raise ValueError("checker target normal_sign must be -1 or 1")
                 if checks < 2 or checks > 32 or width <= 0 or not np.isfinite([cx, cy, z, width]).all():
                     raise ValueError("checker target requires 2..32 checks and positive width")
                 step = width / checks
@@ -1035,8 +1038,8 @@ def _collect_optical_geometry(
                             x0 = cx-width/2 + ix*step
                             y0 = cy+width/2 - iy*step
                             black_tiles.extend(_module_triangles(
-                                x0, y0, x0+step, y0-step, z-1e-6))
-                normal = np.array([0, 0, -1], np.float64)
+                                x0, y0, x0+step, y0-step, z+normal_sign*1e-6))
+                normal = np.array([0, 0, normal_sign], np.float64)
                 target_groups = [
                     (False, np.asarray(backing, np.float64).reshape(-1, 9),
                      np.tile(normal, (2, 1))),

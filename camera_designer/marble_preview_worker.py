@@ -140,7 +140,8 @@ def run(payload: Path, config_path: Path, output: Path, *,
     scene = build_gpu_scene(
         preset, lights,
         scene_object={"type": "checker_target", "checks": int(checker.get("checks", 4)),
-                      "width": checker_width, "pos": checker_pos, "emissive": True},
+                      "width": checker_width, "pos": checker_pos, "emissive": True,
+                      "normal_sign": int(checker.get("normal_sign", -1))},
         wavelengths_um=wavelengths,
     )
     scene = append_saved_studio_mesh_to_gpu_scene(

@@ -914,6 +914,23 @@ class RayOrder:
         wl = np.asarray(wavelengths_um, dtype=np.float64)
         flat_weights = np.ones(len(wl), dtype=np.float64)
 
+        # Named photographic light-shaping accessories, mapped onto the
+        # existing physical DirectionalModel/AngularDistribution machinery
+        # (the same models real EmitterSpec sources use) rather than a new
+        # ad hoc cone parameter. scrim is a soft, wide Gaussian falloff (no
+        # hard edge, the closest existing model to a diffusion panel); grid
+        # and snoot are both NA-limited flat-top beams (ETENDUE_LIMITED --
+        # the model this module's own docstring names for fibre/LED+lens
+        # optics), snoot narrower than grid. bare keeps the prior default.
+        _shape_models: Dict[str, Tuple[DirectionalModel, Dict[str, float]]] = {
+            "scrim": (DirectionalModel.GAUSSIAN_BEAM,
+                     {"divergence_half_angle_rad": math.radians(60.0)}),
+            "grid":  (DirectionalModel.ETENDUE_LIMITED,
+                     {"numerical_aperture": math.sin(math.radians(35.0))}),
+            "snoot": (DirectionalModel.ETENDUE_LIMITED,
+                     {"numerical_aperture": math.sin(math.radians(8.0))}),
+        }
+
         sources: List[SourceRecord] = []
         for lgt in lights:
             pos  = np.asarray(lgt.get("pos",   [0., 0., 5.0]),  np.float64)
@@ -929,14 +946,41 @@ class RayOrder:
             raw_power = float(lgt.get("power", 1.0))
             directivity = max(0.5, raw_power)   # match legacy clamping explicitly
 
+            shape = str(lgt.get("shape", "bare")).lower()
+            preset = _shape_models.get(shape)
+            if preset is None:
+                model = DirectionalModel.LAMBERTIAN
+                angular = AngularDistribution()
+            else:
+                model, kwargs = preset
+                angular = AngularDistribution(model=model, **kwargs)
+
+            weights = flat_weights.copy()
+            filter_rgb = lgt.get("filter_rgb")
+            if filter_rgb is not None:
+                # Legacy-shim approximation: weight each transport band by
+                # how much of the filter's RGB the band's own wavelength
+                # would read on a display sensor, reusing the same CIE-based
+                # weighting camera_software.transport_contract already uses
+                # to turn fixed spectral lines into RGB -- not a new color
+                # model invented here.
+                from camera_software.transport_contract import native_display_rgb_weight
+                fr, fg, fb = (float(x) for x in filter_rgb)
+                for wi, wl_um in enumerate(wl):
+                    r, g, b = native_display_rgb_weight(float(wl_um) * 1000.0)
+                    weights[wi] = max(0.0, fr * r + fg * g + fb * b)
+
             gaps: List[TracerGap] = [
                 TracerGap(
                     source_label  = lbl,
                     property_name = "spectral_distribution",
-                    severity      = "dropped",
+                    severity      = "dropped" if filter_rgb is None else "approximated",
                     detail        = (
                         'Legacy lights dict "color" key is a display tint, not a '
                         "spectral distribution. All bands weighted equally."
+                        if filter_rgb is None else
+                        "filter_rgb approximated per-band via display RGB "
+                        "sensitivity, not an authored spectral distribution."
                     ),
                 ),
                 TracerGap(
@@ -957,11 +1001,11 @@ class RayOrder:
                 pos               = pos,
                 dir               = dirv,
                 directivity       = directivity,
-                amplitude_weights = flat_weights.copy(),
+                amplitude_weights = weights,
                 phase_state       = PhaseState(),
                 polarization      = PolarizationState(),
-                directional_model = DirectionalModel.LAMBERTIAN,
-                profile           = EmitterProfile(),
+                directional_model = model,
+                profile           = EmitterProfile(directional=angular),
                 spec_label        = lbl,
                 component_label   = lbl,
                 tracer_gaps       = gaps,

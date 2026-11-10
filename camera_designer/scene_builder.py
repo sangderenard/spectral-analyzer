@@ -302,6 +302,7 @@ def _triangulate_box_shell_walls(
     z_back:   float,
     port_r:   float = 0.0,
     n_div:    int   = 3,
+    resolved_port: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Six outward-facing walls of a rectangular camera body shell.
 
@@ -328,6 +329,33 @@ def _triangulate_box_shell_walls(
         v0, v1 = bmin[v_axis], bmax[v_axis]
 
         is_front_face = (fixed_axis == 2 and sign > 0)
+
+        if is_front_face and resolved_port and port_r > 0.0:
+            # A sampled-grid centre test seals a small Studio pupil entirely
+            # (2 mm radius versus 4.34 x 3.16 mm body cells). Resolve the real
+            # circular mount with radial strips to the same rectangular shell.
+            # Explicit corner angles retain the complete original rectangle.
+            if port_r >= min(x_half, y_half):
+                raise ValueError("camera pupil does not fit inside its native body")
+            corners = [math.atan2(y, x) % (2 * math.pi)
+                       for x in (-x_half, x_half) for y in (-y_half, y_half)]
+            angles = np.unique(np.concatenate((
+                np.linspace(0, 2 * math.pi, 8 * n_div, endpoint=False), corners)))
+            xy = np.column_stack((np.cos(angles), np.sin(angles)))
+            radial = np.minimum(x_half / np.maximum(abs(xy[:, 0]), 1e-30),
+                                y_half / np.maximum(abs(xy[:, 1]), 1e-30))
+            inner = np.column_stack((xy * port_r, np.full(len(xy), z_front)))
+            outer = np.column_stack((xy * radial[:, None], np.full(len(xy), z_front)))
+            for i in range(len(angles)):
+                j = (i + 1) % len(angles)
+                for ri in range(n_div):
+                    a = inner[i] + (outer[i] - inner[i]) * ri / n_div
+                    b = inner[i] + (outer[i] - inner[i]) * (ri + 1) / n_div
+                    c = inner[j] + (outer[j] - inner[j]) * (ri + 1) / n_div
+                    d = inner[j] + (outer[j] - inner[j]) * ri / n_div
+                    verts_list.extend((np.concatenate((a, b, c)), np.concatenate((a, c, d))))
+                    norms_list.extend((outward_n.copy(), outward_n.copy()))
+            continue
 
         for ui in range(n_div):
             for vi in range(n_div):
@@ -551,6 +579,7 @@ def _collect_optical_geometry(
     scene_object: Optional[dict],
     wavelengths_um: Sequence[float],
     confinement_box: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    camera_frame: Optional[tuple] = None,
 ) -> tuple:
     """Triangulate a CameraPreset + optional scene object into raw geometry arrays.
 
@@ -820,11 +849,12 @@ def _collect_optical_geometry(
     _body_z_front = float(getattr(preset.aperture_stop, "z_pos",
                            float(_bz)))  # align front face to mount/aperture z
     _body_z_back  = _body_z_front - float(_bs.depth)
-    _body_port_r  = _tube_r_inner if (_el_r_maxes and _el_z_vals) else 0.0
+    _body_port_r  = _tube_r_inner if (_el_r_maxes and _el_z_vals) else (
+        float(preset.aperture_stop.r_outer) if camera_frame is not None else 0.0)
 
     _body_bv, _body_bn = _triangulate_box_shell_walls(
         _bx, _by, _body_z_front, _body_z_back,
-        port_r=_body_port_r, n_div=32)
+        port_r=_body_port_r, n_div=32, resolved_port=camera_frame is not None)
     if len(_body_bv) > 0:
         _n_new = len(_body_bv)
         all_verts.append(_body_bv);   all_normals.append(_body_bn)
@@ -1012,14 +1042,83 @@ def _collect_optical_geometry(
             _tri_cursor += _pb_n_new
 
     # ── Scene object ──────────────────────────────────────────────────────
+    if camera_frame is not None:
+        # Only camera-owned geometry has been collected at this point. The
+        # checker, room, saved object and fixture world coordinates below must
+        # never be carried along when the physical camera moves.
+        rotation, translation = camera_frame
+        rotation = np.asarray(rotation, np.float64).reshape(3, 3)
+        translation = np.asarray(translation, np.float64).reshape(3)
+        all_verts = [(v.reshape(-1, 3) @ rotation.T + translation).reshape(-1, 9)
+                     for v in all_verts]
+        all_normals = [n @ rotation.T for n in all_normals]
+        context_specs = [(label, center @ rotation.T + translation,
+                          radius, n_re, n_im, dt_m)
+                         for label, center, radius, n_re, n_im, dt_m in context_specs]
+
     if scene_object is not None:
         obj_type = scene_object.get("type", "sphere")
-        if obj_type in ("qr_target", "checker_target"):
-            from camera_software.qr_optical_validator import triangulate_qr_target, _module_triangles
+        if obj_type in ("qr_target", "checker_target", "studio_room"):
+            if obj_type == "studio_room":
+                # A real two-plane room (floor + back wall meeting at a
+                # corner, matching the Phong Studio preview's own
+                # checkerboard()), so the ray-traced photo actually sits
+                # the marble in the same room instead of leaving it
+                # floating over a tiny generic backdrop plane. Lights stay
+                # the existing point/area sources (see ``lights`` elsewhere
+                # in this function) -- this only supplies the architecture
+                # they illuminate.
+                floor_y = float(scene_object.get("floor_y"))
+                wall_z = float(scene_object.get("wall_z"))
+                extent = float(scene_object.get("extent", 0.13))
+                checks = int(scene_object.get("checks", 8))
+                if checks < 2 or checks > 64 or extent <= 0 or not np.isfinite([floor_y, wall_z, extent]).all():
+                    raise ValueError("studio_room requires 2..64 checks and positive extent")
+                step = (2 * extent) / checks
 
-            if obj_type == "qr_target":
+                def _axis_quad(fixed_axis: int, fixed_value: float,
+                                a0: float, b0: float, a1: float, b1: float):
+                    free = [i for i in range(3) if i != fixed_axis]
+                    p = np.zeros((4, 3), np.float64)
+                    p[:, fixed_axis] = fixed_value
+                    p[0, free[0]], p[0, free[1]] = a0, b0
+                    p[1, free[0]], p[1, free[1]] = a1, b0
+                    p[2, free[0]], p[2, free[1]] = a1, b1
+                    p[3, free[0]], p[3, free[1]] = a0, b1
+                    # Both windings: this is a new, lightly-exercised
+                    # geometry path, and getting a front/back convention
+                    # wrong would otherwise make an entire plane invisible.
+                    return (
+                        np.concatenate([p[0], p[2], p[1]]), np.concatenate([p[0], p[3], p[2]]),
+                        np.concatenate([p[0], p[1], p[2]]), np.concatenate([p[0], p[2], p[3]]),
+                    )
+
+                def _plane(fixed_axis: int, fixed_value: float, normal_sign: int):
+                    backing = np.asarray(
+                        _axis_quad(fixed_axis, fixed_value, -extent, -extent, extent, extent),
+                        np.float64).reshape(-1, 9)
+                    black_tiles = []
+                    for iy in range(checks):
+                        for ix in range(checks):
+                            if (ix + iy) & 1:
+                                a0 = -extent + ix * step
+                                b0 = -extent + iy * step
+                                black_tiles.extend(_axis_quad(
+                                    fixed_axis, fixed_value + normal_sign * 1e-6,
+                                    a0, b0, a0 + step, b0 + step))
+                    black = np.asarray(black_tiles, np.float64).reshape(-1, 9)
+                    normal = np.zeros(3, np.float64); normal[fixed_axis] = normal_sign
+                    return (
+                        (False, backing, np.tile(normal, (len(backing), 1))),
+                        (True, black, np.tile(normal, (len(black), 1))),
+                    )
+
+                target_groups = [*_plane(1, floor_y, 1), *_plane(2, wall_z, 1)]
+            elif obj_type == "qr_target":
+                from camera_software.qr_optical_validator import triangulate_qr_target
                 target_groups = triangulate_qr_target(scene_object)
             else:
+                from camera_software.qr_optical_validator import _module_triangles
                 checks = int(scene_object.get("checks", 4))
                 width = float(scene_object.get("width", 0.15))
                 cx, cy, z = (float(v) for v in scene_object.get("pos", [0, 0, 0.3]))
@@ -1408,6 +1507,7 @@ def build_gpu_scene(
     scene_object: Optional[dict] = None,
     wavelengths_um: Sequence[float] = (0.450, 0.550, 0.650),
     confinement_box: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    camera_frame: Optional[tuple] = None,
 ) -> tuple:
     """Pack a CameraPreset into the GPU SSBO format consumed by _gpu_ray_field().
 
@@ -1427,10 +1527,13 @@ def build_gpu_scene(
         MAT_FLAG_EMISSIVE, MAT_FLAG_ABSORBER, MAT_FLAG_TRANSMISSIVE,
     )
     wavelengths_um = list(wavelengths_um)
+    if camera_frame is not None and (any(e.enabled for e in preset.emitters)
+                                    or getattr(preset.projector_back, "enabled", False)):
+        raise ValueError("positioned camera housing must not contain independent emitters")
 
     (verts_all, normals_all, _refl_re, _refl_im, _diff,
      ior_specs, context_specs, mat_groups, lens_material_specs) = _collect_optical_geometry(
-         preset, scene_object, wavelengths_um, confinement_box)
+         preset, scene_object, wavelengths_um, confinement_box, camera_frame)
 
     # ── Build per-triangle material arrays ────────────────────────────────
     n_tri = len(verts_all)
@@ -1693,14 +1796,27 @@ def build_gpu_scene(
         )
         source_buf = _order.bake_rays(_PREBAKE_N, seed=42)
     else:
-        # Legacy plain-dict lights only — build a minimal RayOrder via the
-        # compatibility shim, then bake from it.
         _legacy_lights = [lgt for lgt in lights if "_spec" not in lgt]
-        if not _legacy_lights:
-            _legacy_lights = [{"pos": [0., 0., 5.], "dir": [0., 0., -1.],
-                                "power": 1.0, "label": "default"}]
-        _order = _RayOrder.from_lights_list(_legacy_lights, wavelengths_um=_WL_UM)
-        source_buf = _order.bake_rays(_PREBAKE_N, seed=42)
+        if _legacy_lights:
+            _order = _RayOrder.from_lights_list(_legacy_lights, wavelengths_um=_WL_UM)
+            source_buf = _order.bake_rays(_PREBAKE_N, seed=42)
+        else:
+            # No real light of any kind (neither an EmitterSpec nor a
+            # legacy lights-list dict) -- a genuinely unlit scene. Both
+            # RayOrder.from_emitter_specs and RayOrder.from_lights_list
+            # hard-raise on an empty list by design (baking zero forward
+            # rays from a nonexistent source isn't meaningful), and that
+            # invariant is correct; fabricating ANY substitute light here
+            # to satisfy it -- however dim, however far away -- is still a
+            # real light nothing in the scene actually authored. The
+            # correct zero-light scene is zero forward rays: an empty
+            # source buffer. uSourceCount=0 is already a first-class,
+            # handled case downstream (the sensor shader's own NEE only
+            # calls sample_direct_light when uSourceCount > 0; the forward
+            # pass's ray_id->source index already guards with
+            # max(uSourceCount, 1) and simply schedules no work when the
+            # source count genuinely is zero).
+            source_buf = np.zeros((0, 12), np.float32)
 
     return packed_geom, packed_shade, mat_buf, bvh_tris, context_buf, ctx_map, (bmin, bmax), source_buf
 
@@ -1714,6 +1830,15 @@ def append_saved_studio_mesh_to_gpu_scene(
     scale_m: float,
     center_m: Sequence[float],
     wavelengths_um: Sequence[float] = (0.5875618,),
+    spectral_emission_rgb: bool = False,
+    boundary_media: dict | None = None,
+    optical_media: dict | None = None,
+    region_media: dict | None = None,
+    material_authoring: dict | None = None,
+    canonical_volume_optics: dict | None = None,
+    return_index_map: bool = False,
+    advanced_surface_mask=None,
+    emitter_profiles=None,
 ) -> tuple:
     """Append a saved Studio design to the canonical GL scene buffers.
 
@@ -1725,7 +1850,10 @@ def append_saved_studio_mesh_to_gpu_scene(
     This function runs once per saved design, before BVH construction.
     """
     import hashlib
-    from material_db import MaterialDatabase
+    from .studio_boundary_media import validate_boundary_ranges, install_boundary_pairs, studio_medium_extinction
+    from material_db import (
+        MaterialDatabase, EmissionProfile, EmissionProfileDatabase, ParametricSpread,
+    )
     from mat_flags import MAT_FLAG_EMISSIVE, MAT_FLAG_TRANSMISSIVE
 
     verts = np.asarray(vertices, np.float32)
@@ -1743,7 +1871,26 @@ def append_saved_studio_mesh_to_gpu_scene(
     if len(ids) and (ids.min() < 0 or ids.max() >= len(pbr)):
         raise ValueError("Studio material ID is outside the supplied PBR table")
     if not len(verts):
-        return scene
+        return (scene, np.zeros(0, np.int64)) if return_index_map else scene
+    pairs = (validate_boundary_ranges(boundary_media, len(verts), len(pbr))
+             if boundary_media is not None else None)
+    if canonical_volume_optics is not None and optical_media is not None:
+        raise ValueError("choose canonical n/k OR reference-transmittance optical media, not both")
+    region_spec = region_owners = None
+    if region_media is not None:
+        if boundary_media is not None or (optical_media is None and canonical_volume_optics is None):
+            raise ValueError("region media require optical definitions and replace fixed boundary pairs")
+        from .studio_region_gpu import validate_region_ranges, tag_region_geometry
+        region_spec, region_owners, pairs = validate_region_ranges(region_media,len(verts),len(pbr))
+    optics = None
+    if optical_media is not None:
+        if pairs is None:
+            raise ValueError("optical media require explicit boundary ownership")
+        from .studio_optical_media import validate_optical_media, optical_extinction
+        optics = validate_optical_media(optical_media, pbr, np.unique(pairs[pairs >= 0]))
+        if region_spec is not None:
+            from .studio_optical_media import validate_region_absorption_bound
+            validate_region_absorption_bound(region_spec, optics)
     wavelengths = np.asarray(wavelengths_um, np.float64).reshape(-1)
     if not len(wavelengths) or not np.isfinite(wavelengths).all() or np.any(wavelengths <= 0):
         raise ValueError("Studio optical wavelengths must be finite and positive")
@@ -1764,13 +1911,84 @@ def append_saved_studio_mesh_to_gpu_scene(
         value[valid] for value in (world, ids, e1, e2, cross, lengths))
 
     db = MaterialDatabase.instance()
-    unique_ids = np.unique(ids)
+    ep_db = EmissionProfileDatabase.instance()
+    from .studio_named_emitters import validate_named_emitter_refs, named_source_material
+    named_emitters=validate_named_emitter_refs(emitter_profiles,len(pbr))
+    canonical = {}
+    if material_authoring is not None:
+        from .studio_material_authoring import compile_scene_authoring
+        canonical = compile_scene_authoring(material_authoring, len(pbr), ep_db, native_volume=canonical_volume_optics is not None)
+        if canonical and (optical_media is not None or region_media is not None) and canonical_volume_optics is None:
+            raise ValueError("canonical source and optical/region media need an explicit composition adapter")
+    if canonical_volume_optics is not None:
+        if pairs is None:
+            raise ValueError("canonical volume optics require explicit boundary or region ownership")
+        from .studio_material_authoring import validate_canonical_volume_optics
+        validate_canonical_volume_optics(canonical_volume_optics, canonical,
+                                        np.unique(pairs[pairs >= 0]), region_spec, wavelengths)
+    unique_ids = np.unique(np.concatenate((ids, pairs[pairs >= 0]))) if pairs is not None else np.unique(ids)
+    advanced_mask=np.zeros(len(vertices),bool) if advanced_surface_mask is None else np.asarray(advanced_surface_mask,bool)
+    if advanced_mask.shape!=(len(vertices),):raise ValueError('advanced surface mask must match source triangles')
+    advanced_mask=advanced_mask[valid]
+    advanced_materials=set(map(int,ids[advanced_mask]))
     names = {}
     for old_id in unique_ids:
         row = pbr[int(old_id)]
-        key = "saved_studio_pbr:" + hashlib.sha256(
-            row.tobytes() + wavelengths.tobytes()).hexdigest()
+        if int(old_id) in named_emitters:
+            if int(old_id) in canonical:raise ValueError('choose named emitter source or canonical material source, not both')
+            key,material=named_source_material(named_emitters[int(old_id)],wavelengths,ep_db,
+                surface=dict(albedo=row[:3].tolist(),roughness=float(row[3]),metallic=float(row[4]),transmission=float(row[5]),ior=float(row[6]),opacity=float(row[7])))
+            key += ":surface:"+hashlib.sha256(row.tobytes()).hexdigest()
+            # Retain the authored emitter surface when it is not emitting.
+            material.update(albedo=row[:3].tolist(),roughness=float(row[3]),metallic=float(row[4]),transmission=float(row[5]),ior=float(row[6]),opacity=float(row[7]))
+            if key not in db:db.register(key,material)
+            names[int(old_id)]=key
+            continue
+        if int(old_id) in canonical:
+            compiled = canonical[int(old_id)]
+            key = "saved_studio_canonical:" + compiled.key + ":" + compiled.revision + (":volume-nk-v1" if canonical_volume_optics is not None else "")
+            if key not in db:
+                material = dict(compiled.payload)
+                if canonical_volume_optics is not None:
+                    # Derived interface flags only: original YAML stays intact.
+                    material.update(opacity=0.0, transmission=1.0)
+                    material['pbr'] = dict(material.get('pbr', {}), opacity=0.0, transmission=1.0)
+                db.register(key, material)
+            names[int(old_id)] = key
+            continue
+        key = ("saved_studio_medium_v1:" if pairs is not None else "saved_studio_pbr:") + hashlib.sha256(
+            row.tobytes() + wavelengths.tobytes() +
+            (repr(optics[int(old_id)]).encode() if optics is not None and int(old_id) in optics else b'')).hexdigest()
+        artistic_reflector = int(old_id) in advanced_materials and row[4] == 1 and row[5] == 0 and row[7] == 1 and not np.any(row[8:11])
+        if artistic_reflector: key += ":spectral-reflector-v1"
         if key not in db:
+            emit_idx = -1.0
+            emis = row[8:11]
+            if np.any(emis > 0.0):
+                # A real registered EmissionProfile, not a colour painted
+                # straight into the albedo slot: three additive spectral
+                # lines at the same R/G/B reference wavelengths the sensor's
+                # film layers are centred on (650/550/450nm), amplitude-
+                # weighted by this fixture's own filter channel values --
+                # the identical pattern every other emissive material in
+                # this database already uses (see EmissionProfileDatabase.
+                # _register_builtins: basic_led_display, tungsten_2800k).
+                # profile_to_rgb() integrates this against the real CIE
+                # 1931 colour-matching functions, so the resolved PBR
+                # emission is genuine colour science, not a dot-product
+                # approximation.
+                ep_name = "saved_studio_emission:" + hashlib.sha256(emis.tobytes()).hexdigest()
+                if ep_name not in ep_db:
+                    ep_db.register(ep_name, EmissionProfile(
+                        spd=[
+                            ParametricSpread(amp=float(emis[0]), center=650.0, q=12.0),
+                            ParametricSpread(amp=float(emis[1]), center=550.0, q=12.0),
+                            ParametricSpread(amp=float(emis[2]), center=450.0, q=12.0),
+                        ],
+                        peak_wavelength_nm=550.0, fwhm_nm=40.0,
+                        total_power_W=1.0,
+                    ))
+                emit_idx = float(ep_db.index_of(ep_name))
             material = {
                 "name": key,
                 "domain": "em_optical",
@@ -1781,6 +1999,7 @@ def append_saved_studio_mesh_to_gpu_scene(
                 "ior": float(row[6]),
                 "opacity": float(row[7]),
                 "emission_rgb": row[8:11].tolist(),
+                "emit_profile_idx": emit_idx,
             }
             if row[5] > 0.0 and row[7] < 0.999:
                 # Match the existing optical-lens band's Fresnel contract at
@@ -1794,15 +2013,28 @@ def append_saved_studio_mesh_to_gpu_scene(
                      "transmittance": float(np.clip(row[5] * (1.0 - fresnel), 0.0, 1.0)),
                      "diffuse_frac": float(np.clip(row[3], 0.0, 1.0)),
                      "emission": 0.0, "reemission": 0.0,
-                     "ior_real": n, "ior_imag": 0.0}
+                     "ior_real": n, "ior_imag": (optical_extinction(optics[int(old_id)], wl) if optics is not None and int(old_id) in optics else studio_medium_extinction(row, wl) if pairs is not None and int(old_id) in pairs else 0.0)}
                     for wl in wavelengths
                 ]
+            if artistic_reflector:
+                from .studio_spectral_reflector import authored_reflector_bands
+                material["spectral_bands"] = authored_reflector_bands(row,wavelengths)
             db.register(key, material)
         names[int(old_id)] = key
     tensors = db.build_tensors()
     ray = tensors["raymat_compat"]
     mapped_ids = np.array([tensors["index"][names[int(i)]] for i in ids], np.uint32)
     ray_rows = ray[mapped_ids]
+    # Use the actual canonical PBR derivative for geometry flags; the upload
+    # row is only the unchanged legacy path, never source authority here.
+    effective_pbr = pbr[ids].copy()
+    for triangle, old_id in enumerate(ids):
+        if int(old_id) in canonical or int(old_id) in named_emitters:
+            effective_pbr[triangle] = tensors["pbr"][mapped_ids[triangle]]
+    # Genuine emit_profile_idx-resolved emission RGB (tensors['pbr'] is the
+    # ONLY tensor the emission-profile resolution in build_tensors() writes
+    # into; raymat_compat's own column 8:11 never goes through it).
+    resolved_emission = tensors["pbr"][mapped_ids, 8:11]
 
     geom = np.zeros((len(world), 16), np.float32)
     geom[:, 0:3] = world[:, 0]
@@ -1810,9 +2042,34 @@ def append_saved_studio_mesh_to_gpu_scene(
     geom[:, 8:11] = e2
     geom[:, 12:15] = cross / lengths[:, None]
     flags = np.zeros(len(world), np.uint32)
-    flags[pbr[ids, 5] > 0.0] |= MAT_FLAG_TRANSMISSIVE
-    flags[np.any(pbr[ids, 8:11] > 0.0, axis=1)] |= MAT_FLAG_EMISSIVE
+    flags[effective_pbr[:, 5] > 0.0] |= MAT_FLAG_TRANSMISSIVE
+    flags[np.any(effective_pbr[:, 8:11] > 0.0, axis=1)] |= MAT_FLAG_EMISSIVE
+    from mat_flags import MAT_FLAG_SPECTRAL_REFLECTOR
+    artistic = np.array([int(i) not in canonical for i in ids])
+    reflector = advanced_mask & artistic & (effective_pbr[:,3]==0) & (effective_pbr[:,4]==1) & (effective_pbr[:,5]==0) & (effective_pbr[:,7]==1) & ~np.any(effective_pbr[:,8:11],axis=1)
+    flags[reflector] |= MAT_FLAG_SPECTRAL_REFLECTOR
+    from mat_flags import MAT_FLAG_ROUGH_CONDUCTOR
+    rough_conductor=advanced_mask & (effective_pbr[:,4]==1) & (effective_pbr[:,5]==0) & (effective_pbr[:,7]==1) & ~np.any(effective_pbr[:,8:11],axis=1)
+    flags[rough_conductor] |= MAT_FLAG_ROUGH_CONDUCTOR
+    from mat_flags import MAT_FLAG_NATIVE_CONDUCTOR_NK
+    nk_ids=set()
+    for material,compiled in canonical.items():
+        bands=compiled.payload.get('bands',compiled.payload.get('spectral_bands',[]))
+        if bands and all('ior_real' in b and 'ior_imag' in b for b in bands):
+            nk=np.asarray([[b['ior_real'],b['ior_imag']] for b in bands],float)
+            if not np.isfinite(nk).all() or np.any(nk<0):raise ValueError('canonical conductor n/k must be finite and nonnegative')
+            nk_ids.add(material)
+    unresolved=rough_conductor & np.array([int(i) in canonical and int(i) not in nk_ids for i in ids])
+    if np.any(unresolved):raise ValueError('advanced canonical conductor requires explicit spectral n/k; scalar reflectance amplitude is not a power substitute')
+    native_nk=rough_conductor & np.array([int(i) in nk_ids for i in ids])
+    flags[native_nk] |= MAT_FLAG_NATIVE_CONDUCTOR_NK
     geom[:, 15] = flags.view(np.float32)
+
+    if pairs is not None:
+        mapped_materials = {old_id: int(tensors["index"][name]) for old_id, name in names.items()}
+        install_boundary_pairs(geom, pairs, valid, mapped_materials)
+        if region_spec is not None:
+            tag_region_geometry(geom,region_spec,region_owners,valid,mapped_materials)
 
     shade = np.zeros((len(world), 16), np.float32)
     shade[:, 0:3] = ray_rows[:, [0, 1, 2]]
@@ -1820,8 +2077,27 @@ def append_saved_studio_mesh_to_gpu_scene(
     shade[:, 4:7] = ray_rows[:, [4, 5, 6]]
     shade[:, 7] = ray_rows[:, 13]
     shade[:, 8:11] = ray_rows[:, [8, 9, 10]]
-    shade[:, 11] = np.any(pbr[ids, 8:11] > 0.0, axis=1).astype(np.float32)
-    shade[:, 12] = np.max(pbr[ids, 8:11], axis=1)
+    emissive_mask = np.any(effective_pbr[:, 8:11] > 0.0, axis=1)
+    # albedo.xyz doubles as "this surface's own colour" for the sensor
+    # shader's existing per-layer projection (demo_pluck_gl.py's
+    # get_layer_light()/aw = dot(surf_albedo, layer_rgb) term, the same
+    # term that already colours ordinary diffuse reflectance). A pure
+    # emitter's base reflectance is irrelevant -- carry its real emission
+    # RGB here instead so that projection has an actual colour to read,
+    # not the zeroed-out albedo a light fixture is otherwise authored with.
+    # Genuine, profile-resolved emission colour (CIE-integrated from the
+    # registered EmissionProfile above), not the raw uploaded channel
+    # values directly -- those never passed through real colour science.
+    shade[emissive_mask, 8:11] = resolved_emission[emissive_mask]
+    if spectral_emission_rgb:
+        # The fixed:3 tracer transports the authored Gaussian emission lines,
+        # not display RGB.  Match RayOrder's source spectrum before film
+        # integration.  Preserve the existing peak radiance in shade[:,12].
+        raw_emission = effective_pbr[:, 8:11]
+        peaks = np.maximum(np.max(raw_emission, axis=1, keepdims=True), 1e-12)
+        shade[emissive_mask, 8:11] = (raw_emission / peaks)[emissive_mask]
+    shade[:, 11] = emissive_mask.astype(np.float32)
+    shade[:, 12] = np.max(effective_pbr[:, 8:11], axis=1)
     shade[:, 14] = mapped_ids.view(np.float32)
 
     all_tris = np.concatenate((base_tris, world), axis=0)
@@ -1829,9 +2105,13 @@ def append_saved_studio_mesh_to_gpu_scene(
               np.maximum(base_bounds[1], world.max(axis=(0, 1))))
     freq_hz = np.asarray([_C_LIGHT / (wl * 1e-6) for wl in wavelengths], np.float64)
     mat_buf = np.ascontiguousarray(db.build_mat_buf(freq_hz=freq_hz), np.float32)
-    return (np.concatenate((base_geom, geom)),
+    all_geom = np.concatenate((base_geom, geom))
+    if pairs is not None:
+        all_geom[0, 11] = 4097.0  # explicit-media scene marker; no vertex coordinate changes
+    result = (all_geom,
             np.concatenate((base_shade, shade)), mat_buf, all_tris,
             contexts, ctx_map, bounds, sources)
+    return (result, np.flatnonzero(valid)) if return_index_map else result
 
 
 # ─────────────────────────────────────────────────────────────────────────────

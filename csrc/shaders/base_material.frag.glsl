@@ -61,6 +61,14 @@
  * Light leaving the body this way is composited additively over what is behind
  * (alpha is raised just enough to carry it), not scaled by the surface's alpha.
  *
+ * PLUCK_PREMULTIPLIED_GLASS is a Studio opt-in on the transmission variant.
+ * It requires ONE, ONE_MINUS_SRC_ALPHA blending: reflected/transmitted light
+ * is already weighted before display conversion, so alpha must not multiply
+ * Fresnel a second time. Clear glass keeps its Fresnel signal at opacity=0;
+ * opacity instead adds the same reflection mixture as the ray material.
+ * This is an RGB, straight-through preview, not traced refraction, spectral
+ * absorption, or nested-medium transport. Non-transmissive lighting is kept.
+ *
  * There is no global scene tint or hardcoded sun. The material's bounded
  * Phong ambient term is treated as an authored indirect-light floor so shadow
  * structure remains legible; all direct illumination comes from host emitters.
@@ -214,6 +222,11 @@ uniform bool uEnableEmissionDirect = false;
 uniform int  uRenderPass = 0;  // 0=all, 1=opaque-only (alpha>=0.85), 2=transparent-only
 uniform sampler3D uFieldVolume;
 uniform float uFieldGain = 0.0;
+// Scales the authored Phong-ambient indirect-light floor (ph_ambient,
+// clamped to 0.12 above). 1.0 preserves the existing baseline everywhere
+// this shader is used; consumers that want pure-emitter lighting (no
+// invisible indirect floor at all) set this to 0.0 per frame.
+uniform float uAmbientFloorGain = 1.0;
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
@@ -357,10 +370,24 @@ void main() {
     vec3  tr_acc    = vec3(0.0);   // radiance from lights behind the surface, through the body
     vec3  sss_acc   = vec3(0.0);   // back-lighting scattered by the body
     vec3  remit_acc = vec3(0.0);   // irradiance the body absorbs and re-emits
+#ifdef PLUCK_PREMULTIPLIED_GLASS
+    float glass_weight = m_trans * (1.0 - clamp(metallic, 0.0, 1.0));
+    bool glass_preview = glass_weight > 0.0;
+    if (glass_preview) {
+        // Same forced-reflection mixture as the transparent ray branch.
+        // This is surface probability, not a volume-scattering coefficient.
+        F_vec = mix(F_vec, vec3(1.0), clamp(opacity, 0.0, 1.0));
+    }
+#endif
 #endif
 
     // Direct illumination from real emitters only.
-    vec3 col = base * clamp(ph_ambient(id), 0.0, 0.12);
+    vec3 col = base * clamp(ph_ambient(id), 0.0, 0.12) * uAmbientFloorGain;
+    float diffuse_weight = 1.0;
+#if defined(PLUCK_TRANSMISSION) && defined(PLUCK_PREMULTIPLIED_GLASS)
+    diffuse_weight = 1.0 - glass_weight;
+    col *= diffuse_weight;
+#endif
     vec3 spec_col_acc = vec3(0.0);
     float spec_acc = 0.0;
     int n = min(uNumLights, MAX_LIGHTS);
@@ -389,7 +416,7 @@ void main() {
         visibility = light_shadow_visibility(i, N, L);
 #endif
 
-        col += base * Lcol * NdotL * visibility;
+        col += base * Lcol * NdotL * visibility * diffuse_weight;
 
         if (uEnableSpecular) {
             col += Lcol * F_vec * (specstr * spec) * visibility;
@@ -511,6 +538,21 @@ void main() {
     // Color compensation equation: C' = CAT_CCM * C.
     col = uCatCcmMatrix * col;
 
+#if defined(PLUCK_TRANSMISSION) && defined(PLUCK_PREMULTIPLIED_GLASS)
+    if (glass_preview) {
+        // Reflected light in col already contains F_vec. Composite it once,
+        // independently of coverage, rather than deleting it at opacity=0.
+        // The background is straight-through with scalar Fresnel coverage;
+        // colour filtering here applies only to the direct transmitted light.
+        float reflection = clamp(max(F_vec.r, max(F_vec.g, F_vec.b)), 0.0, 1.0);
+        float glass_alpha = 1.0 - glass_weight * (1.0 - reflection);
+        if (uRenderPass == 1 && glass_alpha < 0.85) discard;
+        if (uRenderPass == 2 && glass_alpha >= 0.85) discard;
+        FragColor = vec4(pluck_display(col + uCatCcmMatrix * col_t), glass_alpha);
+        return;
+    }
+#endif
+
     // ── Opacity ────────────────────────────────────────────────────────────
     float alpha = opacity;
 #ifdef PLUCK_TRANSMISSION
@@ -536,6 +578,11 @@ void main() {
         srgb = min((srgb * alpha + st) / max(a_t, 1e-4), vec3(1.0));
         alpha = a_t;
     }
+#endif
+#ifdef PLUCK_PREMULTIPLIED_GLASS
+    // The host's single premultiplied blend contract also covers ordinary
+    // translucent materials. Opaque fragments (alpha=1) remain unchanged.
+    srgb *= alpha;
 #endif
     FragColor = vec4(srgb, alpha);
 }

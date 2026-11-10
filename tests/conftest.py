@@ -54,6 +54,9 @@ _kmod_consts = [
     "KMOD_CTRL", "KMOD_SHIFT", "KMOD_ALT", "KMOD_NONE",
     "KMOD_LSHIFT", "KMOD_RSHIFT", "KMOD_LCTRL", "KMOD_RCTRL",
 ]
+_pygame_module_key_consts = [
+    "K_0", "K_1", "K_2", "K_3", "K_4", "K_5", "K_6", "K_7",
+]
 
 # pygame itself needs Surface, Rect, etc.
 _pg = sys.modules["pygame"]
@@ -70,6 +73,8 @@ _pg.font.Font = type("Font", (), {})
 _pg.font.SysFont = lambda *a, **kw: None
 # KMOD constants — must live on the pygame module itself
 for _c in _kmod_consts:
+    setattr(_pg, _c, 0)
+for _c in _pygame_module_key_consts:
     setattr(_pg, _c, 0)
 
 # ---- OpenGL stubs ----

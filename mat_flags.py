@@ -40,7 +40,17 @@ MAT_FLAG_TRANSMISSIVE  = 64
 MAT_FLAG_APERTURE_STOP = 128  # opaque blade — kills ray; diffraction handled downstream
 MAT_FLAG_PICKING_ONLY  = 256  # tracer-5 mode: nearest-hit, no spectrum, no bounce
 
+MAT_FLAG_SPECTRAL_REFLECTOR = 512  # authored normal-incidence spectrum, ideal specular Studio adapter
+
+MAT_FLAG_ROUGH_CONDUCTOR = 1024  # explicit advanced Studio surface transport
+
+MAT_FLAG_NATIVE_CONDUCTOR_NK = 2048  # source explicitly authored spectral n/k
+BINDING_STUDIO_NATIVE_PBR = 18  # 16/17 reserved for cooperative first-hit loan/verifier
+
 ALL_FLAGS = {
+    "MAT_FLAG_NATIVE_CONDUCTOR_NK": MAT_FLAG_NATIVE_CONDUCTOR_NK,
+    "MAT_FLAG_ROUGH_CONDUCTOR": MAT_FLAG_ROUGH_CONDUCTOR,
+    "MAT_FLAG_SPECTRAL_REFLECTOR": MAT_FLAG_SPECTRAL_REFLECTOR,
     "MAT_FLAG_EMISSIVE":      MAT_FLAG_EMISSIVE,
     "MAT_FLAG_REACTIVE":      MAT_FLAG_REACTIVE,
     "MAT_FLAG_ABSORBER":      MAT_FLAG_ABSORBER,

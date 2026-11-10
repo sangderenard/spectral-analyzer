@@ -898,6 +898,25 @@ def simple_doublet_preset() -> CameraPreset:
     )
 
 
+def thin_lens_housing_preset(camera: dict) -> CameraPreset:
+    """Native camera housing for SensorAccumulator's analytical thin lens.
+
+    The former Studio path removed the demo glass but left its body, iris and
+    sensor at the world origin. Retain these authored physical parts, match the
+    active entrance pupil, and let thin_lens_housing_frame place them together.
+    The analytical lens alone forms the image; it must not be refracted twice.
+    """
+    preset = simple_doublet_preset()
+    preset.name = "studio_thin_lens_housing"
+    preset.lens_group.elements = []
+    preset.aperture_stop.r_outer = float(camera.get("aperture_radius_m", .005))
+    preset.aperture_stop.n_blades = int(camera.get("aperture_blades", 0))
+    # Native local X points opposite image-right. Reflect the aperture angle
+    # so the authored iris polygon and the sensor's sampled pupil agree.
+    preset.aperture_stop.aperture_rot = np.pi - float(camera.get("aperture_rotation_radians", 0))
+    return preset
+
+
 def eye_model_preset() -> CameraPreset:
     """Schematic eye model (Gullstrand simplified) as a CameraPreset.
 

@@ -2,6 +2,9 @@
 #define MAT_FLAGS_GENERATED_H
 /* auto-generated from mat_flags.py — DO NOT EDIT */
 
+static constexpr unsigned MAT_FLAG_NATIVE_CONDUCTOR_NK = 2048u;
+static constexpr unsigned MAT_FLAG_ROUGH_CONDUCTOR = 1024u;
+static constexpr unsigned MAT_FLAG_SPECTRAL_REFLECTOR = 512u;
 static constexpr unsigned MAT_FLAG_EMISSIVE = 1u;
 static constexpr unsigned MAT_FLAG_REACTIVE = 2u;
 static constexpr unsigned MAT_FLAG_ABSORBER = 4u;

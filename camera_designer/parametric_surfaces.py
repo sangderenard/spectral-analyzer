@@ -320,9 +320,14 @@ class SphericalSurface(ParametricSurface):
         nrm  = np.where(flip[:, None], -nrm, nrm)
         return t, hit, nrm
 
-    def glsl_intercept_fn(self, fn_name="surf_intercept") -> str:
+    def glsl_intercept_fn(self, fn_name="surf_intercept", *, min_t_argument=False) -> str:
+        # The photo region adapter reuses this exact kernel in unit-sphere
+        # coordinates, with its world-space exclusion distance transformed
+        # to that frame. Existing lens callers keep the original signature.
+        minimum = "min_t" if min_t_argument else "1e-6"
+        argument = "float min_t, " if min_t_argument else ""
         return f"""
-bool {fn_name}(vec3 ro, vec3 rd, out float t, out vec3 normal) {{
+bool {fn_name}(vec3 ro, vec3 rd, {argument}out float t, out vec3 normal) {{
     float R = {self.R};
     float r_max = {self.r_max};
     float r_min = {self.r_min};
@@ -338,7 +343,7 @@ bool {fn_name}(vec3 ro, vec3 rd, out float t, out vec3 normal) {{
     t = 1e30;
     for (int i = 0; i < 2; i++) {{
         float tt = (i == 0) ? t1 : t2;
-        if (tt > 1e-6) {{
+        if (tt > {minimum}) {{
             vec3 h = ro + tt * rd;
             float r2 = h.x*h.x + h.y*h.y;
             if (r2 >= r_min*r_min && r2 <= r_max*r_max) {{

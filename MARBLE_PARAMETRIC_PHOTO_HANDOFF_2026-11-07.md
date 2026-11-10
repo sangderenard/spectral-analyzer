@@ -1,5 +1,13 @@
 # Continuous marble surface in the Spectral photo worker — handoff
 
+**Current source follow-up (2026-11-09):** Read
+[`MARBLE_PARAMETRIC_REGIONS_HANDOFF_2026-11-09.md`](MARBLE_PARAMETRIC_REGIONS_HANDOFF_2026-11-09.md)
+before implementing this proposal. In particular, the native kind named
+`SDF_SPHERE` is triangle-local barycentric post-hit displacement, not an
+exact global sphere intersection. The follow-up distinguishes that original
+contract, exact compound-lens transport, and scale-context regions, and
+records the missing photo data path and observed source-level parity gaps.
+
 **Status (2026-11-07):** The deployed photo path is triangulated. A continuous-surface toggle is requested but is not operative yet. Do not label a mesh subdivision or smooth normal interpolation as a parametric ray intersection.
 
 ## Current boundary

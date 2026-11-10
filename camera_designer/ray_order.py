@@ -958,17 +958,46 @@ class RayOrder:
             weights = flat_weights.copy()
             filter_rgb = lgt.get("filter_rgb")
             if filter_rgb is not None:
-                # Legacy-shim approximation: weight each transport band by
-                # how much of the filter's RGB the band's own wavelength
-                # would read on a display sensor, reusing the same CIE-based
-                # weighting camera_software.transport_contract already uses
-                # to turn fixed spectral lines into RGB -- not a new color
-                # model invented here.
-                from camera_software.transport_contract import native_display_rgb_weight
+                # native_display_rgb_weight() (camera_software.transport_contract)
+                # is NOT a physical sensitivity/weighting function -- it is a
+                # DISPLAY-SWATCH ramp for rendering what a single monochromatic
+                # line should look like on screen (a perceptual visualisation
+                # aid), never meant to decide how much real spectral power a
+                # declared linear filter colour corresponds to. Using it here
+                # mixed that perceptual/display quantity directly into linear
+                # radiometric ray-weighting math -- "slapping linear data
+                # together" with a perceptual one. At the renderer's own fixed
+                # bands (650/550/450nm) it put roughly 27% of a PURE RED
+                # filter's forward rays at 550nm (measured), devastating any
+                # saturated filter's hue; a calibration render of seven known
+                # single-light colours in the Studio confirmed the real,
+                # outsized washout this produced on every non-white colour.
+                #
+                # The authored filter_rgb is, instead, interpreted exactly
+                # the same way scene_builder.py's append_saved_studio_mesh_
+                # to_gpu_scene() already interprets an emissive MATERIAL's
+                # emission RGB: three additive Gaussian spectral lines at
+                # these same 650/550/450nm reference wavelengths, amplitude
+                # = that channel's value, q=12.0 (sigma = center/(q*2.3548)).
+                # One convention for "what spectrum does this declared linear
+                # RGB mean", not two independently-invented, inconsistent
+                # ones. Each transport band's weight is that spectrum
+                # evaluated at the band's own wavelength: at a band whose
+                # wavelength matches one of the three line centres, this
+                # correctly reduces to (almost entirely) that line's own
+                # amplitude, with only the small, physically real spectral
+                # overlap the Gaussian tails of the OTHER lines contribute --
+                # not an invented, perceptually-sourced cross-talk fraction.
                 fr, fg, fb = (float(x) for x in filter_rgb)
+                lines = ((650.0, fr), (550.0, fg), (450.0, fb))
+                q = 12.0
                 for wi, wl_um in enumerate(wl):
-                    r, g, b = native_display_rgb_weight(float(wl_um) * 1000.0)
-                    weights[wi] = max(0.0, fr * r + fg * g + fb * b)
+                    wl_nm = float(wl_um) * 1000.0
+                    total = 0.0
+                    for center_nm, amp in lines:
+                        sigma_nm = center_nm / (q * 2.3548)
+                        total += amp * math.exp(-0.5 * ((wl_nm - center_nm) / sigma_nm) ** 2)
+                    weights[wi] = max(0.0, total)
 
             gaps: List[TracerGap] = [
                 TracerGap(
@@ -979,8 +1008,10 @@ class RayOrder:
                         'Legacy lights dict "color" key is a display tint, not a '
                         "spectral distribution. All bands weighted equally."
                         if filter_rgb is None else
-                        "filter_rgb approximated per-band via display RGB "
-                        "sensitivity, not an authored spectral distribution."
+                        "filter_rgb approximated as three Gaussian spectral "
+                        "lines at 650/550/450nm (q=12.0), the same convention "
+                        "scene_builder.py uses for an emissive material's own "
+                        "emission RGB, not an authored spectral distribution."
                     ),
                 ),
                 TracerGap(

@@ -1,0 +1,10 @@
+# Nominal specs only. No surface prescription, close-focus claim or effect calibration.
+name: mirror_500mm_f8
+specs_only: true
+lens_type: mirror
+focal_mm: 500.0
+min_focal_mm: 500.0
+max_focal_mm: 500.0
+is_zoom: false
+max_aperture_fstop: 8.0
+fixed_aperture: true

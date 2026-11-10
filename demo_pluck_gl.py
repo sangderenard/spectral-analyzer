@@ -791,6 +791,28 @@ FILM_STACKS: dict[str, FilmStack] = {
         'G': FILM_LAYER_PRESETS['em_green'],
         'B': FILM_LAYER_PRESETS['em_blue'],
     }, active='R'),
+    # em_rgb's own R/G/B response centres/widths (above) are deliberately
+    # broad and offset from round numbers: they were tuned to correctly
+    # INTEGRATE a real CONTINUOUS illuminant spectrum (see
+    # DigitalPositiveSensor's 35mm Bayer-CFA auto-white-balance use, further
+    # down this file) the same way real camera/eye sensitivity curves are
+    # broad by design for that purpose. The "fixed:3" transport mode is the
+    # opposite case: forward rays are generated at exactly three DISCRETE
+    # wavelengths (450/550/650nm, see scene_builder.py/ray_order.py), never
+    # a continuum. Feeding an isolated monochromatic ray into a response
+    # tuned for continuum integration smears it across all three layers
+    # with no neighbouring spectrum there to balance it back out --
+    # measured directly: a ray generated at EXACTLY 650nm still read only
+    # 48% on em_rgb's own "R" layer, 38% leaking into "G", 14% into "B".
+    # This stack instead centres each layer exactly on fixed:3's own three
+    # wavelengths with a response narrow enough (0.06 octaves vs. the
+    # ~0.24-0.29 octave spacing between them) to isolate them as the
+    # genuinely monochromatic, discrete lines they are.
+    'em_rgb_fixed3': FilmStack({
+        'R': FilmLayer('R', 'em', response_center_hz=2.998e14 / 0.650, response_width_oct=0.06, channel_labels=_EML),
+        'G': FilmLayer('G', 'em', response_center_hz=2.998e14 / 0.550, response_width_oct=0.06, channel_labels=_EML),
+        'B': FilmLayer('B', 'em', response_center_hz=2.998e14 / 0.450, response_width_oct=0.06, channel_labels=_EML),
+    }, active='R'),
     'em_nir': FilmStack({'nir': FILM_LAYER_PRESETS['em_nir']}, active='nir'),
     # Dual-domain: acoustic + EM NIR
     'acoustic_em_dual': FilmStack({
@@ -1010,6 +1032,8 @@ class LensSpec:
 
     @classmethod
     def from_dict(cls, d: dict) -> "LensSpec":
+        if d.get("specs_only") is True:
+            raise ValueError("Specs-only lenses use camera_software.lens_contracts; optical effects are not authored")
         tx = tuple(float(v) for v in d.get("transmission", [0.98, 0.97, 0.95, 0.85]))
         return cls(
             name=str(d.get("name", "lens")),
@@ -3257,9 +3281,12 @@ void main() {
 # selectable native continuous-spectral mode: spectral MatBuf evaluation and
 # complex BDPT/sensor parity below remain unfinished. New transport work uses
 # camera_software.transport_contract and the native BDPT pipeline.
+from camera_designer.spectral_sensor_basis import FIXED3_SPECTRAL_GLSL, uses_fixed3_transport
+
 _GPU_RAY_FIELD_CS = """
 #version 430 core
 layout(local_size_x = 128) in;
+__FIXED3_SPECTRAL_HELPERS__
 
 // ─── Material flag bits ────────────────────────────────────────────────────
 // Mirrored byte-for-byte from mat_flags.py and mat_flags_generated.h — the
@@ -3467,6 +3494,25 @@ layout(binding = 15) uniform usampler3D uFwdLayer7;
 const float EPS = 1e-7;
 const float PI = 3.14159265358979323846;
 
+// How much of THIS exact ray wavelength a material's own authored albedo
+// colour lets through -- 1.0 if this is the material's own transmission
+// colour (e.g. a blue-band ray through blue glass), 0.0 if it is the
+// complement (e.g. a red-band ray through blue glass, fully absorbed).
+// R/G/B albedo channels are treated as additive spectral lines at the same
+// 650/550/450nm reference wavelengths scene_builder.py's emission-profile
+// registration and every other emissive material in this database already
+// use, Gaussian-weighted in log-frequency against this ray's own freq_hz
+// (this shader has no per-layer uLayerLight uniforms to dot against, only
+// the forward ray's single packet.x frequency). This is the missing link
+// between a transmissive/refractive material's authored RGB and what
+// colour it lets through -- previously refraction only ever applied an
+// achromatic Fresnel transmittance, so a coloured glass's own albedo never
+// tinted light that actually passed through it (only light it diffusely
+// reflected via the existing NEE/emissive per-layer projection).
+float spectral_transmit_weight(vec3 albedo, float freq_hz) {
+    return studio_material_weight(albedo, freq_hz);
+}
+
 uint hash_u(uint x) {
     x = x * 747796405u + 2891336453u;
     uint word = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
@@ -3621,7 +3667,8 @@ vec3 _emit_dir(float u1, float u2, vec3 axis) {
 bool hit_tri(vec3 ro, vec3 rd, TriGeom t, out float hit_t) {
     vec3 h = cross(rd, t.e2.xyz);
     float a = dot(t.e1.xyz, h);
-    if (abs(a) < 1e-8) return false;
+    // Relative float32 parallel test: a fixed area cutoff deletes miniature triangles.
+    if (abs(a) <= 2.384185791015625e-7 * length(t.e1.xyz) * length(t.e2.xyz) * length(rd)) return false;
     float f = 1.0 / a;
     vec3 s = ro - t.v0.xyz;
     float u = f * dot(s, h);
@@ -3651,6 +3698,7 @@ Tri load_tri(int ti) {
     t.emissive = s.emissive;
     return t;
 }
+__STUDIO_BOUNDARY_HELPERS__
 
 // Recompute Möller-Trumbore barycentric (u,v) for a known-hit triangle.
 // Returns the same u,v produced during intersection — direct surface params.
@@ -3687,7 +3735,7 @@ bool hit_aabb(vec3 ro, vec3 rd, vec3 lo, vec3 hi, float best_t) {
     return near_t <= far_t;
 }
 
-int nearest_hit(vec3 ro, vec3 rd, out float best) {
+int nearest_filtered(vec3 ro, vec3 rd, out float best, bool boundary_only) {
     best = 1e30;
     int best_tri = -1;
     int stack[96];
@@ -3710,7 +3758,7 @@ int nearest_hit(vec3 ro, vec3 rd, out float best) {
             for (int k = 0; k < count; ++k) {
                 int ti = tri_ids[start + k];
                 float ht;
-                if (hit_tri(ro, rd, geom_tris[ti], ht) && ht < best) {
+                if ((!boundary_only || (geom_tris[ti].v0.w>=1.0 && shade_tris[ti].mat_out.w<0.999)) && hit_tri(ro, rd, geom_tris[ti], ht) && ht < best) {
                     best = ht;
                     best_tri = ti;
                 }
@@ -3724,6 +3772,9 @@ int nearest_hit(vec3 ro, vec3 rd, out float best) {
     }
     return best_tri;
 }
+int nearest_hit(vec3 ro,vec3 rd,out float best) {return nearest_filtered(ro,rd,best,false);}
+int nearest_boundary(vec3 ro,vec3 rd,out float best) {return nearest_filtered(ro,rd,best,true);}
+
 
 vec4 film_activation(float freq_hz, float phase, float energy) {
     float coherence = 0.75 + 0.25 * cos(phase);
@@ -3759,6 +3810,13 @@ void splat_spectral(vec3 p, vec4 packet) {
     float freq   = packet.x;
     float energy = packet.z;
     float coherence = 0.75 + 0.25 * cos(packet.y);
+    if (uFixed3Transport != 0) {
+        // Store line energy, not already filtered sensor RGB.  Absorption on
+        // the camera half of a path must precede overlapping film responses.
+        uint val = uint(clamp(energy * coherence * 65535.0, 0.0, 1e6));
+        if (val > 0u) layer_splat(studio_band_index(freq), q, val);
+        return;
+    }
     int n = clamp(uLayerCount, 0, 8);
     for (int i = 0; i < n; i++) {
         float ctr = max(uLayerCentersHz[i], 1e-3);
@@ -4117,13 +4175,14 @@ void sensor_main(uint ray_id, inout uint rng) {
     vec3 rd = cone_dir(rand01(rng), rand01(rng), uSrcDir, uSensorConeCos);
     float cone_pdf = 1.0 / max(2.0 * PI * (1.0 - clamp(uSensorConeCos, -1.0, 1.0)), 1e-6);
     float path_weight = 1.0;
+    int currentMedium=studio_origin_medium(ro,rd);
 
     for (int bounce = 0; bounce < uMaxBounces; ++bounce) {
         float best = 1e30;
         int hit = nearest_hit(ro, rd, best);
 
         float march_len = (hit >= 0) ? best : length(uBoxMax - uBoxMin);
-        int air_steps = max(1, int(march_len / max(uVolumeStepMeters * 6.0, 1e-4)));
+        int air_steps = currentMedium<0 ? max(1, int(march_len / max(uVolumeStepMeters * 6.0, 1e-4))) : 0;
         float jitter = rand01(rng);
         for (int i = 0; i < air_steps; ++i) {
             float t = (float(i) + jitter) / float(air_steps);
@@ -4150,6 +4209,13 @@ void sensor_main(uint ray_id, inout uint rng) {
         vec4 fwd = sample_activation_field(hp);
 
         Tri  tri      = load_tri(hit);
+        if(studio_boundary(tri)) {
+            float factor;
+            if(!studio_boundary_step(tri,rd,studio_band_frequency(0),rand01(rng),currentMedium,factor)) break;
+            path_weight*=factor;
+            ro=hp+rd*1e-6;
+            continue;
+        }
         vec3 geom_n   = normalize(tri.normal.xyz);
         bool interior = dot(rd, geom_n) > 0.0;
         vec3 n        = interior ? -geom_n : geom_n;
@@ -4185,7 +4251,7 @@ void sensor_main(uint ray_id, inout uint rng) {
                 rd = refr_dir;
                 cone_pdf *= (1.0 - fresnel_r);
             }
-            ro = hp + rd * 1e-5;
+            ro = hp + rd * (studio_media_enabled()?1e-6:1e-5);
         } else {
             // ── Opaque surface ─────────────────────────────────────────────────
             float mis = balance_weight(fwd, cone_pdf);
@@ -4212,7 +4278,7 @@ void sensor_main(uint ray_id, inout uint rng) {
                 if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
                 cone_pdf *= max(0.05, 1.0 - diffusion);
             }
-            ro = hp + rd * 1e-5;
+            ro = hp + rd * (studio_media_enabled()?1e-6:1e-5);
         }
     }
 }
@@ -4251,6 +4317,7 @@ void main() {
     vec3 rd = normalize(_prebaked.dir_kind.xyz);
     vec4 packet = _prebaked.packet;   // .x=freq_hz, .y=phase(pre-baked), .z=energy, .w=0
 
+    int currentMedium=studio_origin_medium(ro,rd);
     float path_len = 0.0;   // accumulated path length for near-field and context spreading
     for (int bounce = 0; bounce < uMaxBounces; ++bounce) {
         float best = 1e30;
@@ -4258,7 +4325,8 @@ void main() {
         if (hit < 0) break;
         if (uDiagnosticsEnabled != 0) atomicAdd(hit_count, 1u);
         vec3 hp = ro + rd * best;
-        splat_segment_multiscale(ro, hp, packet, path_len);
+        packet.z*=studio_medium_transmittance(currentMedium,packet.x,best);
+        if(currentMedium<0) splat_segment_multiscale(ro, hp, packet, path_len);
         packet = apply_wave_context_physics(ro, rd, best, packet);
         // Segment capture: thin proportionally to total ray count.
         // Only fires when uSegmentCapture != 0 (production disables this path).
@@ -4270,17 +4338,27 @@ void main() {
             }
         }
         Tri tri = load_tri(hit);
+        if(studio_boundary(tri)) {
+            float factor;
+            if(!studio_boundary_step(tri,rd,packet.x,rand01(rng),currentMedium,factor)) break;
+            ro=hp+rd*1e-6;path_len+=best;
+            if (packet.z < 0.002) break;
+            continue;
+        }
         uint  mat_flags_bits = floatBitsToUint(tri.normal.w);
         vec3  geom_n         = normalize(tri.normal.xyz);
         bool  interior_face  = dot(rd, geom_n) > 0.0;
         vec4  mat            = interior_face ? tri.mat_in : tri.mat_out;
-        float reflectivity   = clamp(mat.x, 0.02, 0.98);
+        bool diffuse_surface = studio_diffuse_surface(tri);
+        bool spectral_reflector = studio_spectral_reflector(tri);
+        float reflectivity   = diffuse_surface ? studio_diffuse_rho(tri,packet.x) : clamp(mat.x, 0.02, 0.98);
         float diffusion      = clamp(mat.y, 0.0, 1.0);
         float absorption     = clamp(mat.z, 0.0, 2.0);
         float ior            = max(tri.mat_in.w, 1.0);
         float opacity        = clamp(tri.mat_out.w, 0.0, 1.0);
         vec3  n              = interior_face ? -geom_n : geom_n;
         float cos_i          = max(0.0, dot(-rd, n));
+        if(spectral_reflector)reflectivity=studio_reflector_rho(tri,packet.x,cos_i);
 
         // ── Emissive surface: deposit radiance into the volume field ──────────
         // Independent of bounce direction — any ray that grazes an emissive
@@ -4291,6 +4369,8 @@ void main() {
                                     emit_scale * max(tri.emissive.x,
                                                  max(tri.emissive.y, tri.emissive.z)),
                                     packet.w);
+            if (uFixed3Transport != 0)
+                emit_pkt.z *= studio_emission_weight(tri.albedo.rgb, packet.x);
             splat_spectral(hp, emit_pkt);
         }
 
@@ -4379,7 +4459,7 @@ void main() {
                             w_sum_f   += w_f;
                         }
                         rd = normalize(blended_f / max(w_sum_f, 1e-12));
-                        ro = hp + rd * 1e-5;
+                        ro = hp + rd * (studio_media_enabled()?1e-6:1e-5);
                         path_len += best;
                         packet.y += best * packet.x * 0.000021;
                         if (packet.z < 0.002) break;
@@ -4407,9 +4487,25 @@ void main() {
                     if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
                 } else {
                     rd = normalize(refract(rd, n, eta));
-                    packet.z *= (1.0 - fr);
+                    // Bulk colour of the medium: a material that is blue
+                    // glass (albedo's blue channel high, others low) must
+                    // transmit a blue-band ray almost unabsorbed and a
+                    // red-band ray strongly absorbed, over this material's
+                    // own distance scale (absorption, authored per
+                    // material). Previously only the achromatic Fresnel
+                    // transmittance (1-fr) applied here -- a material's
+                    // authored colour never tinted the light that actually
+                    // passed through it, only light it diffusely reflected.
+                    float chroma = spectral_transmit_weight(tri.albedo.rgb, packet.x);
+                    float medium_decay = exp(-absorption * best * (1.0 - chroma));
+                    packet.z *= (1.0 - fr) * medium_decay;
                 }
             }
+        } else if(studio_rough_conductor(tri)) {
+            vec3 outgoing;float vh;
+            float weight=studio_conductor_sample(tri,rd,n,vec2(rand01(rng),rand01(rng)),outgoing,vh);
+            if(weight<=0.0)break;
+            packet.z*=weight*studio_reflector_rho(tri,packet.x,vh);rd=outgoing;
         } else {
             // Opaque: diffuse or specular bounce
             if (rand01(rng) < diffusion) {
@@ -4418,11 +4514,11 @@ void main() {
                 rd = normalize(reflect(rd, n));
                 if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
             }
-            float band_decay = exp(-absorption * best * clamp(packet.x / 440.0, 0.25, 8.0));
-            float dist_falloff = 1.0 / (1.0 + 0.08 * best);
+            float band_decay = (diffuse_surface || spectral_reflector) ? 1.0 : exp(-absorption * best * clamp(packet.x / 440.0, 0.25, 8.0));
+            float dist_falloff = (diffuse_surface || spectral_reflector) ? 1.0 : 1.0 / (1.0 + 0.08 * best);
             packet.z *= reflectivity * band_decay * dist_falloff;
         }
-        ro = hp + rd * 1e-5;
+        ro = hp + rd * (studio_media_enabled()?1e-6:1e-5);
         path_len += best;
         packet.y += best * packet.x * 0.000021;
         if (packet.z < 0.002) break;
@@ -4443,6 +4539,7 @@ void reactive_main(uint gid, inout uint rng) {
     vec3  rd           = normalize(pr.dir_bounces.xyz);
     int   bounces_rem  = int(floatBitsToUint(pr.dir_bounces.w));
     vec4  packet       = pr.packet;
+    int currentMedium=studio_origin_medium(ro,rd);
 
     for (int bounce = 0; bounce < min(bounces_rem, uMaxBounces); ++bounce) {
         float best;
@@ -4450,20 +4547,31 @@ void reactive_main(uint gid, inout uint rng) {
         if (hit < 0) break;
 
         vec3 hp = ro + rd * best;
-        splat_segment_spectral(ro, hp, packet);
+        packet.z*=studio_medium_transmittance(currentMedium,packet.x,best);
+        if(currentMedium<0) splat_segment_spectral(ro, hp, packet);
 
         Tri   tri            = load_tri(hit);
+        if(studio_boundary(tri)) {
+            float factor;
+            if(!studio_boundary_step(tri,rd,packet.x,rand01(rng),currentMedium,factor)) break;
+            ro=hp+rd*1e-6;
+            if (packet.z < 0.002) break;
+            continue;
+        }
         uint  flags          = floatBitsToUint(tri.normal.w);
         vec3  geom_n         = normalize(tri.normal.xyz);
         bool  interior_face  = dot(rd, geom_n) > 0.0;
         vec4  mat            = interior_face ? tri.mat_in : tri.mat_out;
-        float reflectivity   = clamp(mat.x, 0.02, 0.98);
+        bool diffuse_surface = studio_diffuse_surface(tri);
+        bool spectral_reflector = studio_spectral_reflector(tri);
+        float reflectivity   = diffuse_surface ? studio_diffuse_rho(tri,packet.x) : clamp(mat.x, 0.02, 0.98);
         float diffusion      = clamp(mat.y, 0.0, 1.0);
         float absorption     = clamp(mat.z, 0.0, 2.0);
         float ior            = max(tri.mat_in.w, 1.0);
         float opacity        = clamp(tri.mat_out.w, 0.0, 1.0);
         vec3  n              = interior_face ? -geom_n : geom_n;
         float cos_i          = max(0.0, dot(-rd, n));
+        if(spectral_reflector)reflectivity=studio_reflector_rho(tri,packet.x,cos_i);
 
         // Emissive secondary hit: deposit; no further queuing
         if ((flags & MAT_FLAG_EMISSIVE) != 0u && tri.albedo.w > 0.001) {
@@ -4471,6 +4579,8 @@ void reactive_main(uint gid, inout uint rng) {
                                  tri.albedo.w * cos_i *
                                  max(tri.emissive.x, max(tri.emissive.y, tri.emissive.z)),
                                  packet.w);
+            if (uFixed3Transport != 0)
+                emit_pkt.z *= studio_emission_weight(tri.albedo.rgb, packet.x);
             splat_spectral(hp, emit_pkt);
         }
 
@@ -4530,7 +4640,7 @@ void reactive_main(uint gid, inout uint rng) {
                         w_sum   += w;
                     }
                     rd = normalize(blended / max(w_sum, 1e-12));
-                    ro = hp + rd * 1e-5;
+                    ro = hp + rd * (studio_media_enabled()?1e-6:1e-5);
                     packet.y += best * packet.x * 0.000021;
                     if (packet.z < 0.002) break;
                     continue;
@@ -4555,9 +4665,16 @@ void reactive_main(uint gid, inout uint rng) {
                     if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
                 } else {
                     rd = normalize(refract(rd, n, eta));
-                    packet.z *= (1.0 - fr);
+                    float chroma = spectral_transmit_weight(tri.albedo.rgb, packet.x);
+                    float medium_decay = exp(-absorption * best * (1.0 - chroma));
+                    packet.z *= (1.0 - fr) * medium_decay;
                 }
             }
+        } else if(studio_rough_conductor(tri)) {
+            vec3 outgoing;float vh;
+            float weight=studio_conductor_sample(tri,rd,n,vec2(rand01(rng),rand01(rng)),outgoing,vh);
+            if(weight<=0.0)break;
+            packet.z*=weight*studio_reflector_rho(tri,packet.x,vh);rd=outgoing;
         } else {
             if (rand01(rng) < diffusion) {
                 rd = cosine_dir(rand01(rng), rand01(rng), n);
@@ -4565,11 +4682,11 @@ void reactive_main(uint gid, inout uint rng) {
                 rd = normalize(reflect(rd, n));
                 if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
             }
-            float band_decay   = exp(-absorption * best * clamp(packet.x / 440.0, 0.25, 8.0));
-            float dist_falloff = 1.0 / (1.0 + 0.08 * best);
+            float band_decay   = (diffuse_surface || spectral_reflector) ? 1.0 : exp(-absorption * best * clamp(packet.x / 440.0, 0.25, 8.0));
+            float dist_falloff = (diffuse_surface || spectral_reflector) ? 1.0 : 1.0 / (1.0 + 0.08 * best);
             packet.z *= reflectivity * band_decay * dist_falloff;
         }
-        ro = hp + rd * 1e-5;
+        ro = hp + rd * (studio_media_enabled()?1e-6:1e-5);
         packet.y += best * packet.x * 0.000021;
         if (packet.z < 0.002) break;
     }
@@ -4596,9 +4713,19 @@ void reactive_main(uint gid, inout uint rng) {
 #   3. preserve all spectral bands (n_bands carried through MaterialDatabase
 #      — no collapse to RGB at deposit).
 # ─────────────────────────────────────────────────────────────────────────────
+_GPU_RAY_FIELD_CS = _GPU_RAY_FIELD_CS.replace("__FIXED3_SPECTRAL_HELPERS__", FIXED3_SPECTRAL_GLSL)
+from camera_designer.studio_diffuse_surface import STUDIO_DIFFUSE_GLSL
+from camera_designer.studio_spectral_reflector import STUDIO_REFLECTOR_GLSL
+from mat_flags import MAT_FLAG_SPECTRAL_REFLECTOR, MAT_FLAG_ROUGH_CONDUCTOR, MAT_FLAG_NATIVE_CONDUCTOR_NK, BINDING_STUDIO_NATIVE_PBR
+STUDIO_REFLECTOR_GLSL = f"#define MAT_FLAG_SPECTRAL_REFLECTOR {MAT_FLAG_SPECTRAL_REFLECTOR}u\n#define MAT_FLAG_ROUGH_CONDUCTOR {MAT_FLAG_ROUGH_CONDUCTOR}u\n#define MAT_FLAG_NATIVE_CONDUCTOR_NK {MAT_FLAG_NATIVE_CONDUCTOR_NK}u\n#define STUDIO_NATIVE_PBR_BINDING {BINDING_STUDIO_NATIVE_PBR}\n" + STUDIO_REFLECTOR_GLSL
+from camera_designer.studio_boundary_media import STUDIO_BOUNDARY_GLSL
+
+_GPU_RAY_FIELD_CS = _GPU_RAY_FIELD_CS.replace("__STUDIO_BOUNDARY_HELPERS__", STUDIO_DIFFUSE_GLSL + STUDIO_REFLECTOR_GLSL + STUDIO_BOUNDARY_GLSL)
+
 _GPU_SENSOR_CS = """
 #version 430 core
 layout(local_size_x = 16, local_size_y = 16) in;
+__FIXED3_SPECTRAL_HELPERS__
 
 // ─── Material flag bits (mirrored from mat_flags.py) ──────────────────────────────
 #define MAT_FLAG_EMISSIVE        1u
@@ -4638,6 +4765,20 @@ struct SourceRec {
 };
 layout(std430, binding = 5) readonly buffer SourceBuf { SourceRec bdpt_sources[]; };
 uniform int uSourceCount;
+uniform int uNEEFullSpectrum;
+uniform int uNEEAreaSources;
+
+float studio_emitter_radiance(Tri tri, float frequency) {
+    int base=int(floatBitsToUint(tri.emissive.z))*32*12;
+    int chosen=0;float error=1e30;
+    for(int band=0;band<32;++band) {
+        float f=mat_buf[base+band*12];
+        if(f<=0.0)continue;
+        float d=abs(log(max(frequency,1.0)/f));
+        if(d<error){error=d;chosen=band;}
+    }
+    return max(mat_buf[base+chosen*12+5],0.0);
+}
 
 Tri load_tri(int ti) {
     TriGeom g = geom_tris[ti];
@@ -4648,6 +4789,7 @@ Tri load_tri(int ti) {
     t.albedo = s.albedo; t.emissive = s.emissive;
     return t;
 }
+__STUDIO_BOUNDARY_HELPERS__
 
 // ─── Forward film-layer activation fields (uint, same storage as _MARCH_FS) ──
 layout(binding = 0) uniform usampler3D uFwdLayer0;
@@ -4693,6 +4835,14 @@ uniform vec3  uLayerLight0; uniform vec3  uLayerLight1;
 uniform vec3  uLayerLight2; uniform vec3  uLayerLight3;
 uniform vec3  uLayerLight4; uniform vec3  uLayerLight5;
 uniform vec3  uLayerLight6; uniform vec3  uLayerLight7;
+// Per-layer spectral response curve (same contract as the forward shader's
+// splat_spectral()/film_activation()): a baked source ray's own wavelength
+// (SourceRec.packet.x) projects onto each layer's Gaussian response here,
+// so sample_direct_light()'s NEE term carries that light's own colour
+// instead of a flat scalar only the receiving surface's albedo could tint.
+uniform float uLayerCentersHz[8];
+uniform float uLayerWidthsOct[8];
+uniform float uSensorLayerGains[8];
 uniform vec3  uCamEye;
 uniform vec3  uCamRight;
 uniform vec3  uCamUp;
@@ -4700,7 +4850,7 @@ uniform vec3  uCamFwd;
 uniform float uCamFovTan;
 uniform float uCamAspect;
 uniform float uApertureRadius;
-uniform float uFocusDist;
+uniform float uFocusDist;  // axial focus-plane intercept from uCamEye, metres
 uniform float uCAFactor;
 uniform vec2  uTiltShift;
 uniform int   uNBlades;       // 0 = circle; >=3 = regular N-gon
@@ -4728,6 +4878,21 @@ vec3 get_layer_light(int i) {
     else if (i == 4) return uLayerLight4; else if (i == 5) return uLayerLight5;
     else if (i == 6) return uLayerLight6; else if (i == 7) return uLayerLight7;
     return vec3(1.0);
+}
+
+// Per-layer transmittance of a material's own authored albedo colour at
+// layer i's own response band -- 1.0 if this layer's representative colour
+// IS this material's own colour (e.g. the blue layer through blue glass),
+// 0.0 if it is the complement (e.g. the red layer through blue glass). The
+// camera's refractive branch previously carried zero colour from the
+// medium itself (only an achromatic Fresnel split between reflect and
+// refract), so a coloured transmissive material never tinted light that
+// actually passed through it -- only light it diffusely reflected.
+float layer_transmit_weight(vec3 albedo, int i) {
+    if (uFixed3Transport != 0)
+        return studio_material_weight(albedo, studio_band_frequency(i));
+    vec3 lc = get_layer_light(i);
+    return clamp(dot(albedo, lc) / max(dot(lc, lc), 1e-6), 0.0, 1.0);
 }
 
 const float EPS = 1e-7;
@@ -4764,7 +4929,8 @@ vec3 cosine_dir(float u, float v, vec3 normal) {
 // ─── Möller-Trumbore triangle intersection ────────────────────────────────────
 bool hit_tri(vec3 ro, vec3 rd, TriGeom t, out float hit_t) {
     vec3 h = cross(rd, t.e2.xyz); float a = dot(t.e1.xyz, h);
-    if (abs(a) < 1e-8) return false;
+    // Relative float32 parallel test: a fixed area cutoff deletes miniature triangles.
+    if (abs(a) <= 2.384185791015625e-7 * length(t.e1.xyz) * length(t.e2.xyz) * length(rd)) return false;
     float f = 1.0 / a; vec3 s = ro - t.v0.xyz;
     float u = f * dot(s, h);
     if (u < -1e-5 || u > 1.00001) return false;
@@ -4791,7 +4957,7 @@ bool hit_aabb(vec3 ro, vec3 rd, vec3 lo, vec3 hi, float best) {
 }
 
 // ─── BVH nearest-hit traversal ───────────────────────────────────────────────
-int nearest_hit(vec3 ro, vec3 rd, out float best) {
+int nearest_filtered(vec3 ro, vec3 rd, out float best, bool boundary_only) {
     best = 1e30; int best_tri = -1;
     int stack[96]; int sp = 0; stack[sp++] = 0;
     while (sp > 0) {
@@ -4806,7 +4972,7 @@ int nearest_hit(vec3 ro, vec3 rd, out float best) {
         if (left < 0) {
             for (int k = 0; k < count; ++k) {
                 int ti = tri_ids[start+k]; float ht;
-                if (hit_tri(ro, rd, geom_tris[ti], ht) && ht < best) {
+                if ((!boundary_only || (geom_tris[ti].v0.w>=1.0 && shade_tris[ti].mat_out.w<0.999)) && hit_tri(ro, rd, geom_tris[ti], ht) && ht < best) {
                     best = ht; best_tri = ti;
                 }
             }
@@ -4816,6 +4982,9 @@ int nearest_hit(vec3 ro, vec3 rd, out float best) {
     }
     return best_tri;
 }
+int nearest_hit(vec3 ro,vec3 rd,out float best) {return nearest_filtered(ro,rd,best,false);}
+int nearest_boundary(vec3 ro,vec3 rd,out float best) {return nearest_filtered(ro,rd,best,true);}
+
 
 // ─── Direct light sample (next-event estimation) ─────────────────────────────
 // Opaque surfaces previously had no analogue to the "ray keeps going until it
@@ -4827,16 +4996,33 @@ int nearest_hit(vec3 ro, vec3 rd, out float best) {
 // (measured ~37x dimmer than glass on identical geometry). This samples one
 // of the same light sources the forward pass emits from and tests visibility
 // directly against this shader's own BVH, independent of voxel resolution.
-float sample_direct_light(vec3 p, vec3 n, inout uint rng) {
+float sample_direct_light(vec3 p, vec3 n, inout uint rng, out float src_freq_hz, out vec3 direct_bands) {
+    src_freq_hz = 0.0;
+    direct_bands = vec3(0.0);
     if (uSourceCount <= 0) return 0.0;
     int si = int(clamp(floor(rand01(rng) * float(uSourceCount)), 0.0, float(uSourceCount - 1)));
     SourceRec src = bdpt_sources[si];
+    src_freq_hz = src.packet.x;
     vec3  to_src = src.pos_weight.xyz - p;
-    float dist2  = max(dot(to_src, to_src), 1e-6);
+    float dist2  = max(dot(to_src, to_src), uNEEAreaSources != 0 ? 1e-18 : 1e-6);
     float dist   = sqrt(dist2);
     vec3  wi     = to_src / dist;
     float cos_surf = max(0.0, dot(n, wi));
     if (cos_surf <= 0.0) return 0.0;
+    if (uNEEAreaSources != 0) {
+        // Native roots carry a camera-only view: actual face normal and
+        // area/root-count. Uniform root choice contributes its reciprocal
+        // selection probability exactly once. Lambertian BSDF is 1/pi.
+        vec3 light_normal=vec3(src.pos_weight.w,src.dir_kind.w,src.packet.w);
+        float cos_light=max(0.0,dot(light_normal,-wi));
+        if(cos_light<=0.0)return 0.0;
+        float shadow_t;
+        int shadow_hit=nearest_hit(p+wi*1e-6,wi,shadow_t);
+        if(shadow_hit>=0 && shadow_t<dist-2e-6)return 0.0;
+        float weight=cos_surf*cos_light/dist2*float(uSourceCount)*src.packet.z/PI;
+        direct_bands=src.dir_kind.xyz*weight;
+        return direct_bands.x;
+    }
     float shadow_t;
     // Offset along wi (to-light), matching connect_emitter()'s proven
     // visible_segment() convention, not along n: offsetting along n left
@@ -4857,7 +5043,9 @@ float sample_direct_light(vec3 p, vec3 n, inout uint rng) {
     // unbiased point-light estimate without it. 1/count un-biases uniform
     // source selection; 1/(1+dist^2) is the same bounded geometric spreading
     // term connect_emitter() uses in the forward shader's own direct path.
-    return energy * cos_surf / (1.0 + dist2) * float(uSourceCount);
+    float geometry = cos_surf / (1.0 + dist2) * float(uSourceCount);
+    if (uNEEFullSpectrum != 0) direct_bands = src.dir_kind.xyz * geometry;
+    return energy * geometry;
 }
 
 // ─── Read one film layer's accumulated irradiance from the forward volume ──────
@@ -4943,17 +5131,21 @@ void march_volume_layers(vec3 ro, vec3 rd, float t_near, float t_far,
 }
 
 // ─── Write scalar luminance into layer i's output image ───────────────────────
+__SENSOR_HISTORY_HELPERS__
+__SENSOR_EVIDENCE_HELPERS__
 void sensor_store(int i, ivec2 px, float lum, float cnt) {
+    bool rolling = uHistorySamples > 0;
+    if (rolling) lum = sensor_history_value(i, px, lum);
     // alpha is a presence mask: any ray strike sets it to 1.0 so decayed
     // weight is immediately replaced and re-exposure is instant.
-    if      (i==0){vec4 p=imageLoad(uSensorOut0,px); imageStore(uSensorOut0,px,vec4(p.rgb+lum, 1.0));}
-    else if (i==1){vec4 p=imageLoad(uSensorOut1,px); imageStore(uSensorOut1,px,vec4(p.rgb+lum, 1.0));}
-    else if (i==2){vec4 p=imageLoad(uSensorOut2,px); imageStore(uSensorOut2,px,vec4(p.rgb+lum, 1.0));}
-    else if (i==3){vec4 p=imageLoad(uSensorOut3,px); imageStore(uSensorOut3,px,vec4(p.rgb+lum, 1.0));}
-    else if (i==4){vec4 p=imageLoad(uSensorOut4,px); imageStore(uSensorOut4,px,vec4(p.rgb+lum, 1.0));}
-    else if (i==5){vec4 p=imageLoad(uSensorOut5,px); imageStore(uSensorOut5,px,vec4(p.rgb+lum, 1.0));}
-    else if (i==6){vec4 p=imageLoad(uSensorOut6,px); imageStore(uSensorOut6,px,vec4(p.rgb+lum, 1.0));}
-    else if (i==7){vec4 p=imageLoad(uSensorOut7,px); imageStore(uSensorOut7,px,vec4(p.rgb+lum, 1.0));}
+    if      (i==0){vec4 p=imageLoad(uSensorOut0,px); imageStore(uSensorOut0,px,vec4(rolling ? vec3(lum) : p.rgb+lum, 1.0));}
+    else if (i==1){vec4 p=imageLoad(uSensorOut1,px); imageStore(uSensorOut1,px,vec4(rolling ? vec3(lum) : p.rgb+lum, 1.0));}
+    else if (i==2){vec4 p=imageLoad(uSensorOut2,px); imageStore(uSensorOut2,px,vec4(rolling ? vec3(lum) : p.rgb+lum, 1.0));}
+    else if (i==3){vec4 p=imageLoad(uSensorOut3,px); imageStore(uSensorOut3,px,vec4(rolling ? vec3(lum) : p.rgb+lum, 1.0));}
+    else if (i==4){vec4 p=imageLoad(uSensorOut4,px); imageStore(uSensorOut4,px,vec4(rolling ? vec3(lum) : p.rgb+lum, 1.0));}
+    else if (i==5){vec4 p=imageLoad(uSensorOut5,px); imageStore(uSensorOut5,px,vec4(rolling ? vec3(lum) : p.rgb+lum, 1.0));}
+    else if (i==6){vec4 p=imageLoad(uSensorOut6,px); imageStore(uSensorOut6,px,vec4(rolling ? vec3(lum) : p.rgb+lum, 1.0));}
+    else if (i==7){vec4 p=imageLoad(uSensorOut7,px); imageStore(uSensorOut7,px,vec4(rolling ? vec3(lum) : p.rgb+lum, 1.0));}
 }
 
 // ─── AABB entry/exit along ray (returns false if no intersection) ─────────────
@@ -4995,6 +5187,10 @@ void main() {
         px = ivec2(int(clamp(gx, 0.0, 0.999999) * float(uSensorSize.x)),
                    int(clamp(gy, 0.0, 0.999999) * float(uSensorSize.y)));
     } else {
+        // Workgroups are 16x16, but a retained/client strip may be only one
+        // or two rows. Never execute padded invocations or overrun its buffers.
+        if (tile_xy.x >= uSensorSize.x ||
+            tile_xy.y * uSensorSize.x + tile_xy.x >= max(0,uDispatchPixelCount)) return;
         px = ivec2(tile_xy.x, tile_xy.y + uRowOffset);
     }
     if (any(greaterThanEqual(px, uSensorSize))) return;
@@ -5012,6 +5208,12 @@ void main() {
 
         float pu  = (float(px.x) + rand01(rng)) / W;
         float pv  = (float(px.y) + rand01(rng)) / H;
+        if (uSensorEvidenceEnabled != 0) {
+            int sample_slot = (px.y-uRowOffset)*uSensorSize.x+px.x;
+            studio_evidence_lineage[sample_slot] = StudioSensorLineage(
+                uint(px.y*uSensorSize.x+px.x),0u,pu,pv,
+                pu*W-float(px.x),pv*H-float(px.y),1.0,uSensorEvidenceSampleIndex);
+        }
         vec3 ro   = uCamEye;
         vec3 rd;
         if (uUseManifold != 0) {
@@ -5025,13 +5227,17 @@ void main() {
             // Analytical thin-lens path.
             float fu  = ((pu - 0.5) * 2.0 + uTiltShift.x) * uCamFovTan * uCamAspect;
             float fv  = ((0.5 - pv) * 2.0 + uTiltShift.y) * uCamFovTan;
-            vec3 rd0  = normalize(uCamFwd + uCamRight * fu + uCamUp * fv);
-            // Scheimpflug: per-ray effective focus distance.
+            // Keep the axial component equal to one: a normalized direction
+            // times focus distance would focus on a sphere, not a plane.
+            vec3 focal_ray = uCamFwd + uCamRight * fu + uCamUp * fv;
+            // Existing tilt convention: z - x*tan(pan) - y*tan(nod) = focus.
+            // Retain the near-horizon guard; 1 mm is only a numerical floor
+            // on the plane's axial intercept, not a physical lens limit.
             float _lt_denom = 1.0
                             - fu * tan(uLensTilt.y)
                             - fv * tan(uLensTilt.x);
-            float fd_eff  = uFocusDist / max(0.005, _lt_denom);
-            vec3 focus_pt = ro + rd0 * max(fd_eff, 0.01);
+            float fd_eff  = max(uFocusDist, 0.001) / max(0.005, _lt_denom);
+            vec3 focus_pt = ro + focal_ray * fd_eff;
             float ap = max(uApertureRadius, 0.0);
             if (ap > 1e-7) {
                 vec2 apt_off;
@@ -5058,34 +5264,69 @@ void main() {
         }
         float lum[8];
         for (int i = 0; i < 8; i++) lum[i] = 0.0;
-        float throughput = 1.0;
+        int currentMedium=studio_origin_medium(ro,rd);
+        float throughput[8];
+        // Disjoint estimators: NEE owns the next emitter after a diffuse
+        // scatter. Camera and delta/specular emitter hits retain emission.
+        bool emission_via_bsdf = true;
+        for (int i = 0; i < 8; i++) throughput[i] = 1.0;
 
         for (int bounce = 0; bounce <= uMaxBounces; ++bounce) {
             float surf_t;
             int   hit_id = nearest_hit(ro, rd, surf_t);
+            if(hit_id>=0 && currentMedium>=0) for(int i=0;i<nl;++i) {
+                float frequency=uFixed3Transport!=0?studio_band_frequency(i):uLayerCentersHz[i];
+                throughput[i]*=studio_medium_transmittance(currentMedium,frequency,surf_t);
+            }
 
             float vol_in, vol_out;
             bool in_box = box_intersect(ro, rd, uBoxMin, uBoxMax, vol_in, vol_out);
-            if (in_box) {
+            if (in_box && currentMedium<0) {
                 float march_end = (hit_id >= 0) ? min(surf_t, vol_out) : vol_out;
                 float step_jitter = fract(
                     sin(float(px.x)*127.1 + float(px.y)*311.7 + float(s)*7.3) * 43758.5453);
                 float vol_lum[8]; float vol_alpha;
                 march_volume_layers(ro, rd, vol_in, march_end, uVolSteps,
                                     step_jitter, nl, vol_lum, vol_alpha);
-                for (int i = 0; i < nl; i++) lum[i] += throughput * vol_lum[i];
-                throughput *= (1.0 - vol_alpha);
+                for (int i = 0; i < nl; i++) {
+                    lum[i] += throughput[i] * vol_lum[i];
+                    throughput[i] *= (1.0 - vol_alpha);
+                }
             }
 
-            if (hit_id < 0 || throughput < 0.003) break;
+            float tp_max = 0.0;
+            for (int i = 0; i < nl; i++) tp_max = max(tp_max, throughput[i]);
+            if (hit_id < 0 || tp_max < 0.003) break;
 
             vec3  hp       = ro + rd * surf_t;
             Tri   tri      = load_tri(hit_id);
+            if(uNEEAreaSources != 0 &&
+               (floatBitsToUint(tri.normal.w)&MAT_FLAG_EMISSIVE)!=0u) {
+                // Emitting glass can be a tagged boundary too. Evaluate
+                // authored radiance before any boundary continuation.
+                if(dot(rd,tri.normal.xyz)<0.0 && emission_via_bsdf)
+                    for(int i=0;i<nl;++i) {
+                        float f=uFixed3Transport!=0?studio_band_frequency(i):uLayerCentersHz[i];
+                        lum[i]+=throughput[i]*studio_emitter_radiance(tri,f);
+                    }
+                if(tri.mat_out.w>=0.999)break;
+            }
+            if(studio_boundary(tri)) {
+                float factor;
+                float frequency=uFixed3Transport!=0?studio_band_frequency(0):uLayerCentersHz[0];
+                if(!studio_boundary_step(tri,rd,frequency,rand01(rng),currentMedium,factor)) break;
+                for(int i=0;i<nl;++i)throughput[i]*=factor;
+                emission_via_bsdf = true;
+                ro=hp+rd*1e-6;
+                continue;
+            }
             vec3  geom_n   = normalize(tri.normal.xyz);
             bool  interior = dot(rd, geom_n) > 0.0;
             vec3  n        = interior ? -geom_n : geom_n;
             vec4  mat      = interior ? tri.mat_in : tri.mat_out;
-            float refl     = clamp(mat.x, 0.02, 0.98);
+            bool diffuse_surface = studio_diffuse_surface(tri);
+        bool spectral_reflector = studio_spectral_reflector(tri);
+            float refl     = diffuse_surface ? 1.0 : clamp(mat.x, 0.02, 0.98);
             float diff     = clamp(mat.y, 0.0, 1.0);
             float abso     = clamp(mat.z, 0.0, 2.0);
             float ior      = max(tri.mat_in.w, 1.0);
@@ -5097,32 +5338,69 @@ void main() {
             // The forward field also splats emission at ray arrivals, but
             // requiring a random forward hit here makes a lit target vanish.
             uint surface_flags = floatBitsToUint(tri.normal.w);
-            if ((surface_flags & MAT_FLAG_EMISSIVE) != 0u && tri.albedo.w > 0.001) {
+            if (uNEEAreaSources == 0 && (surface_flags & MAT_FLAG_EMISSIVE) != 0u && tri.albedo.w > 0.001) {
                 float source_radiance = max(tri.emissive.x,
                                             max(tri.emissive.y, tri.emissive.z));
-                for (int i = 0; i < nl; i++)
-                    lum[i] += throughput * source_radiance * tri.albedo.w;
+                for (int i = 0; i < nl; i++) {
+                    // Same per-layer colour projection the reflectance term
+                    // below already uses: surf_albedo now carries this
+                    // emitter's own RGB (scene_builder.py writes its real
+                    // emission colour into albedo.xyz for emissive
+                    // triangles), so dotting it against each layer's RGB
+                    // axis gives the actual frequency mix for this filter,
+                    // not a single achromatic magnitude copied into R/G/B.
+                    vec3  lc = get_layer_light(i);
+                    float aw = dot(surf_albedo, lc) / max(dot(lc, lc), 1e-6);
+                    if (uFixed3Transport != 0)
+                        aw = studio_emission_weight(surf_albedo, studio_band_frequency(i));
+                    float emission_weight = (uFixed3Transport != 0) ? max(aw, 0.0) : clamp(aw, 0.0, 1.0);
+                    lum[i] += throughput[i] * source_radiance * tri.albedo.w * emission_weight;
+                }
                 if (opacity >= 0.999) break;
             }
 
             // Accumulate field energy at surface — only opaque/semi-opaque surfaces scatter
             // Transparent surfaces (opacity≈0) transmit, not scatter; skip accumulation.
-            if (opacity > 0.001) {
-                float direct = (uSourceCount > 0) ? sample_direct_light(hp, n, rng) : 0.0;
+            if (opacity > 0.001 && !spectral_reflector) {
+                float direct_freq = 0.0;
+                vec3 direct_bands = vec3(0.0);
+                float direct = (uSourceCount > 0) ? sample_direct_light(hp, n, rng, direct_freq, direct_bands) : 0.0;
                 for (int i = 0; i < nl; i++) {
                     vec3  lc = get_layer_light(i);
                     float aw = dot(surf_albedo, lc) / max(dot(lc, lc), 1e-6);
-                    lum[i] += throughput * sample_layer_energy(hp, i) * refl * cos_in
+                    if (uFixed3Transport != 0)
+                        aw = studio_material_weight(surf_albedo, studio_band_frequency(i));
+                    lum[i] += throughput[i] * sample_layer_energy(hp, i) * refl * cos_in
                               * clamp(aw, 0.0, 1.0) * opacity;
                     // Direct next-event sample: the resolution-independent
                     // counterpart to the voxel-field term above. See
                     // sample_direct_light() for why opaque surfaces need it.
-                    lum[i] += throughput * direct * refl
+                    // Weighted by the SAME per-layer Gaussian film response
+                    // splat_spectral() already uses for the forward volume
+                    // field (uLayerCentersHz/WidthsOct), keyed to this
+                    // specific picked source's own baked wavelength -- so a
+                    // light picked here carries its own colour into the
+                    // reflection, not a flat scalar that only the receiving
+                    // surface's albedo could ever tint.
+                    float freqW = 1.0;
+                    if (direct_freq > 0.0) {
+                        float ctr = max(uLayerCentersHz[i], 1e-3);
+                        float wid = max(uLayerWidthsOct[i], 1e-3);
+                        float oct = log(max(direct_freq, 1e-3) / ctr) / log(2.0);
+                        freqW = exp(-0.5 * oct * oct / (wid * wid));
+                        if (uFixed3Transport != 0)
+                            freqW = (studio_band_index(direct_freq) == i) ? 1.0 : 0.0;
+                    }
+                    float direct_layer = (uNEEFullSpectrum != 0 && uFixed3Transport != 0)
+                        ? direct_bands[i] : direct * freqW;
+                    if(uNEEAreaSources != 0) direct_layer=direct_bands[i]*diff;
+                    lum[i] += throughput[i] * direct_layer * refl
                               * clamp(aw, 0.0, 1.0) * opacity;
                 }
             }
 
             if (opacity < 0.999) {
+                emission_via_bsdf = true;
                 // ── Transparent / refractive surface ─────────────────────────
                 float eta = interior ? ior : (1.0 / ior);
                 float cos_i = cos_in;
@@ -5147,29 +5425,71 @@ void main() {
                     if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
                 } else {
                     rd = refr_dir;
+                    // The medium's own colour tints light that actually
+                    // transmits through it -- previously this branch left
+                    // throughput untouched entirely (glass was perfectly,
+                    // infinitely clear), so a coloured transmissive
+                    // material's albedo never showed up in anything seen
+                    // THROUGH it, only in what it diffusely reflected.
+                    for (int i = 0; i < nl; i++) {
+                        float chan = layer_transmit_weight(surf_albedo, i);
+                        throughput[i] *= exp(-abso * surf_t * (1.0 - chan));
+                    }
                 }
-                ro = hp + rd * 1e-5;
+                ro = hp + rd * (studio_media_enabled()?1e-6:1e-5);
             } else {
                 // ── Opaque surface ────────────────────────────────────────────
-                float survival = max(refl * (1.0 - abso * 0.5), 0.05);
+                float survival = spectral_reflector ? 0.98 : diffuse_surface ? studio_diffuse_survival(surf_albedo)
+                    : max(refl * (1.0 - abso * 0.5), 0.05);
                 if (rand01(rng) > survival) break;
-                throughput *= refl / survival;
-                if (throughput < 0.005) break;
+                vec3 conductor_out=rd;float conductor_vh=cos_in,conductor_weight=1.0;
+                bool rough_conductor=studio_rough_conductor(tri);
+                if(rough_conductor){
+                    conductor_weight=studio_conductor_sample(tri,rd,n,vec2(rand01(rng),rand01(rng)),conductor_out,conductor_vh);
+                    if(conductor_weight<=0.0)break;
+                }
+                for (int i = 0; i < nl; i++) {
+                    float rho = spectral_reflector ? studio_reflector_rho(tri,uFixed3Transport != 0 ? studio_band_frequency(i) : uLayerCentersHz[i],conductor_vh)*conductor_weight
+                        : diffuse_surface ? layer_transmit_weight(surf_albedo, i) : refl;
+                    throughput[i] *= rho / survival;
+                }
+                float tp_after = 0.0;
+                for (int i = 0; i < nl; i++) tp_after = max(tp_after, throughput[i]);
+                if (tp_after < 0.005) break;
 
-                if (rand01(rng) < diff)
+                emission_via_bsdf = rough_conductor || rand01(rng) >= diff;
+                if(rough_conductor)rd=conductor_out;
+                else if (!emission_via_bsdf)
                     rd = cosine_dir(rand01(rng), rand01(rng), n);
                 else {
                     rd = normalize(reflect(rd, n));
                     if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
                 }
-                ro = hp + rd * 1e-5;
+                ro = hp + rd * (studio_media_enabled()?1e-6:1e-5);
             }
         }
-        for (int i = 0; i < nl; i++) layer_acc[i] += max(lum[i], 0.0);
+        for (int i = 0; i < nl; i++) {
+            float measured = lum[i];
+            if (uFixed3Transport != 0) {
+                measured = 0.0;
+                for (int band = 0; band < 3; ++band) {
+                    float oct = log(studio_band_frequency(band) / max(uLayerCentersHz[i], 1e-3)) / log(2.0);
+                    float width = max(uLayerWidthsOct[i], 1e-3);
+                    measured += lum[band] * exp(-0.5 * oct * oct / (width * width));
+                }
+                measured *= uSensorLayerGains[i];
+            }
+            layer_acc[i] += max(measured, 0.0);
+        }
     }
 
-    for (int i = 0; i < nl; i++)
+    for (int i = 0; i < nl; i++) {
+        if (uSensorEvidenceEnabled != 0) {
+            int sample_slot = (px.y-uRowOffset)*uSensorSize.x+px.x;
+            studio_evidence_spectra[sample_slot*nl+i] = layer_acc[i];
+        }
         sensor_store(i, px, layer_acc[i], float(uSamplesPerPixel));
+    }
 }
 """
 
@@ -5177,6 +5497,23 @@ void main() {
 # Sensor image fullscreen blit shaders
 # Reads the RGBA32F sensor texture, divides by sample count (.a), tonemaps.
 # ─────────────────────────────────────────────────────────────────────────────
+_GPU_SENSOR_CS = _GPU_SENSOR_CS.replace("__FIXED3_SPECTRAL_HELPERS__", FIXED3_SPECTRAL_GLSL)
+_GPU_SENSOR_CS = _GPU_SENSOR_CS.replace("__STUDIO_BOUNDARY_HELPERS__", STUDIO_DIFFUSE_GLSL + STUDIO_REFLECTOR_GLSL + STUDIO_BOUNDARY_GLSL)
+from camera_designer.studio_sphere_regions import with_sphere_regions
+from camera_designer.studio_region_gpu import with_region_media, with_region_spheres, validate_region_records, region_records_from_geometry
+from camera_designer.studio_rod_bundle_gpu import region_record_count
+_GPU_RAY_FIELD_REGION_CS = with_region_spheres(with_sphere_regions(with_region_media(_GPU_RAY_FIELD_CS)))
+_GPU_SENSOR_REGION_CS = with_region_spheres(with_sphere_regions(with_region_media(_GPU_SENSOR_CS)))
+_GPU_RAY_FIELD_CS = with_sphere_regions(_GPU_RAY_FIELD_CS)
+_GPU_SENSOR_CS = with_sphere_regions(_GPU_SENSOR_CS)
+
+from camera_designer.sensor_history import SENSOR_HISTORY_GLSL, SensorHistoryLayout, replace_history_buffers, check_history_sample_count
+_GPU_SENSOR_CS = _GPU_SENSOR_CS.replace("__SENSOR_HISTORY_HELPERS__", SENSOR_HISTORY_GLSL)
+_GPU_SENSOR_REGION_CS = _GPU_SENSOR_REGION_CS.replace("__SENSOR_HISTORY_HELPERS__", SENSOR_HISTORY_GLSL)
+from camera_designer.studio_sensor_evidence import SENSOR_EVIDENCE_GLSL
+_GPU_SENSOR_CS = _GPU_SENSOR_CS.replace("__SENSOR_EVIDENCE_HELPERS__", SENSOR_EVIDENCE_GLSL)
+_GPU_SENSOR_REGION_CS = _GPU_SENSOR_REGION_CS.replace("__SENSOR_EVIDENCE_HELPERS__", SENSOR_EVIDENCE_GLSL)
+
 _SENSOR_BLIT_VS = """
 #version 330 core
 out vec2 vUV;
@@ -6245,6 +6582,7 @@ def _gpu_sensor_render(ssbo_tris, ssbo_nodes, ssbo_ids,
         # uSeed encodes the strip so each strip has unique per-pixel RNG
         glUniform1i(glGetUniformLocation(prog, b'uSeed'),      314159 + row_off)
         glUniform1i(glGetUniformLocation(prog, b'uRowOffset'), row_off)
+        glUniform1i(glGetUniformLocation(prog, b'uDispatchPixelCount'), sensor_w * rows_this)
         glDispatchCompute(gx, cur_gy, 1)
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
         _tile += 1
@@ -6932,6 +7270,7 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     glUniform1f(glGetUniformLocation(prog, b'uSpeedOfMedium'), 343.0)   # acoustic default; optical callers override
     _specs = film_stack.layer_specs()
     glUniform1i(glGetUniformLocation(prog, b'uLayerCount'), len(_specs))
+    glUniform1i(glGetUniformLocation(prog, b'uFixed3Transport'), int(uses_fixed3_transport(film_stack)))
     for _i, _sp_layer in enumerate(_specs):
         glUniform1f(glGetUniformLocation(prog, f'uLayerCentersHz[{_i}]'.encode()), _sp_layer['center_hz'])
         glUniform1f(glGetUniformLocation(prog, f'uLayerWidthsOct[{_i}]'.encode()), _sp_layer['width_oct'])
@@ -7278,6 +7617,9 @@ def _gpu_ray_field_prebuilt(
     initial_rays=32768,
     speed_of_medium=2.998e8,   # optical vacuum
     film_stack=None,           # FilmStack | None — drives layer uniforms & tex count
+    sphere_regions=None,       # optional exact Studio regions; appended for compatibility
+    region_records=None,       # explicit opt-in overlapping-volume ownership
+    native_pbr=None,           # canonical MaterialDatabase PBR16, same material IDs
 ):
     """Compile the canonical _GPU_RAY_FIELD_CS with pre-packed scene SSBOs.
 
@@ -7285,6 +7627,12 @@ def _gpu_ray_field_prebuilt(
     The caller owns every GL object and must call _destroy_prebuilt(state)
     when the scene changes.  Returns None on shader link failure.
     """
+    from camera_designer.studio_conductor_surface import checked_native_pbr
+    native_pbr=checked_native_pbr(native_pbr,packed_geom,packed_shade,len(mat_buf)//32)
+    if region_records is None:region_records=region_records_from_geometry(packed_geom)
+    region_data = (None if region_records is None else validate_region_records(
+        region_records, packed_geom, packed_shade, len(mat_buf)//32))
+    region_count = region_record_count(region_data)
     from OpenGL.GL import (
         GL_COMPUTE_SHADER, GL_LINK_STATUS, GL_READ_WRITE, GL_R32UI,
         GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
@@ -7298,9 +7646,11 @@ def _gpu_ray_field_prebuilt(
         glGetProgramiv, glDeleteProgram, glDeleteTextures, glDeleteBuffers,
         glUseProgram, glGetUniformLocation,
         glUniform1i, glUniform1f, glUniform3f, glUniform4f, glUniform3i,
-        glDispatchCompute, glMemoryBarrier, glFinish,
+        glDispatchCompute, glMemoryBarrier, glFinish, glGetIntegerv, GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS,
     )
 
+    if int(glGetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS))<=BINDING_STUDIO_NATIVE_PBR:
+        raise RuntimeError("Studio native material transport requires 19 SSBO binding slots")
     bmin = np.asarray(bounds[0], np.float32)
     bmax = np.asarray(bounds[1], np.float32)
     n_tris = len(packed_geom)
@@ -7317,7 +7667,7 @@ def _gpu_ray_field_prebuilt(
     # ── Source records: pre-baked rays from RayOrder.bake_rays() ─────────
     # source_buf is already (N, 12) float32 in SourceRec layout — no expansion.
     # Phase and direction are fully baked CPU-side; the GPU just traces them.
-    n_src          = max(1, len(source_buf))
+    n_src          = len(source_buf)
     source_records = np.ascontiguousarray(source_buf, np.float32)
 
     seg_cap    = 0   # camera station doesn't use CPU segment readback
@@ -7346,7 +7696,8 @@ def _gpu_ray_field_prebuilt(
     glBindTexture(GL_TEXTURE_3D, 0)
 
     # ── 11 SSBOs (0=TriGeom 1=Node 2=TriId 3=Seg 4=Counter 5=Source 6=PendingRay 7=EmitProfiles 8=ScaleCtx 9=TriShade 10=MatBuf) ──
-    ssbo = list(glGenBuffers(11))
+    ssbo = list(glGenBuffers(16 if region_count else 13))
+    native_pbr_ssbo=int(glGenBuffers(1))
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[0])
     glBufferData(GL_SHADER_STORAGE_BUFFER, packed_geom.nbytes, packed_geom, GL_STATIC_DRAW)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo[0])
@@ -7394,8 +7745,28 @@ def _gpu_ray_field_prebuilt(
     glBufferData(GL_SHADER_STORAGE_BUFFER, _mb.nbytes, _mb, GL_STATIC_DRAW)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, ssbo[10])
 
+    # Binding 11 remains reserved for the Auto diagnostic; exact geometry
+    # has its own binding 12, shared by field/sensor/visibility queries.
+    sphere_data = (np.zeros((0, 8), np.float32) if sphere_regions is None
+                   else np.ascontiguousarray(sphere_regions, np.float32))
+    if sphere_data.ndim != 2 or sphere_data.shape[1] != 8 or len(sphere_data) > 65:
+        raise ValueError("invalid exact sphere GPU records")
+    sphere_count = len(sphere_data)
+    sphere_upload = sphere_data if sphere_count else np.zeros((1, 8), np.float32)
+    for binding, data in ((11, np.zeros(16, np.float32)), (12, sphere_upload)):
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[binding])
+        glBufferData(GL_SHADER_STORAGE_BUFFER, data.nbytes, data, GL_STATIC_DRAW)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, ssbo[binding])
+
     # ── Compile shader ────────────────────────────────────────────────────
-    prog = _prog((_GPU_RAY_FIELD_CS, GL_COMPUTE_SHADER))
+    if region_count:
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[15])
+        glBufferData(GL_SHADER_STORAGE_BUFFER, region_data.nbytes, region_data, GL_STATIC_DRAW)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 15, ssbo[15])
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER,native_pbr_ssbo)
+    glBufferData(GL_SHADER_STORAGE_BUFFER,native_pbr.nbytes,native_pbr,GL_STATIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,BINDING_STUDIO_NATIVE_PBR,native_pbr_ssbo)
+    prog = _prog(((_GPU_RAY_FIELD_REGION_CS if region_count else _GPU_RAY_FIELD_CS), GL_COMPUTE_SHADER))
     if not glGetProgramiv(prog, GL_LINK_STATUS):
         print("  [gpu_ray_field_prebuilt] compute shader did not link", flush=True)
         glDeleteProgram(prog)
@@ -7403,12 +7774,15 @@ def _gpu_ray_field_prebuilt(
             glDeleteTextures([tex])
         for buf in ssbo:
             glDeleteBuffers(1, [buf])
+        glDeleteBuffers(1,[native_pbr_ssbo])
         return None
 
     glUseProgram(prog)
     for band_idx, tex in enumerate(tex_bands):
         glBindImageTexture(band_idx, tex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI)
 
+    glUniform1i(glGetUniformLocation(prog, b'uStudioSphereCount'), sphere_count)
+    glUniform1i(glGetUniformLocation(prog, b'uStudioRegionCount'), region_count)
     # Static uniforms (don't change between pumps)
     glUniform1i(glGetUniformLocation(prog, b'uTriCount'),        n_tris)
     glUniform1i(glGetUniformLocation(prog, b'uNodeCount'),       len(bvh_nodes))
@@ -7432,6 +7806,7 @@ def _gpu_ray_field_prebuilt(
     glUniform1f(glGetUniformLocation(prog, b'uSpeedOfMedium'),   float(speed_of_medium))
     # Film layer spectral uniforms — driven by FilmStack.layer_specs()
     glUniform1i(glGetUniformLocation(prog, b'uLayerCount'), n_layers)
+    glUniform1i(glGetUniformLocation(prog, b'uFixed3Transport'), int(uses_fixed3_transport(film_stack)))
     for _i, _sp in enumerate(_layer_specs[:n_layers]):
         glUniform1f(glGetUniformLocation(prog, f'uLayerCentersHz[{_i}]'.encode()), float(_sp['center_hz']))
         glUniform1f(glGetUniformLocation(prog, f'uLayerWidthsOct[{_i}]'.encode()), float(_sp['width_oct']))
@@ -7451,7 +7826,7 @@ def _gpu_ray_field_prebuilt(
     }
 
     # ── Initial dispatch ──────────────────────────────────────────────────
-    _n_init = max(128, int(initial_rays))
+    _n_init = max(128, int(initial_rays)) if n_src else 0
     glUniform1i(locs['seed'],       1337)
     glUniform1i(locs['total_rays'], _n_init)
     _off = 0
@@ -7473,12 +7848,16 @@ def _gpu_ray_field_prebuilt(
     return {
         'tex_bands':      tex_bands,
         'ssbo':           ssbo,
+        'sphere_count':   sphere_count,
+        'region_count': region_count,
+        'region_records': region_data,
         'prog':           prog,
         'bmin':           bmin,
         'bmax':           bmax,
         'dims':           tuple(int(d) for d in dims),
         'locs':           locs,
         'n_sources':      n_src,
+        'native_pbr_ssbo': native_pbr_ssbo,
         'source_buf':     source_records,   # pre-baked (N_rays, 12)
         'dispatch_batch': int(dispatch_batch),
         '_pending_cap':   _pending_cap,
@@ -7488,13 +7867,63 @@ def _gpu_ray_field_prebuilt(
     }
 
 
+def _update_prebuilt_geometry(state, packed_geom, packed_shade, mat_buf,
+                              bvh_nodes, bvh_ids, context_buf, bounds,
+                              sphere_regions, native_pbr=None):
+    """Replace native scene geometry without recompiling or replacing handles.
+
+    The caller owns the sweep/frame boundary and clears the prior radiance and
+    sensor history after this update. Both forward and sensor tracers retain
+    these same SSBO identities, so neither can see a stale camera-body BVH.
+    """
+    from OpenGL.GL import (
+        GL_SHADER_STORAGE_BUFFER, GL_STATIC_DRAW, glFinish, glBindBuffer,
+        glBufferData, glUseProgram, glGetUniformLocation, glUniform1i, glUniform3f,
+    )
+    from camera_designer.studio_region_gpu import refreshed_region_records, validate_region_records
+    region_records=refreshed_region_records(packed_geom,state.get('region_records'))
+    region_count=0 if region_records is None else int(region_records[0,3]) if region_records[0,2]==1 else len(region_records)
+    if region_count!=state.get('region_count',0):
+        raise ValueError('region layout change requires a new ray worker')
+    if region_count:
+        region_records=validate_region_records(region_records,packed_geom,packed_shade,len(mat_buf)//32)
+    from camera_designer.studio_conductor_surface import checked_native_pbr
+    native_pbr=checked_native_pbr(native_pbr,packed_geom,packed_shade,len(mat_buf)//32)
+    glFinish()
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER,state['native_pbr_ssbo'])
+    glBufferData(GL_SHADER_STORAGE_BUFFER,native_pbr.nbytes,native_pbr,GL_STATIC_DRAW)
+    contexts = (context_buf if len(context_buf) else np.zeros((1, 8), np.float32))
+    spheres = (sphere_regions if len(sphere_regions) else np.zeros((1, 8), np.float32))
+    for binding, data in ((0, packed_geom), (1, bvh_nodes), (2, bvh_ids),
+                          (8, contexts), (9, packed_shade), (10, mat_buf), (12, spheres)):
+        data = np.ascontiguousarray(data)
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, state['ssbo'][binding])
+        glBufferData(GL_SHADER_STORAGE_BUFFER, data.nbytes, data, GL_STATIC_DRAW)
+    if region_count:
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER,state['ssbo'][15])
+        glBufferData(GL_SHADER_STORAGE_BUFFER,region_records.nbytes,region_records,GL_STATIC_DRAW)
+        state['region_records']=region_records
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
+    state['bmin'] = np.asarray(bounds[0], np.float32)
+    state['bmax'] = np.asarray(bounds[1], np.float32)
+    state['sphere_count'] = len(sphere_regions)
+    glUseProgram(state['prog'])
+    for uniform, value in ((b'uTriCount', len(packed_geom)), (b'uNodeCount', len(bvh_nodes)),
+                           (b'uScaleContextCount', len(context_buf)),
+                           (b'uStudioSphereCount', len(sphere_regions))):
+        glUniform1i(glGetUniformLocation(state['prog'], uniform), value)
+    glUniform3f(glGetUniformLocation(state['prog'], b'uBoxMin'), *state['bmin'])
+    glUniform3f(glGetUniformLocation(state['prog'], b'uBoxMax'), *state['bmax'])
+    glUseProgram(0)
+
+
 def _gpu_pump_prebuilt(state: dict, n_rays: int = 8192) -> None:
     """Dispatch n_rays PASS_FORWARD rays into an existing prebuilt GPU state.
 
     Rays accumulate additively into state['tex_bands'].
     Call _clear_prebuilt(state) before starting a fresh solve cycle.
     """
-    if state is None:
+    if state is None or not state.get('n_sources', 0):
         return
     from OpenGL.GL import (
         GL_SHADER_STORAGE_BARRIER_BIT, GL_SHADER_IMAGE_ACCESS_BARRIER_BIT,
@@ -7511,6 +7940,7 @@ def _gpu_pump_prebuilt(state: dict, n_rays: int = 8192) -> None:
         glBindImageTexture(band_idx, tex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI)
     for bi, buf in enumerate(state['ssbo']):
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, bi, buf)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,BINDING_STUDIO_NATIVE_PBR,state['native_pbr_ssbo'])
 
     glUniform1i(locs['mode'], 0)  # PASS_FORWARD
     seed_base = state['_pump_seed']
@@ -7561,6 +7991,7 @@ def _destroy_prebuilt(state: dict) -> None:
         glDeleteTextures([tex])
     for buf in state['ssbo']:
         glDeleteBuffers(1, [buf])
+    glDeleteBuffers(1,[state['native_pbr_ssbo']])
     state.clear()
 
 
@@ -9443,7 +9874,9 @@ class SensorAccumulator:
                  ray_field_gamma: float = 0.55,
                  vol_alpha: float = 1.0,
                  vol_steps: int = 64,
-                 n_sources: int = 0):
+                 n_sources: int = 0,
+                 ssbo_spheres: int = 0, n_spheres: int = 0,
+                 ssbo_regions: int = 0, n_regions: int = 0, ssbo_native_pbr: int = 0):
         import math
         from OpenGL.GL import (glGenTextures, glBindTexture, glTexImage2D,
                                glTexParameteri, GL_TEXTURE_2D, GL_RGBA32F,
@@ -9452,6 +9885,20 @@ class SensorAccumulator:
                                GL_TEXTURE_WRAP_T, GL_NEAREST, GL_CLAMP_TO_EDGE,
                                glClearTexImage, glDeleteTextures, glDeleteProgram)
         from OpenGL.GL import glGetProgramiv, GL_LINK_STATUS
+
+        # Legacy callers may omit PBR only when no geometry invokes its law.
+        # Inspect before allocations; never alias spectral bytes as roughness.
+        if not ssbo_native_pbr and int(n_tris)>0:
+            from OpenGL import GL as _gl
+            _gl.glBindBuffer(_gl.GL_SHADER_STORAGE_BUFFER,int(ssbo_tris))
+            _bytes=int(_gl.glGetBufferParameteriv(_gl.GL_SHADER_STORAGE_BUFFER,_gl.GL_BUFFER_SIZE))
+            if _bytes<int(n_tris)*64:raise ValueError('sensor geometry buffer is shorter than triangle count')
+            for _first in range(0,int(n_tris),16384):
+                _count=min(16384,int(n_tris)-_first)
+                _raw=_gl.glGetBufferSubData(_gl.GL_SHADER_STORAGE_BUFFER,_first*64,_count*64)
+                _flags=np.frombuffer(_raw,np.uint32).reshape(-1,16)[:,15]
+                if np.any(_flags & MAT_FLAG_ROUGH_CONDUCTOR):
+                    raise ValueError('advanced conductor sensor requires canonical native PBR buffer')
 
         self._w = int(sensor_w)
         self._h = int(sensor_h)
@@ -9463,6 +9910,10 @@ class SensorAccumulator:
         self._auto_advance = True
         self._samples_per_pixel = 1
         self._sprinkle = True
+        self._history_samples = 0
+        self._history_buffers = []
+        self._history_bytes = 0
+        self._sample_evidence = None
 
         self._eye = np.zeros(3, np.float32)
         self._right = np.array([1,0,0], np.float32)
@@ -9471,7 +9922,7 @@ class SensorAccumulator:
         self._fov_tan = 1.0
         self._aspect  = float(self._w) / float(max(1, self._h))
         self._aperture_radius = max(0.0, float(aperture_radius))
-        self._focus_dist = max(0.01, float(focus_dist))
+        self._focus_dist = max(0.001, float(focus_dist))  # axial metres; numerical floor
         self._ca_factor = max(0.0, float(ca_factor))
         self._tilt_shift = np.asarray(tilt_shift, np.float32).ravel()[:2]
         if self._tilt_shift.size < 2:
@@ -9489,6 +9940,13 @@ class SensorAccumulator:
         self._ssbo_ids    = int(ssbo_ids)
         self._ssbo_shade  = int(ssbo_shade)
         self._ssbo_mat    = int(ssbo_mat)
+        self._ssbo_native_pbr = int(ssbo_native_pbr)
+        self._ssbo_spheres = int(ssbo_spheres)
+        self._n_spheres = int(n_spheres)
+        self._ssbo_regions = int(ssbo_regions)
+        self._n_regions = int(n_regions)
+        if not 0<=self._n_regions<=1024 or (self._n_regions and not self._ssbo_regions):
+            raise ValueError('invalid explicit region GPU binding')
         self._n_tris      = int(n_tris)
         self._n_bvh_nodes = int(n_bvh_nodes)
         self._rfs  = float(ray_field_scale)
@@ -9505,6 +9963,9 @@ class SensorAccumulator:
         # only later populated by update_sources()/tick_forward(), an
         # unrelated forward-emission path this class also owns.
         self._nee_source_count = max(0, int(n_sources))
+        self._ssbo_sources_nee = 0
+        self._ssbo_sources_original = 0
+        self._nee_area_sources = False
         # Forward emission state — populated by update_sources() after construction
         self._fwd_prog = 0
         self._ssbo_sources_fwd = 0
@@ -9566,7 +10027,7 @@ class SensorAccumulator:
 
         # Compile compute shader once
         from OpenGL.GL import glGetProgramInfoLog
-        self._prog = _prog((_GPU_SENSOR_CS, GL_COMPUTE_SHADER))
+        self._prog = _prog(((_GPU_SENSOR_REGION_CS if self._n_regions else _GPU_SENSOR_CS), GL_COMPUTE_SHADER))
         if not glGetProgramiv(self._prog, GL_LINK_STATUS):
             log = glGetProgramInfoLog(self._prog)
             print(f"  [SensorAccumulator] compute shader LINK FAILED:\n{log}", flush=True)
@@ -9576,6 +10037,40 @@ class SensorAccumulator:
         else:
             print(f"  [SensorAccumulator] compute shader linked OK  {self._w}x{self._h}  rows_per_frame={self._rows_per_frame}", flush=True)
         self._gx = max(1, int(math.ceil(self._w / 16.0)))
+
+    def enable_sample_evidence(self):
+        """Opt-in raw moment side channel; no confidence display or scheduling."""
+        from camera_designer.studio_sensor_evidence import StudioSensorEvidence
+        if self._sprinkle or self._samples_per_pixel != 1 or not uses_fixed3_transport(self.film):
+            raise ValueError("evidence requires fixed:3 unique-row single-sample transport")
+        if self._sample_evidence is None:
+            self._sample_evidence = StudioSensorEvidence(self._w,self._h,3,self._rows_per_frame,_prog)
+        return self._sample_evidence
+
+    def set_nee_spectral_sources(self, source_records, original_buffer, *, area_scene=None):
+        """Use exact conditional band means for fixed:3 camera NEE only."""
+        from camera_designer.spectral_sensor_basis import fixed3_nee_records
+        from OpenGL.GL import (glGenBuffers, glBindBuffer, glBufferData,
+                               GL_SHADER_STORAGE_BUFFER, GL_STATIC_DRAW)
+        if area_scene is not None:
+            from camera_designer.studio_native_emitters import area_nee_records
+            records = area_nee_records(source_records, *area_scene[:4])
+            self._nee_area_sources = True
+        else:
+            records = fixed3_nee_records(source_records)
+            self._nee_area_sources = False
+        if len(records) != self._nee_source_count:
+            raise ValueError("NEE records must match the declared source count")
+        if not int(original_buffer):
+            raise ValueError("NEE integration needs the original forward source buffer")
+        self._ssbo_sources_original = int(original_buffer)
+        if not len(records):
+            return
+        if not self._ssbo_sources_nee:
+            self._ssbo_sources_nee = int(glGenBuffers(1))
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, self._ssbo_sources_nee)
+        glBufferData(GL_SHADER_STORAGE_BUFFER, records.nbytes, records, GL_STATIC_DRAW)
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
 
     @property
     def tex(self) -> int:
@@ -9638,7 +10133,7 @@ class SensorAccumulator:
         # Compile forward shader if not already done
         if not self._fwd_prog:
             from OpenGL.GL import glGetProgramiv, GL_LINK_STATUS
-            self._fwd_prog = _prog((_GPU_RAY_FIELD_CS, GL_COMPUTE_SHADER))
+            self._fwd_prog = _prog(((_GPU_RAY_FIELD_REGION_CS if self._n_regions else _GPU_RAY_FIELD_CS), GL_COMPUTE_SHADER))
             if not glGetProgramiv(self._fwd_prog, GL_LINK_STATUS):
                 from OpenGL.GL import glDeleteProgram
                 glDeleteProgram(self._fwd_prog)
@@ -9681,6 +10176,9 @@ class SensorAccumulator:
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, self._ssbo_sources_fwd)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, self._ssbo_shade)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, self._ssbo_mat)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BINDING_STUDIO_NATIVE_PBR, self._ssbo_native_pbr)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 12, self._ssbo_spheres)
+        if self._n_regions:glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 15, self._ssbo_regions)
         # Bind band images for atomic-add streaming accumulation
         for band_idx, tex in enumerate(self._tex_bands):
             glBindImageTexture(band_idx, tex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI)
@@ -9690,6 +10188,8 @@ class SensorAccumulator:
         def _u3f(n, x, y, z): glUniform3f(glGetUniformLocation(prog, n), float(x), float(y), float(z))
         def _u4f(n, x, y, z, w): glUniform4f(glGetUniformLocation(prog, n), float(x), float(y), float(z), float(w))
 
+        _u1i(b'uStudioSphereCount', self._n_spheres)
+        _u1i(b'uStudioRegionCount', self._n_regions)
         _u1i(b'uTriCount',          self._n_tris)
         _u1i(b'uNodeCount',         self._n_bvh_nodes)
         _u1i(b'uSegmentCap',        0)
@@ -9711,6 +10211,7 @@ class SensorAccumulator:
         _u1f(b'uAirAnisotropy',     self._air_an)
         _specs = self.film.layer_specs()
         glUniform1i(glGetUniformLocation(prog, b'uLayerCount'), len(_specs))
+        glUniform1i(glGetUniformLocation(prog, b'uFixed3Transport'), int(uses_fixed3_transport(self.film)))
         for _i, _sp_layer in enumerate(_specs):
             glUniform1f(glGetUniformLocation(prog, f'uLayerCentersHz[{_i}]'.encode()), _sp_layer['center_hz'])
             glUniform1f(glGetUniformLocation(prog, f'uLayerWidthsOct[{_i}]'.encode()), _sp_layer['width_oct'])
@@ -9774,14 +10275,8 @@ class SensorAccumulator:
             up    = np.asarray(basis_up,    np.float32).ravel()[:3]
             fwd   = np.asarray(basis_fwd,   np.float32).ravel()[:3]
         else:
-            fwd    = target - eye
-            fwd_l  = float(np.linalg.norm(fwd))
-            fwd    = (fwd / fwd_l if fwd_l > 1e-6 else np.array([0,0,1], np.float32)).astype(np.float32)
-            world_up = np.array([0,1,0], np.float32)
-            if abs(float(np.dot(fwd, world_up))) > 0.97:
-                world_up = np.array([0,0,1], np.float32)
-            right = np.cross(fwd, world_up); right /= max(float(np.linalg.norm(right)), 1e-9)
-            up    = np.cross(right, fwd);    up    /= max(float(np.linalg.norm(up)),    1e-9)
+            from camera_designer.camera_frame import sensor_camera_basis
+            eye, right, up, fwd = sensor_camera_basis(eye, target)
         self._eye   = eye
         self._right = right.astype(np.float32)
         self._up    = up.astype(np.float32)
@@ -9790,7 +10285,7 @@ class SensorAccumulator:
         if aperture_radius is not None:
             self._aperture_radius = max(0.0, float(aperture_radius))
         if focus_dist is not None:
-            self._focus_dist = max(0.01, float(focus_dist))
+            self._focus_dist = max(0.001, float(focus_dist))
         if ca_factor is not None:
             self._ca_factor = max(0.0, float(ca_factor))
         if tilt_shift is not None:
@@ -9806,6 +10301,14 @@ class SensorAccumulator:
         if aperture_rot is not None:
             self._aperture_rot = float(aperture_rot)
 
+    def set_scene_geometry(self, *, n_tris, n_bvh_nodes, bmin, bmax, n_spheres):
+        """Accept the counts/bounds for the already-updated shared scene SSBOs."""
+        self._n_tris = int(n_tris)
+        self._n_bvh_nodes = int(n_bvh_nodes)
+        self._bmin = np.asarray(bmin, np.float32)
+        self._bmax = np.asarray(bmax, np.float32)
+        self._n_spheres = int(n_spheres)
+
     def set_lens(self, *, aperture_radius: float | None = None,
                  focus_dist: float | None = None,
                  ca_factor: float | None = None,
@@ -9816,7 +10319,7 @@ class SensorAccumulator:
         if aperture_radius is not None:
             self._aperture_radius = max(0.0, float(aperture_radius))
         if focus_dist is not None:
-            self._focus_dist = max(0.01, float(focus_dist))
+            self._focus_dist = max(0.001, float(focus_dist))
         if ca_factor is not None:
             self._ca_factor = max(0.0, float(ca_factor))
         if tilt_shift is not None:
@@ -9831,6 +10334,27 @@ class SensorAccumulator:
             self._n_blades = max(0, int(n_blades))
         if aperture_rot is not None:
             self._aperture_rot = float(aperture_rot)
+
+    def set_history(self, samples: int = 0, checkpoint: bool = False):
+        """Keep exactly the newest N ray contributions per pixel and film layer.
+
+        Changing N clears the sensor and its logical history. Buffers are
+        bounded before allocation; old values need not be zeroed because each
+        pixel fills its slots before any eviction/read. Call on the GL owner.
+        """
+        if type(samples) is not int or samples < 0:
+            raise ValueError("history samples must be a nonnegative integer")
+        if type(checkpoint) is not bool:
+            raise ValueError("checkpoint must be a boolean")
+        if samples == self._history_samples and checkpoint == getattr(self, '_history_checkpoint', False):
+            return
+        layout = SensorHistoryLayout(self._w, self._h, len(self._textures), samples, checkpoint) if samples else None
+        replace_history_buffers(self, layout)
+        if samples:
+            self._sprinkle = False
+            self._samples_per_pixel = 1
+            self.half_life = 0.0
+        self.clear()
 
     def tick(self, strips: int = 1):
         """Dispatch one strip of rows into the accumulation texture.
@@ -9856,7 +10380,12 @@ class SensorAccumulator:
         for _strip in range(strips):
             self._dispatch_once()
 
-    def _dispatch_once(self):
+    def _dispatch_once(self, *, _loan_phase=0):
+        loan = getattr(self, '_intersection_loan', None)
+        if loan is not None and _loan_phase == 0:
+            raise RuntimeError('Sensor strip is retained on loan; complete or cancel it before dispatch')
+        if _loan_phase not in (0, 1, 2) or (_loan_phase and loan is None):
+            raise ValueError('Invalid sensor loan dispatch')
         from OpenGL.GL import (glUseProgram, glBindBufferBase,
                                GL_SHADER_STORAGE_BUFFER,
                                glActiveTexture, glBindTexture,
@@ -9865,16 +10394,37 @@ class SensorAccumulator:
                                glUniform2i, glUniform3i, glUniform3f,
                                glBindImageTexture, GL_READ_WRITE, GL_RGBA32F,
                                glDispatchCompute, glMemoryBarrier,
-                               GL_SHADER_IMAGE_ACCESS_BARRIER_BIT,
+                               GL_SHADER_IMAGE_ACCESS_BARRIER_BIT, GL_SHADER_STORAGE_BARRIER_BIT,
                                glGetUniformLocation)
         import math
 
+        if self._history_samples and (self._sprinkle or self._samples_per_pixel != 1 or self._rows_per_frame % 16):
+            raise ValueError("ray history requires unique 16-row dispatches and one sample per pixel")
+        if self._history_samples:
+            check_history_sample_count(self._pass)
+        if self._sample_evidence is not None:
+            if self._sprinkle or self._samples_per_pixel != 1 or not uses_fixed3_transport(self.film):
+                raise ValueError("sample evidence requires unchanged fixed:3 row transport")
+            if self._pass >= 0xffffffff:
+                raise OverflowError("sample evidence count requires reset")
+            self._sample_evidence.bind_sensor()
         glUseProgram(self._prog)
+        if loan is not None:
+            loan.bind(_loan_phase)
+        for binding, buffer in enumerate(self._history_buffers, 6):
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, buffer)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, self._ssbo_tris)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, self._ssbo_nodes)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, self._ssbo_ids)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, self._ssbo_shade)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, self._ssbo_mat)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BINDING_STUDIO_NATIVE_PBR, self._ssbo_native_pbr)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 12, self._ssbo_spheres)
+        if self._n_regions:glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 15, self._ssbo_regions)
+        full_spectrum_nee = bool(self._ssbo_sources_nee and (self._nee_area_sources or uses_fixed3_transport(self.film)))
+        if self._ssbo_sources_original:
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5,
+                self._ssbo_sources_nee if full_spectrum_nee else self._ssbo_sources_original)
         for _i, _t in enumerate(self._tex_bands):
             glActiveTexture(GL_TEXTURE0 + _i)
             glBindTexture(GL_TEXTURE_3D, _t)
@@ -9889,9 +10439,20 @@ class SensorAccumulator:
         def _u3f(n, x,y,z): glUniform3f(glGetUniformLocation(self._prog, n), float(x),float(y),float(z))
         def _u4f(n, x,y,z,w): glUniform4f(glGetUniformLocation(self._prog, n), float(x),float(y),float(z),float(w))
 
+        _u1i(b'uHistorySamples', self._history_samples)
+        _u1i(b'uHistorySlot', self._pass % max(1, self._history_samples))
+        _u1i(b'uHistoryCount', min(self._pass, self._history_samples))
+        _u1i(b'uHistoryCheckpoint', int(getattr(self, '_history_checkpoint', False)))
+        _u1i(b'uStudioSphereCount', self._n_spheres)
+        _u1i(b'uStudioRegionCount', self._n_regions)
         _u1i(b'uTriCount',        self._n_tris)
         _u1i(b'uNodeCount',       self._n_bvh_nodes)
+        _u1i(b'uSensorEvidenceEnabled', int(self._sample_evidence is not None))
+        from OpenGL.GL import glUniform1ui
+        glUniform1ui(glGetUniformLocation(self._prog,b'uSensorEvidenceSampleIndex'),self._pass)
         _u1i(b'uSourceCount',     self._nee_source_count)
+        _u1i(b'uNEEFullSpectrum', int(full_spectrum_nee))
+        _u1i(b'uNEEAreaSources', int(self._nee_area_sources))
         _u1i(b'uSamplesPerPixel', max(1, int(self._samples_per_pixel)))
         _u1i(b'uMaxBounces',      self._max_bounces)
         _u1i(b'uVolSteps',        self._vs)
@@ -9904,9 +10465,13 @@ class SensorAccumulator:
         _u1f(b'uMediumExtinction',   getattr(self, '_medium_extinction', 0.5))
         _sensor_specs = self.film.layer_specs()
         glUniform1i(glGetUniformLocation(self._prog, b'uLayerCount'), len(_sensor_specs))
+        glUniform1i(glGetUniformLocation(self._prog, b'uFixed3Transport'), int(uses_fixed3_transport(self.film)))
         for _i, _sp in enumerate(_sensor_specs):
             glUniform3f(glGetUniformLocation(self._prog, f'uLayerDark{_i}'.encode()),  *_sp['dark_rgb'])
             glUniform3f(glGetUniformLocation(self._prog, f'uLayerLight{_i}'.encode()), *_sp['light_rgb'])
+            glUniform1f(glGetUniformLocation(self._prog, f'uLayerCentersHz[{_i}]'.encode()), float(_sp['center_hz']))
+            glUniform1f(glGetUniformLocation(self._prog, f'uLayerWidthsOct[{_i}]'.encode()), float(_sp['width_oct']))
+            glUniform1f(glGetUniformLocation(self._prog, f'uSensorLayerGains[{_i}]'.encode()), float(_sp['gain']))
         _u3f(b'uCamEye',          *self._eye)
         _u3f(b'uCamRight',        *self._right)
         _u3f(b'uCamUp',           *self._up)
@@ -9952,7 +10517,16 @@ class SensorAccumulator:
             gx = self._gx
             gy = max(1, int(math.ceil(rows_this / 16.0)))
         glDispatchCompute(gx, gy, 1)
-        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT)
+        if _loan_phase == 1:
+            for _i in range(len(self._tex_bands)):
+                glActiveTexture(GL_TEXTURE0 + _i)
+                glBindTexture(GL_TEXTURE_3D, 0)
+            glActiveTexture(GL_TEXTURE0)
+            glUseProgram(0)
+            return  # retained sample: no evidence/history/pass/row/frame advancement
+        if self._sample_evidence is not None:
+            self._sample_evidence.accumulate(self._w*rows_this)
 
         if self._frame == 0:
             mode = "sprinkle" if random_mode else "rows"
@@ -10018,6 +10592,13 @@ class SensorAccumulator:
             self._source_worker.stop()
             self._source_worker.join(timeout=1.0)
             self._source_worker = None
+        if self._sample_evidence is not None:
+            self._sample_evidence.destroy()
+            self._sample_evidence = None
+        if self._history_buffers:
+            glDeleteBuffers(len(self._history_buffers), self._history_buffers)
+            self._history_buffers = []
+        self._history_samples = self._history_bytes = 0
         if self._textures:
             glDeleteTextures(self._textures)
             self._textures = []
@@ -10030,9 +10611,10 @@ class SensorAccumulator:
         if self._decay_prog:
             glDeleteProgram(self._decay_prog)
             self._decay_prog = 0
-        for _b in [self._ssbo_sources_fwd, self._ssbo_seg_dummy, self._ssbo_counter_fwd]:
+        for _b in [self._ssbo_sources_nee, self._ssbo_sources_fwd, self._ssbo_seg_dummy, self._ssbo_counter_fwd]:
             if _b:
                 glDeleteBuffers(1, [_b])
+        self._ssbo_sources_nee = self._ssbo_sources_original = 0
         self._ssbo_sources_fwd = self._ssbo_seg_dummy = self._ssbo_counter_fwd = 0
         self._active = False
 
@@ -10045,6 +10627,8 @@ class SensorAccumulator:
             glBindTexture(GL_TEXTURE_2D, _t)
             glClearTexImage(_t, 0, GL_RGBA, GL_FLOAT, np.zeros(4, np.float32))
         glBindTexture(GL_TEXTURE_2D, 0)
+        if self._sample_evidence is not None:
+            self._sample_evidence.reset()
         self._row_off = 0
         self._pass = 0
         # Reset decay accumulator so the freshly cleared display starts bright.
@@ -10132,7 +10716,7 @@ class SensorAccumulator:
         # Compile forward shader once; never again.
         if not self._fwd_prog:
             from OpenGL.GL import glGetProgramiv, GL_LINK_STATUS
-            self._fwd_prog = _prog((_GPU_RAY_FIELD_CS, GL_COMPUTE_SHADER))
+            self._fwd_prog = _prog(((_GPU_RAY_FIELD_REGION_CS if self._n_regions else _GPU_RAY_FIELD_CS), GL_COMPUTE_SHADER))
             if not glGetProgramiv(self._fwd_prog, GL_LINK_STATUS):
                 from OpenGL.GL import glDeleteProgram
                 glDeleteProgram(self._fwd_prog)
@@ -10195,6 +10779,9 @@ class SensorAccumulator:
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, self._ssbo_sources_fwd)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, self._ssbo_shade)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, self._ssbo_mat)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BINDING_STUDIO_NATIVE_PBR, self._ssbo_native_pbr)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 12, self._ssbo_spheres)
+        if self._n_regions:glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 15, self._ssbo_regions)
         for band_idx, tex in enumerate(self._tex_bands):
             glBindImageTexture(band_idx, tex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI)
 
@@ -10204,6 +10791,8 @@ class SensorAccumulator:
         def _u4f(n, x, y, z, w): glUniform4f(glGetUniformLocation(prog, n), float(x), float(y), float(z), float(w))
 
         # Uniform state that doesn't change within a pump call
+        _u1i(b'uStudioSphereCount', self._n_spheres)
+        _u1i(b'uStudioRegionCount', self._n_regions)
         _u1i(b'uTriCount',           self._n_tris)
         _u1i(b'uNodeCount',          self._n_bvh_nodes)
         _u1i(b'uSegmentCap',         0)
@@ -10225,6 +10814,7 @@ class SensorAccumulator:
         _u1f(b'uAirAnisotropy',      self._air_an)
         _specs = self.film.layer_specs()
         glUniform1i(glGetUniformLocation(prog, b'uLayerCount'), len(_specs))
+        glUniform1i(glGetUniformLocation(prog, b'uFixed3Transport'), int(uses_fixed3_transport(self.film)))
         for _i, _sp_layer in enumerate(_specs):
             glUniform1f(glGetUniformLocation(prog, f'uLayerCentersHz[{_i}]'.encode()), _sp_layer['center_hz'])
             glUniform1f(glGetUniformLocation(prog, f'uLayerWidthsOct[{_i}]'.encode()), _sp_layer['width_oct'])

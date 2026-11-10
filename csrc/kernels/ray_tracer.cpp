@@ -18870,7 +18870,9 @@ int ray_pipeline_submit_emissive_triangles(
             ri.bdpt_stream = BDPT_SIDE_LIGHT;
             ri.bdpt_strategy = 0u;
             ri.bounce = 1;
-            sched_keys.push_back(MortonKey{static_cast<uint32_t>(j), morton_key, static_cast<uint32_t>(di), seq++,
+            /* The wavelength assignment already advanced seq. Advancing it
+             * again here skips every other lane for an even band count. */
+            sched_keys.push_back(MortonKey{static_cast<uint32_t>(j), morton_key, static_cast<uint32_t>(di), seq,
                                             static_cast<uint32_t>(sched_intents.size())});
             sched_intents.push_back(std::move(ri));
             ++submitted;

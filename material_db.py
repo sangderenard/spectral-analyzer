@@ -366,6 +366,23 @@ def _fill_pbr_from_mat11_dict(rec: PBRBaseRecord, d: dict) -> None:
     rec.opacity      = float(d.get('opacity', 1.0))
     em = d.get('emissive_rgb', [0.0, 0.0, 0.0])
     rec.emission[0], rec.emission[1], rec.emission[2] = float(em[0]), float(em[1]), float(em[2])
+    # Canonical YAML can author legacy ray coefficients AND a PBR view.
+    # For example construction_glass has diffusion=.004 but PBR roughness=.06;
+    # deriving roughness from diffusion discarded the explicit PBR definition.
+    # Preserve each adapter's authored fields: raymat keeps refl_in/refl_out;
+    # PBR overrides only fields actually present, with nested pbr precedence.
+    authored = dict(d)
+    nested = d.get('pbr', {}) if isinstance(d.get('pbr'), dict) else {}
+    authored.update(nested)
+    a = nested.get('albedo', nested.get('albedo_rgb', authored.get('albedo', authored.get('albedo_rgb'))))
+    if a is not None:
+        rec.albedo[0], rec.albedo[1], rec.albedo[2] = map(float, a[:3])
+    for key in ('roughness', 'metallic', 'transmission', 'ior', 'opacity'):
+        if key in authored:
+            setattr(rec, key, float(authored[key]))
+    e = nested.get('emission_rgb', nested.get('emission', authored.get('emission_rgb', authored.get('emission'))))
+    if e is not None:
+        rec.emission[0], rec.emission[1], rec.emission[2] = map(float, e[:3])
 
 
 def _pbr_to_phong_record(pbr: PBRBaseRecord, mat: Any = None) -> PhongRecord:
@@ -1192,7 +1209,7 @@ def _spd_from_spread(spread: Any) -> np.ndarray:
     return _spd_term_to_array(spread)
 
 
-def profile_to_rgb(profile: Any) -> np.ndarray:
+def profile_to_rgb(profile: Any, *, clamp_negative: bool = True) -> np.ndarray:
     """Convert an EmissionProfile (or any registered profile object) to a
     linear sRGB float32 3-vector via CIE 1931 XYZ numerical integration.
 
@@ -1248,7 +1265,8 @@ def profile_to_rgb(profile: Any) -> np.ndarray:
     B =  0.0557 * X - 0.2040 * Y + 1.0570 * Z
 
     # Clamp only negative values — positive HDR is valid for emissives.
-    return np.array([max(0.0, R), max(0.0, G), max(0.0, B)], dtype=np.float32)
+    rgb = np.array([R, G, B], dtype=np.float32)
+    return np.maximum(rgb, 0) if clamp_negative else rgb
 
 
 def profile_to_radiance(profile: Any) -> float:

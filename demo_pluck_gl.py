@@ -4813,7 +4813,9 @@ layout(rgba32f, binding = 6) uniform image2D uSensorOut6;
 layout(rgba32f, binding = 7) uniform image2D uSensorOut7;
 
 // ─── Uniforms ─────────────────────────────────────────────────────────────────
-uniform ivec2 uSensorSize;
+uniform ivec2 uSensorSize;       // local storage and dispatch extent
+uniform ivec2 uFullSensorSize;   // zero keeps legacy sampling
+uniform ivec2 uSensorOrigin;     // top-left pixel origin in the full image
 uniform int   uRowOffset;
 uniform int   uRandomPixels;
 uniform int   uDispatchPixelCount;
@@ -5195,24 +5197,28 @@ void main() {
     }
     if (any(greaterThanEqual(px, uSensorSize))) return;
 
-    float W  = float(uSensorSize.x);
-    float H  = float(uSensorSize.y);
+    bool tiled_sampling = all(greaterThan(uFullSensorSize, ivec2(0)));
+    ivec2 full_size = tiled_sampling ? uFullSensorSize : uSensorSize;
+    ivec2 sensor_px = px + (tiled_sampling ? uSensorOrigin : ivec2(0));
+    float W  = float(full_size.x);
+    float H  = float(full_size.y);
     int   nl = clamp(uLayerCount, 1, 8);
     float layer_acc[8];
     for (int i = 0; i < 8; i++) layer_acc[i] = 0.0;
 
     for (int s = 0; s < uSamplesPerPixel; ++s) {
         uint rng = hash_u(
-            (uint(px.x) + uint(px.y) * uint(uSensorSize.x)) * 104729u
-            + uint(s) * 1013u + uint(uSeed) + linear_id * 9176u);
+            (uint(sensor_px.x) + uint(sensor_px.y) * uint(full_size.x)) * 104729u
+            + uint(s) * 1013u + uint(uSeed)
+            + (tiled_sampling ? 0u : linear_id * 9176u));
 
-        float pu  = (float(px.x) + rand01(rng)) / W;
-        float pv  = (float(px.y) + rand01(rng)) / H;
+        float pu  = (float(sensor_px.x) + rand01(rng)) / W;
+        float pv  = (float(sensor_px.y) + rand01(rng)) / H;
         if (uSensorEvidenceEnabled != 0) {
             int sample_slot = (px.y-uRowOffset)*uSensorSize.x+px.x;
             studio_evidence_lineage[sample_slot] = StudioSensorLineage(
                 uint(px.y*uSensorSize.x+px.x),0u,pu,pv,
-                pu*W-float(px.x),pv*H-float(px.y),1.0,uSensorEvidenceSampleIndex);
+                pu*W-float(sensor_px.x),pv*H-float(sensor_px.y),1.0,uSensorEvidenceSampleIndex);
         }
         vec3 ro   = uCamEye;
         vec3 rd;
@@ -5284,7 +5290,7 @@ void main() {
             if (in_box && currentMedium<0) {
                 float march_end = (hit_id >= 0) ? min(surf_t, vol_out) : vol_out;
                 float step_jitter = fract(
-                    sin(float(px.x)*127.1 + float(px.y)*311.7 + float(s)*7.3) * 43758.5453);
+                    sin(float(sensor_px.x)*127.1 + float(sensor_px.y)*311.7 + float(s)*7.3) * 43758.5453);
                 float vol_lum[8]; float vol_alpha;
                 march_volume_layers(ro, rd, vol_in, march_end, uVolSteps,
                                     step_jitter, nl, vol_lum, vol_alpha);
@@ -6546,6 +6552,8 @@ def _gpu_sensor_render(ssbo_tris, ssbo_nodes, ssbo_ids,
     _u1i(b'uSamplesPerPixel', max(1, spp))
     _u1i(b'uMaxBounces',      max(1, max_bounces))
     _u2i(b'uSensorSize',      sensor_w, sensor_h)
+    _u2i(b'uFullSensorSize',  0, 0)
+    _u2i(b'uSensorOrigin',    0, 0)
     _u1f(b'uRayFieldScale',   float(ray_field_scale))
     _u1f(b'uRayFieldGamma',   float(ray_field_gamma))
     _u1f(b'uVolAlpha',        float(vol_alpha))
@@ -9834,12 +9842,42 @@ class Renderer:
 # Sensor accumulator — progressive per-frame path-tracing
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _sensor_tile_coordinates(sensor_w, sensor_h, full_sensor_size, sensor_origin):
+    """Validate top-left image ROI before any GPU allocation (scene_orders convention)."""
+    import operator
+
+    def pair(value, label, minimum):
+        try:
+            values = tuple(value)
+            if len(values) != 2 or any(isinstance(v, (bool, np.bool_)) for v in values):
+                raise ValueError
+            values = tuple(operator.index(v) for v in values)
+            if any(v < minimum or v > 0x7fffffff for v in values):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"{label} must be two integers in [{minimum}, 2147483647]") from None
+        return values
+
+    size = pair((sensor_w, sensor_h), "sensor size", 1)
+    full = size if full_sensor_size is None else pair(full_sensor_size, "full_sensor_size", 1)
+    origin = pair(sensor_origin, "sensor_origin", 0)
+    if any(o + n > f for o, n, f in zip(origin, size, full)):
+        raise ValueError("sensor tile must fit inside full_sensor_size")
+    return size, full, origin
+
+
 class SensorAccumulator:
     """Owns the persistent RGBA32F sensor texture and dispatches a few rows of
     the GPU sensor compute shader each frame, accumulating indefinitely.
 
     The blit shader divides .rgb / .a to get the running per-pixel mean, so
     quality improves continuously without re-clearing.
+
+    full_sensor_size=(W,H) opts into partition-independent row sampling.
+    sensor_origin=(x,y) is the tile's top-left image pixel, as in scene_orders.
+    sensor_w/sensor_h remain local texture dimensions. Use the same full size,
+    camera, pass count and samples per pixel for every tile, including a
+    monolithic reference. Omitting full_sensor_size preserves legacy sampling.
 
     Usage:
         acc = SensorAccumulator(ssbo_tris, ssbo_nodes, ssbo_ids, n_tris,
@@ -9876,7 +9914,12 @@ class SensorAccumulator:
                  vol_steps: int = 64,
                  n_sources: int = 0,
                  ssbo_spheres: int = 0, n_spheres: int = 0,
-                 ssbo_regions: int = 0, n_regions: int = 0, ssbo_native_pbr: int = 0):
+                 ssbo_regions: int = 0, n_regions: int = 0, ssbo_native_pbr: int = 0,
+                 *, full_sensor_size: tuple[int, int] | None = None,
+                 sensor_origin: tuple[int, int] = (0, 0)):
+        (self._w, self._h), self._full_sensor_size, self._sensor_origin = _sensor_tile_coordinates(
+            sensor_w, sensor_h, full_sensor_size, sensor_origin)
+        self._tile_sampling = full_sensor_size is not None
         import math
         from OpenGL.GL import (glGenTextures, glBindTexture, glTexImage2D,
                                glTexParameteri, GL_TEXTURE_2D, GL_RGBA32F,
@@ -9900,8 +9943,6 @@ class SensorAccumulator:
                 if np.any(_flags & MAT_FLAG_ROUGH_CONDUCTOR):
                     raise ValueError('advanced conductor sensor requires canonical native PBR buffer')
 
-        self._w = int(sensor_w)
-        self._h = int(sensor_h)
         self._rows_per_frame = max(1, int(rows_per_frame))
         self._row_off = 0
         self._pass   = 0   # how many full image passes completed
@@ -9909,7 +9950,7 @@ class SensorAccumulator:
         self._active = True
         self._auto_advance = True
         self._samples_per_pixel = 1
-        self._sprinkle = True
+        self._sprinkle = not self._tile_sampling
         self._history_samples = 0
         self._history_buffers = []
         self._history_bytes = 0
@@ -9920,7 +9961,7 @@ class SensorAccumulator:
         self._up = np.array([0,1,0], np.float32)
         self._fwd = np.array([0,0,1], np.float32)
         self._fov_tan = 1.0
-        self._aspect  = float(self._w) / float(max(1, self._h))
+        self._aspect  = float(self._full_sensor_size[0]) / float(self._full_sensor_size[1])
         self._aperture_radius = max(0.0, float(aperture_radius))
         self._focus_dist = max(0.001, float(focus_dist))  # axial metres; numerical floor
         self._ca_factor = max(0.0, float(ca_factor))
@@ -10380,6 +10421,13 @@ class SensorAccumulator:
         for _strip in range(strips):
             self._dispatch_once()
 
+    def _sensor_sample_seed(self):
+        if self._tile_sampling:
+            if self._sprinkle:
+                raise ValueError("full-image tile sampling requires row dispatches")
+            return 314159 + self._pass * 65537
+        return 314159 + self._row_off * 1009 + self._pass * 65537 + self._frame * 1000003
+
     def _dispatch_once(self, *, _loan_phase=0):
         loan = getattr(self, '_intersection_loan', None)
         if loan is not None and _loan_phase == 0:
@@ -10398,6 +10446,8 @@ class SensorAccumulator:
                                glGetUniformLocation)
         import math
 
+        # Validate tile scheduling before changing any GL bindings.
+        seed = self._sensor_sample_seed()
         if self._history_samples and (self._sprinkle or self._samples_per_pixel != 1 or self._rows_per_frame % 16):
             raise ValueError("ray history requires unique 16-row dispatches and one sample per pixel")
         if self._history_samples:
@@ -10498,8 +10548,11 @@ class SensorAccumulator:
         glUniform2i(glGetUniformLocation(self._prog, b'uSensorSize'),
                     self._w, self._h)
 
-        # Unique seed per strip per pass to avoid correlation
-        seed = 314159 + self._row_off * 1009 + self._pass * 65537 + self._frame * 1000003
+        glUniform2i(glGetUniformLocation(self._prog, b'uFullSensorSize'),
+                    *(self._full_sensor_size if self._tile_sampling else (0, 0)))
+        glUniform2i(glGetUniformLocation(self._prog, b'uSensorOrigin'), *self._sensor_origin)
+
+        # Tiled jobs must not depend on strip height, frame count, or tile order.
         _u1i(b'uSeed',      seed & 0x7FFFFFFF)
         _u1i(b'uRowOffset', self._row_off)
 

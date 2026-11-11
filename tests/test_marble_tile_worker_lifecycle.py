@@ -23,7 +23,7 @@ def queue_body():
     return compile(ast.fix_missing_locations(Rewriter().visit(ast.Module(body=[queue], type_ignores=[]))), '<actual-worker-queue>', 'exec')
 
 
-@pytest.mark.parametrize('fail_tile', [None, 1])
+@pytest.mark.parametrize('fail_tile', [None, 1, 'allocation'])
 def test_actual_tile_queue_lifecycle(tmp_path, monkeypatch, fail_tile):
     import OpenGL.GL as gl
     monkeypatch.setattr(gl, 'glFinish', lambda: None, raising=False)
@@ -60,16 +60,29 @@ def test_actual_tile_queue_lifecycle(tmp_path, monkeypatch, fail_tile):
         return {'state': 'complete' if finished else 'exposing', 'image': 'tile.png',
                 'hdr': filename, 'frames': [{'index': 0, 'image': 'tile.png', 'hdr': filename}] if finished else []}
     clock = iter(range(100000))
-    assembly = TileAssembly(tmp_path, plan)
+    assemblies = []
+    def assembly_factory(output, tiles):
+        if fail_tile == 'allocation':
+            raise OSError('injected assembly allocation failure')
+        instance = TileAssembly(output, tiles)
+        assemblies.append(instance)
+        return instance
     ns = dict(live=None, time=SimpleNamespace(monotonic=lambda: next(clock)), tile_windows=tile_windows,
               tiles=plan, total_frames=1, output=tmp_path, preparation_status={}, sensor=sensor,
               snapshot_seconds=.25, renderer=SimpleNamespace(
-                  _gpu_pump_prebuilt=lambda *a, **k: events.append(('pump',)),
+                  _gpu_pump_prebuilt=lambda *a, **k: events.append(('pump', k['n_rays'])),
+                  _clear_prebuilt=lambda *a: events.append(('clear',)),
                   _destroy_prebuilt=lambda state: events.append(('destroy_field',))),
               state={}, cooperative_pump=None, epoch=0, seconds=1., max_epochs=1,
               _snapshot=snapshot, digest='x', preparation=0., completed_frames=[], gamma=1.,
-              film_response=None, transport='fixed:3', assembly=assembly, accumulator=None,
+              film_response=None, transport='fixed:3', assembly=None, TileAssembly=assembly_factory, accumulator=None,
               geometry_stats={}, json=json, _atomic_json=lambda path, value: statuses.append(copy.deepcopy(value)))
+    if fail_tile == 'allocation':
+        with pytest.raises(OSError, match='injected assembly allocation failure'):
+            exec(queue_body(), ns)
+        assert not accumulators and not assemblies
+        assert events == [('destroy_field',)]
+        return
     if fail_tile is not None:
         with pytest.raises(RuntimeError, match='injected snapshot failure'):
             exec(queue_body(), ns)
@@ -85,4 +98,17 @@ def test_actual_tile_queue_lifecycle(tmp_path, monkeypatch, fail_tile):
         assert all(s.get('image') is None for s in statuses if s.get('state') == 'exposing')
     assert len([e for e in events if e[0] == 'destroy']) == len(accumulators)
     assert events[-1] == ('destroy_field',)
-    assert assembly.raw is None
+    assert assemblies[0].raw is None
+    assert [e for e in events if e[0] in ('pump', 'clear')] == [('clear',), ('pump', 8192)]
+
+
+def test_assembly_allocation_is_inside_cleanup_scope():
+    tree = ast.parse((ROOT / 'camera_designer/marble_preview_worker.py').read_text(encoding='utf-8'))
+    run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run')
+    calls = lambda node: [n for n in ast.walk(node) if isinstance(n, ast.Call)
+                          and isinstance(n.func, ast.Name) and n.func.id == 'TileAssembly']
+    protected = next(n for n in run.body if isinstance(n, ast.Try))
+    assert len(calls(protected)) == 1
+    assert sum(len(calls(n)) for n in run.body if n is not protected) == 0
+    assert protected.finalbody
+

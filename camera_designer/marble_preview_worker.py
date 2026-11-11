@@ -678,7 +678,19 @@ def run(payload: Path, config_path: Path, output: Path, *,
                 done = (now - frame_start >= seconds or
                         (max_epochs is not None and frame_epochs >= max_epochs))
                 if cooperative_pump is not None or tiles:done=done and accumulator._pass>=1 and accumulator._row_off==0
-                if now - last_snapshot >= snapshot_seconds or done:
+                if tiles and not done and now - last_snapshot >= snapshot_seconds:
+                    # The UI receives queue progress, not a costly full-tile
+                    # readback/tonemap that it cannot display as the final image.
+                    status = {**preparation_status, "state": "exposing", "tiled": tiles,
+                              "epoch": epoch, "elapsed_seconds": round(now-job_start,3),
+                              "frame_elapsed_seconds": round(now-frame_start,3),
+                              "forward_ray_jobs": 8192, "sensor_sites": tiled_sensor_sites,
+                              "tile_completed_passes": accumulator._pass,
+                              "tile_row": accumulator._row_off}
+                    _atomic_json(output / "status.json", status)
+                    print(json.dumps(status, sort_keys=True), flush=True)
+                    last_snapshot = now
+                if done or (not tiles and now - last_snapshot >= snapshot_seconds):
                     status = _snapshot(accumulator, work_output, digest, epoch,
                                        now - job_start, preparation,
                                        (8192 if tiles else epoch * 8192), (cooperative_pump.profile["committed_rays"] if cooperative_pump is not None else tiled_sensor_sites if tiles else frame_epochs * 4 * 16 * resolution),

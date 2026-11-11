@@ -107,8 +107,9 @@ It is a transform executor, not a wave solver. T4 retains ownership of:
 
 Production builds should consume the reviewed vendored adapter rather than
 depending on the mutable external checkout. Provenance is recorded in
-`third_party/fftfree/VENDORED_FROM.md`. Licensing remains intentionally
-unassigned until the project owner finalizes repository licenses.
+`third_party/fftfree/VENDORED_FROM.md`. Owner-authored material now follows
+the MIT grant in `LICENSE`; `LICENSING.md` records the scope and preserves
+third-party terms.
 
 ### USD and PXR
 

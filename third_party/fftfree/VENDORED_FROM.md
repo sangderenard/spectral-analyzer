@@ -38,8 +38,12 @@ use a narrow adapter target and a clean, isolated test configuration.
 
 ## Licensing
 
-The project owner has not finalized repository licensing. This code may
-ultimately be covered by more than one license, and the source and containing
-repositories may select or combine different compatible terms. This snapshot
-does not invent or narrow those terms; it preserves provenance and defers to
-the licenses the owner later declares.
+On 2026-11-11 the project owner selected MIT for owner-authored material in
+this repository, including the first-party parts of this snapshot. See the
+root LICENSE and LICENSING.md. The recorded source commit and import history
+remain unchanged. This replaces the earlier deferral of license selection.
+
+The source history attributes commits to Albert and sangderenard; that is
+provenance evidence, not a claim of ownership of every dependency. Eigen and
+other third-party material retain their own terms and notices. This declaration
+does not modify the separate fftfree source repository.

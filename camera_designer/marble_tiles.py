@@ -48,7 +48,12 @@ def tile_plan(config):
             "total_tiles": count, "completed_tiles": 0, "active_tile": None,
             "exposure_seconds_per_tile": float(config.get("exposure_seconds", 30)),
             "requested_exposure_seconds": count * float(config.get("exposure_seconds", 30)),
-            "required_disk_bytes": width * height * 100 + 64 * 1024 * 1024,
+            # Peak persistent stores: full internal float32 RGB; final float32
+            # RGB only for downsampling; float64 sRGB + worst-case NPZ/PNG.
+            # Luminance partition scratch is deleted before archive encoding.
+            "required_disk_bytes": width * height * 12 + max(
+                min(size,width) * min(size,height) * 40,
+                output_width * output_height * (65 + (12 if oversampling > 1 else 0))) + 512 * 1024 * 1024,
             "coordinate_origin": "top-left", "execution": "serial sensor windows in the owned photo worker"}
 
 

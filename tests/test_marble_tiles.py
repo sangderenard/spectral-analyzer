@@ -15,6 +15,7 @@ def test_plan_auto_and_bounds():
     plan=tile_plan({"camera":{"resolution":8192},"transport":"fixed:3","oversampling":2})
     assert (plan["width"],plan["output_width"],plan["total_tiles"])==(16384,8192,256)
     assert plan["requested_exposure_seconds"]==7680
+    assert 8*1024**3 < plan["required_disk_bytes"] < 9*1024**3
     for change in ({"oversampling":True},{"oversampling":5},{"live":{}},{"orbit_frames":8},{"client_intersections":True},{"transport":"fixed:1"}):
         with pytest.raises(ValueError):tile_plan(config(**change))
     with pytest.raises(ValueError):tile_plan(config(32768,32768))

@@ -22,7 +22,7 @@ def camera_geometry_key(camera, target_default):
             float(camera.get("aperture_rotation_radians", 0)))
 
 
-def prepare_photo_geometry(config, vertices, material_ids, pbr):
+def prepare_photo_geometry(config, vertices, material_ids, pbr, *, material_lineage_out=None):
     transport = config.get("transport", "fixed:1")
     wavelengths = [.5875618] if transport == "fixed:1" else [.450, .550, .650]
     policy = config.get("sphere_coverage", "mesh")
@@ -78,6 +78,7 @@ def prepare_photo_geometry(config, vertices, material_ids, pbr):
         material_authoring=config.get("material_authoring"),
         canonical_volume_optics=config.get("canonical_volume_optics"),
         return_index_map=True,
+        material_lineage_out=material_lineage_out,
     )
     # Real emissive fixture geometry (the Studio light housings/panels),
     # appended through the exact same function used for the saved marble
@@ -98,6 +99,8 @@ def prepare_photo_geometry(config, vertices, material_ids, pbr):
             advanced_surface_mask=advanced_surface_triangles(fixtures),
             wavelengths_um=wavelengths,
             spectral_emission_rgb=(transport == "fixed:3"),
+            material_lineage_out=material_lineage_out,
+            lineage_source=(fixtures["material_ids"], np.asarray(fixtures["pbr"],np.float32).reshape(-1,16)),
         )
     input_count = len(scene[0])
     spheres = np.zeros((0, 8), np.float32)
@@ -105,8 +108,10 @@ def prepare_photo_geometry(config, vertices, material_ids, pbr):
         scene, spheres = pack_sphere_regions(scene, original_indices, object_offset, regions,
             scale_m=float(config.get("scale_m", .025)), center_m=config.get("object_center_m", [0,0,.18]))
     if fixtures is not None:
-        from .studio_native_emitters import native_emissive_sources
-        sources = native_emissive_sources(scene, wavelengths)
+        from .studio_native_emitters import native_emissive_sources, sampling_settings
+        sampling=sampling_settings(config)
+        sources = native_emissive_sources(scene, wavelengths,ray_budget=sampling['ray_budget'],seed=sampling['seed'])
+        if sampling['refresh_each_sweep'] and len(sources)>config['live'].get('ray_batch_size',8192):raise ValueError(f'live ray_batch_size must cover all {len(sources)} rounded native source roots')
         scene = (*scene[:7], sources)
     stats = geometry_statistics(input_triangles=input_count, packed_triangles=len(scene[0]),
         sphere_count=len(spheres), policy=policy, budget=budget)

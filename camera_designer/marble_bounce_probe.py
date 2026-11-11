@@ -166,7 +166,11 @@ def run_bounce_probe(renderer, state, bounds, wavelengths, *, n_triangles, n_nod
     """
     from OpenGL import GL as gl
     started = time.monotonic()
-    source = probe_shader(renderer._GPU_RAY_FIELD_CS)
+    canonical = renderer._GPU_RAY_FIELD_CS
+    if state.get('volume_extinction') is not None:
+        from camera_designer.studio_volume_extinction import transport_shader
+        canonical = transport_shader(renderer._GPU_RAY_FIELD_REGION_CS if state.get('region_count') else canonical)
+    source = probe_shader(canonical)
     program = renderer._prog((source, gl.GL_COMPUTE_SHADER))
     buffers = []
     try:
@@ -176,6 +180,9 @@ def run_bounce_probe(renderer, state, bounds, wavelengths, *, n_triangles, n_nod
         records = np.zeros((PROBE_GROUPS, RAYS_PER_GROUP, PROBE_DEPTH + 1), np.float32)
         buffers = [int(x) for x in gl.glGenBuffers(2)]
         gl.glUseProgram(program)
+        if state.get('volume_extinction') is not None:
+            from camera_designer.studio_volume_extinction import bind as bind_volume
+            bind_volume(state['volume_extinction'], program)
         def integer(name, value):
             gl.glUniform1i(gl.glGetUniformLocation(program, name.encode()), int(value))
         def scalar(name, value):
@@ -183,6 +190,8 @@ def run_bounce_probe(renderer, state, bounds, wavelengths, *, n_triangles, n_nod
         for binding, buffer in enumerate(state["ssbo"]):
             gl.glBindBufferBase(gl.GL_SHADER_STORAGE_BUFFER, binding, buffer)
         integer("uStudioSphereCount", state.get("sphere_count", 0))
+        if state.get('volume_extinction') is not None:
+            integer("uStudioRegionCount", state.get("region_count", 0))
         integer("uTriCount", n_triangles)
         integer("uNodeCount", n_nodes)
         integer("uSourceCount", RAYS_PER_GROUP)

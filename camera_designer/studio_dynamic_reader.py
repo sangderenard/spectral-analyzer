@@ -161,7 +161,14 @@ class StudioDynamicReader:
         value = json.loads(raw)
         config = {**self.config, "scale_m": 1.0, "object_center_m": [0,0,0]}
         try:
-            scene, spheres, stats, _ = prepare_photo_geometry(config, vertices, self.ids, self.pbr)
+            record=self.field.get('directional_record')
+            refreshed_roi=None
+            if record and record.get('recording_region'):
+                from camera_designer.studio_directional_field import subject_field_region
+                refreshed_roi=subject_field_region(vertices,config)
+                if refreshed_roi['dimensions'][0]!=record['grid_size']:raise ValueError('subject ROI grid changed; new candidate required')
+            lineage=[] if self.field.get("directional_record") is not None else None
+            scene, spheres, stats, _ = prepare_photo_geometry(config, vertices, self.ids, self.pbr, **({"material_lineage_out": lineage} if lineage is not None else {}))
             geom, shade, mat, triangles, contexts, _, bounds, sources = scene
             if len(triangles) != self.triangle_count or len(spheres):
                 raise ValueError("canonical packing changed full triangle/medium ownership")
@@ -173,8 +180,10 @@ class StudioDynamicReader:
             # Existing upload waits glFinish before mutating its shared SSBOs.
             # Both readers retain these handles. No ray is dispatched here.
             from material_db import MaterialDatabase
+            if refreshed_roi is not None:record['recording_region']=refreshed_roi
             self.renderer._update_prebuilt_geometry(self.field,geom,shade,mat,nodes,ids,contexts,bounds,spheres,
                 native_pbr=MaterialDatabase.instance().build_tensors()["pbr"])
+            if lineage is not None:self.field["directional_record"]["material_lineage"]=lineage
             sensor.set_scene_geometry(n_tris=len(triangles),n_bvh_nodes=len(nodes),
                 bmin=bounds[0],bmax=bounds[1],n_spheres=0)
             sensor._geometry_stats = stats

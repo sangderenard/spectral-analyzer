@@ -14,6 +14,19 @@ from bdpt_records import BDPT_VERTEX_RECORD_DTYPE, BDPT_SPECTRAL_RECORD_DTYPE
 VERSION = 'native-emissive-triangle-roots-v1'
 
 
+def sampling_settings(config):
+    value=config.get('emitter_sampling')
+    if value is None:return dict(version=1,ray_budget=4096,seed=42,refresh_each_sweep=False)
+    if not isinstance(value,dict) or set(value)!={'version','ray_budget','seed','refresh_each_sweep'}:raise ValueError('invalid emitter_sampling keys')
+    if type(value['version']) is not int or value['version']!=1:raise ValueError('invalid emitter_sampling version')
+    if type(value['ray_budget']) is not int or not 128<=value['ray_budget']<=65536:raise ValueError('emitter ray_budget must be128..65536')
+    if type(value['seed']) is not int or not 0<=value['seed']<=2147483647:raise ValueError('emitter seed must be0..2147483647')
+    if type(value['refresh_each_sweep']) is not bool:raise ValueError('emitter refresh_each_sweep must be boolean')
+    if value['refresh_each_sweep'] and not (config.get('live') and config.get('transport')=='fixed:3' and 'fixtures' in config and config.get('receive_light_field') and config.get('light_field_estimator')=='track-length-root-sweep-v1'):
+        raise ValueError('emitter refresh requires live fixed:3 fixture root-sweep field')
+    return dict(value)
+
+
 def native_emissive_sources(scene, wavelengths_um, *, ray_budget=4096, seed=42):
     """Return SourceRec12 rows; reserved dir_kind.w is scene triangle ID + 1.
 
@@ -119,3 +132,26 @@ def area_nee_records(sources, geom, shade, materials, triangles):
         nearest=np.argmin(distance,axis=1)
         out[:,4+band]=table[mids,nearest,5]
     return np.ascontiguousarray(out)
+
+
+def install_source_population(renderer,field,sensor,scene,wavelengths,settings,index,*,ray_jobs):
+    """Refresh the original forward SSBO and its camera-only NEE view atomically at a sweep boundary."""
+    from OpenGL import GL
+    from .studio_directional_field import scene_digest
+    seed=(settings['seed']+index)%2147483648
+    rows=native_emissive_sources(scene,wavelengths,ray_budget=settings['ray_budget'],seed=seed)
+    if len(rows)!=field['n_sources']:raise ValueError('refreshed source count changed; new candidate required')
+    if len(rows)>ray_jobs:raise ValueError('live batch does not cover refreshed source population')
+    # Complete the old sweep before changing either consumer. Failure propagates;
+    # no new pump or purported complete publication follows a partial install.
+    GL.glFinish()
+    GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER,field['ssbo'][5])
+    GL.glBufferData(GL.GL_SHADER_STORAGE_BUFFER,rows.nbytes,rows,GL.GL_STATIC_DRAW)
+    sensor.set_nee_spectral_sources(rows,field['ssbo'][5],area_scene=scene)
+    field['source_buf']=rows
+    record=field['directional_record']
+    # Stable geometry + current population; aggregate provenance is separate.
+    import hashlib
+    base=record.setdefault('source_population_scene_base',record['scene_sha256'])
+    record['scene_sha256']=hashlib.sha256(bytes.fromhex(base)+rows.tobytes()).hexdigest()
+    return rows

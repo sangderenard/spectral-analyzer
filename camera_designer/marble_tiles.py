@@ -19,8 +19,11 @@ def tile_plan(config):
     oversampling = config.get("oversampling", 1)
     if type(oversampling) is not int or not 1 <= oversampling <= 4:
         raise ValueError("oversampling must be an integer multiplier from 1 to 4")
+    sample_target = config.get("samples_per_output_pixel")
+    if "samples_per_output_pixel" in config and (type(sample_target) is not int or not 1 <= sample_target <= 65536):
+        raise ValueError("samples_per_output_pixel must be an integer from 1 to 65536")
     custom = "width" in camera or "height" in camera
-    if "tiled" not in config and not custom and oversampling == 1 and resolution in (128,256,512,768,1024,2048,4096):
+    if sample_target is None and "tiled" not in config and not custom and oversampling == 1 and resolution in (128,256,512,768,1024,2048,4096):
         return None
     if custom and not ("width" in camera and "height" in camera):
         raise ValueError("custom camera size requires both width and height")
@@ -46,8 +49,17 @@ def tile_plan(config):
     return {"version": 1, "width": width, "height": height,
             "output_width": output_width, "output_height": output_height, "oversampling": oversampling, "tile_size": size,
             "total_tiles": count, "completed_tiles": 0, "active_tile": None,
-            "exposure_seconds_per_tile": float(config.get("exposure_seconds", 30)),
-            "requested_exposure_seconds": count * float(config.get("exposure_seconds", 30)),
+            "exposure_seconds_per_tile": None if sample_target is not None else float(config.get("exposure_seconds", 30)),
+            "requested_exposure_seconds": None if sample_target is not None else count * float(config.get("exposure_seconds", 30)),
+            # The 2048/2x/60s render completed 4..33 passes per tile. Equal
+            # wall time therefore created unequal noise, although its means
+            # and global tone map were correct. An explicit output-pixel work
+            # target gives every tile equal complete passes without blurring
+            # boundaries or rescaling any tile's radiance. Round up, disclose.
+            **({"requested_samples_per_output_pixel": sample_target,
+                "target_samples_per_pixel": math.ceil(sample_target / oversampling**2),
+                "target_samples_per_output_pixel": math.ceil(sample_target / oversampling**2) * oversampling**2}
+               if sample_target is not None else {}),
             # Peak persistent stores: full internal float32 RGB; final float32
             # RGB only for downsampling; float64 sRGB + worst-case NPZ/PNG.
             # Luminance partition scratch is deleted before archive encoding.
@@ -112,6 +124,8 @@ class TileAssembly:
         import numpy as np
         if samples < 1:
             raise ValueError("A tile must finish at least one complete sensor pass")
+        if "target_samples_per_pixel" in self.plan and samples != self.plan["target_samples_per_pixel"]:
+            raise ValueError("Tile does not meet the uniform sample target")
         expected = next(w for i, w in enumerate(tile_windows(self.plan)) if i == self.completed)
         if window != expected:
             raise ValueError("Tile is not the next queued sensor window")
@@ -183,6 +197,9 @@ class TileAssembly:
                 color_profile_json=np.asarray(json.dumps(profile,sort_keys=True)),
                 geometry_stats_json=np.asarray(json.dumps(geometry_stats,sort_keys=True)),
                 tile_samples=np.asarray(self.samples,np.uint64),
+                **({"requested_samples_per_output_pixel": np.asarray(self.plan["requested_samples_per_output_pixel"],np.uint64),
+                    "target_samples_per_output_pixel": np.asarray(self.plan["target_samples_per_output_pixel"],np.uint64)}
+                   if "target_samples_per_pixel" in self.plan else {}),
                 oversampling=np.asarray(factor,np.int32),
                 sensor_dimensions=np.asarray([self.plan["width"],self.plan["height"]],np.int32),
                 exposure_normalization=np.asarray("mean per complete sensor sample"))
@@ -197,6 +214,8 @@ class TileAssembly:
                 "visible_pixels": n, "width": width, "height": height,
                 "display_transform": display_transform_metadata({"gamma": gamma}, effective_white=white),
                 "samples_per_pixel_min": min(self.samples), "samples_per_pixel_max": max(self.samples),
+                **({"output_samples_per_pixel": self.plan["target_samples_per_output_pixel"]}
+                   if "target_samples_per_pixel" in self.plan else {}),
                 "hdr_channels": "mean linear sensor samples plus separate profiled linear sRGB; one full-image display transform"}
 
     def close(self):

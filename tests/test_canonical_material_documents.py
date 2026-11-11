@@ -13,7 +13,7 @@ from spectral_library import load_default_library
 
 def test_all_disk_documents_roundtrip_exact_bytes_and_independent_mapping():
     docs=read_material_documents()
-    assert len(docs)==47
+    assert len(docs)==53
     assert len({d.key for d in docs})==len(docs)
     for d in docs:
         raw=(MATERIAL_DIRECTORY/(d.key+'.yaml')).read_bytes()
@@ -79,7 +79,7 @@ unknown_science: {future: preserved}
     assert read_material_document('construction_glass').definition['pbr']['roughness']==.06
 
 
-def test_all47_imports_preserve_source_and_make_missing_profiles_explicit():
+def test_all53_imports_preserve_source_and_make_missing_profiles_explicit():
     load_default_library();db=MaterialDatabase();missing={};compiled=[]
     for d in read_material_documents():
         before=d.source_bytes
@@ -92,7 +92,7 @@ def test_all47_imports_preserve_source_and_make_missing_profiles_explicit():
     assert set(missing)=={'acoustic_foam_panel','acoustic_plaster_ceiling','construction_glass',
       'corrugated_steel_exterior','flashlight_reflector','flashlight_shell','painted_plaster_wall',
       'pearl_white_tile','tungsten_filament'}
-    assert len(compiled)==38
+    assert len(compiled)==44
     t=db.build_tensors()
     for name in ('pbr','phong_compat','raymat_compat','spectral','enamel','texture_stack'):
         assert np.isfinite(t[name]).all()

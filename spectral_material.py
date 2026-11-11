@@ -653,6 +653,8 @@ class Material:
     radiance:          Optional["RadianceProfile"]    = None
     reemission_matrix: Optional["ReemissionMatrix"]   = None
     maxwell_patch:     Optional[dict]                 = None
+    # Cold canonical gas/aerosol definition; never infer it from surface PBR.
+    medium:            Optional[dict]                 = None
 
     # ── Synthetic band fallback ───────────────────────────────────────────────
 
@@ -697,6 +699,10 @@ class Material:
           2. self.spectral_identity histogram converted to Gaussian bands
           3. If still empty, synthesise from PBR params
         """
+        if self.medium is not None:
+            # Unknown molecular/particle spectra must not become synthetic
+            # surface reflectance bands from an editor swatch.
+            return list(self.spectral_bands)
         bands = list(self.spectral_bands)
         if self.spectral_identity is not None:
             bands = bands + self.spectral_identity.to_spectral_bands()
@@ -714,6 +720,8 @@ class Material:
           emission, reemission, ior_real, ior_imag, specular_frac
         All values are sums over the band Gaussians.
         """
+        if self.medium is not None:
+            raise ValueError('participating-medium optics require the explicit volume-field route, not surface evaluation')
         bands = self.effective_bands()
         refl = trans = diff = emit = reemit = ior_r = ior_i = 0.0
         for b in bands:
@@ -765,6 +773,8 @@ class Material:
         emission  : (n_bands,) float64  — self-emission power at each band
         reemission: (n_bands,) float64  — re-emission coefficient at each band
         """
+        if self.medium is not None:
+            raise ValueError('participating-medium optics cannot be projected as surface tracer bands')
         freq_hz = np.asarray(freq_hz, dtype=np.float64)
         n = len(freq_hz)
         refl_re   = np.zeros(n, np.float64)
@@ -941,6 +951,10 @@ class Material:
             raise ValueError("maxwell_patch must be a mapping")
         maxwell_patch = (dict(maxwell_patch_raw)
                          if maxwell_patch_raw is not None else None)
+        medium = None
+        if d.get('medium') is not None:
+            from material_medium import validate_medium_profile
+            medium = validate_medium_profile(d['medium'])
 
         return cls(
             name              = name,
@@ -960,6 +974,7 @@ class Material:
             radiance          = radiance,
             reemission_matrix = reemission_matrix,
             maxwell_patch     = maxwell_patch,
+            medium            = medium,
         )
 
     def to_dict(self) -> dict:
@@ -990,6 +1005,9 @@ class Material:
             d["reemission_matrix"] = self.reemission_matrix.to_dict()
         if self.maxwell_patch is not None:
             d["maxwell_patch"] = dict(self.maxwell_patch)
+        if self.medium is not None:
+            from material_medium import validate_medium_profile
+            d['medium'] = validate_medium_profile(self.medium)
         return d
 
 

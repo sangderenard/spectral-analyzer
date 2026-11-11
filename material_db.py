@@ -1550,11 +1550,35 @@ class MaterialDatabase:
         Registering the same name again updates the material and marks the
         cache dirty.
         """
+        medium = material.get('medium') if isinstance(material, dict) else getattr(material, 'medium', None)
+        if medium is not None:
+            from material_medium import validate_medium_profile
+            validated = validate_medium_profile(medium)
+            if isinstance(material, dict):
+                material = dict(material)
+                material['medium'] = validated
+            else:
+                import copy
+                material = copy.copy(material)
+                material.medium = validated
         if name not in self._materials:
             self._order.append(name)
         self._materials[name] = material
         self._dirty = True
         return self._order.index(name)
+
+    def medium_profile(self, name: str):
+        """Independent cold participating-medium definition from this registry.
+
+        None means undeclared, not zero measured extinction. Consumers must
+        resolve an explicit optical law before building a volume field.
+        """
+        material = self._materials[name]
+        medium = material.get('medium') if isinstance(material, dict) else getattr(material, 'medium', None)
+        if medium is None:
+            return None
+        from material_medium import validate_medium_profile
+        return validate_medium_profile(medium)
 
     def register_from_mat16(self, name: str, mat16: np.ndarray) -> int:
         """Register from a 16-float authored material vector.

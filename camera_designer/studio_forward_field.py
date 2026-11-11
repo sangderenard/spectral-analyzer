@@ -24,6 +24,16 @@ def _regular_file(path):
 
 
 def validate_receive_light_field(config):
+    from camera_designer.studio_directional_field import recording_options
+    recording_options(config.get('light_field_estimator','track-length-throughput-v1'),config.get('light_field_grid_size'))
+    if 'light_field_stencil' in config:
+        from camera_designer.studio_directional_field import validate_stencil
+        validate_stencil(config['light_field_stencil'])
+    internal=config.get('light_field_internal_media',False)
+    if type(internal) is not bool:raise ValueError('light_field_internal_media must be a boolean')
+    if internal:
+        from camera_designer.studio_native_emitters import sampling_settings
+        if not sampling_settings(config)['refresh_each_sweep']:raise ValueError('internal directional recording requires refreshed v6 populations')
     enabled = config.get('receive_light_field', False)
     if type(enabled) is not bool:
         raise ValueError('receive_light_field must be a boolean')
@@ -121,6 +131,11 @@ class ForwardFieldPublisher:
     def snapshot(self, renderer, field, *, live_revision=0, sweep=0,
                  sensor_samples=0, ray_jobs=0, accumulation='additive since last clear',
                  scene_ack=None, now=None):
+        progressive=(field.get('directional_record') or {}).get('progressive')
+        if progressive and self.latest is not None and self.latest.get('live_revision')==int(live_revision):
+            previous=self.latest.get('directional',{}).get('source_populations')
+            if previous==progressive['metadata'] and self.latest.get('scene_sha256')==field['directional_record'].get('scene_sha256'):
+                return self.latest
         supplied_now = now
         now = time.monotonic() if now is None else now
         if now - self.last_readback < self.interval:
@@ -141,6 +156,21 @@ class ForwardFieldPublisher:
         counts = renderer._gpu_readback_prebuilt(field['tex_bands'], dimensions)
         rgb = field_to_linear_srgb(counts, dimensions)
         payload = rgb.tobytes(order='C')
+        sections = {}
+        directional_unavailable = None
+        if field.get('directional_record') is not None:
+            from camera_designer.studio_directional_field import bundle_sections, DirectionalUnavailable
+            try:
+                extra, sections = bundle_sections(field['directional_record'], field['source_buf'], len(payload))
+                payload += extra
+            except DirectionalUnavailable as unavailable:
+                # Optional recording must never kill the primary exposure or
+                # silently reset/normalize the existing scalar estimator.
+                directional_unavailable = {
+                    'reason': unavailable.reason,
+                    'recovery': unavailable.recovery,
+                    'fallback': 'unchanged canonical scalar v1; no directional approximation published',
+                }
         name = f'light-field-{uuid.uuid4().hex}.bin'
         target = self.output / name
         temporary = target.with_suffix('.tmp')
@@ -168,6 +198,17 @@ class ForwardFieldPublisher:
             'normalization': 'none; not divided by ray count or sensor samples',
             'limits': 'Three-line reference colorimetry; signed out-of-gamut RGB retained. Scalar voxel energy, not directional radiance or calibrated irradiance. No film response, tone mapping, gamma, denoising or temporal averaging.',
         }
+        if field.get('surface_transport') is not None:self.latest['surface_transport']=field['surface_transport']
+        if directional_unavailable is not None:
+            self.latest['directional_unavailable'] = directional_unavailable
+        if sections:
+            self.latest.update(sections)
+            self.latest['schema'] = ('studio.forward-field.v6' if sections['directional'].get('source_populations') else 'studio.forward-field.v5' if sections['directional'].get('region') else 'studio.forward-field.v4' if sections['directional']['estimator']=='track-length-root-sweep-v1' else 'studio.forward-field.v3')
+            if field.get('geometry_sha256') is not None:
+                self.latest['geometry_sha256'] = field['geometry_sha256']
+            self.latest['limits'] += (' Directional section records actual interior/exterior Beer-integrated track-length throughput density in explicit coarse angular bins.' if sections['directional'].get('internal_media') else ' Directional section records exterior segment track-length throughput density in explicit coarse angular bins.') + ' This is not a complete angular radiance function. Signed 32-bit sums require bounded fresh sweeps; no individual path ancestry. Material/triangle IDs use the assembled server scene, not browser mesh indices.'
+        if sections.get('directional',{}).get('source_populations'):
+            self.latest['limits'] += ' Directional values are a mean of complete refreshed source populations; deterministic population provenance is retained, not individual ray ancestry. Scalar remains fresh per sweep.'
         if scene_ack is not None:
             self.latest['scene_ack'] = dict(scene_ack)
         self.last_readback = time.monotonic() if supplied_now is None else now

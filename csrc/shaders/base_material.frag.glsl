@@ -231,6 +231,48 @@ uniform mat4 uFieldFromView;
 // this shader is used; consumers that want pure-emitter lighting (no
 // invisible indirect floor at all) set this to 0.0 per frame.
 uniform float uAmbientFloorGain = 1.0;
+// Opt-in scene-linear premultiplied output. A host must resolve exposure/ACES/
+// sRGB exactly once after all layers; false preserves the legacy display path.
+uniform bool uLinearOutput = false;
+#if defined(PLUCK_SECONDARY_FIELD) || defined(PLUCK_FIELD_PRIMARY)
+uniform usampler2D uFieldMaterialMask;
+uniform bool uFieldReplaceSpecular = false;
+// Per-geometry ownership, never a material-ID category guess.
+uniform bool uFieldCategoryDisabled = false;
+// Opt-in bounded directional ROI. Zero preserves old host binding behavior.
+uniform bool uFieldRestrictToBounds = false;
+uint field_material_mask(int id) {
+    if (uFieldCategoryDisabled) return 0u;
+    if (uFieldRestrictToBounds) {
+        vec3 coordinate = (uFieldFromView * vec4(vPosV, 1.0)).xyz;
+        if (!all(greaterThanEqual(coordinate, vec3(0.0))) ||
+            !all(lessThanEqual(coordinate, vec3(1.0)))) return 0u;
+    }
+    ivec2 mask_size = textureSize(uFieldMaterialMask, 0);
+    if (id >= 0 && id < mask_size.x * mask_size.y) {
+        return texelFetch(uFieldMaterialMask,
+            ivec2(id % mask_size.x, id / mask_size.x), 0).r;
+    }
+    return 0u;
+}
+#endif
+#ifdef PLUCK_SECONDARY_FIELD
+// Configurable angular cells tiled across X and Z. RGBA direction stores
+// measured weighted world propagation moments and their scalar weight.
+// Legacy RGB direction textures have implicit weight one. This angular atlas is
+// not a full light-field reconstruction or a refracted-ray solution.
+uniform sampler2D uFieldResolvedColor;
+uniform sampler3D uFieldRadiance;
+uniform sampler3D uFieldDirection;
+uniform float uFieldGridDepth = 32.0;
+uniform int uFieldBinCount = 6;
+uniform int uFieldAtlasColumns = 1;
+uniform bool uFieldSpatialLinear = false;
+uniform mat3 uFieldViewFromWorld = mat3(1.0);
+uniform int uSecondaryPass = 0; // 0=body scattering, 1=reflection, 2=transparent layers, 3=resolve
+// Prefer authored direct-light Phong specular instead of field specular.
+uniform bool uSecondaryPhongSpecular = false;
+#endif
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
@@ -291,6 +333,13 @@ vec3 pluck_display(vec3 c) {
 /* ── Main ─────────────────────────────────────────────────────────────────── */
 
 void main() {
+#ifdef PLUCK_SECONDARY_FIELD
+    if (uSecondaryPass == 3) {
+        vec4 linear_color = texelFetch(uFieldResolvedColor, ivec2(gl_FragCoord.xy), 0);
+        FragColor = vec4(pluck_display(linear_color.rgb), linear_color.a);
+        return;
+    }
+#endif
     int id = vMatId;
 
     // Geometry
@@ -385,6 +434,46 @@ void main() {
 #endif
 #endif
 
+#ifdef PLUCK_SECONDARY_FIELD
+    // The primary opaque depth buffer is retained by the host (EQUAL for
+    // passes 0/1). Pass 2 redraws ALL transparent layers back-to-front with
+    // primary + field light, so nearer layers attenuate farther contributions.
+    // Delivered native class bits: body scattering=1, reflection=2, glass=4.
+    // The host validates material identity before uploading this mask.
+    uint field_mask = field_material_mask(id);
+    float field_alpha = opacity;
+#ifdef PLUCK_TRANSMISSION
+    if (m_trans > 0.0) field_alpha = min(opacity, 1.0 - 0.8 * m_trans);
+#ifdef PLUCK_PREMULTIPLIED_GLASS
+    if (glass_preview) field_alpha = 1.0 - glass_weight *
+        (1.0 - clamp(max(F_vec.r, max(F_vec.g, F_vec.b)), 0.0, 1.0));
+#endif
+#endif
+    if (uSecondaryPass < 2 && field_alpha < 0.85) discard;
+    // Pass 2 owns the host's retained transparent mesh list. A transmissive
+    // mesh can have near-opaque Fresnel coverage and must still be rendered;
+    // imposing the opaque threshold again here would drop those layers.
+    if (uSecondaryPass == 0 && (field_mask & 1u) == 0u) discard;
+    if (uSecondaryPass == 1 && (field_mask & 2u) == 0u) discard;
+#ifdef PLUCK_TRANSMISSION
+    // A material with no body scattering/remission contributes exactly zero
+    // in pass 0. Avoid twelve atlas reads on ordinary opaque room surfaces;
+    // this uses the authored response, not a brightness/visibility heuristic.
+    if (uSecondaryPass == 0 && tl_frac <= 0.0 && remit_g <= 0.0) discard;
+#endif
+    vec3 field_coord = (uFieldFromView * vec4(vPosV, 1.0)).xyz;
+    bool field_inside = all(greaterThanEqual(field_coord, vec3(0.0))) &&
+                        all(lessThanEqual(field_coord, vec3(1.0)));
+    int primary_count = uSecondaryPass == 2 ? min(uNumLights, MAX_LIGHTS) : 0;
+#endif
+
+    bool direct_specular = uEnableSpecular;
+#ifdef PLUCK_FIELD_PRIMARY
+    uint primary_field_mask = field_material_mask(id);
+    direct_specular = direct_specular &&
+        !(uFieldReplaceSpecular && (primary_field_mask & 2u) != 0u);
+#endif
+
     // Direct illumination from real emitters only.
     vec3 col = base * clamp(ph_ambient(id), 0.0, 0.12) * uAmbientFloorGain;
     float diffuse_weight = 1.0;
@@ -395,51 +484,140 @@ void main() {
     vec3 spec_col_acc = vec3(0.0);
     float spec_acc = 0.0;
     int n = min(uNumLights, MAX_LIGHTS);
+#ifdef PLUCK_SECONDARY_FIELD
+    if (uSecondaryPass != 2) col = vec3(0.0);
+    n = primary_count + clamp(uFieldBinCount, 1, 12);
+#endif
     for (int i = 0; i < n; ++i) {
+#ifdef PLUCK_SECONDARY_FIELD
+        bool field_sample = i >= primary_count;
+        vec3 L, Lcol;
+        if (field_sample) {
+            if (!field_inside || uFieldGain <= 0.0 || field_mask == 0u) continue;
+            int bin = i - primary_count;
+            int depth = max(int(uFieldGridDepth), 1);
+            int columns = max(uFieldAtlasColumns, 1);
+            ivec3 atlas_size = textureSize(uFieldRadiance, 0);
+            ivec3 field_size = ivec3(atlas_size.x / columns, atlas_size.y, depth);
+            ivec3 tile = ivec3((bin % columns) * field_size.x, 0, (bin / columns) * depth);
+            vec3 field_rgb;
+            vec4 direction_moment;
+            if (uFieldSpatialLinear) {
+                // Interpolate actual energy and weighted moments together,
+                // never unweighted directions or fabricated empty-cell light.
+                // Half-cell clamping prevents filtering across angular tiles.
+                vec3 local = clamp(field_coord * vec3(field_size), vec3(0.5), vec3(field_size) - 0.5);
+                vec3 atlas_coord = (vec3(tile) + local) / vec3(atlas_size);
+                field_rgb = texture(uFieldRadiance, atlas_coord).rgb;
+                direction_moment = texture(uFieldDirection, atlas_coord);
+            } else {
+                // Exact nearest-cell partition remains available for comparison.
+                ivec3 field_cell = min(ivec3(floor(field_coord * vec3(field_size))), field_size - 1) + tile;
+                field_rgb = texelFetch(uFieldRadiance, field_cell, 0).rgb;
+                direction_moment = texelFetch(uFieldDirection, field_cell, 0);
+            }
+            if (direction_moment.w <= 0.0) continue;
+            vec3 propagation = direction_moment.xyz / max(direction_moment.w, 1e-30);
+            float coherence = clamp(length(propagation), 0.0, 1.0);
+            if (coherence <= 1e-6) continue;
+            L = normalize(uFieldViewFromWorld * -propagation);
+            Lcol = field_rgb * (uFieldGain * coherence);
+        } else {
+#endif
         if (uLightGroupId[i] == vGroupId) {
             continue;
         }
         vec3  Lvec  = uLightPos[i] - vPosV;
         float Lr2   = max(dot(Lvec, Lvec), 1e-8);
+#ifdef PLUCK_SECONDARY_FIELD
+        L = Lvec * inversesqrt(Lr2);
+#else
         vec3  L     = Lvec * inversesqrt(Lr2);
+#endif
         float emitter_r2 = max(uLightIntensity[i], 0.0) * 0.0795774715; // area / (4*pi)
         float atten_r2 = max(Lr2 + emitter_r2, 1e-8);
+#ifdef PLUCK_SECONDARY_FIELD
+        Lcol = uLightColor[i] * ((uLightIntensity[i] * uLightCalibration) / atten_r2);
+#else
         vec3  Lcol  = uLightColor[i] * ((uLightIntensity[i] * uLightCalibration) / atten_r2);
+#endif
         // Spot cone: a light with a direction lights only the fragments inside
         // its cone, fading across the edge between the inner and outer angles.
         if (dot(uLightSpotDir[i], uLightSpotDir[i]) > 0.25) {
             float cos_a = dot(-L, normalize(uLightSpotDir[i]));
             Lcol *= smoothstep(uLightSpotCone[i].y, uLightSpotCone[i].x, cos_a);
         }
+#ifdef PLUCK_SECONDARY_FIELD
+        }
+#endif
+#ifdef PLUCK_SECONDARY_FIELD
+        // Exact back-light is common in angular bins; normalize(0) is undefined.
+        vec3 half_sum = L + V;
+        vec3 H = half_sum * inversesqrt(max(dot(half_sum, half_sum), 1e-12));
+#else
         vec3  H     = normalize(L + V);
+#endif
         float NdotL = max(dot(N, L), 0.0);
         float NdotH = max(dot(N, H), 0.0);
         float spec  = pow(NdotH, max(shini, 1.0));
         float visibility = 1.0;
 #ifdef PLUCK_SHADOW_MAP
+#ifdef PLUCK_SECONDARY_FIELD
+        if (!field_sample)
+#endif
         visibility = light_shadow_visibility(i, N, L);
 #endif
 
-        col += base * Lcol * NdotL * visibility * diffuse_weight;
-
-        if (uEnableSpecular) {
-            col += Lcol * F_vec * (specstr * spec) * visibility;
+        bool diffuse_sample = true;
+        bool specular_sample = direct_specular;
+        bool transmission_sample = true;
+        bool body_sample = true;
+#ifdef PLUCK_FIELD_PRIMARY
+        // The field contains zero-bounce as well as bounced source segments.
+        // Its eligible components REPLACE direct-light estimates, never add
+        // a second copy. Authored ambient/self-emission remain outside this loop.
+        diffuse_sample = (primary_field_mask & 2u) == 0u;
+        transmission_sample = (primary_field_mask & 4u) == 0u;
+        body_sample = (primary_field_mask & 1u) == 0u;
+#endif
+#ifdef PLUCK_SECONDARY_FIELD
+        if (field_sample) {
+            diffuse_sample = uSecondaryPass != 0 && (field_mask & 2u) != 0u;
+            specular_sample = direct_specular && diffuse_sample && !uSecondaryPhongSpecular;
+            transmission_sample = uSecondaryPass == 2 && (field_mask & 4u) != 0u;
+            body_sample = uSecondaryPass != 1 && (field_mask & 1u) != 0u;
+        } else {
+            diffuse_sample = (field_mask & 2u) == 0u;
+            // Specular override must not depend on the diffuse ownership gate.
+            specular_sample = direct_specular && (uSecondaryPhongSpecular || diffuse_sample);
+            transmission_sample = (field_mask & 4u) == 0u;
+            body_sample = (field_mask & 1u) == 0u;
         }
+#endif
+        if (diffuse_sample) col += base * Lcol * NdotL * visibility * diffuse_weight;
+        if (specular_sample) col += Lcol * F_vec * (specstr * spec) * visibility;
 
-        spec_col_acc += Lcol * spec * visibility;
-        spec_acc     += spec * visibility;
+        if (
+#if defined(PLUCK_SECONDARY_FIELD) || defined(PLUCK_FIELD_PRIMARY)
+            specular_sample
+#else
+            !uLinearOutput || direct_specular
+#endif
+        ) {
+            spec_col_acc += Lcol * spec * visibility;
+            spec_acc     += spec * visibility;
+        }
 
 #ifdef PLUCK_TRANSMISSION
         if (use_tr) {
             float back = max(-dot(N, L), 0.0);
             if (back > 0.0) {
                 float fwd = pow(max(dot(-L, V), 0.0), max(shini, 1.0));
-                tr_acc  += Lcol * ((back * m_rough + fwd * (1.0 - m_rough)) * m_trans);
-                sss_acc += Lcol * back;
+                if (transmission_sample)
+                    tr_acc += Lcol * ((back * m_rough + fwd * (1.0 - m_rough)) * m_trans);
+                if (body_sample) sss_acc += Lcol * back;
             }
-            if (remit_g > 0.0) {
-                remit_acc += Lcol * abs(dot(N, L));
-            }
+            if (remit_g > 0.0 && body_sample) remit_acc += Lcol * abs(dot(N, L));
         }
 #endif
     }
@@ -465,6 +643,9 @@ void main() {
 #endif
 
     // ── Self-emission via UV texture-pack ────────────────────────────────
+#ifdef PLUCK_SECONDARY_FIELD
+    if (uSecondaryPass == 2) {
+#endif
     float emit_layer = tx_emit_layer(id);
     vec4  e_uv     = (emit_layer >= 0.0)
                    ? texture(uEmitUv, vec3(vUv, emit_layer))
@@ -510,6 +691,10 @@ void main() {
         col = max(col, vec3(0.0));
     }
 
+#ifdef PLUCK_SECONDARY_FIELD
+    }
+#endif
+
     // ── Enamel thin-film coating ──────────────────────────────────────────
     vec3  spec_col = spec_col_acc;
     float spec     = spec_acc;
@@ -537,6 +722,7 @@ void main() {
     // irradiance or a new BRDF. Signed linear RGB reaches the original display
     // conversion unchanged. Transformed samples outside the field contribute
     // nothing; texture edge clamping must not extend the physical field.
+#ifndef PLUCK_SECONDARY_FIELD
     if (uFieldGain > 0.0) {
         if (uFieldUseTransform) {
             vec3 field_coord = (uFieldFromView * vec4(vPosV, 1.0)).xyz;
@@ -548,6 +734,8 @@ void main() {
             col += texture(uFieldVolume, vPosObj).rgb * uFieldGain;
         }
     }
+
+#endif
 
     // Color compensation equation: C' = CAT_CCM * C.
     col = uCatCcmMatrix * col;
@@ -562,7 +750,15 @@ void main() {
         float glass_alpha = 1.0 - glass_weight * (1.0 - reflection);
         if (uRenderPass == 1 && glass_alpha < 0.85) discard;
         if (uRenderPass == 2 && glass_alpha >= 0.85) discard;
+#ifdef PLUCK_SECONDARY_FIELD
+        FragColor = vec4(col + uCatCcmMatrix * col_t, uSecondaryPass == 2 ? glass_alpha : 0.0);
+#else
+        if (uLinearOutput) {
+            FragColor = vec4(col + uCatCcmMatrix * col_t, glass_alpha);
+            return;
+        }
         FragColor = vec4(pluck_display(col + uCatCcmMatrix * col_t), glass_alpha);
+#endif
         return;
     }
 #endif
@@ -574,6 +770,21 @@ void main() {
 #endif
     if (uRenderPass == 1 && alpha < 0.85) discard;
     if (uRenderPass == 2 && alpha >= 0.85) discard;
+
+#ifdef PLUCK_SECONDARY_FIELD
+    FragColor = vec4(col * alpha + uCatCcmMatrix * col_t,
+                     uSecondaryPass == 2 ? alpha : 0.0);
+    return;
+#else
+    if (uLinearOutput) {
+        vec3 linear_color = col * alpha;
+#ifdef PLUCK_TRANSMISSION
+        linear_color += uCatCcmMatrix * col_t;
+#endif
+        FragColor = vec4(linear_color, alpha);
+        return;
+    }
+#endif
 
     vec3 lin = max(col, vec3(0.0)) * max(uExposure, 0.0);
     // ACES approximation keeps energetic emitters colourful while preserving

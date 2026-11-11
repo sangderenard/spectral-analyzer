@@ -431,6 +431,8 @@ def run(payload: Path, config_path: Path, output: Path, *,
     transport = str(config.get("transport", "fixed:1"))
     from camera_designer.studio_forward_field import ForwardFieldPublisher, validate_receive_light_field
     receive_light_field = validate_receive_light_field(config)
+    from camera_designer.studio_opaque_pbr import validate_surface_transport
+    surface_transport=validate_surface_transport(config)
     if transport not in ("fixed:1", "fixed:3"):
         raise ValueError("transport must be fixed:1 or fixed:3")
     if transport == "fixed:1" and "film_response" in config:
@@ -468,19 +470,33 @@ def run(payload: Path, config_path: Path, output: Path, *,
         vertices = np.asarray(saved["vertices"], np.float32)
         material_ids = np.asarray(saved["material_ids"], np.int32)
         pbr = np.asarray(saved["pbr"], np.float32)
+        from camera_designer.studio_volume_extinction import from_payload
+        volume_extinction = from_payload(config, saved)
+    if volume_extinction is not None and config.get('light_field_internal_media',False):
+        raise ValueError('internal directional recording with ExtinctionGrid requires joint attenuation integration')
+    if volume_extinction is not None:
+        effective_config['volume_extinction_field'] = volume_extinction.metadata()
 
     preparation_start = time.monotonic()
     from camera_designer.studio_photo_geometry import (
         CAMERA_GEOMETRY_VERSION, camera_geometry_key, prepare_photo_geometry,
     )
     initial_config = {**config, "camera": camera_poses[0]} if camera_poses is not None else config
-    scene, sphere_regions, geometry_stats, checker_pos = prepare_photo_geometry(initial_config, vertices, material_ids, pbr)
+    material_lineage = [] if receive_light_field else None
+    scene, sphere_regions, geometry_stats, checker_pos = prepare_photo_geometry(initial_config, vertices, material_ids, pbr, **({"material_lineage_out": material_lineage} if material_lineage is not None else {}))
     geom, shade, mat_buf, triangles, contexts, _, bounds, sources = scene
+    if surface_transport is not None:geometry_stats['surface_transport']=surface_transport
     preparation_status["geometry_stats"] = geometry_stats
     effective_config["geometry_stats"] = geometry_stats
     effective_config["camera_geometry_version"] = CAMERA_GEOMETRY_VERSION
     _atomic_json(output / "effective_config.json", effective_config)
     _atomic_json(output / "status.json", preparation_status)
+    recording_region = None
+    if config.get('light_field_region') is not None:
+        if config['light_field_region']!='subject':raise ValueError('only bounded subject recording ROI is supported')
+        from camera_designer.studio_directional_field import subject_field_region
+        recording_region=subject_field_region(vertices,config)
+        if config.get('light_field_subject_region') not in (None,recording_region):raise ValueError('subject ROI receipt differs from actual geometry')
     renderer._ensure_worker_gl_context()
     margin = np.asarray([.02, .02, .04], np.float32)
     bounds = (bounds[0] - margin, bounds[1] + margin)
@@ -512,9 +528,21 @@ def run(payload: Path, config_path: Path, output: Path, *,
         dims=(96, 96, 96), dispatch_batch=512, max_bounces=max_bounces, initial_rays=128,
         film_stack=film, sphere_regions=sphere_regions, region_records=region_records,
         native_pbr=MaterialDatabase.instance().build_tensors()["pbr"],
+        record_directional=validate_receive_light_field(config),
+        light_field_stencil=config.get("light_field_stencil",12),
+        light_field_estimator=config.get("light_field_estimator","track-length-throughput-v1"),
+        light_field_grid_size=config.get("light_field_grid_size"),
+        light_field_region=recording_region,
+        surface_transport=surface_transport,
+        light_field_internal_media=config.get("light_field_internal_media",False),
+        directional_quantization_divisor=(16777216 if config.get('emitter_sampling',{}).get('refresh_each_sweep') else 65535),
+        volume_extinction=volume_extinction,
     )
     if state is None:
         raise RuntimeError("Spectral GPU ray-field shader did not link")
+    if receive_light_field:
+        state["geometry_sha256"] = config.get("geometry_sha256")
+        state["directional_record"]["material_lineage"] = material_lineage
     bounce_diagnostic = {"mode": "manual", "chosen_depth": max_bounces, "render_cap": 200}
     if bounce_mode == "auto":
         from camera_designer.marble_bounce_probe import run_bounce_probe
@@ -574,14 +602,17 @@ def run(payload: Path, config_path: Path, output: Path, *,
         if next_key == active_camera_key:
             return
         next_config = {**config, "camera": next_camera}
+        next_lineage = [] if receive_light_field else None
         next_scene, next_spheres, next_stats, _ = prepare_photo_geometry(
-            next_config, vertices, material_ids, pbr)
+            next_config, vertices, material_ids, pbr, **({"material_lineage_out": next_lineage} if next_lineage is not None else {}))
         next_geom, next_shade, next_mat, next_tris, next_ctx, _, next_bounds, _ = next_scene
         next_bounds = (next_bounds[0] - margin, next_bounds[1] + margin)
         next_nodes, next_ids = renderer._build_gpu_bvh(next_tris)
         renderer._update_prebuilt_geometry(state, next_geom, next_shade, next_mat,
             next_nodes, next_ids, next_ctx, next_bounds, next_spheres,
             native_pbr=MaterialDatabase.instance().build_tensors()["pbr"])
+        if receive_light_field:
+            state["directional_record"]["material_lineage"] = next_lineage
         if active_sensor is not None:
             active_sensor.set_scene_geometry(n_tris=len(next_tris), n_bvh_nodes=len(next_nodes),
                 bmin=next_bounds[0], bmax=next_bounds[1], n_spheres=len(next_spheres))
@@ -628,6 +659,8 @@ def run(payload: Path, config_path: Path, output: Path, *,
             ssbo_regions=state["ssbo"][15] if state.get("region_count") else 0,
             n_regions=state.get("region_count",0),
             ssbo_native_pbr=state["native_pbr_ssbo"],
+            volume_extinction=state.get("volume_extinction"),
+            surface_transport=surface_transport,
         )
         if not accumulator._active:
             accumulator.destroy()
@@ -679,11 +712,19 @@ def run(payload: Path, config_path: Path, output: Path, *,
                 from camera_designer.studio_dynamic_reader import StudioDynamicReader
                 dynamic_reader = StudioDynamicReader(renderer, state, config, scene, material_ids, pbr)
                 dynamic_scene_receiver(dynamic_reader)
+            from camera_designer.studio_native_emitters import sampling_settings,install_source_population
+            source_settings=sampling_settings(config)
+            refresh_sources=None
+            if source_settings['refresh_each_sweep']:
+                if dynamic_reader is not None:raise ValueError('fresh source populations with dynamic subject updates require a new candidate')
+                def refresh_sources(index,ray_jobs):
+                    return install_source_population(renderer,state,accumulator,scene,wavelengths,source_settings,index,ray_jobs=ray_jobs)
             return run_live_sensor(accumulator, renderer, state, output, digest,
                                    config, preparation, _snapshot, _atomic_json,
                                    max_epochs=max_epochs,
                                    update_camera_geometry=update_camera_geometry,
-                                   dynamic_scene_reader=dynamic_reader)
+                                   dynamic_scene_reader=dynamic_reader,
+                                   refresh_sources=refresh_sources)
         windows = list(tile_windows(tiles)) if tiles else [None] * total_frames
         for work_index, window in enumerate(windows):
             frame_index = 0 if tiles else work_index
@@ -739,8 +780,14 @@ def run(payload: Path, config_path: Path, output: Path, *,
                     if field_publisher is not None:
                         field_publisher.invalidate()
                 now = time.monotonic()
-                done = (now - frame_start >= seconds or
-                        (max_epochs is not None and frame_epochs >= max_epochs))
+                target_samples = tiles.get("target_samples_per_pixel") if tiles else None
+                if target_samples is not None:
+                    done = accumulator._pass * accumulator._samples_per_pixel >= target_samples
+                    if max_epochs is not None and frame_epochs >= max_epochs and not done:
+                        raise RuntimeError("Epoch limit reached before the uniform tile sample target")
+                else:
+                    done = (now - frame_start >= seconds or
+                            (max_epochs is not None and frame_epochs >= max_epochs))
                 if cooperative_pump is not None or tiles:done=done and accumulator._pass>=1 and accumulator._row_off==0
                 if tiles and not done and now - last_snapshot >= snapshot_seconds:
                     # The UI receives queue progress, not a costly full-tile

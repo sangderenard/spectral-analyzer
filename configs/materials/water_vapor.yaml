@@ -1,0 +1,39 @@
+name: water_vapor
+domain: optical
+description: Molecular water vapor, distinct from condensed fog droplets. Optical spectrum is not parameterized.
+# Neutral editor-only surface placeholder, not molecular optical properties.
+albedo: [1.0, 1.0, 1.0]
+roughness: 0.0
+metallic: 0.0
+transmission: 1.0
+ior: 1.0
+opacity: 0.0
+emission_rgb: [0.0, 0.0, 0.0]
+medium:
+  schema: participating-medium-v1
+  phase: molecular_gas
+  formula: H2O
+  molar_mass_kg_mol: 0.0180153
+  particle_material_density_kg_m3: null
+  optics:
+    model: unparameterized
+    mass_extinction_m2_kg: null
+    mass_absorption_m2_kg: null
+    mass_scattering_m2_kg: null
+    single_scattering_albedo: null
+    asymmetry_g: null
+    phase_function: null
+    refractive_index: null
+    required_inputs:
+      - Wavelength-resolved molecular absorption data at the actual temperature and pressure.
+      - Water-vapor species concentration, not total moist-air density.
+      - Molecular scattering data if scattering is to be modeled.
+    notes: Relative humidity is not liquid water content. No automatic condensation, fog or zero-opacity physical assertion is made.
+  provenance:
+    - property: molar_mass_kg_mol
+      url: https://webbook.nist.gov/cgi/cbook.cgi?ID=C7732185
+      note: NIST Chemistry WebBook SRD 69 molecular weight 18.0153, converted from g/mol to kg/mol.
+    - property: optics.required_inputs
+      url: https://hitran.org/docs/cross-sections-definitions/
+      note: Molecular cross sections are spectral and condition-dependent; no spectral dataset is imported by this profile.
+notes: The surface fields are neutral catalog/editor placeholders. Sprite opacity and Brownian display points do not define absorption, extinction or phase.

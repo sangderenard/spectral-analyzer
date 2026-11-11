@@ -36,6 +36,10 @@ layout(location = 4) in int  aGroupId;
 layout(location = 5) in int  aCullImmune;
 layout(location = 6) in vec3 aVelocity;   // world-space surface velocity (m/s)
 
+// Primary and secondary are distinct programs sharing exact depth-EQUAL
+// visibility. Require invariant clip positions across those linked programs.
+invariant gl_Position;
+
 uniform mat4 uMVP;
 uniform mat4 uMV;
 

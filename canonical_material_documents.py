@@ -47,7 +47,11 @@ class MaterialDocument:
         value=yaml.safe_load(self.source_bytes.decode('utf-8'))
         if not isinstance(value,dict):
             raise ValueError('material document root must be a mapping')
-        return _independent_tree(value)
+        result = _independent_tree(value)
+        if 'medium' in result:
+            from material_medium import validate_medium_profile
+            result['medium'] = validate_medium_profile(result['medium'])
+        return result
 
     def with_field(self,path,value):
         """Replace one existing mapping/list field; never create hidden structure."""
@@ -241,14 +245,20 @@ def native_payload(document, *, profile_database=None):
     if not isinstance(bands,list) or len(bands)>MAX_SPECTRAL_BANDS:
         raise ValueError('spectral bands exceed native capacity or are not a list')
     known={'name','description','notes','gameplay','domain','albedo','albedo_rgb','pbr','roughness','smoothness','metallic','transmission','ior','opacity','emission','emission_rgb','ambient','spec_strength','shininess','grain','inner_color','bands','spectral_bands','enamel','texture_stack','reflectivity','diffusion','absorption','color_profile_name','emit_profile_name','emission_profile_name','remit_profile_name','color_profile_idx','emit_profile_idx','remit_profile_idx','reactive_shift_hz','mat_flags'}
+    known.add('medium')
     uncompiled += [str(k) for k in source if k not in known]
     uncompiled += _nested_uncompiled(source)
+    if 'medium' in source:
+        # The authoritative document owns this cold definition. Surface PBR
+        # records cannot represent volume density or molecular cross sections.
+        uncompiled.append('medium (cold definition; explicit volume-field route)')
+        warnings.append('Participating-medium optics are separate from the editor PBR placeholder; no extinction or scattering is inferred from opacity.')
     if not legacy:
         for field in ("reactive_shift_hz", "mat_flags"):
             if source.get(field, 0) != 0:
                 uncompiled.append(field + " (not propagated by native PBR route)")
     _validate_native_projection(out)
-    if not bands:warnings.append('No authored spectral bands; native transport uses its existing fallback, not a measured spectrum.')
+    if not bands and 'medium' not in source:warnings.append('No authored spectral bands; native transport uses its existing fallback, not a measured spectrum.')
     return NativeMaterialPayload(document.key,document.revision,route,out,
                                  tuple(sorted(set(uncompiled))),tuple(warnings))
 
@@ -256,6 +266,8 @@ def native_volume_payload(document, *, profile_database=None):
     """Explicit n/k-volume adapter; preserve but do not resolve surface-only data."""
     from dataclasses import replace
     source=document.definition
+    if 'medium' in source:
+        raise ValueError('participating-medium profiles require the explicit extinction-field route, not a surface n/k-volume fallback')
     ignored=[]
     for key in ('color_profile_name','color_profile_idx','enamel','texture_stack'):
         if key in source:

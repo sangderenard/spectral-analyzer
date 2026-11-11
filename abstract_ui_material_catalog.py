@@ -57,6 +57,10 @@ def build_material_catalog(material_directory: Path = MATERIAL_DIRECTORY) -> dic
             "description": str(payload.get("description") or ""),
             "source": path.relative_to(material_directory.parent.parent).as_posix(),
         }
+        medium = database.medium_profile(name)
+        if medium is not None:
+            metadata[name]['medium'] = medium
+            metadata[name]['surface_role'] = 'editor-placeholder-only'
 
     tensors = database.build_tensors()
     records = []

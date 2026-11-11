@@ -30,14 +30,43 @@ def test_windows_cover_partial_edges_once():
     assert list(tile_windows(plan))[-1]=={'x':256,'y':256,'width':1,'height':3}
 
 
+@pytest.mark.parametrize('factor,passes,effective',[(1,64,64),(2,16,64),(3,8,72),(4,4,64)])
+def test_uniform_output_sample_target(factor,passes,effective):
+    plan=tile_plan({'camera':{'resolution':256},'transport':'fixed:3',
+        'oversampling':factor,'samples_per_output_pixel':64,'exposure_seconds':.1})
+    assert plan['target_samples_per_pixel']==passes
+    assert plan['requested_samples_per_output_pixel']==64
+    assert plan['target_samples_per_output_pixel']==effective
+    assert plan['exposure_seconds_per_tile'] is None
+    assert plan['requested_exposure_seconds'] is None
+
+
+@pytest.mark.parametrize('value',[None,True,False,0,-1,1.5,float('inf'),'64',65537])
+def test_invalid_uniform_sample_targets(value):
+    with pytest.raises(ValueError,match='samples_per_output_pixel'):
+        tile_plan(config(samples_per_output_pixel=value))
+
+
+def test_uniform_assembly_rejects_undersampled_tile(tmp_path):
+    plan=tile_plan(config(samples_per_output_pixel=8))
+    assembly=TileAssembly(tmp_path,plan)
+    try:
+        with pytest.raises(ValueError,match='uniform sample target'):
+            assembly.add(next(tile_windows(plan)),tmp_path/'missing.npz',7)
+        assert assembly.completed==0
+    finally:assembly.close()
+
+
 @pytest.mark.parametrize('factor',[1,2,3,4])
-def test_assembly_matches_monolithic_linear_downsample(tmp_path,factor):
-    plan=tile_plan(config(129,130,oversampling=factor))
+@pytest.mark.parametrize('uniform',[False,True])
+def test_assembly_matches_monolithic_linear_downsample(tmp_path,factor,uniform):
+    plan=tile_plan(config(129,130,oversampling=factor,
+        **({'samples_per_output_pixel':64} if uniform else {})))
     raw=np.random.default_rng(17).random((130*factor,129*factor,3),dtype=np.float32)
     assembly=TileAssembly(tmp_path,plan)
     try:
         for i,w in enumerate(tile_windows(plan)):
-            samples=2**(i%3)
+            samples=plan['target_samples_per_pixel'] if uniform else 2**(i%3)
             tile=raw[w['y']:w['y']+w['height'],w['x']:w['x']+w['width']]
             path=tmp_path/'input.npz';np.savez(path,linear_rgb_exposure=tile*samples)
             assembly.add(w,path,samples)
@@ -51,6 +80,9 @@ def test_assembly_matches_monolithic_linear_downsample(tmp_path,factor):
             np.testing.assert_array_equal(data['linear_rgb_exposure'],expected_raw)
             np.testing.assert_array_equal(data['linear_srgb_exposure'],rgb)
             assert int(data['oversampling'])==factor
+            if uniform:
+                assert np.all(data['tile_samples']==plan['target_samples_per_pixel'])
+                assert int(data['target_samples_per_output_pixel'])==plan['target_samples_per_output_pixel']
         assert not list(tmp_path.glob('tile-*.npy'))
     finally:assembly.close()
 

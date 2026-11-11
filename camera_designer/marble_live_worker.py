@@ -27,11 +27,14 @@ def _scheduler_control(control, generation, state):
 
 def run_live_sensor(accumulator, renderer, field, output, digest, config,
                     preparation, snapshot, atomic_json, *, max_epochs=None,
-                    update_camera_geometry=None, dynamic_scene_reader=None):
+                    update_camera_geometry=None, dynamic_scene_reader=None, refresh_sources=None):
     live = config["live"]
     from camera_designer.studio_forward_field import ForwardFieldPublisher, validate_receive_light_field
     field_publisher = ForwardFieldPublisher(output, digest) if validate_receive_light_field(config) else None
     field_sweep = 0
+    population_index = 0
+    from camera_designer.studio_native_emitters import sampling_settings
+    source_settings=sampling_settings(config)
     ray_batch_size = _ray_batch_size(live)
     from OpenGL.GL import glFinish
     accumulator.set_history(live["history_samples"], checkpoint=live.get("checkpoint", False))
@@ -146,6 +149,8 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
                     # size. Never average the old field estimate into the new
                     # ring/checkpoint, even when its capacity is unchanged.
                     accumulator.clear()
+                    if refresh_sources is not None:
+                        field.get('directional_record',{}).pop('progressive',None)
                     revision = pending_control["revision"]
                     if field_publisher is not None:
                         field_publisher.invalidate()
@@ -161,9 +166,16 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
                             status.pop('light_field', None)
                         atomic_json(output / "scene-ack.json", acknowledgment)
                 seed = field["_pump_seed"]
-                renderer._clear_prebuilt(field)
+                if refresh_sources is not None:
+                    refresh_sources(population_index,ray_batch_size)
+                    renderer._clear_prebuilt(field,preserve_directional_history=True)
+                else:renderer._clear_prebuilt(field)
                 field["_pump_seed"] = seed
                 renderer._gpu_pump_prebuilt(field, n_rays=ray_batch_size)
+                if refresh_sources is not None:
+                    from camera_designer.studio_directional_field import commit_source_population
+                    commit_source_population(field['directional_record'],field['source_buf'],source_settings,population_index)
+                    population_index+=1
                 field_sweep += 1
                 rays += ray_batch_size
             completed_sites=min(accumulator._rows_per_frame,
@@ -201,8 +213,9 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
                           total_samples=accumulator._pass if live.get("checkpoint") else min(accumulator._pass, live["history_samples"]),
                           history_block_limit=getattr(accumulator, "_history_block_limit", None),
                           ray_batch_size=ray_batch_size,
-                          forward_history=f"fresh {ray_batch_size}-ray field per sensor sweep",
+                          forward_history=(f"fresh {ray_batch_size}-ray scalar per sensor sweep; directional mean over complete refreshed source populations" if refresh_sources is not None else f"fresh {ray_batch_size}-ray field per sensor sweep"),
                           width=accumulator._w,height=accumulator._h)
+            if config.get('surface_transport') is not None:status['surface_transport']=config['surface_transport']
             if cooperative_pump is not None:status.update(client_work_profile=dict(cooperative_pump.profile),client_work_state='committed')
             if dynamic_scene_reader is not None and dynamic_scene_reader.ack is not None:
                 status["scene_ack"] = dict(dynamic_scene_reader.ack)
@@ -210,7 +223,7 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
                 exported = field_publisher.snapshot(renderer, field, live_revision=revision,
                     sweep=field_sweep, sensor_samples=accumulator._pass,
                     ray_jobs=ray_batch_size if field.get('n_sources') else 0,
-                    accumulation='fresh fixed-budget additive field per sensor sweep; no forward temporal accumulation',
+                    accumulation=('scalar fresh per sweep; directional cumulative mean of complete refreshed source populations' if refresh_sources is not None else 'fresh fixed-budget additive field per sensor sweep; no forward temporal accumulation'),
                     scene_ack=status.get('scene_ack'))
                 if exported is not None:
                     status['light_field'] = exported

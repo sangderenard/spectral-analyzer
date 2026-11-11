@@ -1839,6 +1839,8 @@ def append_saved_studio_mesh_to_gpu_scene(
     return_index_map: bool = False,
     advanced_surface_mask=None,
     emitter_profiles=None,
+    material_lineage_out=None,
+    lineage_source=None,
 ) -> tuple:
     """Append a saved Studio design to the canonical GL scene buffers.
 
@@ -2024,6 +2026,18 @@ def append_saved_studio_mesh_to_gpu_scene(
     tensors = db.build_tensors()
     ray = tensors["raymat_compat"]
     mapped_ids = np.array([tensors["index"][names[int(i)]] for i in ids], np.uint32)
+    if material_lineage_out is not None:
+        # Capture the original submitted row at the existing registration seam.
+        # Engine projection may have changed the row/ID used by native transport.
+        original_ids, original_pbr = ((material_ids, pbr_records) if lineage_source is None else lineage_source)
+        original_ids=np.asarray(original_ids,np.int32).reshape(-1)
+        original_pbr=np.asarray(original_pbr,np.float32).reshape(-1,16)
+        if original_ids.shape!=(len(verts),) or np.any(original_ids<0) or np.any(original_ids>=len(original_pbr)) or not np.isfinite(original_pbr).all():
+            raise ValueError('invalid authored material lineage')
+        lineage_pairs=np.unique(np.column_stack((mapped_ids,original_ids[valid])),axis=0)
+        for native_id, authored_id in lineage_pairs:
+            material_lineage_out.append((int(native_id),original_pbr[int(authored_id)].copy()))
+
     ray_rows = ray[mapped_ids]
     # Use the actual canonical PBR derivative for geometry flags; the upload
     # row is only the unchanged legacy path, never source authority here.

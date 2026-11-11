@@ -7628,6 +7628,15 @@ def _gpu_ray_field_prebuilt(
     sphere_regions=None,       # optional exact Studio regions; appended for compatibility
     region_records=None,       # explicit opt-in overlapping-volume ownership
     native_pbr=None,           # canonical MaterialDatabase PBR16, same material IDs
+    record_directional=False, # opt-in bounded actual traced direction moments
+    light_field_stencil=12,    # explicit angular bins; no extra transport rays
+    volume_extinction=None,    # explicit ExtinctionGrid in world metres; absent is unchanged
+    light_field_estimator="track-length-throughput-v1",
+    surface_transport=None, # explicit shared opaque PBR correction
+    light_field_internal_media=False, # explicit v6 observer; canonical optics unchanged
+    directional_quantization_divisor=65535, # v6 subject precision; scalar unchanged
+    light_field_region=None, # derived subject ROI independent of transport bounds
+    light_field_grid_size=None, # v3 stays32; explicit root-sweep v4 defaults64
 ):
     """Compile the canonical _GPU_RAY_FIELD_CS with pre-packed scene SSBOs.
 
@@ -7635,12 +7644,33 @@ def _gpu_ray_field_prebuilt(
     The caller owns every GL object and must call _destroy_prebuilt(state)
     when the scene changes.  Returns None on shader link failure.
     """
+    if type(light_field_internal_media) is not bool:raise ValueError('light_field_internal_media must be boolean')
+    if light_field_internal_media:
+        if not record_directional or light_field_estimator!='track-length-root-sweep-v1' or directional_quantization_divisor!=16777216:raise ValueError('internal observer requires v6 root-sweep recording')
+        if volume_extinction is not None:raise ValueError('internal directional recording with ExtinctionGrid requires joint attenuation integration')
     from camera_designer.studio_conductor_surface import checked_native_pbr
     native_pbr=checked_native_pbr(native_pbr,packed_geom,packed_shade,len(mat_buf)//32)
     if region_records is None:region_records=region_records_from_geometry(packed_geom)
     region_data = (None if region_records is None else validate_region_records(
         region_records, packed_geom, packed_shade, len(mat_buf)//32))
     region_count = region_record_count(region_data)
+    if light_field_region is not None:
+        if light_field_estimator!='track-length-root-sweep-v1':raise ValueError('subject ROI requires root-sweep estimator')
+        light_field_grid_size=light_field_region['dimensions'][0]
+    if surface_transport not in (None,'studio-pbr-mixture-v1'):raise ValueError('unsupported surface_transport')
+    volume_shader_source = None
+    if volume_extinction is not None:
+        from camera_designer.studio_volume_extinction import ExtinctionGrid, transport_shader
+        if not isinstance(volume_extinction, ExtinctionGrid):
+            raise TypeError('volume_extinction must be an ExtinctionGrid or None')
+        volume_shader_source = _GPU_RAY_FIELD_REGION_CS if region_count else _GPU_RAY_FIELD_CS
+        if surface_transport is not None:
+            from camera_designer.studio_opaque_pbr import with_opaque_pbr
+            volume_shader_source=with_opaque_pbr(volume_shader_source)
+        if record_directional:
+            from camera_designer.studio_directional_field import recording_shader
+            volume_shader_source = recording_shader(volume_shader_source, stencil=light_field_stencil, grid_size=light_field_grid_size, estimator=light_field_estimator, independent_bounds=light_field_region is not None, quantization_divisor=directional_quantization_divisor)
+        volume_shader_source = transport_shader(volume_shader_source)
     from OpenGL.GL import (
         GL_COMPUTE_SHADER, GL_LINK_STATUS, GL_READ_WRITE, GL_R32UI,
         GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
@@ -7659,6 +7689,8 @@ def _gpu_ray_field_prebuilt(
 
     if int(glGetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS))<=BINDING_STUDIO_NATIVE_PBR:
         raise RuntimeError("Studio native material transport requires 19 SSBO binding slots")
+    if volume_extinction is not None and int(glGetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS))<=20:
+        raise RuntimeError("volume extinction requires 21 SSBO binding slots")
     bmin = np.asarray(bounds[0], np.float32)
     bmax = np.asarray(bounds[1], np.float32)
     n_tris = len(packed_geom)
@@ -7774,7 +7806,32 @@ def _gpu_ray_field_prebuilt(
     glBindBuffer(GL_SHADER_STORAGE_BUFFER,native_pbr_ssbo)
     glBufferData(GL_SHADER_STORAGE_BUFFER,native_pbr.nbytes,native_pbr,GL_STATIC_DRAW)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER,BINDING_STUDIO_NATIVE_PBR,native_pbr_ssbo)
-    prog = _prog(((_GPU_RAY_FIELD_REGION_CS if region_count else _GPU_RAY_FIELD_CS), GL_COMPUTE_SHADER))
+    directional_record = None
+    volume_record = None
+    shader_source = _GPU_RAY_FIELD_REGION_CS if region_count else _GPU_RAY_FIELD_CS
+    if surface_transport is not None:
+        from camera_designer.studio_opaque_pbr import with_opaque_pbr
+        shader_source=with_opaque_pbr(shader_source)
+    if record_directional:
+        from camera_designer.studio_directional_field import allocate, recording_shader, scene_digest
+        directional_record = allocate(packed_geom, packed_shade, native_pbr, bounds=((light_field_region['bounds_min_m'],light_field_region['bounds_max_m']) if light_field_region is not None else (bmin,bmax)), stencil=light_field_stencil, grid_size=light_field_grid_size, estimator=light_field_estimator, source_root_count=n_src)
+        directional_record['internal_media'] = light_field_internal_media
+        directional_record['quantization_divisor'] = directional_quantization_divisor
+        directional_record['recording_region'] = light_field_region
+        directional_record['materials'] = native_pbr.copy()
+        directional_record['scene_sha256'] = scene_digest(packed_geom,packed_shade,native_pbr,source_records,mat_buf,context_buf,bmin,bmax,sphere_data,*([region_data] if region_data is not None else []))
+        shader_source = recording_shader(shader_source, stencil=light_field_stencil, grid_size=light_field_grid_size, estimator=light_field_estimator, independent_bounds=light_field_region is not None, quantization_divisor=directional_quantization_divisor)
+        if light_field_internal_media:
+            from camera_designer.studio_directional_media import with_internal_medium_recording
+            shader_source=with_internal_medium_recording(shader_source)
+    if volume_extinction is not None:
+        from camera_designer.studio_volume_extinction import allocate as allocate_volume
+        volume_record = allocate_volume(volume_extinction)
+        shader_source = volume_shader_source
+        if directional_record is not None:
+            directional_record['volume_extinction'] = volume_extinction.metadata()
+            directional_record['scene_sha256'] = scene_digest(packed_geom,packed_shade,native_pbr,source_records,mat_buf,context_buf,bmin,bmax,sphere_data,*([region_data] if region_data is not None else []),volume_extinction.bounds_m,volume_extinction.sigma_t_m_inv)
+    prog = _prog((shader_source, GL_COMPUTE_SHADER))
     if not glGetProgramiv(prog, GL_LINK_STATUS):
         print("  [gpu_ray_field_prebuilt] compute shader did not link", flush=True)
         glDeleteProgram(prog)
@@ -7783,9 +7840,14 @@ def _gpu_ray_field_prebuilt(
         for buf in ssbo:
             glDeleteBuffers(1, [buf])
         glDeleteBuffers(1,[native_pbr_ssbo])
+        if directional_record is not None: glDeleteBuffers(1,[directional_record['buffer']])
+        if volume_record is not None: glDeleteBuffers(1,[volume_record['buffer']])
         return None
 
     glUseProgram(prog)
+    if volume_record is not None:
+        from camera_designer.studio_volume_extinction import bind as bind_volume
+        bind_volume(volume_record, prog)
     for band_idx, tex in enumerate(tex_bands):
         glBindImageTexture(band_idx, tex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI)
 
@@ -7798,6 +7860,9 @@ def _gpu_ray_field_prebuilt(
     glUniform1i(glGetUniformLocation(prog, b'uSegmentStride'),   seg_stride)
     glUniform1i(glGetUniformLocation(prog, b'uSourceCount'),     n_src)
     glUniform1i(glGetUniformLocation(prog, b'uMaxBounces'),      int(max_bounces))
+    if light_field_region is not None:
+        glUniform3f(glGetUniformLocation(prog,b'uStudioRecordMin'),*light_field_region['bounds_min_m'])
+        glUniform3f(glGetUniformLocation(prog,b'uStudioRecordMax'),*light_field_region['bounds_max_m'])
     glUniform3f(glGetUniformLocation(prog, b'uBoxMin'),          *bmin)
     glUniform3f(glGetUniformLocation(prog, b'uBoxMax'),          *bmax)
     glUniform3i(glGetUniformLocation(prog, b'uDims'),
@@ -7837,17 +7902,25 @@ def _gpu_ray_field_prebuilt(
     _n_init = max(128, int(initial_rays)) if n_src else 0
     glUniform1i(locs['seed'],       1337)
     glUniform1i(locs['total_rays'], _n_init)
-    _off = 0
-    while _off < _n_init:
-        _b  = min(int(dispatch_batch), _n_init - _off)
-        _ng = max(1, int(math.ceil(_b / 128.0)))
-        glUniform1i(locs['batch_size'], _b)
-        glUniform1i(locs['batch_off'],  _off)
-        glDispatchCompute(min(_ng, 65535), max(1, int(math.ceil(_ng / 65535))), 1)
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
-                        GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
-        _off += _b
-    glFinish()
+    from camera_designer.studio_directional_field import prepare_root_dispatch, submitted_root_chunk, finish_root_dispatch, abort_root_dispatch
+    prepare_root_dispatch(directional_record,prog,_n_init)
+    try:
+        _off = 0
+        while _off < _n_init:
+            _b  = min(int(dispatch_batch), _n_init - _off)
+            _ng = max(1, int(math.ceil(_b / 128.0)))
+            glUniform1i(locs['batch_size'], _b)
+            glUniform1i(locs['batch_off'],  _off)
+            glDispatchCompute(min(_ng, 65535), max(1, int(math.ceil(_ng / 65535))), 1)
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
+                            GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+            submitted_root_chunk(directional_record,_b)
+            _off += _b
+        glFinish()
+        finish_root_dispatch(directional_record)
+    except BaseException:
+        abort_root_dispatch(directional_record)
+        raise
     glUseProgram(0)
 
     print(f"  [gpu_ray_field_prebuilt] {n_tris} tris  {n_src} src  "
@@ -7855,6 +7928,9 @@ def _gpu_ray_field_prebuilt(
           f"n_ctx={_n_ctx}", flush=True)
     return {
         'tex_bands':      tex_bands,
+        'directional_record': directional_record,
+        'surface_transport': surface_transport,
+        'volume_extinction': volume_record,
         'ssbo':           ssbo,
         'sphere_count':   sphere_count,
         'region_count': region_count,
@@ -7897,6 +7973,16 @@ def _update_prebuilt_geometry(state, packed_geom, packed_shade, mat_buf,
         region_records=validate_region_records(region_records,packed_geom,packed_shade,len(mat_buf)//32)
     from camera_designer.studio_conductor_surface import checked_native_pbr
     native_pbr=checked_native_pbr(native_pbr,packed_geom,packed_shade,len(mat_buf)//32)
+    if state.get('directional_record') is not None:
+        from camera_designer.studio_directional_field import triangle_metadata, scene_digest, voxel_volume
+        state['directional_record'].pop('source_population_scene_base',None)
+        state['directional_record']['triangles'] = triangle_metadata(packed_geom, packed_shade, native_pbr)
+        state['directional_record']['materials'] = native_pbr.copy()
+        state['directional_record']['voxel_volume_m3'] = voxel_volume(((state['directional_record']['recording_region']['bounds_min_m'],state['directional_record']['recording_region']['bounds_max_m']) if state['directional_record'].get('recording_region') else bounds),state['directional_record'].get('grid_size',32))
+        state['directional_record']['scene_sha256'] = scene_digest(packed_geom,packed_shade,native_pbr,state['source_buf'],mat_buf,context_buf,*bounds,sphere_regions,*([region_records] if region_records is not None else []))
+        if state.get('volume_extinction') is not None:
+            grid=state['volume_extinction']['grid']
+            state['directional_record']['scene_sha256'] = scene_digest(packed_geom,packed_shade,native_pbr,state['source_buf'],mat_buf,context_buf,*bounds,sphere_regions,*([region_records] if region_records is not None else []),grid.bounds_m,grid.sigma_t_m_inv)
     glFinish()
     glBindBuffer(GL_SHADER_STORAGE_BUFFER,state['native_pbr_ssbo'])
     glBufferData(GL_SHADER_STORAGE_BUFFER,native_pbr.nbytes,native_pbr,GL_STATIC_DRAW)
@@ -7920,8 +8006,15 @@ def _update_prebuilt_geometry(state, packed_geom, packed_shade, mat_buf,
                            (b'uScaleContextCount', len(context_buf)),
                            (b'uStudioSphereCount', len(sphere_regions))):
         glUniform1i(glGetUniformLocation(state['prog'], uniform), value)
+    roi=(state.get('directional_record') or {}).get('recording_region')
+    if roi is not None:
+        glUniform3f(glGetUniformLocation(state['prog'],b'uStudioRecordMin'),*roi['bounds_min_m'])
+        glUniform3f(glGetUniformLocation(state['prog'],b'uStudioRecordMax'),*roi['bounds_max_m'])
     glUniform3f(glGetUniformLocation(state['prog'], b'uBoxMin'), *state['bmin'])
     glUniform3f(glGetUniformLocation(state['prog'], b'uBoxMax'), *state['bmax'])
+    if (state.get('directional_record') or {}).get('estimator')=='track-length-root-sweep-v1':
+        from camera_designer.studio_directional_field import clear
+        clear(state['directional_record'])
     glUseProgram(0)
 
 
@@ -7949,6 +8042,11 @@ def _gpu_pump_prebuilt(state: dict, n_rays: int = 8192) -> None:
     for bi, buf in enumerate(state['ssbo']):
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, bi, buf)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER,BINDING_STUDIO_NATIVE_PBR,state['native_pbr_ssbo'])
+    if state.get('directional_record') is not None:
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER,19,state['directional_record']['buffer'])
+    if state.get('volume_extinction') is not None:
+        from camera_designer.studio_volume_extinction import bind as bind_volume
+        bind_volume(state['volume_extinction'], prog)
 
     glUniform1i(locs['mode'], 0)  # PASS_FORWARD
     seed_base = state['_pump_seed']
@@ -7958,20 +8056,29 @@ def _gpu_pump_prebuilt(state: dict, n_rays: int = 8192) -> None:
     # No per-source loop — the CS reads bdpt_sources[ray_id % uSourceCount].
     glUniform1i(locs['seed'],       seed_base)
     glUniform1i(locs['total_rays'], n_rays)
-    offset = 0
-    while offset < n_rays:
-        _b  = min(batch, n_rays - offset)
-        _ng = max(1, int(math.ceil(_b / 128.0)))
-        glUniform1i(locs['batch_size'], _b)
-        glUniform1i(locs['batch_off'],  offset)
-        glDispatchCompute(min(_ng, 65535), max(1, int(math.ceil(_ng / 65535))), 1)
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
-                        GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
-        offset += _b
+    from camera_designer.studio_directional_field import prepare_root_dispatch, submitted_root_chunk, finish_root_dispatch, abort_root_dispatch
+    record=state.get('directional_record')
+    prepare_root_dispatch(record,prog,n_rays)
+    try:
+        offset = 0
+        while offset < n_rays:
+            _b  = min(batch, n_rays - offset)
+            _ng = max(1, int(math.ceil(_b / 128.0)))
+            glUniform1i(locs['batch_size'], _b)
+            glUniform1i(locs['batch_off'],  offset)
+            glDispatchCompute(min(_ng, 65535), max(1, int(math.ceil(_ng / 65535))), 1)
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
+                            GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+            submitted_root_chunk(record,_b)
+            offset += _b
+        finish_root_dispatch(record)
+    except BaseException:
+        abort_root_dispatch(record)
+        raise
     glUseProgram(0)
 
 
-def _clear_prebuilt(state: dict) -> None:
+def _clear_prebuilt(state: dict, *, preserve_directional_history=False) -> None:
     """Zero all 4 accumulation textures in a prebuilt GPU state."""
     if state is None:
         return
@@ -7985,6 +8092,9 @@ def _clear_prebuilt(state: dict) -> None:
         glClearTexImage(tex, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, zero)
     glBindTexture(GL_TEXTURE_3D, 0)
     state['_pump_seed'] = 0
+    if state.get('directional_record') is not None:
+        from camera_designer.studio_directional_field import clear
+        clear(state['directional_record'],preserve_progressive=preserve_directional_history)
 
 
 def _destroy_prebuilt(state: dict) -> None:
@@ -8000,6 +8110,10 @@ def _destroy_prebuilt(state: dict) -> None:
     for buf in state['ssbo']:
         glDeleteBuffers(1, [buf])
     glDeleteBuffers(1,[state['native_pbr_ssbo']])
+    if state.get('directional_record') is not None:
+        glDeleteBuffers(1,[state['directional_record']['buffer']])
+    if state.get('volume_extinction') is not None:
+        glDeleteBuffers(1,[state['volume_extinction']['buffer']])
     state.clear()
 
 
@@ -9916,9 +10030,23 @@ class SensorAccumulator:
                  ssbo_spheres: int = 0, n_spheres: int = 0,
                  ssbo_regions: int = 0, n_regions: int = 0, ssbo_native_pbr: int = 0,
                  *, full_sensor_size: tuple[int, int] | None = None,
-                 sensor_origin: tuple[int, int] = (0, 0)):
+                 sensor_origin: tuple[int, int] = (0, 0),
+                 volume_extinction=None,surface_transport=None):
         (self._w, self._h), self._full_sensor_size, self._sensor_origin = _sensor_tile_coordinates(
             sensor_w, sensor_h, full_sensor_size, sensor_origin)
+        # Borrow the prebuilt field; its owner outlives every camera accumulator.
+        self._volume_extinction = volume_extinction
+        sensor_shader_source = _GPU_SENSOR_REGION_CS if n_regions else _GPU_SENSOR_CS
+        if surface_transport is not None:
+            from camera_designer.studio_opaque_pbr import VERSION,with_opaque_pbr
+            if surface_transport!=VERSION:raise ValueError('unsupported surface_transport')
+            sensor_shader_source=with_opaque_pbr(sensor_shader_source,camera=True)
+        if volume_extinction is not None:
+            from camera_designer.studio_volume_extinction import ExtinctionGrid, transport_shader
+            if not isinstance(volume_extinction, dict) or not isinstance(volume_extinction.get('grid'), ExtinctionGrid) or not volume_extinction.get('buffer'):
+                raise TypeError('sensor volume_extinction must be the live prebuilt field binding')
+            sensor_shader_source = transport_shader(sensor_shader_source, sensor=True)
+        self._sensor_shader_source = sensor_shader_source
         self._tile_sampling = full_sensor_size is not None
         import math
         from OpenGL.GL import (glGenTextures, glBindTexture, glTexImage2D,
@@ -10068,7 +10196,7 @@ class SensorAccumulator:
 
         # Compile compute shader once
         from OpenGL.GL import glGetProgramInfoLog
-        self._prog = _prog(((_GPU_SENSOR_REGION_CS if self._n_regions else _GPU_SENSOR_CS), GL_COMPUTE_SHADER))
+        self._prog = _prog((sensor_shader_source, GL_COMPUTE_SHADER))
         if not glGetProgramiv(self._prog, GL_LINK_STATUS):
             log = glGetProgramInfoLog(self._prog)
             print(f"  [SensorAccumulator] compute shader LINK FAILED:\n{log}", flush=True)
@@ -10174,7 +10302,11 @@ class SensorAccumulator:
         # Compile forward shader if not already done
         if not self._fwd_prog:
             from OpenGL.GL import glGetProgramiv, GL_LINK_STATUS
-            self._fwd_prog = _prog(((_GPU_RAY_FIELD_REGION_CS if self._n_regions else _GPU_RAY_FIELD_CS), GL_COMPUTE_SHADER))
+            shader_source = _GPU_RAY_FIELD_REGION_CS if self._n_regions else _GPU_RAY_FIELD_CS
+            if self._volume_extinction is not None:
+                from camera_designer.studio_volume_extinction import transport_shader
+                shader_source = transport_shader(shader_source)
+            self._fwd_prog = _prog((shader_source, GL_COMPUTE_SHADER))
             if not glGetProgramiv(self._fwd_prog, GL_LINK_STATUS):
                 from OpenGL.GL import glDeleteProgram
                 glDeleteProgram(self._fwd_prog)
@@ -10209,6 +10341,9 @@ class SensorAccumulator:
         # Just emit — never clear here.  Band textures accumulate forever until
         # an explicit clear_field() call on cadence reset.
         glUseProgram(prog)
+        if self._volume_extinction is not None:
+            from camera_designer.studio_volume_extinction import bind as bind_volume
+            bind_volume(self._volume_extinction, prog)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, self._ssbo_tris)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, self._ssbo_nodes)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, self._ssbo_ids)
@@ -10459,6 +10594,9 @@ class SensorAccumulator:
                 raise OverflowError("sample evidence count requires reset")
             self._sample_evidence.bind_sensor()
         glUseProgram(self._prog)
+        if self._volume_extinction is not None:
+            from camera_designer.studio_volume_extinction import bind as bind_volume
+            bind_volume(self._volume_extinction, self._prog)
         if loan is not None:
             loan.bind(_loan_phase)
         for binding, buffer in enumerate(self._history_buffers, 6):
@@ -10769,7 +10907,11 @@ class SensorAccumulator:
         # Compile forward shader once; never again.
         if not self._fwd_prog:
             from OpenGL.GL import glGetProgramiv, GL_LINK_STATUS
-            self._fwd_prog = _prog(((_GPU_RAY_FIELD_REGION_CS if self._n_regions else _GPU_RAY_FIELD_CS), GL_COMPUTE_SHADER))
+            shader_source = _GPU_RAY_FIELD_REGION_CS if self._n_regions else _GPU_RAY_FIELD_CS
+            if self._volume_extinction is not None:
+                from camera_designer.studio_volume_extinction import transport_shader
+                shader_source = transport_shader(shader_source)
+            self._fwd_prog = _prog((shader_source, GL_COMPUTE_SHADER))
             if not glGetProgramiv(self._fwd_prog, GL_LINK_STATUS):
                 from OpenGL.GL import glDeleteProgram
                 glDeleteProgram(self._fwd_prog)
@@ -10824,6 +10966,9 @@ class SensorAccumulator:
 
         prog = self._fwd_prog
         glUseProgram(prog)
+        if self._volume_extinction is not None:
+            from camera_designer.studio_volume_extinction import bind as bind_volume
+            bind_volume(self._volume_extinction, prog)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, self._ssbo_tris)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, self._ssbo_nodes)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, self._ssbo_ids)

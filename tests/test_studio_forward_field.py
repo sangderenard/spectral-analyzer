@@ -216,3 +216,19 @@ def test_real_live_loop_export_and_revision_boundary(tmp_path, monkeypatch, enab
                 assert status['light_field']['live_revision'] == status['live_revision']
                 assert status['light_field']['ray_jobs'] == status['ray_batch_size']
         assert len(list(tmp_path.glob('light-field-*.bin'))) <= 4
+
+
+def test_directional_overflow_preserves_primary_scalar_export(tmp_path,monkeypatch):
+    from camera_designer import studio_directional_field as directional
+    renderer,field,counts,_=fixture(monkeypatch)
+    field.update(directional_record={},source_buf=np.zeros((0,12),np.float32))
+    def overflow(*args):raise directional.DirectionalOverflow('injected signed overflow')
+    monkeypatch.setattr(directional,'bundle_sections',overflow)
+    pub=ForwardFieldPublisher(tmp_path,'d')
+    meta=pub.snapshot(renderer,field,now=0)
+    assert meta['schema']=='studio.forward-field.v1' and 'directional' not in meta
+    assert meta['directional_unavailable']['reason']=='signed-accumulator-overflow'
+    np.testing.assert_array_equal(np.fromfile(tmp_path/meta['name'],'<f4').reshape(2,3,4,3),field_to_linear_srgb(counts,(4,3,2)))
+    field.pop('directional_record')
+    recovered=pub.snapshot(renderer,field,now=1)
+    assert 'directional_unavailable' not in recovered

@@ -1,0 +1,38 @@
+name: ethanol_vapor
+domain: optical
+description: Molecular ethanol vapor. Optical spectrum is not parameterized; this is not an ethanol-droplet mist.
+albedo: [1.0, 1.0, 1.0]
+roughness: 0.0
+metallic: 0.0
+transmission: 1.0
+ior: 1.0
+opacity: 0.0
+emission_rgb: [0.0, 0.0, 0.0]
+medium:
+  schema: participating-medium-v1
+  phase: molecular_gas
+  formula: C2H6O
+  molar_mass_kg_mol: 0.0460684
+  particle_material_density_kg_m3: null
+  optics:
+    model: unparameterized
+    mass_extinction_m2_kg: null
+    mass_absorption_m2_kg: null
+    mass_scattering_m2_kg: null
+    single_scattering_albedo: null
+    asymmetry_g: null
+    phase_function: null
+    refractive_index: null
+    required_inputs:
+      - Wavelength-resolved ethanol absorption data at the actual temperature and pressure.
+      - Ethanol species concentration, not carrier-gas density.
+      - Molecular scattering data if scattering is to be modeled.
+    notes: No droplet size, condensation rule, flame emission or gas density is implied.
+  provenance:
+    - property: molar_mass_kg_mol
+      url: https://webbook.nist.gov/cgi/cbook.cgi?Name=ethanol&cTG=on
+      note: NIST Chemistry WebBook SRD 69 molecular weight 46.0684, converted from g/mol to kg/mol.
+    - property: optics.required_inputs
+      url: https://hitran.org/docs/cross-sections-definitions/
+      note: Spectral molecular cross-section requirements only; no claim that a particular ethanol spectrum has been loaded.
+notes: Surface fields are neutral editor placeholders, not measured gas optics or a combustion model. Debug sprites are a separate visualization.

@@ -25,7 +25,8 @@ def queue_body():
 
 @pytest.mark.parametrize('fail_tile', [None, 1, 'allocation'])
 @pytest.mark.parametrize('receive_light_field', [False, True])
-def test_actual_tile_queue_lifecycle(tmp_path, monkeypatch, fail_tile, receive_light_field):
+@pytest.mark.parametrize('sample_target', [None, 3])
+def test_actual_tile_queue_lifecycle(tmp_path, monkeypatch, fail_tile, receive_light_field, sample_target):
     import OpenGL.GL as gl
     monkeypatch.setattr(gl, 'glFinish', lambda: None, raising=False)
     monkeypatch.setattr(gl, 'glMemoryBarrier', lambda bits: None, raising=False)
@@ -33,7 +34,8 @@ def test_actual_tile_queue_lifecycle(tmp_path, monkeypatch, fail_tile, receive_l
     from camera_designer.studio_forward_field import ForwardFieldPublisher
     publisher = ForwardFieldPublisher(tmp_path, 'x') if receive_light_field else None
     plan = tile_plan({'transport': 'fixed:3', 'camera': {'width': 129, 'height': 130},
-                      'tiled': {'tile_size': 128}})
+                      'tiled': {'tile_size': 128},
+                      **({'samples_per_output_pixel':sample_target} if sample_target else {})})
     events, statuses, accumulators = [], [], []
     class Accumulator:
         def __init__(self, window):
@@ -80,7 +82,7 @@ def test_actual_tile_queue_lifecycle(tmp_path, monkeypatch, fail_tile, receive_l
                   _clear_prebuilt=lambda *a: events.append(('clear',)),
                   _destroy_prebuilt=lambda state: events.append(('destroy_field',))),
               state=dict(n_sources=1, tex_bands=[1,2,3], dims=(1,1,1), bmin=[0,0,0], bmax=[1,1,1]),
-              cooperative_pump=None, field_publisher=publisher, epoch=0, seconds=1., max_epochs=1,
+              cooperative_pump=None, field_publisher=publisher, epoch=0, seconds=1., max_epochs=None if sample_target else 1,
               _snapshot=snapshot, digest='x', preparation=0., completed_frames=[], gamma=1.,
               film_response=None, transport='fixed:3', assembly=None, TileAssembly=assembly_factory, accumulator=None,
               geometry_stats={}, json=json, _atomic_json=lambda path, value: statuses.append(copy.deepcopy(value)))
@@ -99,6 +101,7 @@ def test_actual_tile_queue_lifecycle(tmp_path, monkeypatch, fail_tile, receive_l
         assert [a.window for a in accumulators] == list(tile_windows(plan))
         assert ns['result']['state'] == 'complete'
         assert ns['result']['tiled']['completed_tiles'] == 4
+        assert all(a._pass==(sample_target or 1) for a in accumulators)
         if receive_light_field:
             exported = ns['result']['light_field']
             assert exported['live_revision'] == 0 and exported['ray_jobs'] == 8192
@@ -108,6 +111,12 @@ def test_actual_tile_queue_lifecycle(tmp_path, monkeypatch, fail_tile, receive_l
         assert not list(tmp_path.glob('tile-*'))
         with np.load(tmp_path / ns['result']['hdr']) as data:
             np.testing.assert_array_equal(data['linear_rgb_exposure'], np.ones((130, 129, 3)))
+            if sample_target:
+                assert int(data['requested_samples_per_output_pixel'])==sample_target
+                assert int(data['target_samples_per_output_pixel'])==sample_target
+                assert ns['result']['output_samples_per_pixel']==sample_target
+            else:
+                assert 'requested_samples_per_output_pixel' not in data
         assert all(s.get('image') is None for s in statuses if s.get('state') == 'exposing')
     assert len([e for e in events if e[0] == 'destroy']) == len(accumulators)
     assert events[-1] == ('destroy_field',)

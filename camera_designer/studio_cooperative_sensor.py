@@ -111,6 +111,8 @@ class CooperativeSensorPump:
         from contract_service_peer import ServicePeer
         start=time.perf_counter();self.sequence+=1;variant='region-bvh' if a._n_regions else 'plain-bvh'
         source=self.renderer._GPU_SENSOR_REGION_CS if a._n_regions else self.renderer._GPU_SENSOR_CS
+        # Resume the same specialized transport, including any declared optical field.
+        source=getattr(a,'_sensor_shader_source',source)
         base=self.turing/'build/dot-client-ray-20261109'/('studio-region-compute' if a._n_regions else 'studio-compute')
         manifest=self.query_manifest or self._measure('manifest_read_seconds',lambda:json.loads((base/'studio_bvh_query.json').read_text()))
         query_kernel=manifest['query_kernel_sha256']

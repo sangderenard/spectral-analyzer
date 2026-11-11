@@ -1,0 +1,44 @@
+name: quartz_dust_coarse
+domain: optical
+description: Dry quartz coarse-dust reference with an explicitly approximate 25 micrometre sphere radius; not a measured size distribution.
+albedo: [1.0, 1.0, 1.0]
+roughness: 0.0
+metallic: 0.0
+transmission: 1.0
+ior: 1.0
+opacity: 0.0
+emission_rgb: [0.0, 0.0, 0.0]
+medium:
+  schema: participating-medium-v1
+  phase: solid_aerosol
+  formula: SiO2
+  molar_mass_kg_mol: null
+  particle_material_density_kg_m3: 2650.0
+  optics:
+    model: geometric_optics_spheres
+    particle_radius_m: 0.000025
+    size_distribution: monodisperse_reference
+    extinction_efficiency: 2.0
+    wavelength_interval_m: [0.0000004, 0.0000007]
+    mass_extinction_m2_kg: null
+    mass_absorption_m2_kg: null
+    mass_scattering_m2_kg: null
+    single_scattering_albedo: null
+    asymmetry_g: null
+    phase_function: null
+    refractive_index: null
+    approximation: Idealized dry equal-volume spheres with Q_ext=2 in the large-particle limit. The visible interval is an authored evaluation scope, not a measured error bound. Crystal shape, birefringence and the actual size distribution are not resolved.
+    required_inputs:
+      - Suspended quartz mass per carrier volume in kg/m3, not solid-grain density.
+      - Explicit acceptance of this coarse-particle geometric-optics approximation.
+  provenance:
+    - property: particle_material_density_kg_m3
+      url: https://www.hec.usace.army.mil/confluence/rasdocs/d2sd/ras2dsedtr/6.6/model-description/water-and-sediment-properties/sediment-properties
+      note: US Army Corps of Engineers HEC-RAS lists approximately 2650 kg/m3 for quartz grains. This is not atmospheric dust concentration.
+    - property: optics.model
+      url: https://journals.ametsoc.org/view/journals/atsc/79/11/JAS-D-22-0047.1.xml
+      note: Extinction cross section Q_ext*pi*r^2 and geometric scattering limit Q_ext=2. Applied here as a labeled idealized sphere approximation, not measured quartz aerosol optics.
+    - property: optics.particle_radius_m
+      url: https://www.hec.usace.army.mil/confluence/rasdocs/d2sd/ras2dsedtr/6.6/model-description/water-and-sediment-properties/sediment-properties
+      note: Radius 25 micrometres is an authored coarse reference assumption; this source explains equivalent-volume diameter, not a measurement of this particle population.
+notes: Neutral surface fields are editor placeholders. No phase function, multiple scattering, Brownian diffusion coefficient or sprite opacity is inferred.

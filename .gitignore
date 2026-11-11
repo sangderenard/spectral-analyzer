@@ -42,3 +42,6 @@ csrc_build/
 
 # The native kernel build configuration is source, not a text artifact.
 !csrc/CMakeLists.txt
+
+# The repository's own GitHub workflows (the review gate check).
+!.github/

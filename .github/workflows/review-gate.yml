@@ -1,0 +1,48 @@
+# The review gate of this repository's default branch (mock lock). The source of this file, and the
+# explanation of the lock, is turing examples/meowdoku/deploy/review-gate.yml.
+name: review-gate
+
+on:
+  push:
+    branches: [nogodsnomasters]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      head:
+        description: The full commit id to ask about (default is this ref's commit)
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  REPOSITORY: spectral-analyzer
+  SERVICE: https://stichka.duckdns.org:8766
+
+jobs:
+  review-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ask the service whether this commit has an accepted review
+        env:
+          HEAD: ${{ github.event.pull_request.head.sha || inputs.head || github.sha }}
+        run: |
+          set -eu
+          case "$HEAD" in *[!0-9a-f]*|"") echo "not a commit id"; exit 1;; esac
+          if ! answer=$(curl --fail --silent --show-error --max-time 30 \
+              "$SERVICE/api/reviews/standing?repository=$REPOSITORY&head=$HEAD"); then
+            echo "::warning::The review service did not answer; nothing was checked."
+            exit 0
+          fi
+          if [ "$(echo "$answer" | jq -r '.accepted')" = "true" ]; then
+            echo "Commit $HEAD has an accepted review."
+            exit 0
+          fi
+          echo "$answer" | jq -r '.advice'
+          if [ "$(echo "$answer" | jq -r '.lock')" = "enforce" ]; then
+            echo "::error::Commit $HEAD has no accepted review. Read the steps above."
+            exit 1
+          fi
+          echo "::warning::Mock lock: commit $HEAD has no accepted review and would be refused. Read the steps in the log."

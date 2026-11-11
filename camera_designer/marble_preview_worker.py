@@ -71,6 +71,49 @@ def _atomic_json(path: Path, data: dict) -> None:
             time.sleep(0.01)
 
 
+def _camera_pose_sequence(config):
+    """Read server-resolved cameras; lens/back derivation belongs to admission."""
+    if "camera_poses" not in config:
+        return None
+    poses = config["camera_poses"]
+    if not isinstance(poses, list) or not 1 <= len(poses) <= 32:
+        raise ValueError("camera_poses must contain 1..32 resolved cameras")
+    from camera_designer.marble_tiles import tile_plan
+    if (config.get("orbit_frames", 1) != 1 or tile_plan(config) is not None
+            or "live" in config or config.get("client_intersections", False)):
+        raise ValueError("camera_poses cannot be combined with orbit, tiles, live view or client intersections")
+    resolution = config.get("camera", {}).get("resolution", 256)
+    for index, pose in enumerate(poses):
+        if not isinstance(pose, dict) or "projection" in pose or "width" in pose or "height" in pose:
+            raise ValueError(f"camera_poses[{index}] must be a resolved analytical camera")
+        if pose.get("resolution") != resolution:
+            raise ValueError("camera_poses must share the photo resolution")
+        for name in ("eye_m", "target_m"):
+            vector = pose.get(name)
+            if (not isinstance(vector, list) or len(vector) != 3
+                    or any(type(v) not in (int, float) or not np.isfinite(v) or abs(v) > 10 for v in vector)):
+                raise ValueError(f"camera_poses[{index}].{name} must contain three finite scene coordinates")
+        delta = np.asarray(pose["target_m"], np.float32) - np.asarray(pose["eye_m"], np.float32)
+        if float(np.linalg.norm(delta)) <= 1e-6:
+            raise ValueError("camera pose eye and target must be distinct in the sensor basis")
+        for name in ("fov_degrees", "aperture_radius_m", "focus_distance_m", "aperture_blades", "aperture_rotation_radians"):
+            if type(pose.get(name)) not in (int, float) or not np.isfinite(pose[name]):
+                raise ValueError(f"camera_poses[{index}].{name} must be resolved and finite")
+    return poses
+
+
+def _camera_for_frame(camera, frame_index, total_frames, poses=None):
+    if poses is not None:
+        return dict(poses[frame_index])
+    eye = np.asarray(camera["eye_m"], np.float32)
+    target = np.asarray(camera["target_m"], np.float32)
+    angle = 2.0 * np.pi * frame_index / total_frames
+    dx, dy, dz = eye - target
+    camera_eye = target + np.asarray((np.cos(angle) * dx + np.sin(angle) * dz,
+                                      dy, -np.sin(angle) * dx + np.cos(angle) * dz), np.float32)
+    return {**camera, "eye_m": camera_eye.tolist(), "target_m": target.tolist()}
+
+
 def _write_orbit_avi(output: Path, frames: list[dict], resolution: int,
                      writer_root: Path, on_frame=None) -> Path:
     """Use Turing's JPEG encoder and indexed MJPEG/AVI writer, one frame at a time."""
@@ -201,7 +244,10 @@ def _snapshot(accumulator, output: Path, digest: str, epoch: int,
     os.replace(temporary, output / filename)
     frames = [*completed_frames]
     if finished:
-        frames.append({"index": frame_index, "image": filename, "hdr": hdr_name})
+        frame = {"index": frame_index, "image": filename, "hdr": hdr_name}
+        if getattr(accumulator, "_frame_camera", None) is not None:
+            frame["camera"] = accumulator._frame_camera
+        frames.append(frame)
     # Delete this epoch's now-superseded intermediate preview/HDR files.
     # Only the just-written frame and any already-"finished" frames (kept
     # for orbit playback) survive -- the progressive-preview history served
@@ -364,6 +410,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
         raise ValueError("snapshot interval must be in [0.25, 60] seconds")
     config = json.loads(config_path.read_text(encoding="utf-8"))
     from camera_designer.marble_tiles import tile_plan, tile_windows, require_tile_disk, TileAssembly
+    camera_poses = _camera_pose_sequence(config)
     tiles = tile_plan(config)
     if tiles:
         output.mkdir(parents=True, exist_ok=True)
@@ -377,9 +424,10 @@ def run(payload: Path, config_path: Path, output: Path, *,
     bounce_mode = config.get("bounce_mode", "manual")
     if bounce_mode not in ("auto", "manual"):
         raise ValueError("bounce_mode must be auto or manual")
-    total_frames = int(config.get("orbit_frames", 1))
-    if total_frames not in (1, 8, 16, 32):
+    orbit_frames = config.get("orbit_frames", 1)
+    if type(orbit_frames) is not int or orbit_frames not in (1, 8, 16, 32):
         raise ValueError("orbit_frames must be 1, 8, 16, or 32")
+    total_frames = len(camera_poses) if camera_poses is not None else orbit_frames
     transport = str(config.get("transport", "fixed:1"))
     if transport not in ("fixed:1", "fixed:3"):
         raise ValueError("transport must be fixed:1 or fixed:3")
@@ -422,7 +470,8 @@ def run(payload: Path, config_path: Path, output: Path, *,
     from camera_designer.studio_photo_geometry import (
         CAMERA_GEOMETRY_VERSION, camera_geometry_key, prepare_photo_geometry,
     )
-    scene, sphere_regions, geometry_stats, checker_pos = prepare_photo_geometry(config, vertices, material_ids, pbr)
+    initial_config = {**config, "camera": camera_poses[0]} if camera_poses is not None else config
+    scene, sphere_regions, geometry_stats, checker_pos = prepare_photo_geometry(initial_config, vertices, material_ids, pbr)
     geom, shade, mat_buf, triangles, contexts, _, bounds, sources = scene
     preparation_status["geometry_stats"] = geometry_stats
     effective_config["geometry_stats"] = geometry_stats
@@ -497,7 +546,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
     print(f"  [marble_bounces] {bounce_mode}: render={max_bounces}/200; "
           f"probe={bounce_diagnostic.get('probe_depth', 'not requested')}; "
           f"{bounce_diagnostic.get('warning', '')}", flush=True)
-    camera = config.get("camera", {})
+    camera = initial_config.get("camera", {})
     resolution = int(camera.get("resolution", 256))
     if not tiles and resolution not in (128, 256, 512, 768, 1024, 2048, 4096):
         raise ValueError("preview resolution must be 128, 256, 512, 768, 1024, 2048, or 4096")
@@ -511,10 +560,11 @@ def run(payload: Path, config_path: Path, output: Path, *,
         SensorHistoryLayout(width, height, 3, live["history_samples"], live.get("checkpoint", False))
     eye = np.asarray(camera.get("eye_m", [0, 0, .07]), np.float32)
     target = np.asarray(camera.get("target_m", checker_pos), np.float32)
+    camera = {**camera, "eye_m": eye.tolist(), "target_m": target.tolist()}
     active_camera_key = camera_geometry_key(camera, checker_pos)
 
     def update_camera_geometry(next_camera, active_sensor=None):
-        nonlocal active_camera_key, geometry_stats, triangles, nodes, sphere_regions
+        nonlocal active_camera_key, geometry_stats, triangles, nodes, sphere_regions, scene
         next_key = camera_geometry_key(next_camera, checker_pos)
         if next_key == active_camera_key:
             return
@@ -531,6 +581,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
             active_sensor.set_scene_geometry(n_tris=len(next_tris), n_bvh_nodes=len(next_nodes),
                 bmin=next_bounds[0], bmax=next_bounds[1], n_spheres=len(next_spheres))
             active_sensor._geometry_stats = next_stats
+        scene = next_scene
         geometry_stats, triangles, nodes, sphere_regions = next_stats, next_tris, next_nodes, next_spheres
         active_camera_key = next_key
         # Old-pose photons cannot survive into an orbit frame or live sweep.
@@ -542,11 +593,10 @@ def run(payload: Path, config_path: Path, output: Path, *,
     def sensor(frame_index: int, window=None):
         sensor_width = window["width"] if window else width
         sensor_height = window["height"] if window else height
-        angle = 2.0 * np.pi * frame_index / total_frames
-        dx, dy, dz = eye - target
-        camera_eye = target + np.asarray((np.cos(angle) * dx + np.sin(angle) * dz,
-                                          dy, -np.sin(angle) * dx + np.cos(angle) * dz), np.float32)
-        update_camera_geometry({**camera, "eye_m": camera_eye.tolist(), "target_m": target.tolist()})
+        frame_camera = _camera_for_frame(camera, frame_index, total_frames, camera_poses)
+        camera_eye = np.asarray(frame_camera["eye_m"], np.float32)
+        camera_target = np.asarray(frame_camera["target_m"], np.float32)
+        update_camera_geometry(frame_camera)
         device_limits=_sensor_device_limits(sensor_width,sensor_height)
         print(json.dumps({"sensor_device_limits":device_limits}),flush=True)
         accumulator = renderer.SensorAccumulator(
@@ -555,15 +605,15 @@ def run(payload: Path, config_path: Path, output: Path, *,
             ssbo_mat=state["ssbo"][10], n_tris=len(triangles),
             n_bvh_nodes=len(nodes), tex_bands=state["tex_bands"],
             bmin=state["bmin"], bmax=state["bmax"], dims=state["dims"],
-            camera_eye=camera_eye, camera_target=target,
+            camera_eye=camera_eye, camera_target=camera_target,
             sensor_w=sensor_width, sensor_h=sensor_height,
             **({"full_sensor_size": (width, height), "sensor_origin": (window["x"], window["y"])} if window else {}),
             rows_per_frame=(max(1,4096//width) if cooperative and not live else 16),
-            fov_deg=float(camera.get("fov_degrees", 20)), max_bounces=max_bounces,
-            aperture_radius=float(camera.get("aperture_radius_m", .005)),
-            focus_dist=float(camera.get("focus_distance_m", .23)),
-            n_blades=int(camera.get("aperture_blades", 0)),
-            aperture_rot=float(camera.get("aperture_rotation_radians", 0)),
+            fov_deg=float(frame_camera.get("fov_degrees", 20)), max_bounces=max_bounces,
+            aperture_radius=float(frame_camera.get("aperture_radius_m", .005)),
+            focus_dist=float(frame_camera.get("focus_distance_m", .23)),
+            n_blades=int(frame_camera.get("aperture_blades", 0)),
+            aperture_rot=float(frame_camera.get("aperture_rotation_radians", 0)),
             vol_alpha=0.0, vol_steps=8,
             n_sources=len(sources),
             ssbo_spheres=state["ssbo"][12], n_spheres=len(sphere_regions),
@@ -583,6 +633,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
             except Exception:
                 accumulator.destroy()
                 raise
+        accumulator._frame_camera = frame_camera
         accumulator._has_rod_bundle = authored_bundle is not None
         accumulator._geometry_stats = geometry_stats
         accumulator._bounce_diagnostic = bounce_diagnostic
@@ -738,7 +789,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
             print(json.dumps(status, sort_keys=True), flush=True)
         if total_frames > 1:
             if avi_writer_root is None:
-                raise ValueError("orbit animation needs the Turing AVI writer root")
+                raise ValueError("camera sequence animation needs the Turing AVI writer root")
             encoding_start = time.monotonic()
             def encoding_progress(frame_count: int) -> None:
                 progress = {**status, "state": "encoding", "encoding_frames": frame_count,

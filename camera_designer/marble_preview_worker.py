@@ -363,6 +363,11 @@ def run(payload: Path, config_path: Path, output: Path, *,
     if not 0.25 <= snapshot_seconds <= 60:
         raise ValueError("snapshot interval must be in [0.25, 60] seconds")
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    from camera_designer.marble_tiles import tile_plan, tile_windows, require_tile_disk, TileAssembly
+    tiles = tile_plan(config)
+    if tiles:
+        output.mkdir(parents=True, exist_ok=True)
+        require_tile_disk(output, tiles)
     cooperative=config.get('client_intersections',False)
     if type(cooperative) is not bool:raise ValueError('client_intersections must be boolean')
     if cooperative and (config.get('transport')!='fixed:3' or config.get('orbit_frames',1)!=1):
@@ -400,6 +405,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
     preparation_status = {
         "digest": digest, "state": "preparing", "image": None,
         "frames": [], "frame_index": 0, "total_frames": total_frames,
+        **({"tiled": tiles} if tiles else {}),
         "transport": ("fixed:3@450,550,650nm" if transport == "fixed:3"
                       else "fixed:1@587.5618nm"),
         **({"film_response": film_response, "effective_config": "effective_config.json"}
@@ -493,11 +499,11 @@ def run(payload: Path, config_path: Path, output: Path, *,
           f"{bounce_diagnostic.get('warning', '')}", flush=True)
     camera = config.get("camera", {})
     resolution = int(camera.get("resolution", 256))
-    if resolution not in (128, 256, 512, 768, 1024, 2048, 4096):
+    if not tiles and resolution not in (128, 256, 512, 768, 1024, 2048, 4096):
         raise ValueError("preview resolution must be 128, 256, 512, 768, 1024, 2048, or 4096")
     live = config.get("live")
-    width = int(live["width"]) if live else resolution
-    height = int(live["height"]) if live else resolution
+    width = int(live["width"]) if live else tiles["width"] if tiles else resolution
+    height = int(live["height"]) if live else tiles["height"] if tiles else resolution
     if live:
         from camera_designer.sensor_history import SensorHistoryLayout
         if transport != "fixed:3" or total_frames != 1 or width > 512 or height > 512:
@@ -533,13 +539,15 @@ def run(payload: Path, config_path: Path, output: Path, *,
         renderer._clear_prebuilt(state)
         state["_pump_seed"] = seed
 
-    def sensor(frame_index: int):
+    def sensor(frame_index: int, window=None):
+        sensor_width = window["width"] if window else width
+        sensor_height = window["height"] if window else height
         angle = 2.0 * np.pi * frame_index / total_frames
         dx, dy, dz = eye - target
         camera_eye = target + np.asarray((np.cos(angle) * dx + np.sin(angle) * dz,
                                           dy, -np.sin(angle) * dx + np.cos(angle) * dz), np.float32)
         update_camera_geometry({**camera, "eye_m": camera_eye.tolist(), "target_m": target.tolist()})
-        device_limits=_sensor_device_limits(width,height)
+        device_limits=_sensor_device_limits(sensor_width,sensor_height)
         print(json.dumps({"sensor_device_limits":device_limits}),flush=True)
         accumulator = renderer.SensorAccumulator(
             ssbo_tris=state["ssbo"][0], ssbo_nodes=state["ssbo"][1],
@@ -548,7 +556,9 @@ def run(payload: Path, config_path: Path, output: Path, *,
             n_bvh_nodes=len(nodes), tex_bands=state["tex_bands"],
             bmin=state["bmin"], bmax=state["bmax"], dims=state["dims"],
             camera_eye=camera_eye, camera_target=target,
-            sensor_w=width, sensor_h=height, rows_per_frame=(max(1,4096//width) if cooperative and not live else 16),
+            sensor_w=sensor_width, sensor_h=sensor_height,
+            **({"full_sensor_size": (width, height), "sensor_origin": (window["x"], window["y"])} if window else {}),
+            rows_per_frame=(max(1,4096//width) if cooperative and not live else 16),
             fov_deg=float(camera.get("fov_degrees", 20)), max_bounces=max_bounces,
             aperture_radius=float(camera.get("aperture_radius_m", .005)),
             focus_dist=float(camera.get("focus_distance_m", .23)),
@@ -584,6 +594,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
     epoch = 0
     completed_frames: list[dict] = []
     accumulator = None
+    assembly = None
     cooperative_pump=None
     if cooperative:
         from camera_designer.studio_cooperative_sensor import CooperativeSensorPump
@@ -596,6 +607,8 @@ def run(payload: Path, config_path: Path, output: Path, *,
     try:
         from OpenGL.GL import glFinish
         job_start = time.monotonic()
+        assembly = TileAssembly(output, tiles) if tiles else None
+        tiled_sensor_sites = 0
         if live:
             from camera_designer.marble_live_worker import run_live_sensor
             accumulator = sensor(0)
@@ -612,26 +625,50 @@ def run(payload: Path, config_path: Path, output: Path, *,
                                    max_epochs=max_epochs,
                                    update_camera_geometry=update_camera_geometry,
                                    dynamic_scene_reader=dynamic_reader)
-        for frame_index in range(total_frames):
-            accumulator = sensor(frame_index)
+        windows = list(tile_windows(tiles)) if tiles else [None] * total_frames
+        for work_index, window in enumerate(windows):
+            frame_index = 0 if tiles else work_index
+            work_output = output
+            if tiles:
+                work_output = output / f"tile-{work_index:06d}"
+                work_output.mkdir(exist_ok=True)
+                tiles = {**tiles, "active_tile": {"index": work_index, **window}}
+                _atomic_json(output / "status.json", {**preparation_status, "state": "exposing", "tiled": tiles})
+            accumulator = sensor(frame_index, window)
+            if tiles and work_index == 0:
+                # Surface reception also samples the forward field. Pumping it
+                # between tiles brightens later windows even after SPP division.
+                # Every tile shares this exact existing 8192-ray prepared field.
+                renderer._clear_prebuilt(state)
+                renderer._gpu_pump_prebuilt(state, n_rays=8192)
+                glFinish()
+                tiles = {**tiles, "forward_field_ray_jobs": 8192,
+                         "forward_field": "shared frozen after one prepared epoch"}
             frame_start = time.monotonic()
             last_snapshot = frame_start - snapshot_seconds
             frame_epochs = 0
+            tile_sensor_sites = 0
             while True:
-                renderer._gpu_pump_prebuilt(state, n_rays=8192)
+                if not tiles:
+                    renderer._gpu_pump_prebuilt(state, n_rays=8192)
                 if cooperative_pump is not None:
                     # No forward field or camera mutation while a strip is on loan.
                     for _ in range(4):
                         cooperative_pump.step(accumulator)
                         time_done=time.monotonic()-frame_start>=seconds or (max_epochs is not None and frame_epochs+1>=max_epochs)
                         if time_done and accumulator._pass>=1 and accumulator._row_off==0:break
-                else:accumulator.tick(strips=4)
+                else:
+                    if tiles:
+                        sites = accumulator._w * min(accumulator._rows_per_frame, accumulator._h - accumulator._row_off)
+                        tile_sensor_sites += sites
+                        tiled_sensor_sites += sites
+                    accumulator.tick(strips=1 if tiles else 4)
                 epoch += 1
                 frame_epochs += 1
                 if epoch % 8 == 0:
                     # Do not queue an unbounded number of epochs ahead of the GPU.
                     glFinish()
-                if epoch % 4096 == 0:
+                if not tiles and epoch % 4096 == 0:
                     # R32UI forward voxels must not overflow during long exposures.
                     glFinish()
                     seed = state["_pump_seed"]
@@ -640,26 +677,53 @@ def run(payload: Path, config_path: Path, output: Path, *,
                 now = time.monotonic()
                 done = (now - frame_start >= seconds or
                         (max_epochs is not None and frame_epochs >= max_epochs))
-                if cooperative_pump is not None:done=done and accumulator._pass>=1 and accumulator._row_off==0
+                if cooperative_pump is not None or tiles:done=done and accumulator._pass>=1 and accumulator._row_off==0
                 if now - last_snapshot >= snapshot_seconds or done:
-                    status = _snapshot(accumulator, output, digest, epoch,
+                    status = _snapshot(accumulator, work_output, digest, epoch,
                                        now - job_start, preparation,
-                                       epoch * 8192, (cooperative_pump.profile["committed_rays"] if cooperative_pump is not None else frame_epochs * 4 * 16 * resolution),
+                                       (8192 if tiles else epoch * 8192), (cooperative_pump.profile["committed_rays"] if cooperative_pump is not None else tiled_sensor_sites if tiles else frame_epochs * 4 * 16 * resolution),
                                        finished=done, transport=transport,
                                        frame_index=frame_index, total_frames=total_frames,
                                        frame_elapsed=now - frame_start,
                                        completed_frames=tuple(completed_frames),
                                        gamma=gamma, film_response=film_response)
+                    if tiles:
+                        # Tile previews are not the full image. Do not publish their
+                        # URLs through the authenticated final-image route.
+                        status = {**status, "state": "exposing", "image": None,
+                                  "frames": [], "tiled": tiles}
+                        status.pop("hdr", None)
+                        _atomic_json(output / "status.json", status)
                     if cooperative_pump is not None:
                         status['client_work_profile']=dict(cooperative_pump.profile)
                         _atomic_json(output / 'status.json',status)
                     print(json.dumps(status, sort_keys=True), flush=True)
                     last_snapshot = now
                 if done:
+                    if tiles:
+                        assembly.add(window, work_output / f"exposure-{epoch:06d}.npz",
+                                     accumulator._pass * accumulator._samples_per_pixel)
+                        tiles = {**tiles, "completed_tiles": work_index + 1, "active_tile": None}
+                        _atomic_json(output / "status.json", {**status, "tiled": tiles})
+                        # Persisted mean sensor storage is authoritative. Tile
+                        # snapshots are temporary, not another image archive.
+                        for artifact in work_output.iterdir():
+                            artifact.unlink()
+                        work_output.rmdir()
                     completed_frames = status["frames"]
                     accumulator.destroy()
                     accumulator = None
                     break
+        if tiles:
+            status = {**status, "state": "assembling", "tiled": tiles}
+            _atomic_json(output / "status.json", status)
+            artifacts = assembly.finish(film_response, gamma, geometry_stats)
+            status = {**status, **artifacts, "state": "complete", "frame_index": 0,
+                      "total_frames": 1, "tiled": tiles,
+                      "elapsed_seconds": round(time.monotonic() - job_start, 3),
+                      "frames": [{"index": 0, "image": artifacts["image"], "hdr": artifacts["hdr"]}]}
+            _atomic_json(output / "status.json", status)
+            print(json.dumps(status, sort_keys=True), flush=True)
         if total_frames > 1:
             if avi_writer_root is None:
                 raise ValueError("orbit animation needs the Turing AVI writer root")
@@ -681,6 +745,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
             print(json.dumps(status, sort_keys=True), flush=True)
         return status
     finally:
+        if assembly is not None: assembly.close()
         if cooperative_pump is not None:cooperative_pump.close()
         if accumulator is not None:
             accumulator.destroy()

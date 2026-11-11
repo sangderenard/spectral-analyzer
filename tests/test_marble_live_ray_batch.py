@@ -180,7 +180,8 @@ def test_real_pump_submits_exact_total_in_bounded_dispatches(size, monkeypatch):
     tree = ast.parse(source.read_text(encoding="utf-8"))
     function = next(node for node in tree.body
                     if isinstance(node, ast.FunctionDef) and node.name == "_gpu_pump_prebuilt")
-    namespace = {"math": math, "GL_TRUE": 1}
+    from mat_flags import BINDING_STUDIO_NATIVE_PBR
+    namespace = {"math": math, "GL_TRUE": 1, 'BINDING_STUDIO_NATIVE_PBR': BINDING_STUDIO_NATIVE_PBR}
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
     gl = importlib.import_module("OpenGL.GL")
     uniforms, dispatches = {}, []
@@ -193,6 +194,7 @@ def test_real_pump_submits_exact_total_in_bounded_dispatches(size, monkeypatch):
     monkeypatch.setattr(gl, "glDispatchCompute", lambda x, y, z: dispatches.append(
         (uniforms["batch_off"], uniforms["batch_size"], x * y * 128)), raising=False)
     state = dict(prog=1, tex_bands=[1, 2, 3], ssbo=[1], dispatch_batch=512, _pump_seed=7,
+                 n_sources=1, native_pbr_ssbo=2,
                  locs={name: name for name in ("mode", "seed", "total_rays", "batch_size", "batch_off")})
     namespace["_gpu_pump_prebuilt"](state, size)
     assert uniforms["total_rays"] == size and uniforms["seed"] == 7

@@ -29,6 +29,9 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
                     preparation, snapshot, atomic_json, *, max_epochs=None,
                     update_camera_geometry=None, dynamic_scene_reader=None):
     live = config["live"]
+    from camera_designer.studio_forward_field import ForwardFieldPublisher, validate_receive_light_field
+    field_publisher = ForwardFieldPublisher(output, digest) if validate_receive_light_field(config) else None
+    field_sweep = 0
     ray_batch_size = _ray_batch_size(live)
     from OpenGL.GL import glFinish
     accumulator.set_history(live["history_samples"], checkpoint=live.get("checkpoint", False))
@@ -82,6 +85,9 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
                         # edit returning to active settings cancels a queued reset.
                         camera, live = next_camera, next_live
                         revision = control["revision"]
+                        if field_publisher is not None:
+                            field_publisher.invalidate()
+                            status.pop('light_field', None)
                         pending_control = None
         if ((time.time() >= expires and cooperative_pump is None and not retained_pause and scheduler_state!='paused')
                 or (max_epochs is not None and epoch >= max_epochs)):
@@ -141,17 +147,24 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
                     # ring/checkpoint, even when its capacity is unchanged.
                     accumulator.clear()
                     revision = pending_control["revision"]
+                    if field_publisher is not None:
+                        field_publisher.invalidate()
+                        status.pop('light_field', None)
                     pending_control = None
                 if dynamic_scene_reader is not None:
                     # The existing complete-sweep boundary owns both readers.
                     # Failed installation raises before another forward ray.
                     acknowledgment = dynamic_scene_reader.commit_boundary(accumulator)
                     if acknowledgment is not None:
+                        if field_publisher is not None:
+                            field_publisher.invalidate()
+                            status.pop('light_field', None)
                         atomic_json(output / "scene-ack.json", acknowledgment)
                 seed = field["_pump_seed"]
                 renderer._clear_prebuilt(field)
                 field["_pump_seed"] = seed
                 renderer._gpu_pump_prebuilt(field, n_rays=ray_batch_size)
+                field_sweep += 1
                 rays += ray_batch_size
             completed_sites=min(accumulator._rows_per_frame,
                                 accumulator._h-accumulator._row_off)*accumulator._w
@@ -193,5 +206,13 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
             if cooperative_pump is not None:status.update(client_work_profile=dict(cooperative_pump.profile),client_work_state='committed')
             if dynamic_scene_reader is not None and dynamic_scene_reader.ack is not None:
                 status["scene_ack"] = dict(dynamic_scene_reader.ack)
+            if field_publisher is not None:
+                exported = field_publisher.snapshot(renderer, field, live_revision=revision,
+                    sweep=field_sweep, sensor_samples=accumulator._pass,
+                    ray_jobs=ray_batch_size if field.get('n_sources') else 0,
+                    accumulation='fresh fixed-budget additive field per sensor sweep; no forward temporal accumulation',
+                    scene_ack=status.get('scene_ack'))
+                if exported is not None:
+                    status['light_field'] = exported
             atomic_json(output / "status.json", status)
             last_snapshot = time.monotonic()

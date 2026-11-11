@@ -222,6 +222,10 @@ uniform bool uEnableEmissionDirect = false;
 uniform int  uRenderPass = 0;  // 0=all, 1=opaque-only (alpha>=0.85), 2=transparent-only
 uniform sampler3D uFieldVolume;
 uniform float uFieldGain = 0.0;
+// Optional affine view-space to normalized field coordinates. Legacy hosts
+// leave this disabled and retain their existing vPosObj sampling contract.
+uniform bool uFieldUseTransform = false;
+uniform mat4 uFieldFromView;
 // Scales the authored Phong-ambient indirect-light floor (ph_ambient,
 // clamped to 0.12 above). 1.0 preserves the existing baseline everywhere
 // this shader is used; consumers that want pure-emitter lighting (no
@@ -529,10 +533,20 @@ void main() {
         col = mix(col, tinted, 0.35);
     }
 
-    // 3-D field volume — sample energy density at this fragment's scene position
-    // and add as glow.  vPosObj is already in [0,1]³ (= field texture UVW space).
+    // 3-D field volume: retain the existing additive glow, not directional
+    // irradiance or a new BRDF. Signed linear RGB reaches the original display
+    // conversion unchanged. Transformed samples outside the field contribute
+    // nothing; texture edge clamping must not extend the physical field.
     if (uFieldGain > 0.0) {
-        col += texture(uFieldVolume, vPosObj).rgb * uFieldGain;
+        if (uFieldUseTransform) {
+            vec3 field_coord = (uFieldFromView * vec4(vPosV, 1.0)).xyz;
+            if (all(greaterThanEqual(field_coord, vec3(0.0))) &&
+                all(lessThanEqual(field_coord, vec3(1.0)))) {
+                col += texture(uFieldVolume, field_coord).rgb * uFieldGain;
+            }
+        } else {
+            col += texture(uFieldVolume, vPosObj).rgb * uFieldGain;
+        }
     }
 
     // Color compensation equation: C' = CAT_CCM * C.

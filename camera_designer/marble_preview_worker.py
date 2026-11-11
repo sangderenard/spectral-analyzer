@@ -429,6 +429,8 @@ def run(payload: Path, config_path: Path, output: Path, *,
         raise ValueError("orbit_frames must be 1, 8, 16, or 32")
     total_frames = len(camera_poses) if camera_poses is not None else orbit_frames
     transport = str(config.get("transport", "fixed:1"))
+    from camera_designer.studio_forward_field import ForwardFieldPublisher, validate_receive_light_field
+    receive_light_field = validate_receive_light_field(config)
     if transport not in ("fixed:1", "fixed:3"):
         raise ValueError("transport must be fixed:1 or fixed:3")
     if transport == "fixed:1" and "film_response" in config:
@@ -444,6 +446,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
     digest = hashlib.sha256(payload.read_bytes() +
                             json.dumps(config, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     output.mkdir(parents=True, exist_ok=True)
+    field_publisher = ForwardFieldPublisher(output, digest) if receive_light_field else None
     # Preserve the caller's digest/config identity, while recording defaults
     # explicitly for reproducibility of old requests that omit this field.
     effective_config = dict(config)
@@ -540,6 +543,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
     effective_config.update(bounce_mode=bounce_mode, max_bounces=max_bounces,
                             requested_manual_bounces=config.get("max_bounces", 4),
                             bounce_diagnostic=bounce_diagnostic)
+    field_ray_jobs = 0 if bounce_mode == 'auto' or not state.get('n_sources') else 128
     _atomic_json(output / "effective_config.json", effective_config)
     _atomic_json(output / "status.json", {**preparation_status,
         "bounce_diagnostic": bounce_diagnostic, "effective_config": "effective_config.json"})
@@ -565,6 +569,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
 
     def update_camera_geometry(next_camera, active_sensor=None):
         nonlocal active_camera_key, geometry_stats, triangles, nodes, sphere_regions, scene
+        nonlocal field_ray_jobs
         next_key = camera_geometry_key(next_camera, checker_pos)
         if next_key == active_camera_key:
             return
@@ -589,6 +594,9 @@ def run(payload: Path, config_path: Path, output: Path, *,
         seed = state["_pump_seed"]
         renderer._clear_prebuilt(state)
         state["_pump_seed"] = seed
+        field_ray_jobs = 0
+        if field_publisher is not None:
+            field_publisher.invalidate()
 
     def sensor(frame_index: int, window=None):
         sensor_width = window["width"] if window else width
@@ -692,6 +700,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
                 # Every tile shares this exact existing 8192-ray prepared field.
                 renderer._clear_prebuilt(state)
                 renderer._gpu_pump_prebuilt(state, n_rays=8192)
+                field_ray_jobs = 8192 if state.get('n_sources') else 0
                 glFinish()
                 tiles = {**tiles, "forward_field_ray_jobs": 8192,
                          "forward_field": "shared frozen after one prepared epoch"}
@@ -702,6 +711,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
             while True:
                 if not tiles:
                     renderer._gpu_pump_prebuilt(state, n_rays=8192)
+                    field_ray_jobs += 8192 if state.get('n_sources') else 0
                 if cooperative_pump is not None:
                     # No forward field or camera mutation while a strip is on loan.
                     for _ in range(4):
@@ -725,6 +735,9 @@ def run(payload: Path, config_path: Path, output: Path, *,
                     seed = state["_pump_seed"]
                     renderer._clear_prebuilt(state)
                     state["_pump_seed"] = seed
+                    field_ray_jobs = 0
+                    if field_publisher is not None:
+                        field_publisher.invalidate()
                 now = time.monotonic()
                 done = (now - frame_start >= seconds or
                         (max_epochs is not None and frame_epochs >= max_epochs))
@@ -749,7 +762,15 @@ def run(payload: Path, config_path: Path, output: Path, *,
                                        frame_index=frame_index, total_frames=total_frames,
                                        frame_elapsed=now - frame_start,
                                        completed_frames=tuple(completed_frames),
-                                       gamma=gamma, film_response=film_response)
+                                       gamma=gamma, film_response=film_response,
+                                       publish_status=field_publisher is None)
+                    if field_publisher is not None:
+                        exported = field_publisher.snapshot(renderer, state,
+                            sweep=epoch, sensor_samples=accumulator._pass, ray_jobs=field_ray_jobs,
+                            accumulation=('frozen shared field for all tiles' if tiles else
+                                          'additive since last clear; existing 4096-epoch overflow reset'))
+                        if exported is not None:
+                            status['light_field'] = exported
                     if tiles:
                         # Tile previews are not the full image. Do not publish their
                         # URLs through the authenticated final-image route.
@@ -760,6 +781,8 @@ def run(payload: Path, config_path: Path, output: Path, *,
                     if cooperative_pump is not None:
                         status['client_work_profile']=dict(cooperative_pump.profile)
                         _atomic_json(output / 'status.json',status)
+                    if field_publisher is not None and not tiles and cooperative_pump is None:
+                        _atomic_json(output / 'status.json', status)
                     print(json.dumps(status, sort_keys=True), flush=True)
                     last_snapshot = now
                 if done:

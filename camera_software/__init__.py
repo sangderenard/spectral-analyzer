@@ -120,20 +120,32 @@ from .exposure_priority import (
     sensor_region_morton_key,
     LocalityAwarePriorityPolicy,
 )
-from .sensor_priority_network import (
-    SensorWorkValueNet,
-    render_flat_orthographic,
-    sensor_features,
-)
-from .raytraced_priority_training import (
-    RaytracedSensorState,
-    RaytracedWorkExample,
-    RaytracedTrainingResult,
-    normalized_camera_rgb,
-    load_raytraced_states,
-    measured_work_examples,
-    train_from_raytraced_examples,
-)
+# Optional learned scheduling/training exports must not pull Torch into the
+# analytical renderer service. Resolve them only when explicitly requested.
+_OPTIONAL_EXPORTS = {
+    **{name: ".sensor_priority_network" for name in (
+        "SensorWorkValueNet", "render_flat_orthographic", "sensor_features")},
+    **{name: ".raytraced_priority_training" for name in (
+        "RaytracedSensorState", "RaytracedWorkExample", "RaytracedTrainingResult",
+        "normalized_camera_rgb", "load_raytraced_states", "measured_work_examples",
+        "train_from_raytraced_examples")},
+}
+
+
+def __getattr__(name):
+    module_name = _OPTIONAL_EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+    value = getattr(import_module(module_name, __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_OPTIONAL_EXPORTS))
+
+
 from .sensor_mipmap import (
     SensorUvBounds,
     WeightedSpectralMoments,

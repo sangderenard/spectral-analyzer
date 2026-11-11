@@ -180,7 +180,10 @@ def fit_acceptance_boundary(
 # Model
 # ─────────────────────────────────────────────────────────────────────────────
 
-class NeuralAssemblyMLP(nn.Module):
+# The Torch-free photo service imports this package for emitter validation.
+# Keep the existing constructor's explicit ImportError reachable without trying
+# to resolve nn.Module at import time when the optional dependency is absent.
+class NeuralAssemblyMLP(nn.Module if _TORCH_OK else object):
     """N_INPUTS(5) → [hidden]*n_hidden → N_OUTPUTS(6) MLP.
 
     Returns normalized outputs; caller denormalizes with NormStats.

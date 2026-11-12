@@ -5,6 +5,7 @@ No live application or exposure is opened, stopped, or modified.
 """
 import json
 import os
+import sys
 from pathlib import Path
 
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
@@ -157,6 +158,15 @@ void main() {
         for trans,opacity in ((0,1),(0,.4),(1,0),(1,.6)):
             np.testing.assert_array_equal(draw(0,trans=trans,opacity=opacity,linear=False,gain=0),draw(1,trans=trans,opacity=opacity,linear=False,gain=0));checks+=1
         f0=.04;albedo=pbr[:3].copy()
+        # The copied-response shader has no material-mask/volume-texture route.
+        # Keep the old probe below available for historical investigation, but
+        # exercise only the surviving direct fallback in the release gate.
+        if "--legacy-fields" not in sys.argv:
+            equal(draw(program=3,lights=True,replace=True,mask=2,gain=0),[*(albedo+f0),1])
+            print(json.dumps({"status":"PASS","gpu":gl.glGetString(gl.GL_RENDERER).decode(),
+                              "checks":checks,"legacy_bit_identical":True,
+                              "current_response_fallback":True}))
+            return
         # Field replacement is per material: unmatched rows retain direct Phong.
         equal(draw(program=3,lights=True,replace=True,mask=0,gain=0),[*(albedo+f0),1])
         equal(draw(program=3,lights=True,replace=True,mask=2,gain=0),[0,0,0,1])

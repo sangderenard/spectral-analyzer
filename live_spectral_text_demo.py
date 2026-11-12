@@ -3192,6 +3192,124 @@ class InkAtlasSubprocessRenderer:
         return record
 
 
+class InkAtlasStudioRestRenderer(InkAtlasSubprocessRenderer):
+    """Bake the same atlas plan through the account-owned Studio photo API."""
+
+    def __init__(self, output_root: str, catalog: RenderAssetCatalog, *,
+                 studio_url: str, studio_cookie: str, shutter_seconds: float | None = None,
+                 shutter_substeps: int | None = None, iso: float | None = None,
+                 photo_contract_path: str = "") -> None:
+        super().__init__(output_root, catalog)
+        from camera_software.studio_atlas_rest import StudioAtlasRestClient, load_studio_atlas_contract
+        self.studio_client = StudioAtlasRestClient(studio_url, studio_cookie)
+        self.studio_photo_contract = load_studio_atlas_contract(photo_contract_path) if photo_contract_path else load_studio_atlas_contract()
+        self.studio_photo_contract_path = photo_contract_path
+        self.studio_shutter_seconds = self.studio_photo_contract.get("exposure_seconds", .1) if shutter_seconds is None else shutter_seconds
+        self.studio_shutter_substeps = self.studio_photo_contract.get("exposure_substeps", 1) if shutter_substeps is None else shutter_substeps
+        self.studio_iso = self.studio_photo_contract.get("exposure_iso", 100.0) if iso is None else iso
+        self._studio_digest = ""
+
+    def cancel_current(self) -> None:
+        with self._lock:
+            digest = self._studio_digest
+        if digest:
+            self.studio_client.json("/api/marble_photo/cancel", value={"digest": digest})
+
+    def request_active_visual_pass(self) -> bool:
+        # A Studio timed shutter publishes one completed frame, not BDPT epochs.
+        return False
+
+    def __call__(self, request: BakeRequest):
+        from camera_software.studio_atlas_rest import (
+            _studio_points, build_studio_atlas_upload, studio_linear_image,
+        )
+        import scene_orders
+        order = ink_order_for_request(request)
+        job = scene_orders.resolved_jobs(order)[0]
+        plane = job["planes"][0]
+        subject = _studio_points(scene_orders._glyph_triangles(job, plane))
+        if request.capture is None or request.capture.width != request.capture.height:
+            raise ValueError("Studio atlas currently requires a square capture")
+        directory = _atlas_request_directory(self.output_root, request)
+        os.makedirs(directory, exist_ok=True)
+        order_path = os.path.join(directory, "scene_order.json")
+        with open(order_path, "w", encoding="utf-8") as stream:
+            json.dump(order, stream, indent=2)
+        with self._lock:
+            self._work_revision += 1
+            self._work_object_key = render_style_key(request.token_asset)
+            self._work_state = ("", request.token_asset.token, 0, True)
+        try:
+            asset = self.studio_client.upload_subject(subject)
+            payload = build_studio_atlas_upload(
+                request, asset, shutter_seconds=self.studio_shutter_seconds,
+                substeps=self.studio_shutter_substeps, iso=self.studio_iso,
+                photo_contract=self.studio_photo_contract)
+            started = self.studio_client.submit(payload)
+            digest = started["digest"]
+            with self._lock:
+                self._studio_digest = digest
+            status = self.studio_client.await_complete(digest)
+            if not status.get("hdr") or not status.get("image"):
+                raise RuntimeError("Studio completed without an HDR and preview artifact")
+            hdr = self.studio_client.artifact(digest, status["hdr"], hdr=True)
+            linear = studio_linear_image(hdr)
+            if linear.shape[:2] != (request.capture.height, request.capture.width):
+                raise ValueError("Studio HDR does not match the atlas capture")
+            preview = self.studio_client.artifact(digest, status["image"])
+            linear_path = os.path.join(directory, "studio_linear.npy")
+            preview_path = os.path.join(directory, "studio_preview.png")
+            hdr_path = os.path.join(directory, "studio_exposure.npz")
+            np.save(linear_path, linear, allow_pickle=False)
+            with open(preview_path, "wb") as stream:
+                stream.write(preview)
+            with open(hdr_path, "wb") as stream:
+                stream.write(hdr)
+            sprite_path = extract_raytraced_sprite(
+                linear, request.token_asset, request.capture).save(
+                    os.path.join(directory, "raytraced_sprite.npz"))
+            manifest_path = os.path.join(directory, "atlas_capture_manifest.json")
+            receipt = {
+                "schema_version": 1, "backend": "studio-rest-timed",
+                "studio_photo_digest": digest,
+                "studio_photo_url": self.studio_client.base_url,
+                "studio_shutter_seconds": self.studio_shutter_seconds,
+                "studio_shutter_substeps": self.studio_shutter_substeps,
+                "studio_iso": self.studio_iso,
+                "studio_photo_contract_path": self.studio_photo_contract_path,
+                "studio_photo_contract": self.studio_photo_contract,
+                "bdpt_order_exposure_seconds": order["defaults"]["exposure"]["time_s"],
+                "clock_relation": "independent camera shutter and BDPT order settings",
+                "target_key": request.target_key, "condition_key": request.condition.condition_key,
+                "linear_path": linear_path, "preview_path": preview_path,
+                "hdr_path": hdr_path, "sprite_path": sprite_path,
+            }
+            with open(manifest_path, "w", encoding="utf-8") as stream:
+                json.dump(receipt, stream, indent=2, sort_keys=True)
+            record = self.catalog.complete(
+                request, linear_path=linear_path, preview_path=preview_path,
+                manifest_path=manifest_path, width=request.capture.width,
+                height=request.capture.height, samples=1,
+                metadata={"backend": "studio-rest-timed", "completion_basis": "studio_completed_shutter",
+                          "studio_photo_digest": digest, "sprite_path": sprite_path,
+                          "hdr_path": hdr_path, "render_context_path": manifest_path})
+            self.object_library.adopt_record(
+                record, scene_path=order_path, condition=request.condition,
+                object_kind=request.target_kind.value, token=request.token_asset.token,
+                tags=("ink-on-slate", "studio-rest-asset-bake"),
+                renderer_context_path=manifest_path)
+            with self._lock:
+                self._work_revision += 1
+                self._work_state = (preview_path, request.token_asset.token, 1, False)
+            return record
+        finally:
+            with self._lock:
+                self._studio_digest = ""
+                if self._work_state[3]:
+                    self._work_revision += 1
+                    self._work_state = ("", request.token_asset.token, 0, False)
+
+
 class SpectralTextRenderWorker:
     """Single render owner with a coalescing one-item pending slot."""
 
@@ -4598,6 +4716,11 @@ def run_window(
     atlas_character_vertical_spacing_px: int = (
         DEFAULT_MONOFONT_VERTICAL_SPACING_PX
     ),
+    studio_atlas_url: str = "",
+    studio_atlas_shutter_seconds: float | None = None,
+    studio_atlas_substeps: int | None = None,
+    studio_atlas_iso: float | None = None,
+    studio_atlas_contract: str = "",
     program_manifest_override: Any = None,
     parent_gl_context: Any = None,
     gl_context_factory: Callable[[Any], Any] | None = None,
@@ -4813,14 +4936,24 @@ def run_window(
         horizontal_spacing_px=atlas_character_horizontal_spacing_px,
         vertical_spacing_px=atlas_character_vertical_spacing_px,
     )
-    atlas_renderer = InkAtlasSubprocessRenderer(
-        output_root,
-        atlas_catalog,
-        epochs_per_exposure=atlas_epochs_per_exposure,
-        sensor_top_k=atlas_sensor_top_k,
-        steps_per_epoch=atlas_steps_per_epoch,
-        samples_per_node=atlas_samples_per_node,
-    )
+    if studio_atlas_url:
+        atlas_renderer = InkAtlasStudioRestRenderer(
+            output_root, atlas_catalog, studio_url=studio_atlas_url,
+            studio_cookie=os.environ.get("SPECTRAL_STUDIO_COOKIE", ""),
+            shutter_seconds=studio_atlas_shutter_seconds,
+            shutter_substeps=studio_atlas_substeps, iso=studio_atlas_iso,
+            photo_contract_path=studio_atlas_contract)
+        print(f"[ink-atlas] backend=Studio REST timed shutter "
+              f"model_seconds={atlas_renderer.studio_shutter_seconds} "
+              f"substeps={atlas_renderer.studio_shutter_substeps}", flush=True)
+    else:
+        atlas_renderer = InkAtlasSubprocessRenderer(
+            output_root, atlas_catalog,
+            epochs_per_exposure=atlas_epochs_per_exposure,
+            sensor_top_k=atlas_sensor_top_k,
+            steps_per_epoch=atlas_steps_per_epoch,
+            samples_per_node=atlas_samples_per_node,
+        )
     layout_library_objects = (
         atlas_renderer.object_library.register_parametric_layout_manifest(
             layout_work_manifest
@@ -6372,6 +6505,16 @@ def _args(argv: list[str]) -> argparse.Namespace:
             f"native atlas submission (default: {DEFAULT_ATLAS_SAMPLES_PER_NODE})."
         ),
     )
+    parser.add_argument("--studio-atlas-url", default="",
+                        help="Use the authenticated Studio REST timed-photo backend for atlas bakes.")
+    parser.add_argument("--studio-atlas-contract", default="",
+                        help="Saved Studio atlas photo profile JSON; default is configs/studio_ink_atlas_photo.json.")
+    parser.add_argument("--studio-atlas-shutter-seconds", type=float, default=None,
+                        help="Override the saved Studio model shutter duration.")
+    parser.add_argument("--studio-atlas-substeps", type=int, default=None,
+                        help="Override the saved Studio shutter tick count.")
+    parser.add_argument("--studio-atlas-iso", type=float, default=None,
+                        help="Override the saved Studio ISO.")
     parser.add_argument(
         "--atlas-character-horizontal-spacing-px",
         "--monofont-horizontal-spacing-px",
@@ -6478,6 +6621,11 @@ def main(argv: list[str] | None = None) -> int:
         args.atlas_samples_per_node,
         args.atlas_character_horizontal_spacing_px,
         args.atlas_character_vertical_spacing_px,
+        studio_atlas_url=args.studio_atlas_url,
+        studio_atlas_shutter_seconds=args.studio_atlas_shutter_seconds,
+        studio_atlas_substeps=args.studio_atlas_substeps,
+        studio_atlas_iso=args.studio_atlas_iso,
+        studio_atlas_contract=args.studio_atlas_contract,
     )
 
 

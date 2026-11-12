@@ -25,6 +25,12 @@ def test_bundle_sections_are_contiguous_actual_materials_and_sources(monkeypatch
         assert blob[offset-48:offset-48+data.nbytes]==data.tobytes()
         offset+=data.nbytes
     assert len(blob)==offset-48
+    validity=meta['directional']['validity']
+    assert validity==m.partial_estimate_validity()
+    assert 'replacement_authorized' not in validity
+    assert 'darkness_authorized' not in validity
+    assert validity['zero_semantics']=='unknown'
+    assert validity['occlusion_certification']=='none'
 
 
 def test_shader_records_only_actual_segment_directions():
@@ -153,3 +159,34 @@ def test_stencil_classification_once_per_segment_preserves_atmosphere_hook(count
     assert segment.index('studio_record_bin=0;')<segment.index('for(int iteration=0;iteration<99;++iteration)')
     assert 'if(score>closest){closest=score;studio_record_bin=i;}' in segment
     assert source.count('studio_record_track(q,d,packet,next-cursor);')==1
+
+
+def test_slab_decode_is_bit_identical_to_original_full_conversion():
+    from camera_designer.studio_directional_field import _decode_directional_slices
+    from camera_designer.marble_color_profile import XYZ_TO_SRGB, _LINE_TO_XYZ
+    rng=np.random.default_rng(824)
+    for dtype in (np.int32,np.float64):
+        raw=rng.integers(0,1000000,size=(4,5,6,12,6)).astype(dtype)
+        raw[0,0,0,:,:]=0
+        raw[...,3:]-=10000
+        record={'quantization_divisor':16777216,'voxel_volume_m3':.0005**3}
+        divisor=22
+        expected=np.zeros(raw.shape,dtype='<f4')
+        expected[...,:3]=((raw[...,:3].astype(np.float64)/record['quantization_divisor'])@(XYZ_TO_SRGB@_LINE_TO_XYZ).T)/(record['voxel_volume_m3']*divisor)
+        weight=raw[...,:3].astype(np.float64).sum(axis=-1)
+        np.divide(raw[...,3:],weight[...,None],out=expected[...,3:],where=weight[...,None]>0)
+        norm=np.linalg.norm(expected[...,3:],axis=-1,keepdims=True)
+        expected[...,3:]/=np.maximum(norm,1)
+        actual=_decode_directional_slices(raw,record,divisor)
+        assert actual.tobytes()==expected.tobytes()
+
+
+def test_streamed_sections_are_byte_identical_without_full_join(monkeypatch):
+    import camera_designer.studio_directional_field as m
+    monkeypatch.setattr(m,'readback',lambda record:np.arange(2*2*2*6*6,dtype='<f4').reshape(2,2,2,6,6))
+    record=dict(bin_count=6,triangles=np.zeros((1,4),'<u4'),materials=np.zeros((1,16),'<f4'),scene_sha256='a'*64)
+    source=np.zeros((1,12),'<f4')
+    joined,meta=m.bundle_sections(record,source,12)
+    parts,stream_meta=m.bundle_sections(record,source,12,streaming=True)
+    assert isinstance(parts[0],memoryview)
+    assert b''.join(parts)==joined and stream_meta==meta

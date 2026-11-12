@@ -580,6 +580,7 @@ def _collect_optical_geometry(
     wavelengths_um: Sequence[float],
     confinement_box: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     camera_frame: Optional[tuple] = None,
+    include_camera_geometry: bool = True,
 ) -> tuple:
     """Triangulate a CameraPreset + optional scene object into raw geometry arrays.
 
@@ -934,6 +935,16 @@ def _collect_optical_geometry(
                     1.6, 1.0, _GEO_FLAG_APERTURE_STOP,
                 ))
                 _tri_cursor += _n_new
+
+    if not include_camera_geometry:
+        # The analytical thin-lens sensor is owned by SensorAccumulator. Drop
+        # only the authored optical housing/iris/sensor triangles; the scene
+        # object and real emitters below still enter the ordinary packer.
+        all_verts.clear(); all_normals.clear(); all_refl_re.clear()
+        all_refl_im.clear(); all_diff.clear()
+        context_specs.clear(); ior_specs.clear(); mat_groups.clear()
+        lens_material_specs.clear()
+        _tri_cursor = 0
 
     # ── Scene object ──────────────────────────────────────────────────
     # ── Emitter discs ────────────────────────────────────────────────
@@ -1508,6 +1519,7 @@ def build_gpu_scene(
     wavelengths_um: Sequence[float] = (0.450, 0.550, 0.650),
     confinement_box: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     camera_frame: Optional[tuple] = None,
+    include_camera_geometry: bool = True,
 ) -> tuple:
     """Pack a CameraPreset into the GPU SSBO format consumed by _gpu_ray_field().
 
@@ -1533,7 +1545,8 @@ def build_gpu_scene(
 
     (verts_all, normals_all, _refl_re, _refl_im, _diff,
      ior_specs, context_specs, mat_groups, lens_material_specs) = _collect_optical_geometry(
-         preset, scene_object, wavelengths_um, confinement_box, camera_frame)
+         preset, scene_object, wavelengths_um, confinement_box, camera_frame,
+         include_camera_geometry)
 
     # ── Build per-triangle material arrays ────────────────────────────────
     n_tri = len(verts_all)
@@ -1833,6 +1846,7 @@ def append_saved_studio_mesh_to_gpu_scene(
     spectral_emission_rgb: bool = False,
     boundary_media: dict | None = None,
     optical_media: dict | None = None,
+    optical_outside_policy: str = "error",
     region_media: dict | None = None,
     material_authoring: dict | None = None,
     canonical_volume_optics: dict | None = None,
@@ -1841,6 +1855,8 @@ def append_saved_studio_mesh_to_gpu_scene(
     emitter_profiles=None,
     material_lineage_out=None,
     lineage_source=None,
+    response_lineage_out=None,
+    response_source=None,
 ) -> tuple:
     """Append a saved Studio design to the canonical GL scene buffers.
 
@@ -1862,6 +1878,8 @@ def append_saved_studio_mesh_to_gpu_scene(
     ids = np.asarray(material_ids, np.int32).reshape(-1)
     pbr = np.asarray(pbr_records, np.float32)
     center = np.asarray(center_m, np.float32)
+    if optical_outside_policy not in ("error","game-transparent-outside-authored-v1"):
+        raise ValueError('unsupported optical outside-spectrum policy')
     if verts.ndim != 3 or verts.shape[1:] != (3, 3):
         raise ValueError("Studio vertices must have shape (triangles, 3, 3)")
     if ids.shape != (len(verts),) or pbr.ndim != 2 or pbr.shape[1] != 16:
@@ -2008,16 +2026,26 @@ def append_saved_studio_mesh_to_gpu_scene(
                 # the preview wavelength, while retaining edited PBR IOR.
                 n = max(1.0, float(row[6]))
                 fresnel = float(_fresnel_reflectance(1.0, n))
-                material["spectral_bands"] = [
-                    {"center_hz": float(_C_LIGHT / (wl * 1e-6)),
-                     "bandwidth_hz": float(_C_LIGHT / (wl * 1e-6) * 0.01),
-                     "reflectance": fresnel,
-                     "transmittance": float(np.clip(row[5] * (1.0 - fresnel), 0.0, 1.0)),
-                     "diffuse_frac": float(np.clip(row[3], 0.0, 1.0)),
-                     "emission": 0.0, "reemission": 0.0,
-                     "ior_real": n, "ior_imag": (optical_extinction(optics[int(old_id)], wl) if optics is not None and int(old_id) in optics else studio_medium_extinction(row, wl) if pairs is not None and int(old_id) in pairs else 0.0)}
-                    for wl in wavelengths
-                ]
+                def optical_band(wl):
+                    record=optics.get(int(old_id)) if optics is not None else None
+                    outside=(record is not None and not record['wavelengths_nm'][0]<=wl*1000<=record['wavelengths_nm'][-1])
+                    if outside and optical_outside_policy=="game-transparent-outside-authored-v1":
+                        # No measured response means no game-material boundary
+                        # at this frequency, including its Fresnel interface.
+                        return {"center_hz":float(_C_LIGHT/(wl*1e-6)),
+                                "bandwidth_hz":float(_C_LIGHT/(wl*1e-6)*.01),
+                                "reflectance":0.,"transmittance":1.,"diffuse_frac":0.,
+                                "emission":0.,"reemission":0.,"ior_real":1.,"ior_imag":0.}
+                    return {"center_hz":float(_C_LIGHT/(wl*1e-6)),
+                            "bandwidth_hz":float(_C_LIGHT/(wl*1e-6)*.01),
+                            "reflectance":fresnel,
+                            "transmittance":float(np.clip(row[5]*(1.-fresnel),0.,1.)),
+                            "diffuse_frac":float(np.clip(row[3],0.,1.)),
+                            "emission":0.,"reemission":0.,"ior_real":n,
+                            "ior_imag":(optical_extinction(record,wl,outside_policy=optical_outside_policy)
+                                         if record is not None else studio_medium_extinction(row,wl)
+                                         if pairs is not None and int(old_id) in pairs else 0.)}
+                material["spectral_bands"]=[optical_band(wl) for wl in wavelengths]
             if artistic_reflector:
                 from .studio_spectral_reflector import authored_reflector_bands
                 material["spectral_bands"] = authored_reflector_bands(row,wavelengths)
@@ -2049,6 +2077,10 @@ def append_saved_studio_mesh_to_gpu_scene(
     # ONLY tensor the emission-profile resolution in build_tensors() writes
     # into; raymat_compat's own column 8:11 never goes through it).
     resolved_emission = tensors["pbr"][mapped_ids, 8:11]
+    freq_hz = np.asarray([_C_LIGHT / (wl * 1e-6) for wl in wavelengths], np.float64)
+    mat_buf = np.ascontiguousarray(db.build_mat_buf(freq_hz=freq_hz), np.float32)
+    spectral_emissive = np.any(
+        mat_buf.reshape(-1, 32, 12)[mapped_ids, :len(wavelengths), 5] > 0.0, axis=1)
 
     geom = np.zeros((len(world), 16), np.float32)
     geom[:, 0:3] = world[:, 0]
@@ -2057,7 +2089,7 @@ def append_saved_studio_mesh_to_gpu_scene(
     geom[:, 12:15] = cross / lengths[:, None]
     flags = np.zeros(len(world), np.uint32)
     flags[effective_pbr[:, 5] > 0.0] |= MAT_FLAG_TRANSMISSIVE
-    flags[np.any(effective_pbr[:, 8:11] > 0.0, axis=1)] |= MAT_FLAG_EMISSIVE
+    flags[spectral_emissive] |= MAT_FLAG_EMISSIVE
     from mat_flags import MAT_FLAG_SPECTRAL_REFLECTOR
     artistic = np.array([int(i) not in canonical for i in ids])
     reflector = advanced_mask & artistic & (effective_pbr[:,3]==0) & (effective_pbr[:,4]==1) & (effective_pbr[:,5]==0) & (effective_pbr[:,7]==1) & ~np.any(effective_pbr[:,8:11],axis=1)
@@ -2091,7 +2123,7 @@ def append_saved_studio_mesh_to_gpu_scene(
     shade[:, 4:7] = ray_rows[:, [4, 5, 6]]
     shade[:, 7] = ray_rows[:, 13]
     shade[:, 8:11] = ray_rows[:, [8, 9, 10]]
-    emissive_mask = np.any(effective_pbr[:, 8:11] > 0.0, axis=1)
+    emissive_mask = spectral_emissive
     # albedo.xyz doubles as "this surface's own colour" for the sensor
     # shader's existing per-layer projection (demo_pluck_gl.py's
     # get_layer_light()/aw = dot(surf_albedo, layer_rgb) term, the same
@@ -2117,15 +2149,18 @@ def append_saved_studio_mesh_to_gpu_scene(
     all_tris = np.concatenate((base_tris, world), axis=0)
     bounds = (np.minimum(base_bounds[0], world.min(axis=(0, 1))),
               np.maximum(base_bounds[1], world.max(axis=(0, 1))))
-    freq_hz = np.asarray([_C_LIGHT / (wl * 1e-6) for wl in wavelengths], np.float64)
-    mat_buf = np.ascontiguousarray(db.build_mat_buf(freq_hz=freq_hz), np.float32)
     all_geom = np.concatenate((base_geom, geom))
     if pairs is not None:
         all_geom[0, 11] = 4097.0  # explicit-media scene marker; no vertex coordinate changes
     result = (all_geom,
             np.concatenate((base_shade, shade)), mat_buf, all_tris,
             contexts, ctx_map, bounds, sources)
-    return (result, np.flatnonzero(valid)) if return_index_map else result
+    retained = np.flatnonzero(valid) if return_index_map or response_lineage_out is not None else None
+    if response_lineage_out is not None:
+        if response_source is None:
+            raise ValueError('response identity copy requires its original source namespace and ID')
+        response_lineage_out.append(*response_source, len(base_geom), retained)
+    return (result, retained) if return_index_map else result
 
 
 # ─────────────────────────────────────────────────────────────────────────────

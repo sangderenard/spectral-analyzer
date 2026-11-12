@@ -35,6 +35,7 @@ layout(location = 3) in vec2 aUv;
 layout(location = 4) in int  aGroupId;
 layout(location = 5) in int  aCullImmune;
 layout(location = 6) in vec3 aVelocity;   // world-space surface velocity (m/s)
+layout(location = 7) in uint aResponseRecipient;
 
 // Primary and secondary are distinct programs sharing exact depth-EQUAL
 // visibility. Require invariant clip positions across those linked programs.
@@ -51,6 +52,7 @@ flat out int vGroupId;
 flat out int vCullImmune;
 out vec2 vUv;
 out vec3 vVelocityW;   // world-space velocity passed to fragment for optical effects
+flat out uint vResponseRecipient;
 
 void main() {
     vec4 posV   = uMV  * vec4(aPos, 1.0);
@@ -62,5 +64,6 @@ void main() {
     vCullImmune = aCullImmune;
     vUv         = aUv;
     vVelocityW  = aVelocity;
+    vResponseRecipient = aResponseRecipient;
     gl_Position = uMVP * vec4(aPos, 1.0);
 }

@@ -39,8 +39,8 @@ def native_emissive_sources(scene, wavelengths_um, *, ray_budget=4096, seed=42):
     geom, shade, materials, triangles = scene[:4]
     frequencies = 299792458. / (np.asarray(wavelengths_um, np.float64) * 1e-6)
     bands = len(frequencies)
-    if bands not in (1, 3):
-        raise ValueError('Studio native emitter adapter supports fixed:1 and fixed:3')
+    if bands not in (1, 3, 4, 8):
+        raise ValueError('Studio native emitter adapter supports fixed:1, fixed:3, fixed:4 and fixed:8')
     mat_ids = np.ascontiguousarray(shade[:,14]).view(np.uint32)
     flags = np.ascontiguousarray(geom[:,15]).view(np.uint32)
     selected = np.flatnonzero((flags & int(native.MAT_FLAG_EMISSIVE)) != 0)
@@ -102,6 +102,98 @@ def native_emissive_sources(scene, wavelengths_um, *, ray_budget=4096, seed=42):
         tracer.stop_pipeline()
 
 
+def reweight_native_sources(roots, shade, baseline_materials, current_materials):
+    """Retain native root identity while applying a slice's actual light state.
+
+    Native source preparation fixes the spatial and wavelength sample set.  A
+    camera slice may change the source energy without changing those samples:
+    each root's original beta is multiplied by current/baseline MatBuf emission
+    at its own triangle and frequency.  The caller must also install the same
+    current MatBuf for camera paths and area NEE before dispatching that slice.
+    A newly emitting band absent from the prepared population is refused.
+    """
+    rows=np.asarray(roots,np.float32)
+    if rows.ndim!=2 or rows.shape[1]!=12 or not np.isfinite(rows).all():
+        raise ValueError('native source roots must be finite SourceRec12 rows')
+    base=np.asarray(baseline_materials,np.float32)
+    current=np.asarray(current_materials,np.float32)
+    if base.shape!=current.shape or base.ndim!=2 or base.shape[1]!=12 or len(base)%32:
+        raise ValueError('slice MatBuf must retain the prepared material layout')
+    if not np.isfinite(base).all() or not np.isfinite(current).all():
+        raise ValueError('slice MatBuf must be finite')
+    out=rows.copy()
+    if not len(rows):return out
+    ids=rows[:,7].astype(np.int64)-1
+    if np.any(ids<0) or np.any(ids>=len(shade)) or not np.array_equal(ids+1,rows[:,7]):
+        raise ValueError('native roots must retain triangle identities')
+    mids=np.ascontiguousarray(np.asarray(shade)[ids,14]).view(np.uint32)
+    if np.any(mids>=len(base)//32):raise ValueError('native root material is outside MatBuf')
+    base_table=base.reshape(-1,32,12)[mids]
+    current_table=current.reshape(-1,32,12)[mids]
+    valid=base_table[:,:,0]>0
+    nearest=np.argmin(np.where(valid,abs(base_table[:,:,0]-rows[:,None,8]),np.inf),axis=1)
+    indices=np.arange(len(rows))
+    old=base_table[indices,nearest,5]
+    new=current_table[indices,nearest,5]
+    if np.any(~valid[indices,nearest]) or np.any(old<=0) or np.any(new<0):
+        raise ValueError('slice emission needs prepared positive spectral roots')
+    if np.any((current_table[:,:,5]>0)&(base_table[:,:,5]<=0)&valid):
+        raise ValueError('slice introduced an unprepared emitting band')
+    out[:,10]=(rows[:,10].astype(np.float64)*(new.astype(np.float64)/old.astype(np.float64))).astype(np.float32)
+    if not np.isfinite(out).all():raise ValueError('slice source beta is nonfinite')
+    return out
+
+
+def timed_light_buffers(baseline_scene, current_scene):
+    """Map the current emitter powers onto stable prepared native material IDs."""
+    base_geom,base_shade,base_mat,base_triangles=baseline_scene[:4]
+    geom,shade,mat,triangles=current_scene[:4]
+    if not np.array_equal(geom[:,:15],base_geom[:,:15]) or not np.array_equal(triangles,base_triangles):
+        raise ValueError('timed light frame changed native geometry')
+    base_ids=np.ascontiguousarray(base_shade[:,14]).view(np.uint32)
+    current_ids=np.ascontiguousarray(shade[:,14]).view(np.uint32)
+    adjusted_mat=np.array(base_mat,copy=True).reshape(-1,32,12)
+    current_table=np.asarray(mat,np.float32).reshape(-1,32,12)
+    for base_id in np.unique(base_ids):
+        peers=np.unique(current_ids[base_ids==base_id])
+        if len(peers)!=1 or peers[0]>=len(current_table):
+            raise ValueError('timed light frame split a prepared material identity')
+        old=adjusted_mat[base_id]
+        new=current_table[peers[0]]
+        if not np.array_equal(old[:,0],new[:,0]):
+            raise ValueError('timed light frame changed spectral band identity')
+        old[:,5]=new[:,5]
+    adjusted_mat=adjusted_mat.reshape(-1,12)
+    adjusted_shade=np.array(shade,copy=True)
+    adjusted_shade[:,14]=base_shade[:,14]
+    roots=reweight_native_sources(baseline_scene[7],base_shade,base_mat,adjusted_mat)
+    return adjusted_shade,adjusted_mat,roots
+
+
+def install_timed_light_frame(field, sensor, baseline_scene, current_scene):
+    """Install one captured light state in both native readers at a sweep boundary.
+
+    The sensor texture and its pass counter remain owned by the exposure.  The
+    forward field is rebuilt by the caller for this interval only.
+    """
+    if sensor._row_off != 0:
+        raise RuntimeError('timed light state requires a complete sensor sweep')
+    base_geom,_,_,base_triangles=baseline_scene[:4]
+    adjusted_shade,adjusted_mat,roots=timed_light_buffers(baseline_scene,current_scene)
+    if len(roots)!=field['n_sources'] or len(roots)!=sensor._nee_source_count:
+        raise ValueError('timed light frame changed the prepared source population')
+    from OpenGL import GL
+    GL.glFinish()
+    for binding,data in ((9,adjusted_shade),(10,adjusted_mat),(5,roots)):
+        data=np.ascontiguousarray(data,np.float32)
+        GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER,field['ssbo'][binding])
+        GL.glBufferData(GL.GL_SHADER_STORAGE_BUFFER,data.nbytes,data,GL.GL_STATIC_DRAW)
+    GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER,0)
+    sensor.set_nee_spectral_sources(roots,field['ssbo'][5],area_scene=(base_geom,adjusted_shade,adjusted_mat,base_triangles))
+    field['source_buf']=roots
+    return roots
+
+
 def area_nee_records(sources, geom, shade, materials, triangles):
     """Camera view of the same native roots, not another source population.
 
@@ -131,6 +223,7 @@ def area_nee_records(sources, geom, shade, materials, triangles):
         distance=np.where(valid,abs(table[mids,:,0]-frequency),np.inf)
         nearest=np.argmin(distance,axis=1)
         out[:,4+band]=table[mids,nearest,5]
+    out[:,9]=ids+1  # camera-only packet.y: native emitting triangle identity
     return np.ascontiguousarray(out)
 
 
@@ -149,6 +242,9 @@ def install_source_population(renderer,field,sensor,scene,wavelengths,settings,i
     GL.glBufferData(GL.GL_SHADER_STORAGE_BUFFER,rows.nbytes,rows,GL.GL_STATIC_DRAW)
     sensor.set_nee_spectral_sources(rows,field['ssbo'][5],area_scene=scene)
     field['source_buf']=rows
+    if field.get('forward_response_owner') is not None:
+        field['response_identity']['population_index']=int(index)
+        field['response_identity']['source_population_seed']=int(seed)
     record=field['directional_record']
     # Stable geometry + current population; aggregate provenance is separate.
     import hashlib

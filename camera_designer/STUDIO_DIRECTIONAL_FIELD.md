@@ -319,3 +319,31 @@ configuration retains the previous shader. This explicit correction changes
 transport results; scalar bit parity is not claimed for the corrected mode.
 Neither finer cells nor this correction guarantees that a finite source
 population visits the subject ROI. Coverage reports only actual recorded data.
+
+## Validity and darkness are not established by occupancy
+
+Every directional export carries validity version partial-track-estimate-v1.
+This metadata describes data quality and does not disable the field path. A nonzero quantized value
+is a recorded estimate, not a completeness certificate; a zero is unknown.
+Neither completed root sweeps nor occupied-cell percentages establish spatial,
+angular, spectral or material completeness. Finite Monte Carlo samples cannot
+prove a region has exactly zero transport.
+
+Current six-float bins discard pre-quantization visit counts, per-spectral-line
+direction moments, angular second moments, per-cell medium/bounce ancestry,
+and per-cell exclusion/rounded-to-zero counts. They carry no known-occlusion
+or error/convergence certificate. Scene material tables identify geometry but
+do not identify which medium contributed each cell. Internal Beer observer
+metadata describes the integrated law, not per-cell interior coverage. The
+three fixed spectral lines are not a continuous spectrum. Mean directions can
+cancel and cannot represent every incident direction within a bin. Signed
+RGB values and exact transform metadata must not be confused with negative
+physical line energy.
+
+A future measured sampling contract needs bounded per-cell/per-band arrival
+and exclusion counters, spectral moments, medium attribution or an explicit
+mixed/unknown state, complete reset/population accounting, counter-overflow
+handling and producer-to-screen validity propagation. Even those observations
+must distinguish measured visits from certified visibility and must not turn
+sample thresholds into proof of darkness. Sparse field availability must alpha-blend with Phong for the unknown portion;
+energy zero must not be used as availability.

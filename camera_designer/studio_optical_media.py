@@ -67,11 +67,15 @@ def validate_optical_media(value, pbr, required_ids):
     return result
 
 
-def optical_extinction(record, wavelength_um):
-    """Linearly interpolate sigma_a over wavelength; never extrapolate silently."""
+def optical_extinction(record, wavelength_um, *, outside_policy="error"):
+    """Interpolate authored absorption; explicitly clear unmeasured game bands."""
     nm = float(wavelength_um)*1000
     w = record['wavelengths_nm']
-    if not math.isfinite(nm) or not w[0] <= nm <= w[-1]:
+    if not math.isfinite(nm):
+        raise ValueError('transport wavelength outside authored optical spectrum')
+    if not w[0] <= nm <= w[-1]:
+        if outside_policy == "game-transparent-outside-authored-v1":
+            return 0.0
         raise ValueError('transport wavelength outside authored optical spectrum')
     sigma = -np.log(np.asarray(record['transmittance'], np.float64)) / (record['reference_thickness_mm']*.001)
     sigma *= record['concentration']

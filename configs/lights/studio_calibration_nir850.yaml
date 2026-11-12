@@ -1,0 +1,7 @@
+description: Studio exposure card alignment emitter, 850 nm near infrared
+spectrum:
+  type: gaussian_peaks
+  peaks:
+    - nm: 850.0
+      fwhm_nm: 12.0
+      weight: 1.0

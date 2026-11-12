@@ -123,7 +123,8 @@ def with_sphere_regions(source):
     return source
 
 
-def pack_sphere_regions(scene, original_indices, object_offset, regions, *, scale_m, center_m):
+def pack_sphere_regions(scene, original_indices, object_offset, regions, *, scale_m, center_m,
+                        response_lineage_out=None):
     """Replace only declared sphere faces, retaining owner materials/media."""
     geom, shade, mat, tris, contexts, ctx_map, bounds, sources = scene
     indices = np.asarray(original_indices, np.int64)
@@ -146,6 +147,8 @@ def pack_sphere_regions(scene, original_indices, object_offset, regions, *, scal
         records[i, :3] = np.asarray(center_m, np.float64) + float(scale_m) * np.asarray(sphere["center"])
         records[i, 3] = float(scale_m) * sphere["radius"]
     old_to_new = np.cumsum(keep, dtype=np.int64) - 1
+    if response_lineage_out is not None:
+        response_lineage_out.compact_spheres(keep, old_to_new, representatives, spheres)
     geom, shade, tris = geom[keep].copy(), shade[keep].copy(), tris[keep].copy()
     for i, old in enumerate(representatives):
         index = int(old_to_new[old])

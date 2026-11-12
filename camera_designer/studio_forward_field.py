@@ -39,6 +39,10 @@ def validate_receive_light_field(config):
         raise ValueError('receive_light_field must be a boolean')
     if enabled and config.get('transport', 'fixed:1') != 'fixed:3':
         raise ValueError('receive_light_field requires fixed:3 transport')
+    information=config.get('light_field_information')
+    if information is not None:
+        if information!='evaluated-responses-v1' or not enabled:
+            raise ValueError('evaluated response copies require explicit field information opt-in')
     return enabled
 
 
@@ -156,13 +160,14 @@ class ForwardFieldPublisher:
         counts = renderer._gpu_readback_prebuilt(field['tex_bands'], dimensions)
         rgb = field_to_linear_srgb(counts, dimensions)
         payload = rgb.tobytes(order='C')
+        payload_parts = [payload]
         sections = {}
         directional_unavailable = None
         if field.get('directional_record') is not None:
             from camera_designer.studio_directional_field import bundle_sections, DirectionalUnavailable
             try:
-                extra, sections = bundle_sections(field['directional_record'], field['source_buf'], len(payload))
-                payload += extra
+                extra, sections = bundle_sections(field['directional_record'], field['source_buf'], len(payload), streaming=True)
+                payload_parts.extend(extra)
             except DirectionalUnavailable as unavailable:
                 # Optional recording must never kill the primary exposure or
                 # silently reset/normalize the existing scalar estimator.
@@ -175,17 +180,22 @@ class ForwardFieldPublisher:
         target = self.output / name
         temporary = target.with_suffix('.tmp')
         try:
-            temporary.write_bytes(payload)
+            with temporary.open('wb') as stream:
+                for part in payload_parts:
+                    stream.write(part)
             os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
+        payload_length=sum(len(part) for part in payload_parts)
+        payload_hash=hashlib.sha256()
+        for part in payload_parts:payload_hash.update(part)
         self.sequence += 1
         self.latest = {
             'schema': 'studio.forward-field.v1', 'digest': self.digest,
             'live_revision': int(live_revision), 'sequence': self.sequence,
             'sweep': int(sweep), 'sensor_samples': int(sensor_samples),
-            'name': name, 'byte_length': len(payload),
-            'sha256': hashlib.sha256(payload).hexdigest(),
+            'name': name, 'byte_length': payload_length,
+            'sha256': payload_hash.hexdigest(),
             'dimensions': list(dimensions),
             'bounds_min_m': bmin.tolist(),
             'bounds_max_m': bmax.tolist(),

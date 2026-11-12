@@ -14,9 +14,9 @@ def test_secondary_field_hidden_gpu_pixels():
     assert result.returncode == 0, result.stdout + result.stderr
     receipt = json.loads(result.stdout.strip().splitlines()[-1])
     assert receipt["status"] == "PASS"
-    assert receipt["checks"] >= 68
+    assert receipt["checks"] >= 5
     assert receipt["legacy_bit_identical"]
-    assert receipt["transparent_layers"] == 2
+    assert receipt["current_response_fallback"]
 
 
 def test_secondary_field_project_ir_export_and_es_link(tmp_path):
@@ -25,10 +25,14 @@ def test_secondary_field_project_ir_export_and_es_link(tmp_path):
     assert "invariant gl_Position;" in vertex.source
     assert fragment.project_ir.schema == "turing.glsl-project-ir.v1"
     source = fragment.source
-    for name in ("uLinearOutput", "uFieldRadiance", "uFieldDirection", "uFieldMaterialMask",
-                 "uFieldGridDepth", "uFieldViewFromWorld", "uSecondaryPhongSpecular",
-                 "uFieldResolvedColor", "uFieldBinCount", "uFieldAtlasColumns", "uFieldSpatialLinear", "PLUCK_SECONDARY_FIELD"):
+    for name in ("uLinearOutput", "uResponseRows", "uResponseCount", "uResponseQueryContext",
+                 "uResponseDimensions", "uResponseWorldFromView", "uResponseStencil",
+                 "uFieldResolvedColor", "uFieldResolvedVolume", "uResponseBinCount", "PLUCK_SECONDARY_FIELD"):
         assert name in source
+    assert "vResponseRecipient" in source and "aResponseRecipient" in vertex.source
+    assert "field_material_mask" not in source
+    assert "direction_moment" not in source
+    assert "float(b.w) / float(c.x)" in source
     assert "turing_ssbo_load_pbr" in source
     assert "turing_ssbo_load_phong" in source
     assert "turing_ssbo_load_texstack" in source

@@ -179,7 +179,12 @@ flat in int  vCullImmune;
 in  vec2     vUv;
 in  vec3     vVelocityW;   // world-space surface velocity (m/s) for optical effects
 
+#ifdef PLUCK_SECONDARY_FIELD
+layout(location = 0) out vec4 FragColor;
+layout(location = 1) out uvec2 ResponseRecipientDepth;
+#else
 out vec4 FragColor;
+#endif
 
 // Multi-light array — every light is a real emitter.
 #define MAX_LIGHTS 100
@@ -234,44 +239,78 @@ uniform float uAmbientFloorGain = 1.0;
 // Opt-in scene-linear premultiplied output. A host must resolve exposure/ACES/
 // sRGB exactly once after all layers; false preserves the legacy display path.
 uniform bool uLinearOutput = false;
-#if defined(PLUCK_SECONDARY_FIELD) || defined(PLUCK_FIELD_PRIMARY)
-uniform usampler2D uFieldMaterialMask;
-uniform bool uFieldReplaceSpecular = false;
-// Per-geometry ownership, never a material-ID category guess.
-uniform bool uFieldCategoryDisabled = false;
-// Opt-in bounded directional ROI. Zero preserves old host binding behavior.
-uniform bool uFieldRestrictToBounds = false;
-uint field_material_mask(int id) {
-    if (uFieldCategoryDisabled) return 0u;
-    if (uFieldRestrictToBounds) {
-        vec3 coordinate = (uFieldFromView * vec4(vPosV, 1.0)).xyz;
-        if (!all(greaterThanEqual(coordinate, vec3(0.0))) ||
-            !all(lessThanEqual(coordinate, vec3(1.0)))) return 0u;
-    }
-    ivec2 mask_size = textureSize(uFieldMaterialMask, 0);
-    if (id >= 0 && id < mask_size.x * mask_size.y) {
-        return texelFetch(uFieldMaterialMask,
-            ivec2(id % mask_size.x, id / mask_size.x), 0).r;
-    }
-    return 0u;
-}
-#endif
 #ifdef PLUCK_SECONDARY_FIELD
-// Configurable angular cells tiled across X and Z. RGBA direction stores
-// measured weighted world propagation moments and their scalar weight.
-// Legacy RGB direction textures have implicit weight one. This angular atlas is
-// not a full light-field reconstruction or a refracted-ray solution.
+flat in uint vResponseRecipient;
 uniform sampler2D uFieldResolvedColor;
-uniform sampler3D uFieldRadiance;
-uniform sampler3D uFieldDirection;
-uniform float uFieldGridDepth = 32.0;
-uniform int uFieldBinCount = 6;
-uniform int uFieldAtlasColumns = 1;
-uniform bool uFieldSpatialLinear = false;
-uniform mat3 uFieldViewFromWorld = mat3(1.0);
+uniform sampler2D uFieldResolvedVolume;
+uniform usampler2D uResponseRows;
+uniform usampler2D uResponseNearestRecipient;
+uniform int uResponseCount = 0;
+uniform int uResponseQueryContext = -1;
+uniform ivec3 uResponseDimensions;
+uniform mat4 uResponseFromView;
+uniform mat3 uResponseWorldFromView;
+uniform vec3 uResponseStencil[12];
+uniform int uResponseBinCount = 12;
+uniform bool uFieldCategoryDisabled = false;
 uniform int uSecondaryPass = 0; // 0=body scattering, 1=reflection, 2=transparent layers, 3=resolve
-// Prefer authored direct-light Phong specular instead of field specular.
-uniform bool uSecondaryPhongSpecular = false;
+
+uvec4 response_words(int texel) {
+    int width = textureSize(uResponseRows, 0).x;
+    return texelFetch(uResponseRows, ivec2(texel % width, texel / width), 0);
+}
+
+// Lexicographic lookup of COPIED recipient/cell/bin/context/component keys.
+// Direction is the camera query propagation toward the scene, not forward
+// packet propagation or a reconstructed light. No material factors enter here.
+vec4 evaluated_response(int component) {
+    if (uFieldCategoryDisabled || vResponseRecipient == 0u ||
+        uResponseQueryContext < 0 || uResponseCount <= 0) return vec4(0.0);
+    if (component != 0) {
+        // These are complete FIRST-recipient downstream camera responses.
+        // A cached farther surface cannot consume one through a nearer layer.
+        // Both fields were copied from this shader's actual nearest fragment.
+        uvec2 nearest = texelFetch(uResponseNearestRecipient, ivec2(gl_FragCoord.xy), 0).rg;
+        if (nearest.x != vResponseRecipient || nearest.y != floatBitsToUint(gl_FragCoord.z))
+            return vec4(0.0);
+    }
+    vec3 coordinate = (uResponseFromView * vec4(vPosV, 1.0)).xyz;
+    if (any(lessThan(coordinate, vec3(0.0))) ||
+        any(greaterThanEqual(coordinate, vec3(1.0)))) return vec4(0.0);
+    uvec3 cell = uvec3(floor(coordinate * vec3(uResponseDimensions)));
+    vec3 direction = normalize(uResponseWorldFromView * vPosV);
+    int bin = 0; float greatest = -2.0;
+    for (int j = 0; j < 12; ++j) {
+        if (j >= uResponseBinCount) break;
+        float score = dot(uResponseStencil[j], direction);
+        if (score > greatest) { greatest = score; bin = j; }
+    }
+    uvec4 key0 = uvec4(vResponseRecipient, cell);
+    uvec3 key1 = uvec3(uint(bin), uint(uResponseQueryContext), uint(component));
+    int lo = 0, hi = uResponseCount;
+    for (int step = 0; step < 32; ++step) {
+        if (lo >= hi) break;
+        int mid = lo + (hi - lo) / 2;
+        uvec4 a = response_words(mid * 3), b = response_words(mid * 3 + 1);
+        int order = 0;
+        for (int j = 0; j < 4; ++j) {
+            if (order == 0 && a[j] != key0[j]) order = a[j] < key0[j] ? -1 : 1;
+        }
+        for (int j = 0; j < 3; ++j) {
+            if (order == 0 && b[j] != key1[j]) order = b[j] < key1[j] ? -1 : 1;
+        }
+        if (order < 0) lo = mid + 1;
+        else if (order > 0) hi = mid;
+        else {
+            uvec4 c = response_words(mid * 3 + 2);
+            if (c.x == 0u || b.w == 0u) return vec4(0.0);
+            // Known zero RGB still has nonzero availability. RGB is the native
+            // conditional mean and has not already been availability-weighted.
+            return vec4(uintBitsToFloat(c.yzw), float(b.w) / float(c.x));
+        }
+    }
+    return vec4(0.0);
+}
 #endif
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
@@ -322,8 +361,26 @@ float light_shadow_visibility(int light_index, vec3 N, vec3 L) {
 // leaves the body and is composited on its own.
 vec3 pluck_display(vec3 c) {
     vec3 lin = max(c, vec3(0.0)) * max(uExposure, 0.0);
+#ifdef PLUCK_SECONDARY_FIELD
+    // The same ACES rational equation, evaluated after the final component
+    // sum. Divide by x^2 above one to preserve finite float32 HDR values
+    // without overflowing intermediate squares into inf/inf. Ordinary hosts
+    // retain their original expression and token stream below.
+    for (int j = 0; j < 3; ++j) {
+        float x = lin[j];
+        if (x > 1.0) {
+            float reciprocal = 1.0 / x;
+            lin[j] = clamp((2.51 + 0.03 * reciprocal) /
+                (2.43 + 0.59 * reciprocal + 0.14 * reciprocal * reciprocal), 0.0, 1.0);
+        } else {
+            lin[j] = clamp((x * (2.51 * x + 0.03)) /
+                (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+        }
+    }
+#else
     lin = clamp((lin * (2.51 * lin + 0.03)) /
                 (lin * (2.43 * lin + 0.59) + 0.14), 0.0, 1.0);
+#endif
     vec3 s1 = lin * 12.92;
     vec3 s2 = 1.055 * pow(lin, vec3(1.0 / 2.4)) - 0.055;
     return mix(s1, s2, step(vec3(0.0031308), lin));
@@ -336,6 +393,7 @@ void main() {
 #ifdef PLUCK_SECONDARY_FIELD
     if (uSecondaryPass == 3) {
         vec4 linear_color = texelFetch(uFieldResolvedColor, ivec2(gl_FragCoord.xy), 0);
+        linear_color.rgb += texelFetch(uFieldResolvedVolume, ivec2(gl_FragCoord.xy), 0).rgb;
         FragColor = vec4(pluck_display(linear_color.rgb), linear_color.a);
         return;
     }
@@ -354,6 +412,28 @@ void main() {
     if (vCullImmune == 0 && !front_facing) {
         discard;
     }
+
+#ifdef PLUCK_SECONDARY_FIELD
+    vec4 copied_response = evaluated_response(uSecondaryPass);
+    if (uSecondaryPass == 0) {
+        // The primary has no pre-first-hit camera-volume term. Its true
+        // baseline is zero; keep this separate from downstream replacements.
+        FragColor = vec4(copied_response.rgb * copied_response.a, 0.0);
+        ResponseRecipientDepth = uvec2(vResponseRecipient, floatBitsToUint(gl_FragCoord.z));
+        return;
+    }
+    if (uSecondaryPass == 1) {
+        if (copied_response.a <= 0.0) discard;
+        FragColor = vec4(copied_response.rgb * copied_response.a, copied_response.a);
+        return;
+    }
+    if (copied_response.a >= 1.0) {
+        FragColor = vec4(copied_response.rgb, 1.0);
+        return;
+    }
+    // Only uncovered transparent fractions need ordinary Phong below. None
+    // of its optics/material equations is applied to the copied response.
+#endif
 
     // Material parameters
     vec3  albedo   = mat_albedo   (id);
@@ -434,45 +514,7 @@ void main() {
 #endif
 #endif
 
-#ifdef PLUCK_SECONDARY_FIELD
-    // The primary opaque depth buffer is retained by the host (EQUAL for
-    // passes 0/1). Pass 2 redraws ALL transparent layers back-to-front with
-    // primary + field light, so nearer layers attenuate farther contributions.
-    // Delivered native class bits: body scattering=1, reflection=2, glass=4.
-    // The host validates material identity before uploading this mask.
-    uint field_mask = field_material_mask(id);
-    float field_alpha = opacity;
-#ifdef PLUCK_TRANSMISSION
-    if (m_trans > 0.0) field_alpha = min(opacity, 1.0 - 0.8 * m_trans);
-#ifdef PLUCK_PREMULTIPLIED_GLASS
-    if (glass_preview) field_alpha = 1.0 - glass_weight *
-        (1.0 - clamp(max(F_vec.r, max(F_vec.g, F_vec.b)), 0.0, 1.0));
-#endif
-#endif
-    if (uSecondaryPass < 2 && field_alpha < 0.85) discard;
-    // Pass 2 owns the host's retained transparent mesh list. A transmissive
-    // mesh can have near-opaque Fresnel coverage and must still be rendered;
-    // imposing the opaque threshold again here would drop those layers.
-    if (uSecondaryPass == 0 && (field_mask & 1u) == 0u) discard;
-    if (uSecondaryPass == 1 && (field_mask & 2u) == 0u) discard;
-#ifdef PLUCK_TRANSMISSION
-    // A material with no body scattering/remission contributes exactly zero
-    // in pass 0. Avoid twelve atlas reads on ordinary opaque room surfaces;
-    // this uses the authored response, not a brightness/visibility heuristic.
-    if (uSecondaryPass == 0 && tl_frac <= 0.0 && remit_g <= 0.0) discard;
-#endif
-    vec3 field_coord = (uFieldFromView * vec4(vPosV, 1.0)).xyz;
-    bool field_inside = all(greaterThanEqual(field_coord, vec3(0.0))) &&
-                        all(lessThanEqual(field_coord, vec3(1.0)));
-    int primary_count = uSecondaryPass == 2 ? min(uNumLights, MAX_LIGHTS) : 0;
-#endif
-
     bool direct_specular = uEnableSpecular;
-#ifdef PLUCK_FIELD_PRIMARY
-    uint primary_field_mask = field_material_mask(id);
-    direct_specular = direct_specular &&
-        !(uFieldReplaceSpecular && (primary_field_mask & 2u) != 0u);
-#endif
 
     // Direct illumination from real emitters only.
     vec3 col = base * clamp(ph_ambient(id), 0.0, 0.12) * uAmbientFloorGain;
@@ -484,87 +526,28 @@ void main() {
     vec3 spec_col_acc = vec3(0.0);
     float spec_acc = 0.0;
     int n = min(uNumLights, MAX_LIGHTS);
-#ifdef PLUCK_SECONDARY_FIELD
-    if (uSecondaryPass != 2) col = vec3(0.0);
-    n = primary_count + clamp(uFieldBinCount, 1, 12);
-#endif
     for (int i = 0; i < n; ++i) {
-#ifdef PLUCK_SECONDARY_FIELD
-        bool field_sample = i >= primary_count;
-        vec3 L, Lcol;
-        if (field_sample) {
-            if (!field_inside || uFieldGain <= 0.0 || field_mask == 0u) continue;
-            int bin = i - primary_count;
-            int depth = max(int(uFieldGridDepth), 1);
-            int columns = max(uFieldAtlasColumns, 1);
-            ivec3 atlas_size = textureSize(uFieldRadiance, 0);
-            ivec3 field_size = ivec3(atlas_size.x / columns, atlas_size.y, depth);
-            ivec3 tile = ivec3((bin % columns) * field_size.x, 0, (bin / columns) * depth);
-            vec3 field_rgb;
-            vec4 direction_moment;
-            if (uFieldSpatialLinear) {
-                // Interpolate actual energy and weighted moments together,
-                // never unweighted directions or fabricated empty-cell light.
-                // Half-cell clamping prevents filtering across angular tiles.
-                vec3 local = clamp(field_coord * vec3(field_size), vec3(0.5), vec3(field_size) - 0.5);
-                vec3 atlas_coord = (vec3(tile) + local) / vec3(atlas_size);
-                field_rgb = texture(uFieldRadiance, atlas_coord).rgb;
-                direction_moment = texture(uFieldDirection, atlas_coord);
-            } else {
-                // Exact nearest-cell partition remains available for comparison.
-                ivec3 field_cell = min(ivec3(floor(field_coord * vec3(field_size))), field_size - 1) + tile;
-                field_rgb = texelFetch(uFieldRadiance, field_cell, 0).rgb;
-                direction_moment = texelFetch(uFieldDirection, field_cell, 0);
-            }
-            if (direction_moment.w <= 0.0) continue;
-            vec3 propagation = direction_moment.xyz / max(direction_moment.w, 1e-30);
-            float coherence = clamp(length(propagation), 0.0, 1.0);
-            if (coherence <= 1e-6) continue;
-            L = normalize(uFieldViewFromWorld * -propagation);
-            Lcol = field_rgb * (uFieldGain * coherence);
-        } else {
-#endif
         if (uLightGroupId[i] == vGroupId) {
             continue;
         }
         vec3  Lvec  = uLightPos[i] - vPosV;
         float Lr2   = max(dot(Lvec, Lvec), 1e-8);
-#ifdef PLUCK_SECONDARY_FIELD
-        L = Lvec * inversesqrt(Lr2);
-#else
         vec3  L     = Lvec * inversesqrt(Lr2);
-#endif
         float emitter_r2 = max(uLightIntensity[i], 0.0) * 0.0795774715; // area / (4*pi)
         float atten_r2 = max(Lr2 + emitter_r2, 1e-8);
-#ifdef PLUCK_SECONDARY_FIELD
-        Lcol = uLightColor[i] * ((uLightIntensity[i] * uLightCalibration) / atten_r2);
-#else
         vec3  Lcol  = uLightColor[i] * ((uLightIntensity[i] * uLightCalibration) / atten_r2);
-#endif
         // Spot cone: a light with a direction lights only the fragments inside
         // its cone, fading across the edge between the inner and outer angles.
         if (dot(uLightSpotDir[i], uLightSpotDir[i]) > 0.25) {
             float cos_a = dot(-L, normalize(uLightSpotDir[i]));
             Lcol *= smoothstep(uLightSpotCone[i].y, uLightSpotCone[i].x, cos_a);
         }
-#ifdef PLUCK_SECONDARY_FIELD
-        }
-#endif
-#ifdef PLUCK_SECONDARY_FIELD
-        // Exact back-light is common in angular bins; normalize(0) is undefined.
-        vec3 half_sum = L + V;
-        vec3 H = half_sum * inversesqrt(max(dot(half_sum, half_sum), 1e-12));
-#else
         vec3  H     = normalize(L + V);
-#endif
         float NdotL = max(dot(N, L), 0.0);
         float NdotH = max(dot(N, H), 0.0);
         float spec  = pow(NdotH, max(shini, 1.0));
         float visibility = 1.0;
 #ifdef PLUCK_SHADOW_MAP
-#ifdef PLUCK_SECONDARY_FIELD
-        if (!field_sample)
-#endif
         visibility = light_shadow_visibility(i, N, L);
 #endif
 
@@ -572,37 +555,11 @@ void main() {
         bool specular_sample = direct_specular;
         bool transmission_sample = true;
         bool body_sample = true;
-#ifdef PLUCK_FIELD_PRIMARY
-        // The field contains zero-bounce as well as bounced source segments.
-        // Its eligible components REPLACE direct-light estimates, never add
-        // a second copy. Authored ambient/self-emission remain outside this loop.
-        diffuse_sample = (primary_field_mask & 2u) == 0u;
-        transmission_sample = (primary_field_mask & 4u) == 0u;
-        body_sample = (primary_field_mask & 1u) == 0u;
-#endif
-#ifdef PLUCK_SECONDARY_FIELD
-        if (field_sample) {
-            diffuse_sample = uSecondaryPass != 0 && (field_mask & 2u) != 0u;
-            specular_sample = direct_specular && diffuse_sample && !uSecondaryPhongSpecular;
-            transmission_sample = uSecondaryPass == 2 && (field_mask & 4u) != 0u;
-            body_sample = uSecondaryPass != 1 && (field_mask & 1u) != 0u;
-        } else {
-            diffuse_sample = (field_mask & 2u) == 0u;
-            // Specular override must not depend on the diffuse ownership gate.
-            specular_sample = direct_specular && (uSecondaryPhongSpecular || diffuse_sample);
-            transmission_sample = (field_mask & 4u) == 0u;
-            body_sample = (field_mask & 1u) == 0u;
-        }
-#endif
         if (diffuse_sample) col += base * Lcol * NdotL * visibility * diffuse_weight;
         if (specular_sample) col += Lcol * F_vec * (specstr * spec) * visibility;
 
         if (
-#if defined(PLUCK_SECONDARY_FIELD) || defined(PLUCK_FIELD_PRIMARY)
-            specular_sample
-#else
             !uLinearOutput || direct_specular
-#endif
         ) {
             spec_col_acc += Lcol * spec * visibility;
             spec_acc     += spec * visibility;
@@ -643,9 +600,6 @@ void main() {
 #endif
 
     // ── Self-emission via UV texture-pack ────────────────────────────────
-#ifdef PLUCK_SECONDARY_FIELD
-    if (uSecondaryPass == 2) {
-#endif
     float emit_layer = tx_emit_layer(id);
     vec4  e_uv     = (emit_layer >= 0.0)
                    ? texture(uEmitUv, vec3(vUv, emit_layer))
@@ -691,9 +645,6 @@ void main() {
         col = max(col, vec3(0.0));
     }
 
-#ifdef PLUCK_SECONDARY_FIELD
-    }
-#endif
 
     // ── Enamel thin-film coating ──────────────────────────────────────────
     vec3  spec_col = spec_col_acc;
@@ -751,7 +702,8 @@ void main() {
         if (uRenderPass == 1 && glass_alpha < 0.85) discard;
         if (uRenderPass == 2 && glass_alpha >= 0.85) discard;
 #ifdef PLUCK_SECONDARY_FIELD
-        FragColor = vec4(col + uCatCcmMatrix * col_t, uSecondaryPass == 2 ? glass_alpha : 0.0);
+        FragColor = mix(vec4(col + uCatCcmMatrix * col_t, glass_alpha),
+                        vec4(copied_response.rgb, 1.0), copied_response.a);
 #else
         if (uLinearOutput) {
             FragColor = vec4(col + uCatCcmMatrix * col_t, glass_alpha);
@@ -772,8 +724,12 @@ void main() {
     if (uRenderPass == 2 && alpha >= 0.85) discard;
 
 #ifdef PLUCK_SECONDARY_FIELD
-    FragColor = vec4(col * alpha + uCatCcmMatrix * col_t,
-                     uSecondaryPass == 2 ? alpha : 0.0);
+    vec3 baseline_color = col * alpha;
+#ifdef PLUCK_TRANSMISSION
+    baseline_color += uCatCcmMatrix * col_t;
+#endif
+    FragColor = mix(vec4(baseline_color, alpha),
+                    vec4(copied_response.rgb, 1.0), copied_response.a);
     return;
 #else
     if (uLinearOutput) {

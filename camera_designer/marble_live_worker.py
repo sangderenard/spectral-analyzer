@@ -37,6 +37,9 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
     source_settings=sampling_settings(config)
     ray_batch_size = _ray_batch_size(live)
     from OpenGL.GL import glFinish
+    if field.get('forward_response_owner') is not None:
+        from camera_designer.studio_response_factory import admit_response_history_change
+        admit_response_history_change(accumulator,field,live['history_samples'],live.get('checkpoint',False))
     accumulator.set_history(live["history_samples"], checkpoint=live.get("checkpoint", False))
     accumulator._aspect = live["aspect"]
     camera = config.get("camera")
@@ -143,6 +146,9 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
                                          focus_dist=camera["focus_distance_m"],
                                          n_blades=camera.get("aperture_blades", 0),
                                          aperture_rot=camera.get("aperture_rotation_radians", 0))
+                    if field.get('forward_response_owner') is not None:
+                        from camera_designer.studio_response_factory import admit_response_history_change
+                        admit_response_history_change(accumulator,field,live['history_samples'],live.get('checkpoint',False))
                     accumulator.set_history(live["history_samples"], checkpoint=live.get("checkpoint", False))
                     accumulator._aspect = live["aspect"]
                     # Forward energy is additive, not normalized by batch
@@ -152,6 +158,7 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
                     if refresh_sources is not None:
                         field.get('directional_record',{}).pop('progressive',None)
                     revision = pending_control["revision"]
+                    if config.get("light_field_information")=="evaluated-responses-v1":field["response_live_revision"]=revision
                     if field_publisher is not None:
                         field_publisher.invalidate()
                         status.pop('light_field', None)
@@ -171,6 +178,10 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
                     renderer._clear_prebuilt(field,preserve_directional_history=True)
                 else:renderer._clear_prebuilt(field)
                 field["_pump_seed"] = seed
+                if field.get('forward_response_owner') is not None:
+                    field['response_live_revision']=int(revision)
+                    from camera_designer.studio_response_factory import rebind_response_owner
+                    rebind_response_owner(accumulator,field,camera)
                 renderer._gpu_pump_prebuilt(field, n_rays=ray_batch_size)
                 if refresh_sources is not None:
                     from camera_designer.studio_directional_field import commit_source_population
@@ -184,7 +195,12 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
                 # Same retained history dispatch; no forward-field/camera edits while on loan.
                 cooperative_pump.revision=f'{digest}:live:{revision}:pass:{accumulator._pass}'
                 cooperative_pump.step(accumulator)
-            else:accumulator.tick(strips=1)
+            else:
+                if config.get("light_field_information")=="evaluated-responses-v1":
+                    from camera_designer.studio_response_factory import rebind_response_owner
+                    field['response_live_revision']=int(revision)
+                    rebind_response_owner(accumulator,field,camera)
+                accumulator.tick(strips=1)
             sensor_sites += completed_sites
         epoch += 1
         if epoch % 8 == 0:
@@ -216,6 +232,7 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
                           forward_history=(f"fresh {ray_batch_size}-ray scalar per sensor sweep; directional mean over complete refreshed source populations" if refresh_sources is not None else f"fresh {ray_batch_size}-ray field per sensor sweep"),
                           width=accumulator._w,height=accumulator._h)
             if config.get('surface_transport') is not None:status['surface_transport']=config['surface_transport']
+            if field.get("response_components") is not None:status["response_components"]=field["response_components"]
             if cooperative_pump is not None:status.update(client_work_profile=dict(cooperative_pump.profile),client_work_state='committed')
             if dynamic_scene_reader is not None and dynamic_scene_reader.ack is not None:
                 status["scene_ack"] = dict(dynamic_scene_reader.ack)
@@ -227,5 +244,8 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
                     scene_ack=status.get('scene_ack'))
                 if exported is not None:
                     status['light_field'] = exported
+            if field.get('scene_response_publisher') is not None:
+                recorded=field['scene_response_publisher'].publish(field['scene_response_consumer'],live_revision=revision)
+                if recorded is not None:status['scene_responses']=recorded
             atomic_json(output / "status.json", status)
             last_snapshot = time.monotonic()

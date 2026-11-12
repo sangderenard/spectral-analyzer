@@ -10,21 +10,23 @@ def ref(key,gain=1,material=0):
     return dict(material=material,profile=key,revision=d['revision'],gain=gain,filter=[1,1,1])
 
 
-def scene(reference):
+def scene(reference,wavelengths=None):
+    wavelengths=wavelengths or ([.65,.55,.45,.59,.365,.395,.85,.94] if reference['profile']=='studio_calibration_nir850' else [.45,.55,.65])
     empty=(np.zeros((0,16),np.float32),np.zeros((0,16),np.float32),np.zeros((0,12),np.float32),np.zeros((0,3,3),np.float32),np.zeros((0,8),np.float32),{},(np.zeros(3),np.ones(3)),np.zeros((0,12),np.float32))
     v=np.array([[[0,0,0],[.1,0,0],[0,.1,0]]],np.float32);p=np.zeros((1,16),np.float32);p[0,:3]=1;p[0,3]=1;p[0,6]=1.5;p[0,7]=1
-    return append_saved_studio_mesh_to_gpu_scene(empty,v,[0],p,scale_m=1,center_m=[0,0,0],wavelengths_um=[.45,.55,.65],emitter_profiles={'version':1,'records':[reference]})
+    return append_saved_studio_mesh_to_gpu_scene(empty,v,[0],p,scale_m=1,center_m=[0,0,0],wavelengths_um=wavelengths,emitter_profiles={'version':1,'records':[reference]})
 
 
 @pytest.mark.parametrize('key',KEYS)
 def test_original_named_source_reaches_native_emission_bands_without_rgb_substitution(key):
     definition,_=named_emitter(key);source=ref(key);s=scene(source)
-    mid=s[1][0,14:15].view(np.uint32)[0];bands=s[2].reshape(-1,32,12)[mid,:3]
-    np.testing.assert_allclose(bands[:,5],transport_band_power(definition,[.45,.55,.65]),rtol=1e-5)
+    wavelengths=[.65,.55,.45,.59,.365,.395,.85,.94] if key=='studio_calibration_nir850' else [.45,.55,.65]
+    mid=s[1][0,14:15].view(np.uint32)[0];bands=s[2].reshape(-1,32,12)[mid,:len(wavelengths)]
+    np.testing.assert_allclose(bands[:,5],transport_band_power(definition,wavelengths),rtol=1e-5,atol=1e-30)
     assert s[0][0,15:16].view(np.uint32)[0]&1
     off=scene(ref(key,0));offmid=off[1][0,14:15].view(np.uint32)[0]
     assert not off[0][0,15:16].view(np.uint32)[0]&1
-    assert not off[2].reshape(-1,32,12)[offmid,:3,5].any()
+    assert not off[2].reshape(-1,32,12)[offmid,:len(wavelengths),5].any()
 
 
 def test_revision_and_duplicate_material_fail_closed():
@@ -45,19 +47,22 @@ def test_native_colour_is_not_peak_normalized():
 def test_source_power_is_preserved_without_pdf_height_dimming():
     d={'wavelengths_nm':[380,750],'spectral_power':[1/370,1/370]}
     assert transport_band_power(d,[.45,.55,.65]).sum()==pytest.approx(3)
-    for key in KEYS:
+    for key in KEYS[:-1]:
         definition,_=named_emitter(key)
         assert transport_band_power(definition,[.45,.55,.65]).sum()==pytest.approx(3)
+    definition,_=named_emitter(KEYS[-1])
+    assert transport_band_power(definition,[.65,.55,.45,.59,.365,.395,.85,.94]).sum()==pytest.approx(8)
 
 @pytest.mark.parametrize('key',KEYS)
 def test_original_native_triangle_emitter_samples_named_power(key):
     from camera_designer.studio_native_emitters import native_emissive_sources
-    s=scene(ref(key));roots=native_emissive_sources(s,[.45,.55,.65],ray_budget=30)
+    wavelengths=[.65,.55,.45,.59,.365,.395,.85,.94] if key=='studio_calibration_nir850' else [.45,.55,.65]
+    s=scene(ref(key));roots=native_emissive_sources(s,wavelengths,ray_budget=30)
     assert len(roots)>=3 and np.isfinite(roots).all()
     # Same authored triangle area and source gain for every profile; changing
     # spectrum redistributes original power instead of shrinking by PDF height.
-    assert roots[:,10].sum()==pytest.approx(.005*3,rel=1e-5)
-    assert len(native_emissive_sources(scene(ref(key,0)),[.45,.55,.65],ray_budget=30))==0
+    assert roots[:,10].sum()==pytest.approx(.005*len(wavelengths),rel=1e-5)
+    assert len(native_emissive_sources(scene(ref(key,0)),wavelengths,ray_budget=30))==0
 
 @pytest.mark.parametrize('bad',[10**400,float('inf'),float('nan')])
 def test_oversized_gain_rejected_as_value_error(bad):
@@ -68,6 +73,17 @@ def test_oversized_gain_rejected_as_value_error(bad):
 def test_oversized_filter_rejected_as_value_error():
     value=ref(KEYS[0]);value['filter']=[10**400,1,1]
     with pytest.raises(ValueError):validate_named_emitter_refs({'version':1,'records':[value]},1)
+
+
+def test_filter_off_uses_unmodified_material_emission_profile():
+    from camera_designer.studio_named_emitters import named_source_material
+    from material_db import EmissionProfileDatabase,profile_to_rgb
+    value=ref('led_cool_white');value['filter']=None
+    validated=validate_named_emitter_refs({'version':1,'records':[value]},1)[0]
+    definition,native=named_emitter(value['profile'])
+    _,payload=named_source_material(validated,[.45,.55,.65],EmissionProfileDatabase())
+    np.testing.assert_allclose(payload['emission_rgb'],np.maximum(profile_to_rgb(native),0),atol=2e-6)
+    np.testing.assert_allclose(transport_band_power(definition,[.45,.55,.65],None).sum(),3,rtol=1e-6)
 
 
 @pytest.mark.parametrize('filter_rgb',[[1,1,1],[1,0,0],[0,.4,1],[0,0,0]])

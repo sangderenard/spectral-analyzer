@@ -362,30 +362,42 @@ def clear(record, preserve_progressive=False):
     if not preserve_progressive:record.pop('progressive',None)
 
 
+def _decode_directional_slices(raw, record, divisor):
+    """Same native decode, bounded one-z-slab color/weight temporaries."""
+    from camera_designer.marble_color_profile import XYZ_TO_SRGB, _LINE_TO_XYZ
+    result=np.zeros(raw.shape,dtype='<f4')
+    matrix=(XYZ_TO_SRGB@_LINE_TO_XYZ).T
+    for z in range(raw.shape[0]):
+        slab=raw[z];out=result[z]
+        if np.any(slab[...,:3]<0):raise DirectionalOverflow('directional field accumulator overflow; clear more frequently')
+        out[...,:3]=((slab[...,:3].astype(np.float64)/record.get('quantization_divisor',65535))@matrix)/(record['voxel_volume_m3']*divisor)
+        weight=slab[...,:3].astype(np.float64).sum(axis=-1)
+        np.divide(slab[...,3:],weight[...,None],out=out[...,3:],where=weight[...,None]>0)
+        norm=np.linalg.norm(out[...,3:],axis=-1,keepdims=True)
+        out[...,3:]/=np.maximum(norm,1)
+    return result
+
+
 def readback(record):
     from OpenGL import GL
-    from camera_designer.marble_color_profile import XYZ_TO_SRGB, _LINE_TO_XYZ
     GL.glMemoryBarrier(GL.GL_BUFFER_UPDATE_BARRIER_BIT|GL.GL_SHADER_STORAGE_BARRIER_BIT)
     GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER,record['buffer'])
     divisor=root_normalization(record)
     grid=record.get('grid_size',32)
     bins=validate_stencil(record['bin_count'])
-    raw=np.frombuffer(GL.glGetBufferSubData(GL.GL_SHADER_STORAGE_BUFFER,0,(word_count(bins,grid)+1)*4),dtype=np.int32).copy()
-    if raw[-1]:raise DirectionalOverflow('directional field signed accumulator overflow; clear more frequently')
-    raw=raw[:-1].reshape(grid,grid,grid,bins,6)
+    words=word_count(bins,grid)
     if record.get('progressive'):
+        # A committed population has already been copied into the owned sum.
+        # Still inspect the native loss flag; do not copy its unused full atlas.
+        overflow=np.frombuffer(GL.glGetBufferSubData(GL.GL_SHADER_STORAGE_BUFFER,words*4,4),dtype=np.int32)
+        if overflow[0]:raise DirectionalOverflow('directional field signed accumulator overflow; clear more frequently')
         raw=record['progressive']['sum']
         divisor=record['progressive']['metadata']['count']
-    if np.any(raw[...,:3]<0):raise DirectionalOverflow('directional field accumulator overflow; clear more frequently')
-    result=np.zeros(raw.shape,dtype='<f4')
-    result[...,:3]=((raw[...,:3].astype(np.float64)/record.get('quantization_divisor',65535))@(XYZ_TO_SRGB@_LINE_TO_XYZ).T)/(record['voxel_volume_m3']*divisor)
-    weight=raw[...,:3].astype(np.float64).sum(axis=-1)
-    np.divide(raw[...,3:],weight[...,None],out=result[...,3:],where=weight[...,None]>0)
-    # Quantization error can exceed unit norm slightly; preserve measured mean,
-    # clamp only to physically possible unit length (not a fabricated direction).
-    norm=np.linalg.norm(result[...,3:],axis=-1,keepdims=True)
-    result[...,3:]/=np.maximum(norm,1)
-    return result
+    else:
+        raw=np.frombuffer(GL.glGetBufferSubData(GL.GL_SHADER_STORAGE_BUFFER,0,(words+1)*4),dtype=np.int32)
+        if raw[-1]:raise DirectionalOverflow('directional field signed accumulator overflow; clear more frequently')
+        raw=raw[:-1].reshape(grid,grid,grid,bins,6)
+    return _decode_directional_slices(raw,record,divisor)
 
 
 def commit_source_population(record,sources,settings,index):
@@ -416,13 +428,21 @@ def commit_source_population(record,sources,settings,index):
     record['progressive']=history
 
 
-def bundle_sections(record, source_buf, scalar_bytes):
+def partial_estimate_validity():
+    """Information actually available, never a certification of darkness."""
+    return dict(version='partial-track-estimate-v1',zero_semantics='unknown',
+        nonzero_semantics='recorded-quantized-throughput',spatial_sampling='unreported',
+        angular_sampling='coarse-bin-mean-only',spectral_sampling='three-fixed-lines',
+        occlusion_certification='none',convergence_certification='none')
+
+
+def bundle_sections(record, source_buf, scalar_bytes, *, streaming=False):
     atlas=readback(record); triangles=record['triangles']; sources=np.ascontiguousarray(source_buf,dtype='<f4')
     materials=np.ascontiguousarray(record['materials'],dtype='<f4')
     lineage=list(dict(((int(i),np.asarray(row,dtype='<f4').tobytes()),None) for i,row in record.get('material_lineage',[])))
     lineage_ids=[item[0] for item in lineage]
     lineage_bytes=b''.join(item[1] for item in lineage)
-    parts=[atlas.tobytes(),triangles.tobytes(),sources.tobytes(),materials.tobytes(),lineage_bytes]
+    parts=[(memoryview(np.ascontiguousarray(a)).cast('B') if a.size else b'') for a in (atlas,triangles,sources,materials)]+[lineage_bytes]
     bins=validate_stencil(record['bin_count'])
     offset=scalar_bytes
     directional=dict(offset_bytes=offset,byte_length=len(parts[0]),dimensions=[record.get('grid_size',32)]*3,
@@ -437,6 +457,7 @@ def bundle_sections(record, source_buf, scalar_bytes):
         direction_quantization='nearest integer energy-length and moment per segment-voxel; <=0.5 count rounding each; mean clamped to unit ball',
         overflow_policy='signed atomic overflow publishes scalar-only v1 with explicit unavailable reason until field clear',
         semantics='Actual exterior segment entry-packet throughput times exact clipped in-voxel length, divided by voxel volume. No legacy fog attenuation, scattering coefficient or phase-coherence filter. Pre-wave-context entry throughput; not an interior-medium estimate, calibrated irradiance or full angular radiance. Surface emission without traced direction excluded.')
+    directional['validity']=partial_estimate_validity()
     if record.get('estimator')==ROOT_ESTIMATOR:
         root_normalization(record)
         directional['root_sampling']=dict(record.get('progressive',{}).get('root_sampling',record['root_sampling']))
@@ -470,4 +491,5 @@ def bundle_sections(record, source_buf, scalar_bytes):
     mat=dict(offset_bytes=offset,byte_length=len(parts[3]),count=len(materials),stride_bytes=64,format='f32le',layout='native-pbr16')
     offset+=len(parts[3])
     authored=dict(offset_bytes=offset,byte_length=len(parts[4]),count=len(lineage),stride_bytes=64,format='f32le',layout='authored-pbr16',material_ids=lineage_ids)
-    return b''.join(parts),dict(directional=directional,triangles=tri,sources=src,materials=mat,source_pbr16=authored,scene_sha256=record['scene_sha256'])
+    sections=dict(directional=directional,triangles=tri,sources=src,materials=mat,source_pbr16=authored,scene_sha256=record['scene_sha256'])
+    return (parts if streaming else b''.join(parts)),sections

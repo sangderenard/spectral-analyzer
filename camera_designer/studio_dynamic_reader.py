@@ -168,7 +168,8 @@ class StudioDynamicReader:
                 refreshed_roi=subject_field_region(vertices,config)
                 if refreshed_roi['dimensions'][0]!=record['grid_size']:raise ValueError('subject ROI grid changed; new candidate required')
             lineage=[] if self.field.get("directional_record") is not None else None
-            scene, spheres, stats, _ = prepare_photo_geometry(config, vertices, self.ids, self.pbr, **({"material_lineage_out": lineage} if lineage is not None else {}))
+            response_lineage={} if self.config.get("light_field_information")=="evaluated-responses-v1" else None
+            scene, spheres, stats, _ = prepare_photo_geometry(config, vertices, self.ids, self.pbr, **({"material_lineage_out": lineage} if lineage is not None else {}), **({"response_lineage_out":response_lineage} if response_lineage is not None else {}))
             geom, shade, mat, triangles, contexts, _, bounds, sources = scene
             if len(triangles) != self.triangle_count or len(spheres):
                 raise ValueError("canonical packing changed full triangle/medium ownership")
@@ -184,6 +185,11 @@ class StudioDynamicReader:
             self.renderer._update_prebuilt_geometry(self.field,geom,shade,mat,nodes,ids,contexts,bounds,spheres,
                 native_pbr=MaterialDatabase.instance().build_tensors()["pbr"])
             if lineage is not None:self.field["directional_record"]["material_lineage"]=lineage
+            if response_lineage is not None:
+                self.field["response_lineage"]=response_lineage
+                from .studio_response_factory import retained_scene_identity
+                self.field['response_identity']['scene_revision']=retained_scene_identity(config,vertices,self.ids,self.pbr)
+                self.field["_response_extra_arrays"]=(scene,nodes,ids,vertices,self.ids,self.pbr)
             sensor.set_scene_geometry(n_tris=len(triangles),n_bvh_nodes=len(nodes),
                 bmin=bounds[0],bmax=bounds[1],n_spheres=0)
             sensor._geometry_stats = stats

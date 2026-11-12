@@ -8,13 +8,14 @@ import yaml
 from material_db import EmissionProfile,HistogramSpread,profile_to_rgb
 
 ROOT=Path(__file__).resolve().parents[1]
-KEYS=('fluorescent_cool_white','fluorescent_warm_white','led_cool_white','led_warm_white')
+KEYS=('fluorescent_cool_white','fluorescent_warm_white','led_cool_white','led_warm_white',
+      'studio_calibration_nir850')
 
 
 def named_emitter(key):
     if key not in KEYS:raise ValueError('unknown named Studio emitter profile')
-    wavelengths=np.arange(380.,751.,1.)
-    if key.startswith('fluorescent_'):
+    wavelengths=np.arange(380.,901. if key=='studio_calibration_nir850' else 751.,1.)
+    if key.startswith('fluorescent_') or key=='studio_calibration_nir850':
         path=ROOT/'configs'/'lights'/f'{key}.yaml';raw=path.read_bytes();definition=yaml.safe_load(raw)
         # Same normalized Gaussian-mixture law as original LightSpec sampling.
         spec=definition['spectrum']
@@ -65,8 +66,8 @@ def transport_band_power(record,wavelengths_um,filter_rgb=None):
     power budget per scalar gain. No PDF-height dimming or peak normalization.
     """
     grid=np.asarray(wavelengths_um,float)*1000
-    if len(grid) not in (1,3) or len(set(grid))!=len(grid):raise ValueError('named source currently supports fixed1/fixed3 transport')
-    order=np.argsort(grid);ordered=grid[order];edges=np.r_[380.,(ordered[:-1]+ordered[1:])*.5,750.]
+    if len(grid) not in (1,3,4,8) or len(set(grid))!=len(grid):raise ValueError('named source supports fixed1/fixed3/fixed4/fixed8 transport')
+    order=np.argsort(grid);ordered=grid[order];edges=np.r_[350. if len(grid)==8 else 380.,(ordered[:-1]+ordered[1:])*.5,1000. if len(grid)==8 else 900. if len(grid)==4 else 750.]
     w=np.asarray(record['wavelengths_nm']);d=np.asarray(record['spectral_power']);energy=[]
     if filter_rgb is not None:
         from .studio_spectral_reflector import authored_reflector_bands
@@ -74,7 +75,7 @@ def transport_band_power(record,wavelengths_um,filter_rgb=None):
         d=d*np.array([b['reflectance'] for b in authored_reflector_bands(row,w/1000.)])
     for lo,hi in zip(edges[:-1],edges[1:]):
         x=np.r_[lo,w[(w>lo)&(w<hi)],hi]
-        energy.append(np.trapezoid(np.interp(x,w,d),x))
+        energy.append(np.trapezoid(np.interp(x,w,d,left=0.,right=0.),x))
     result=np.empty(len(grid));result[order]=energy;result*=len(grid)
     return result
 
@@ -91,10 +92,10 @@ def validate_named_emitter_refs(value,material_count):
         if reference['revision']!=definition['revision']:raise ValueError('named emitter revision changed; refresh authored profile before capture')
         gain=reference['gain']
         if isinstance(gain,bool) or not isinstance(gain,(int,float)) or not 0<=gain<=1e6:raise ValueError('invalid named emitter gain/filter')
-        try:f=np.asarray(reference['filter'],float)
+        try:f=None if reference['filter'] is None else np.asarray(reference['filter'],float)
         except (OverflowError,TypeError,ValueError):raise ValueError('invalid named emitter gain/filter') from None
-        if not math.isfinite(gain) or f.shape!=(3,) or not np.isfinite(f).all() or np.any((f<0)|(f>1)):raise ValueError('invalid named emitter gain/filter')
-        result[material]=dict(reference,filter=f.tolist(),gain=float(gain))
+        if not math.isfinite(gain) or (f is not None and (f.shape!=(3,) or not np.isfinite(f).all() or np.any((f<0)|(f>1)))):raise ValueError('invalid named emitter gain/filter')
+        result[material]=dict(reference,filter=None if f is None else f.tolist(),gain=float(gain))
     return result
 
 
@@ -103,14 +104,17 @@ def named_source_material(reference,wavelengths_um,profile_database,surface=None
     from .studio_spectral_reflector import authored_reflector_bands
     definition,native=named_emitter(reference['profile'])
     if reference['revision']!=definition['revision']:raise ValueError('named emitter source revision mismatch')
-    gain=float(reference['gain']);filter_rgb=np.asarray(reference['filter'],float)
-    filter_row=np.zeros(16);filter_row[:3]=filter_rgb
+    gain=float(reference['gain']);filter_rgb=None if reference['filter'] is None else np.asarray(reference['filter'],float)
     power=transport_band_power(definition,wavelengths_um,filter_rgb)*gain
     fingerprint=hashlib.sha256(json.dumps(reference,sort_keys=True).encode()+np.asarray(wavelengths_um,np.float64).tobytes()).hexdigest()
     key='studio_named_emitter:'+fingerprint
     # Preserve the original native profile radiance; dimmer is a scalar gain.
     # No new peak/white/energy normalization is inserted here.
-    full_filter=np.array([b['reflectance'] for b in authored_reflector_bands(filter_row,np.asarray(definition['wavelengths_nm'])/1000.)])
+    if filter_rgb is None:
+        full_filter=np.ones(len(definition['wavelengths_nm']))
+    else:
+        filter_row=np.zeros(16);filter_row[:3]=filter_rgb
+        full_filter=np.array([b['reflectance'] for b in authored_reflector_bands(filter_row,np.asarray(definition['wavelengths_nm'])/1000.)])
     native.spd=HistogramSpread(np.asarray(definition['wavelengths_nm']),np.asarray(definition['spectral_power'])*(750.-380.)*full_filter)
     native.total_power_W=gain
     preview=np.asarray(profile_to_rgb(native),float)

@@ -9,7 +9,7 @@ def validate_surface_transport(config):
     value=config.get('surface_transport')
     if value is None:return None
     if value!=VERSION:raise ValueError('unsupported surface_transport')
-    if config.get('transport')!='fixed:3' or 'fixtures' not in config:raise ValueError('corrected opaque PBR transport requires fixed:3 Studio fixtures')
+    if config.get('transport') not in ('fixed:3','fixed:4','fixed:8') or 'fixtures' not in config:raise ValueError('corrected opaque PBR transport requires RGB Studio fixtures')
     return value
 
 

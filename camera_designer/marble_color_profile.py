@@ -30,6 +30,7 @@ CIE_FIXED3_XYZ = np.array([
     [.000000000000, .008749999000, 1.772110000000],
 ], dtype=np.float64)
 
+
 # IEC sRGB primaries and D65 chromaticity, as published by the ICC registry:
 # https://registry.color.org/rgb-registry/srgb
 D65_XYZ = np.array([.3127 / .3290, 1.0, (1.0 - .3127 - .3290) / .3290])

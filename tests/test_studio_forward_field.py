@@ -222,7 +222,7 @@ def test_directional_overflow_preserves_primary_scalar_export(tmp_path,monkeypat
     from camera_designer import studio_directional_field as directional
     renderer,field,counts,_=fixture(monkeypatch)
     field.update(directional_record={},source_buf=np.zeros((0,12),np.float32))
-    def overflow(*args):raise directional.DirectionalOverflow('injected signed overflow')
+    def overflow(*args,**kwargs):raise directional.DirectionalOverflow('injected signed overflow')
     monkeypatch.setattr(directional,'bundle_sections',overflow)
     pub=ForwardFieldPublisher(tmp_path,'d')
     meta=pub.snapshot(renderer,field,now=0)

@@ -40,7 +40,7 @@ import time
 import wave
 import enum
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Literal, Optional, Sequence, TYPE_CHECKING
 
 
 class RenderMode(enum.Enum):
@@ -58,6 +58,24 @@ class RenderMode(enum.Enum):
     RAYTRACE = "raytrace"
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from numpy.typing import ArrayLike, NDArray
+    from cavity_engine import CavityScene
+    from camera_designer.studio_response_factory import SceneResponseConsumer
+    from camera_designer.studio_volume_extinction import ExtinctionGrid
+
+    # Legacy source records have four required fields and up to four optional
+    # trailing fields; the sampler accepts every prefix of that trailing group.
+    _RaySource = (
+        tuple[np.ndarray, np.ndarray, int, np.ndarray]
+        | tuple[np.ndarray, np.ndarray, int, np.ndarray, float | np.floating]
+        | tuple[np.ndarray, np.ndarray, int, np.ndarray, float | np.floating, int]
+        | tuple[np.ndarray, np.ndarray, int, np.ndarray, float | np.floating, int, float]
+        | tuple[np.ndarray, np.ndarray, int, np.ndarray, float | np.floating, int, float, LightSpec | None]
+    )
+    # PyOpenGL may return Python integers or NumPy integer scalars for handles.
+    _GLHandle = int | np.integer
 
 try:
     import yaml as _yaml
@@ -4825,6 +4843,7 @@ uniform int   uTriCount;
 uniform int   uNodeCount;
 uniform int   uSeed;
 uniform float uRayFieldScale;
+uniform float uExposureIntervalWeight;
 uniform float uRayFieldGamma;
 uniform float uVolAlpha;
 uniform int   uVolSteps;
@@ -4998,9 +5017,11 @@ int nearest_boundary(vec3 ro,vec3 rd,out float best) {return nearest_filtered(ro
 // (measured ~37x dimmer than glass on identical geometry). This samples one
 // of the same light sources the forward pass emits from and tests visibility
 // directly against this shader's own BVH, independent of voxel resolution.
-float sample_direct_light(vec3 p, vec3 n, inout uint rng, out float src_freq_hz, out vec3 direct_bands) {
+float sample_direct_light(vec3 p, vec3 n, inout uint rng, out float src_freq_hz, out vec3 direct_bands, out float area_factor, out int area_tri) {
     src_freq_hz = 0.0;
     direct_bands = vec3(0.0);
+    area_factor = 0.0;
+    area_tri = -1;
     if (uSourceCount <= 0) return 0.0;
     int si = int(clamp(floor(rand01(rng) * float(uSourceCount)), 0.0, float(uSourceCount - 1)));
     SourceRec src = bdpt_sources[si];
@@ -5023,6 +5044,8 @@ float sample_direct_light(vec3 p, vec3 n, inout uint rng, out float src_freq_hz,
         if(shadow_hit>=0 && shadow_t<dist-2e-6)return 0.0;
         float weight=cos_surf*cos_light/dist2*float(uSourceCount)*src.packet.z/PI;
         direct_bands=src.dir_kind.xyz*weight;
+        area_factor=weight;
+        area_tri=int(src.packet.y)-1;
         return direct_bands.x;
     }
     float shadow_t;
@@ -5137,6 +5160,7 @@ __SENSOR_HISTORY_HELPERS__
 __SENSOR_EVIDENCE_HELPERS__
 void sensor_store(int i, ivec2 px, float lum, float cnt) {
     bool rolling = uHistorySamples > 0;
+    lum *= uExposureIntervalWeight;
     if (rolling) lum = sensor_history_value(i, px, lum);
     // alpha is a presence mask: any ray strike sets it to 1.0 so decayed
     // weight is immediately replaced and re-exposure is instant.
@@ -5370,7 +5394,9 @@ void main() {
             if (opacity > 0.001 && !spectral_reflector) {
                 float direct_freq = 0.0;
                 vec3 direct_bands = vec3(0.0);
-                float direct = (uSourceCount > 0) ? sample_direct_light(hp, n, rng, direct_freq, direct_bands) : 0.0;
+                float area_factor = 0.0;
+                int area_tri = -1;
+                float direct = (uSourceCount > 0) ? sample_direct_light(hp, n, rng, direct_freq, direct_bands, area_factor, area_tri) : 0.0;
                 for (int i = 0; i < nl; i++) {
                     vec3  lc = get_layer_light(i);
                     float aw = dot(surf_albedo, lc) / max(dot(lc, lc), 1e-6);
@@ -5399,7 +5425,8 @@ void main() {
                     }
                     float direct_layer = (uNEEFullSpectrum != 0 && uFixed3Transport != 0)
                         ? direct_bands[i] : direct * freqW;
-                    if(uNEEAreaSources != 0) direct_layer=direct_bands[i]*diff;
+                    if(uNEEAreaSources != 0) direct_layer=(uFixed3Transport != 0 ? direct_bands[i] :
+                        area_tri>=0?area_factor*studio_emitter_radiance(load_tri(area_tri),uLayerCentersHz[i]):0.0)*diff;
                     lum[i] += throughput[i] * direct_layer * refl
                               * clamp(aw, 0.0, 1.0) * opacity;
                 }
@@ -5742,36 +5769,54 @@ void main() {
 
 def _compile(src: str, kind: int) -> int:
     sh = glCreateShader(kind)
-    glShaderSource(sh, src)
-    glCompileShader(sh)
-    ok = glGetShaderiv(sh, GL_COMPILE_STATUS)
-    log = glGetShaderInfoLog(sh)
-    if log:
-        tag = "VS" if kind == GL_VERTEX_SHADER else ("CS" if kind == GL_COMPUTE_SHADER else "FS")
-        print(f"[{tag} compile{'  OK' if ok else ' FAIL'}] {log.decode()}")
-    elif not ok:
-        tag = "VS" if kind == GL_VERTEX_SHADER else ("CS" if kind == GL_COMPUTE_SHADER else "FS")
-        print(f"[{tag} compile FAIL] (no log)")
-    return sh
+    try:
+        glShaderSource(sh, src)
+        glCompileShader(sh)
+        ok = glGetShaderiv(sh, GL_COMPILE_STATUS)
+        log = glGetShaderInfoLog(sh)
+        if log:
+            tag = "VS" if kind == GL_VERTEX_SHADER else ("CS" if kind == GL_COMPUTE_SHADER else "FS")
+            print(f"[{tag} compile{'  OK' if ok else ' FAIL'}] {log.decode()}")
+        elif not ok:
+            tag = "VS" if kind == GL_VERTEX_SHADER else ("CS" if kind == GL_COMPUTE_SHADER else "FS")
+            print(f"[{tag} compile FAIL] (no log)")
+        # Preserve the original API: failed-status handles still go to caller.
+        return sh
+    except BaseException:
+        try:glDeleteShader(sh)
+        except Exception:pass
+        raise
 
-def _prog(*shader_pairs) -> int:
-    """Build program from (source, kind) pairs."""
+
+def _prog(*shader_pairs: tuple[str, int]) -> int:
+    """Build program; caller owns returned program even on failed link status."""
     p = glCreateProgram()
-    handles = []
-    for src, kind in shader_pairs:
-        s = _compile(src, kind)
-        glAttachShader(p, s)
-        handles.append(s)
-    glLinkProgram(p)
-    ok = glGetProgramiv(p, GL_LINK_STATUS)
-    log = glGetProgramInfoLog(p)
-    if log:
-        print(f"[link{'  OK' if ok else ' FAIL'}] {log.decode()}")
-    elif not ok:
-        print(f"[link FAIL] (no log)")
-    for s in handles:
-        glDeleteShader(s)
-    return p
+    handles=[];attached=[];program_deleted=False
+    try:
+        for src, kind in shader_pairs:
+            shader=_compile(src,kind)
+            handles.append(shader)
+            glAttachShader(p,shader)
+            attached.append(shader)
+        glLinkProgram(p)
+        ok=glGetProgramiv(p,GL_LINK_STATUS)
+        log=glGetProgramInfoLog(p)
+        if log:print(f"[link{'  OK' if ok else ' FAIL'}] {log.decode()}")
+        elif not ok:print('[link FAIL] (no log)')
+        return p
+    except BaseException:
+        try:glDeleteProgram(p);program_deleted=True
+        except Exception:pass
+        raise
+    finally:
+        for shader in handles:
+            if shader in attached and not program_deleted:
+                try:glDetachShader(p,shader)
+                except Exception:pass
+            try:glDeleteShader(shader)
+            except Exception:pass
+
+
 
 def _build_gpu_bvh(tris: np.ndarray, leaf_size: int = 4):
     tri_min = tris.min(axis=1)
@@ -6835,9 +6880,13 @@ class _SourceWorker(threading.Thread):
         return {"sources_list": sources, "source_records_np": rec}
 
 
-def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
-                   dims=GPU_RAY_FIELD_DIMS, segment_cap=GPU_RAY_SEGMENT_CAP,
-                   dispatch_batch=GPU_DISPATCH_BATCH, include_stage=False,
+def _gpu_ray_field(scene: Optional[CavityScene], outline: np.ndarray,
+                   body_h: float, sources: Optional[Sequence[_RaySource]],
+                   max_bounces: int,
+                   dims: tuple[int, int, int] = GPU_RAY_FIELD_DIMS,
+                   segment_cap: int = GPU_RAY_SEGMENT_CAP,
+                   dispatch_batch: int = GPU_DISPATCH_BATCH,
+                   include_stage: bool = False,
                    model_matrix: Optional[np.ndarray] = None,
                    bounds: Optional[tuple[np.ndarray, np.ndarray]] = None,
                    sim_bounds: Optional[tuple[np.ndarray, np.ndarray]] = None,
@@ -6853,7 +6902,10 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
                    film: Optional[FilmStack] = None,
                    air_diffuse_scatter: float = 0.35,
                    air_specular_scatter: float = 0.65,
-                   air_anisotropy: float = 12.0):
+                   air_anisotropy: float = 12.0) -> tuple[
+                       Optional[list[_GLHandle]], Optional[np.ndarray],
+                       Optional[np.ndarray], Optional[_GLHandle], int,
+                       Optional[_GLHandle], int, SensorAccumulator | Literal[0]]:
     _ray_diag_update(
         "gpu_ray_field:start",
         n_sources=len(sources) if sources is not None else 0,
@@ -7610,34 +7662,38 @@ def _upload_uint_ray_textures(data: np.ndarray) -> list[int]:
 GPU_OPTICAL_FIELD_DIMS = (128, 128, 256)
 
 def _gpu_ray_field_prebuilt(
-    packed_geom,     # (N, 16) float32  — TriGeomBuf rows (binding 0)
-    packed_shade,    # (N, 16) float32  — TriShadeBuf rows (binding 9)
-    mat_buf,         # (N_mat * MAX_SPECTRAL_BANDS, 12) float32 — MatBuf (binding 10)
-    bvh_nodes,       # float32 from _build_gpu_bvh
-    bvh_ids,         # uint32  from _build_gpu_bvh
-    context_buf,     # (M, 8)  float32  — ScaleContext SSBO rows
-    source_buf,      # (N, 12) float32  — pre-baked rays from RayOrder.bake_rays()
+    packed_geom: NDArray[np.float32],     # (N, 16) - TriGeomBuf rows (binding 0)
+    packed_shade: NDArray[np.float32],    # (N, 16) - TriShadeBuf rows (binding 9)
+    mat_buf: NDArray[np.float32],         # (N_mat * MAX_SPECTRAL_BANDS, 12) - MatBuf (binding 10)
+    bvh_nodes: NDArray[np.float32],       # from _build_gpu_bvh
+    bvh_ids: NDArray[np.int32],           # from _build_gpu_bvh (signed int32)
+    context_buf: NDArray[np.float32],     # (M, 8) - ScaleContext SSBO rows
+    source_buf: NDArray[np.float32],      # (N, 12) - pre-baked rays from RayOrder.bake_rays()
                      #   [pos_xyz, amp_w, dir_xyz, 0, freq_hz, phase, energy, 0]
-    bounds,          # (bmin, bmax) each float32 (3,)
-    dims=GPU_OPTICAL_FIELD_DIMS,
-    dispatch_batch=8192,
-    max_bounces=8,
-    initial_rays=32768,
-    speed_of_medium=2.998e8,   # optical vacuum
-    film_stack=None,           # FilmStack | None — drives layer uniforms & tex count
-    sphere_regions=None,       # optional exact Studio regions; appended for compatibility
-    region_records=None,       # explicit opt-in overlapping-volume ownership
-    native_pbr=None,           # canonical MaterialDatabase PBR16, same material IDs
-    record_directional=False, # opt-in bounded actual traced direction moments
-    light_field_stencil=12,    # explicit angular bins; no extra transport rays
-    volume_extinction=None,    # explicit ExtinctionGrid in world metres; absent is unchanged
-    light_field_estimator="track-length-throughput-v1",
-    surface_transport=None, # explicit shared opaque PBR correction
-    light_field_internal_media=False, # explicit v6 observer; canonical optics unchanged
-    directional_quantization_divisor=65535, # v6 subject precision; scalar unchanged
-    light_field_region=None, # derived subject ROI independent of transport bounds
-    light_field_grid_size=None, # v3 stays32; explicit root-sweep v4 defaults64
-):
+    bounds: tuple[ArrayLike, ArrayLike],   # bmin/bmax become float32 (3,) arrays
+    dims: tuple[int, int, int] = GPU_OPTICAL_FIELD_DIMS,
+    dispatch_batch: int = 8192,
+    max_bounces: int = 8,
+    initial_rays: int = 32768,
+    speed_of_medium: float = 2.998e8,   # optical vacuum
+    film_stack: Optional[FilmStack] = None, # drives layer uniforms & tex count
+    sphere_regions: Optional[NDArray[np.float32]] = None, # optional exact Studio regions
+    region_records: Optional[NDArray[np.float32]] = None, # explicit opt-in overlapping-volume ownership
+    native_pbr: Optional[NDArray[np.float32]] = None, # canonical MaterialDatabase PBR16, same material IDs
+    record_directional: bool = False, # opt-in bounded actual traced direction moments
+    light_field_stencil: int = 12,    # explicit angular bins; no extra transport rays
+    volume_extinction: Optional[ExtinctionGrid] = None, # explicit world-metre extinction
+    light_field_estimator: str = "track-length-throughput-v1",
+    surface_transport: Optional[str] = None, # explicit shared opaque PBR correction
+    light_field_internal_media: bool = False, # explicit v6 observer; canonical optics unchanged
+    light_field_information: Optional[str] = None, # explicit additional-data opt-in
+    forward_response_consumer: Optional[SceneResponseConsumer] = None, # synchronous typed scene retention
+    forward_response_identity: Optional[dict[str, object]] = None, # actual population/scene ancestry
+    forward_response_reserved_bytes: Optional[int] = None, # measured external allocations
+    directional_quantization_divisor: int = 65535, # v6 subject precision; scalar unchanged
+    light_field_region: Optional[dict[str, object]] = None, # derived subject ROI
+    light_field_grid_size: Optional[int] = None, # v3 stays32; explicit root-sweep v4 defaults64
+) -> Optional[dict[str, object]]:
     """Compile the canonical _GPU_RAY_FIELD_CS with pre-packed scene SSBOs.
 
     Returns a state dict with all GL handles + cached uniform locations.
@@ -7657,6 +7713,15 @@ def _gpu_ray_field_prebuilt(
     if light_field_region is not None:
         if light_field_estimator!='track-length-root-sweep-v1':raise ValueError('subject ROI requires root-sweep estimator')
         light_field_grid_size=light_field_region['dimensions'][0]
+    if light_field_information is not None and (light_field_information!='evaluated-responses-v1' or not record_directional):
+        raise ValueError('evaluated response copies require explicit field information opt-in')
+    if light_field_information is not None:
+        if not callable(forward_response_consumer) or not isinstance(forward_response_identity,dict) or 'population_index' not in forward_response_identity:
+            raise ValueError('evaluated responses require synchronous scene consumer and actual dispatch identity')
+        if not callable(getattr(forward_response_consumer,'consume_scalar_cells',None)):
+            raise ValueError('scene consumer must retain typed native scalar cells')
+        if type(forward_response_reserved_bytes) is not int or forward_response_reserved_bytes<0:
+            raise ValueError('measured external response reservations required')
     if surface_transport not in (None,'studio-pbr-mixture-v1'):raise ValueError('unsupported surface_transport')
     volume_shader_source = None
     if volume_extinction is not None:
@@ -7831,19 +7896,53 @@ def _gpu_ray_field_prebuilt(
         if directional_record is not None:
             directional_record['volume_extinction'] = volume_extinction.metadata()
             directional_record['scene_sha256'] = scene_digest(packed_geom,packed_shade,native_pbr,source_records,mat_buf,context_buf,bmin,bmax,sphere_data,*([region_data] if region_data is not None else []),volume_extinction.bounds_m,volume_extinction.sigma_t_m_inv)
-    prog = _prog((shader_source, GL_COMPUTE_SHADER))
-    if not glGetProgramiv(prog, GL_LINK_STATUS):
-        print("  [gpu_ray_field_prebuilt] compute shader did not link", flush=True)
-        glDeleteProgram(prog)
-        for tex in tex_bands:
-            glDeleteTextures([tex])
-        for buf in ssbo:
-            glDeleteBuffers(1, [buf])
-        glDeleteBuffers(1,[native_pbr_ssbo])
-        if directional_record is not None: glDeleteBuffers(1,[directional_record['buffer']])
-        if volume_record is not None: glDeleteBuffers(1,[volume_record['buffer']])
+    scalar_visit_buffer=None
+    scalar_columns=None
+    prog=0
+    def release_failed_prebuilt():
+        if prog:
+            try:glDeleteProgram(prog)
+            except Exception:pass
+        for texture in tex_bands:
+            try:glDeleteTextures([texture])
+            except Exception:pass
+        for buffer in ssbo:
+            try:glDeleteBuffers(1,[buffer])
+            except Exception:pass
+        for buffer in (native_pbr_ssbo,(directional_record or {}).get('buffer'),(volume_record or {}).get('buffer')):
+            if buffer:
+                try:glDeleteBuffers(1,[buffer])
+                except Exception:pass
+        if scalar_visit_buffer is not None:
+            from camera_designer.studio_scalar_visits import release
+            try:release(scalar_visit_buffer)
+            except Exception:pass
+    try:
+        if light_field_information is not None:
+            from camera_designer.studio_scalar_visits import with_scalar_visits,allocate as allocate_scalar_visits
+            shader_source=with_scalar_visits(shader_source)
+            from camera_designer.studio_scalar_columns import with_scalar_columns
+            shader_source=with_scalar_columns(shader_source,n_layers,shared=True)
+            scalar_column_bytes=int(np.prod(dims))*n_layers*16
+            response_tail_bytes=8+int(dispatch_batch)*int(max_bounces)*512
+            response_word_offset_bytes=int(np.prod(dims))*8+scalar_column_bytes
+            scalar_visit_buffer=allocate_scalar_visits(dims,extra_bytes=scalar_column_bytes+response_tail_bytes)
+            from camera_designer.studio_forward_responses import copy_forward_responses
+            shader_source,_=copy_forward_responses(shader_source,terminal_only=True,shared_scalar_buffer=True,precleared_rows=True)
+            from camera_designer.studio_forward_responses import specialize_prebuilt_forward
+            shader_source=specialize_prebuilt_forward(shader_source)
+            from camera_designer.studio_forward_responses import admit_shader_storage
+            from OpenGL.GL import GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS
+            response_resource_receipt=admit_shader_storage(shader_source,int(glGetIntegerv(GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS)))
+        prog = _prog((shader_source, GL_COMPUTE_SHADER))
+        prebuilt_linked=glGetProgramiv(prog,GL_LINK_STATUS)
+    except BaseException:
+        release_failed_prebuilt()
+        raise
+    if not prebuilt_linked:
+        print("  [gpu_ray_field_prebuilt] compute shader did not link",flush=True)
+        release_failed_prebuilt()
         return None
-
     glUseProgram(prog)
     if volume_record is not None:
         from camera_designer.studio_volume_extinction import bind as bind_volume
@@ -7890,6 +7989,44 @@ def _gpu_ray_field_prebuilt(
     glUniform1i(glGetUniformLocation(prog, b'uMode'),            0)  # PASS_FORWARD
 
     # Cache per-pump uniform locations (source params removed — rays are pre-baked)
+    response_owner=None
+    response_state=None
+    if light_field_information is not None:
+        import uuid
+        from camera_designer.studio_forward_responses import ForwardResponseCopies
+        from camera_designer.studio_response_factory import field_reserved_bytes
+        response_state=dict(prog=prog,ssbo=ssbo,native_pbr_ssbo=native_pbr_ssbo,
+            tex_bands=tex_bands,dims=dims,bmin=bmin,bmax=bmax,directional_record=directional_record,
+            scalar_visit_buffer=scalar_visit_buffer,volume_extinction=volume_record,
+            _pending_cap=_pending_cap,source_buf=source_records,
+            response_identity=dict(forward_response_identity),response_dispatch_serial=0,scalar_clear_epoch=0,
+            response_resource_receipt=response_resource_receipt,response_stream_id=uuid.uuid4().hex,response_initial_warmup=True,
+            response_entry_contract='studio-prebuilt-forward-only-v1',
+            response_program_sha256=__import__('hashlib').sha256(shader_source.encode()).hexdigest(),
+            response_transport_scene_sha256=scene_digest(packed_geom,packed_shade,native_pbr,mat_buf,context_buf,bmin,bmax,sphere_data,*([region_data] if region_data is not None else [])))
+        reserved=field_reserved_bytes(response_state,(packed_geom,packed_shade,mat_buf,bvh_nodes,bvh_ids,context_buf,native_pbr,source_records,sphere_data,region_data))
+        from camera_designer.studio_response_factory import publication_working_reserve
+        reserved+=publication_working_reserve(response_state)
+        from camera_designer.studio_scalar_columns import descriptor as scalar_column_descriptor,allocate as allocate_scalar_columns
+        reserved+=int(dims[0])*int(dims[1])*n_layers*16-response_tail_bytes
+        try:
+            response_owner=ForwardResponseCopies(ray_count=int(dispatch_batch),bounce_limit=int(max_bounces),
+                reserved_bytes=reserved+forward_response_reserved_bytes,consume=forward_response_consumer,
+                borrowed_buffer=scalar_visit_buffer,offset_bytes=response_word_offset_bytes)
+            response_state['forward_response_owner']=response_owner
+            response_state['response_auxiliary_layout']=dict(binding=23,total_bytes=response_word_offset_bytes+response_tail_bytes,
+                visits=dict(offset_bytes=0,byte_length=int(np.prod(dims))*8),
+                scalar_columns=dict(offset_bytes=int(np.prod(dims))*8,byte_length=scalar_column_bytes),
+                terminal=dict(offset_bytes=response_word_offset_bytes,byte_length=response_tail_bytes),ownership='native field owns allocation; each view resets only its range')
+            scalar_columns=dict(buffer=scalar_visit_buffer,offset_bytes=int(np.prod(dims))*8,
+                borrowed=True,metadata=scalar_column_descriptor(dims,n_layers))
+            scalar_columns['metadata'].update(bounds_min_m=np.asarray(bmin).tolist(),bounds_max_m=np.asarray(bmax).tolist(),
+                cell_size_m=((np.asarray(bmax)-np.asarray(bmin))/np.asarray(dims)).tolist(),recording_scope='original global scalar grid; not the subject directional ROI')
+            response_state['scalar_columns']=scalar_columns
+        except BaseException:
+            _destroy_prebuilt(response_state)
+            raise
+
     locs = {
         'mode':       glGetUniformLocation(prog, b'uMode'),
         'seed':       glGetUniformLocation(prog, b'uSeed'),
@@ -7911,15 +8048,22 @@ def _gpu_ray_field_prebuilt(
             _ng = max(1, int(math.ceil(_b / 128.0)))
             glUniform1i(locs['batch_size'], _b)
             glUniform1i(locs['batch_off'],  _off)
+            if response_owner is not None:
+                _begin_prebuilt_responses(response_state,1337,_off,_b,_n_init)
             glDispatchCompute(min(_ng, 65535), max(1, int(math.ceil(_ng / 65535))), 1)
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
                             GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+            if response_owner is not None:
+                from camera_designer.studio_forward_responses import finish_native_dispatch
+                finish_native_dispatch(response_owner,response_state,lambda:_restore_prebuilt_bindings(response_state))
             submitted_root_chunk(directional_record,_b)
             _off += _b
         glFinish()
         finish_root_dispatch(directional_record)
+        if response_owner is not None:_consume_prebuilt_scalar_columns(response_state)
     except BaseException:
         abort_root_dispatch(directional_record)
+        if response_state is not None:_destroy_prebuilt(response_state)
         raise
     glUseProgram(0)
 
@@ -7930,6 +8074,20 @@ def _gpu_ray_field_prebuilt(
         'tex_bands':      tex_bands,
         'directional_record': directional_record,
         'surface_transport': surface_transport,
+        'scalar_visit_buffer':scalar_visit_buffer,
+        'forward_response_owner':response_owner,
+        'scalar_columns':scalar_columns,
+        'scalar_clear_epoch':0,
+        'response_resource_receipt':(response_state or {}).get('response_resource_receipt'),
+        'response_entry_contract':(response_state or {}).get('response_entry_contract'),
+        'response_reactive_queue':(response_state or {}).get('response_reactive_queue'),
+        'response_stream_id':(response_state or {}).get('response_stream_id'),
+        'response_transport_scene_sha256':(response_state or {}).get('response_transport_scene_sha256'),
+        'response_program_sha256':(response_state or {}).get('response_program_sha256'),
+        'response_auxiliary_layout':(response_state or {}).get('response_auxiliary_layout'),
+        'response_identity':dict(forward_response_identity or {}),
+        'response_dispatch_serial':(response_state or {}).get('response_dispatch_serial',0),
+        'light_field_information':light_field_information,
         'volume_extinction': volume_record,
         'ssbo':           ssbo,
         'sphere_count':   sphere_count,
@@ -8000,6 +8158,9 @@ def _update_prebuilt_geometry(state, packed_geom, packed_shade, mat_buf,
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
     state['bmin'] = np.asarray(bounds[0], np.float32)
     state['bmax'] = np.asarray(bounds[1], np.float32)
+    if state.get('scalar_columns') is not None:
+        state['scalar_columns']['metadata'].update(bounds_min_m=state['bmin'].tolist(),bounds_max_m=state['bmax'].tolist(),
+            cell_size_m=((state['bmax']-state['bmin'])/np.asarray(state['dims'])).tolist())
     state['sphere_count'] = len(sphere_regions)
     glUseProgram(state['prog'])
     for uniform, value in ((b'uTriCount', len(packed_geom)), (b'uNodeCount', len(bvh_nodes)),
@@ -8012,10 +8173,76 @@ def _update_prebuilt_geometry(state, packed_geom, packed_shade, mat_buf,
         glUniform3f(glGetUniformLocation(state['prog'],b'uStudioRecordMax'),*roi['bounds_max_m'])
     glUniform3f(glGetUniformLocation(state['prog'], b'uBoxMin'), *state['bmin'])
     glUniform3f(glGetUniformLocation(state['prog'], b'uBoxMax'), *state['bmax'])
+    if state.get('forward_response_owner') is not None and state.get('directional_record') is not None:
+        state['directional_record'].pop('source_population_scene_base',None)
+        state['response_transport_scene_sha256']=scene_digest(packed_geom,packed_shade,native_pbr,mat_buf,context_buf,*bounds,sphere_regions,*([region_records] if region_records is not None else []))
     if (state.get('directional_record') or {}).get('estimator')=='track-length-root-sweep-v1':
         from camera_designer.studio_directional_field import clear
         clear(state['directional_record'])
     glUseProgram(0)
+
+
+def _restore_prebuilt_bindings(state):
+    from OpenGL import GL
+    GL.glUseProgram(state['prog'])
+    for i,handle in enumerate(state['ssbo']):GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER,i,handle)
+    GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER,BINDING_STUDIO_NATIVE_PBR,state['native_pbr_ssbo'])
+    for i,texture in enumerate(state['tex_bands']):
+        GL.glBindImageTexture(i,texture,0,GL.GL_TRUE,0,GL.GL_READ_WRITE,GL.GL_R32UI)
+    if state.get('directional_record') is not None:
+        GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER,19,state['directional_record']['buffer'])
+    if state.get('scalar_visit_buffer') is not None:
+        from camera_designer.studio_scalar_visits import bind
+        bind(state['scalar_visit_buffer'])
+    if state.get('scalar_columns') is not None and not state['scalar_columns'].get('borrowed'):
+        from camera_designer.studio_scalar_columns import bind
+        bind(state['scalar_columns']['buffer'])
+    if state.get('volume_extinction') is not None:
+        from camera_designer.studio_volume_extinction import bind
+        bind(state['volume_extinction'],state['prog'])
+
+
+def _consume_prebuilt_scalar_columns(state):
+    from camera_designer.studio_scalar_columns import consume
+    owner=state['forward_response_owner']
+    identity=dict(state['response_identity'],scene_revision=state['response_identity'].get('scene_revision',state['directional_record'].get('source_population_scene_base',state['directional_record']['scene_sha256'])),
+        transport_scene_sha256=state['response_transport_scene_sha256'],
+        population_scene_sha256=state['directional_record']['scene_sha256'],
+        scalar_clear_epoch=state['scalar_clear_epoch'],last_dispatch_id=state['response_dispatch_serial']-1,
+        snapshot_id=state['response_dispatch_serial'],stream_id=state['response_stream_id'],
+        sequence=state['response_dispatch_serial'],source_sha256=state.get('response_last_source_sha256'),
+        root_sampling=dict(state['directional_record'].get('root_sampling',{})))
+    try:consume(state['scalar_columns'],owner.consume.consume_scalar_cells,identity)
+    finally:_restore_prebuilt_bindings(state)
+
+
+def _begin_prebuilt_responses(state,seed,offset,count,total):
+    import hashlib
+    owner=state['forward_response_owner']
+    metadata=dict(state['response_identity'],shader_resources=state['response_resource_receipt'],
+        stream_id=state['response_stream_id'],sequence=state['response_dispatch_serial'])
+    metadata.update(scene_revision=state['response_identity'].get('scene_revision',state['directional_record'].get('source_population_scene_base',state['directional_record']['scene_sha256'])),
+        transport_scene_sha256=state['response_transport_scene_sha256'],
+        population_scene_sha256=state['directional_record']['scene_sha256'],
+        source_sha256=hashlib.sha256(np.ascontiguousarray(state['source_buf'],dtype='<f4').tobytes()).hexdigest(),
+        dispatch_id=state['response_dispatch_serial'],path_family='forward',ray_offset=int(offset),
+        ray_count=int(count),total_rays=int(total),bounce_limit=owner.bounce_limit,seed=int(seed),
+        root_sampling=dict(state['directional_record'].get('root_sampling',{})))
+    state['response_last_source_sha256']=metadata['source_sha256']
+    metadata['source_population_sha256']=metadata['source_sha256']
+    metadata['source_kind']='baked-source-records'
+    metadata['transport_program_sha256']=state['response_program_sha256']
+    metadata['population_id']=metadata['population_index']
+    metadata['primitive_identity_offsets']=[112,113]
+    scope=state['directional_record'].get('recording_region')
+    metadata['indexing_bounds']=[scope['bounds_min_m'],scope['bounds_max_m']] if scope else [np.asarray(state['bmin']).tolist(),np.asarray(state['bmax']).tolist()]
+    metadata['indexing_dimensions']=[state['directional_record']['grid_size']]*3
+    metadata['dispatch']={key:metadata[key] for key in ('dispatch_id','population_index','ray_offset','ray_count','total_rays','bounce_limit','seed','root_sampling')}
+    metadata['dispatch']['root_coverage_scope']='complete source coverage candidate' if total>=len(state['source_buf']) else 'partial root sweep; typed observations only'
+    metadata['dispatch']['warmup']=bool(state.get('response_initial_warmup',False))
+    metadata['dispatch']['auxiliary_layout']=state['response_auxiliary_layout']
+    owner.begin(state['prog'],metadata)
+    state['response_dispatch_serial']+=1
 
 
 def _gpu_pump_prebuilt(state: dict, n_rays: int = 8192) -> None:
@@ -8044,10 +8271,19 @@ def _gpu_pump_prebuilt(state: dict, n_rays: int = 8192) -> None:
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER,BINDING_STUDIO_NATIVE_PBR,state['native_pbr_ssbo'])
     if state.get('directional_record') is not None:
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER,19,state['directional_record']['buffer'])
+    if state.get('scalar_visit_buffer') is not None:
+        from camera_designer.studio_scalar_visits import bind as bind_scalar_visits
+        bind_scalar_visits(state['scalar_visit_buffer'])
+    if state.get('scalar_columns') is not None and not state['scalar_columns'].get('borrowed'):
+        from camera_designer.studio_scalar_columns import bind as bind_scalar_columns
+        bind_scalar_columns(state['scalar_columns']['buffer'])
     if state.get('volume_extinction') is not None:
         from camera_designer.studio_volume_extinction import bind as bind_volume
         bind_volume(state['volume_extinction'], prog)
 
+    if state.get('response_entry_contract') is not None:
+        from camera_designer.studio_forward_responses import require_prebuilt_mode
+        require_prebuilt_mode(state,0)
     glUniform1i(locs['mode'], 0)  # PASS_FORWARD
     seed_base = state['_pump_seed']
     state['_pump_seed'] = (seed_base + 7) & 0x7FFFFFFF
@@ -8066,12 +8302,18 @@ def _gpu_pump_prebuilt(state: dict, n_rays: int = 8192) -> None:
             _ng = max(1, int(math.ceil(_b / 128.0)))
             glUniform1i(locs['batch_size'], _b)
             glUniform1i(locs['batch_off'],  offset)
+            if state.get('forward_response_owner') is not None:
+                _begin_prebuilt_responses(state,seed_base,offset,_b,n_rays)
             glDispatchCompute(min(_ng, 65535), max(1, int(math.ceil(_ng / 65535))), 1)
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
                             GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+            if state.get('forward_response_owner') is not None:
+                from camera_designer.studio_forward_responses import finish_native_dispatch
+                finish_native_dispatch(state['forward_response_owner'],state,lambda:_restore_prebuilt_bindings(state))
             submitted_root_chunk(record,_b)
             offset += _b
         finish_root_dispatch(record)
+        if state.get('forward_response_owner') is not None:_consume_prebuilt_scalar_columns(state)
     except BaseException:
         abort_root_dispatch(record)
         raise
@@ -8092,6 +8334,13 @@ def _clear_prebuilt(state: dict, *, preserve_directional_history=False) -> None:
         glClearTexImage(tex, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, zero)
     glBindTexture(GL_TEXTURE_3D, 0)
     state['_pump_seed'] = 0
+    if state.get('scalar_visit_buffer') is not None:
+        from camera_designer.studio_scalar_visits import clear as clear_scalar_visits
+        clear_scalar_visits(state['scalar_visit_buffer'])
+    if state.get('scalar_columns') is not None:
+        from camera_designer.studio_scalar_columns import clear_view
+        clear_view(state['scalar_columns'])
+        state['scalar_clear_epoch']+=1
     if state.get('directional_record') is not None:
         from camera_designer.studio_directional_field import clear
         clear(state['directional_record'],preserve_progressive=preserve_directional_history)
@@ -8104,6 +8353,8 @@ def _destroy_prebuilt(state: dict) -> None:
     from OpenGL.GL import (
         glDeleteProgram, glDeleteTextures, glDeleteBuffers,
     )
+    if state.get('forward_response_owner') is not None:state['forward_response_owner'].close()
+    if state.get('scalar_columns') is not None and not state['scalar_columns'].get('borrowed'):glDeleteBuffers(1,[state['scalar_columns']['buffer']])
     glDeleteProgram(state['prog'])
     for tex in state['tex_bands']:
         glDeleteTextures([tex])
@@ -8112,6 +8363,9 @@ def _destroy_prebuilt(state: dict) -> None:
     glDeleteBuffers(1,[state['native_pbr_ssbo']])
     if state.get('directional_record') is not None:
         glDeleteBuffers(1,[state['directional_record']['buffer']])
+    if state.get('scalar_visit_buffer') is not None:
+        from camera_designer.studio_scalar_visits import release as release_scalar_visits
+        release_scalar_visits(state['scalar_visit_buffer'])
     if state.get('volume_extinction') is not None:
         glDeleteBuffers(1,[state['volume_extinction']['buffer']])
     state.clear()
@@ -10031,7 +10285,7 @@ class SensorAccumulator:
                  ssbo_regions: int = 0, n_regions: int = 0, ssbo_native_pbr: int = 0,
                  *, full_sensor_size: tuple[int, int] | None = None,
                  sensor_origin: tuple[int, int] = (0, 0),
-                 volume_extinction=None,surface_transport=None):
+                 volume_extinction=None,surface_transport=None,camera_interval_observer=None,field_continuation=False,light_field_information=None):
         (self._w, self._h), self._full_sensor_size, self._sensor_origin = _sensor_tile_coordinates(
             sensor_w, sensor_h, full_sensor_size, sensor_origin)
         # Borrow the prebuilt field; its owner outlives every camera accumulator.
@@ -10046,6 +10300,32 @@ class SensorAccumulator:
             if not isinstance(volume_extinction, dict) or not isinstance(volume_extinction.get('grid'), ExtinctionGrid) or not volume_extinction.get('buffer'):
                 raise TypeError('sensor volume_extinction must be the live prebuilt field binding')
             sensor_shader_source = transport_shader(sensor_shader_source, sensor=True)
+        if field_continuation:
+            from camera_designer.studio_field_continuation import separate_field_continuation
+            sensor_shader_source = separate_field_continuation(sensor_shader_source, enabled=True)
+        self._field_continuation = bool(field_continuation)
+        self._light_field_information = light_field_information
+        if light_field_information is not None:
+            from camera_designer.studio_sensor_evidence import StudioResponseEvidence
+            if not isinstance(light_field_information, StudioResponseEvidence) or camera_interval_observer is not None:
+                raise TypeError('light_field_information requires one explicit StudioResponseEvidence')
+            camera_interval_observer = light_field_information
+        self._camera_interval_observer = camera_interval_observer
+        if camera_interval_observer is not None:
+            from camera_designer.studio_camera_intervals import CameraIntervalObserver, observe_camera_continuation
+            if not isinstance(camera_interval_observer, CameraIntervalObserver):
+                raise TypeError('camera_interval_observer must be caller-owned native observation storage')
+            sensor_shader_source = observe_camera_continuation(sensor_shader_source, enabled=True)
+            camera_interval_observer.identity['shared_band0_path'] = not bool(field_continuation)
+            if light_field_information is not None:
+                if light_field_information.scalar_visit_buffer:
+                    from camera_designer.studio_scalar_visits import with_scalar_visit_queries
+                    sensor_shader_source = with_scalar_visit_queries(sensor_shader_source)
+                from camera_designer.studio_camera_responses import copy_camera_responses
+                sensor_shader_source = copy_camera_responses(sensor_shader_source, enabled=True)
+            if light_field_information is not None and light_field_information.completed_samples:
+                from camera_designer.studio_completed_samples import with_completed_camera_samples
+                sensor_shader_source = with_completed_camera_samples(sensor_shader_source)
         self._sensor_shader_source = sensor_shader_source
         self._tile_sampling = full_sensor_size is not None
         import math
@@ -10099,7 +10379,9 @@ class SensorAccumulator:
         self._lens_tilt  = np.zeros(2, np.float32)   # Scheimpflug tilt (x=nod, y=pan)
         self._n_blades = max(0, int(n_blades))
         self._aperture_rot = float(aperture_rot)
+        self._response_initializing=True
         self.set_camera(camera_eye, camera_target, fov_deg=fov_deg)
+        self._response_initializing=False
         self._bmin    = np.asarray(bmin, np.float32)
         self._bmax    = np.asarray(bmax, np.float32)
         self._dims    = dims
@@ -10476,9 +10758,11 @@ class SensorAccumulator:
             self._n_blades = max(0, int(n_blades))
         if aperture_rot is not None:
             self._aperture_rot = float(aperture_rot)
+        if self._light_field_information is not None and not getattr(self,'_response_initializing',False):self._light_field_information.note_mutation('camera')
 
     def set_scene_geometry(self, *, n_tris, n_bvh_nodes, bmin, bmax, n_spheres):
         """Accept the counts/bounds for the already-updated shared scene SSBOs."""
+        if self._light_field_information is not None:self._light_field_information.note_mutation('scene')
         self._n_tris = int(n_tris)
         self._n_bvh_nodes = int(n_bvh_nodes)
         self._bmin = np.asarray(bmin, np.float32)
@@ -10510,6 +10794,7 @@ class SensorAccumulator:
             self._n_blades = max(0, int(n_blades))
         if aperture_rot is not None:
             self._aperture_rot = float(aperture_rot)
+        if self._light_field_information is not None and not getattr(self,'_response_initializing',False):self._light_field_information.note_mutation('camera')
 
     def set_history(self, samples: int = 0, checkpoint: bool = False):
         """Keep exactly the newest N ray contributions per pixel and film layer.
@@ -10556,7 +10841,30 @@ class SensorAccumulator:
         for _strip in range(strips):
             self._dispatch_once()
 
+    def set_exposure_interval_weight(self, weight: float) -> None:
+        """Scale a complete scene interval's sensor contribution without clearing exposure."""
+        value = float(weight)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("exposure interval weight must be finite and nonnegative")
+        if self._row_off != 0:
+            raise RuntimeError("exposure interval changes require a complete sensor sweep")
+        if self._history_samples:
+            raise ValueError("rolling live history cannot be a long-exposure sensor")
+        self._exposure_interval_weight = value
+
     def _sensor_sample_seed(self):
+        lane_count = getattr(self, '_sensor_lane_count', 1)
+        if lane_count > 1:
+            # Timed multi-sensor work has one namespace for every submitted
+            # strip in every lane and pass. This is packing identity only;
+            # the shader's ray generation and transport are unchanged.
+            strips = (self._h + self._rows_per_frame - 1) // self._rows_per_frame
+            sequence = (self._pass * lane_count + self._sensor_lane_index) * strips
+            sequence += self._row_off // self._rows_per_frame
+            seed = 314159 + sequence
+            if seed > 0x7fffffff:
+                raise OverflowError('disjoint sensor seed namespace exhausted')
+            return seed
         if self._tile_sampling:
             if self._sprinkle:
                 raise ValueError("full-image tile sampling requires row dispatches")
@@ -10567,6 +10875,8 @@ class SensorAccumulator:
         loan = getattr(self, '_intersection_loan', None)
         if loan is not None and _loan_phase == 0:
             raise RuntimeError('Sensor strip is retained on loan; complete or cancel it before dispatch')
+        if loan is not None and getattr(self, '_camera_interval_observer', None) is not None:
+            raise ValueError('camera interval observer does not yet support retained loan replay')
         if _loan_phase not in (0, 1, 2) or (_loan_phase and loan is None):
             raise ValueError('Invalid sensor loan dispatch')
         from OpenGL.GL import (glUseProgram, glBindBufferBase,
@@ -10582,6 +10892,15 @@ class SensorAccumulator:
         import math
 
         # Validate tile scheduling before changing any GL bindings.
+        if self._light_field_information is not None:
+            if self._history_samples and hasattr(self._light_field_information.consume,'preflight_capacity'):
+                raise ValueError('copied component accumulation does not yet support selected rolling history')
+            _path_bands = (3 if uses_fixed3_transport(self.film) else min(8, len(self.film.layer_specs()))) if self._field_continuation else 1
+            self._light_field_information.prepare(
+                width=self._w, rows=self._rows_per_frame,
+                samples=max(1,int(self._samples_per_pixel)), path_bands=_path_bands,
+                max_bounces=self._max_bounces,
+                row_granularity=16 if self._history_samples or self._sample_evidence is not None else 1)
         seed = self._sensor_sample_seed()
         if self._history_samples and (self._sprinkle or self._samples_per_pixel != 1 or self._rows_per_frame % 16):
             raise ValueError("ray history requires unique 16-row dispatches and one sample per pixel")
@@ -10599,6 +10918,8 @@ class SensorAccumulator:
             bind_volume(self._volume_extinction, self._prog)
         if loan is not None:
             loan.bind(_loan_phase)
+        if self._camera_interval_observer is not None:
+            self._camera_interval_observer.bind(self._prog)
         for binding, buffer in enumerate(self._history_buffers, 6):
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, buffer)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, self._ssbo_tris)
@@ -10628,6 +10949,7 @@ class SensorAccumulator:
         def _u4f(n, x,y,z,w): glUniform4f(glGetUniformLocation(self._prog, n), float(x),float(y),float(z),float(w))
 
         _u1i(b'uHistorySamples', self._history_samples)
+        _u1f(b'uExposureIntervalWeight', getattr(self, '_exposure_interval_weight', 1.0))
         _u1i(b'uHistorySlot', self._pass % max(1, self._history_samples))
         _u1i(b'uHistoryCount', min(self._pass, self._history_samples))
         _u1i(b'uHistoryCheckpoint', int(getattr(self, '_history_checkpoint', False)))
@@ -10709,6 +11031,23 @@ class SensorAccumulator:
             gy = max(1, int(math.ceil(rows_this / 16.0)))
         glDispatchCompute(gx, gy, 1)
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT)
+        if self._light_field_information is not None:
+            self._light_field_information.finish(dispatch_identity=dict(
+                seed=seed & 0x7FFFFFFF, row_offset=self._row_off, rows=rows_this,
+                width=self._w, frame=self._frame, sample_pass=self._pass,
+                active_pixels=dispatch_px if random_mode else self._w*rows_this,active_path_bands=_path_bands,
+                samples_per_pixel=max(1,int(self._samples_per_pixel)),history_samples=self._history_samples,
+                source_sha256=__import__('hashlib').sha256(self._sensor_shader_source.encode()).hexdigest(),
+                layer_specs=_sensor_specs,
+                volume_controls=dict(master_alpha=self._va,diffuse_scatter=self._air_ds,specular_scatter=self._air_ss),
+                camera_uniforms=dict(eye=self._eye.tolist(),right=self._right.tolist(),
+                    up=self._up.tolist(),forward=self._fwd.tolist(),fov_tan=self._fov_tan,
+                    aspect=self._aspect,aperture_radius=self._aperture_radius,
+                    focus_distance=self._focus_dist,chromatic_aberration=self._ca_factor,
+                    tilt_shift=list(self._tilt_shift),lens_tilt=list(_lt) if _lt is not None else [0.,0.],
+                    aperture_blades=getattr(self,'_n_blades',0),aperture_rotation=getattr(self,'_aperture_rot',0.),
+                    sensor_size=[self._w,self._h],sensor_origin=list(self._sensor_origin),
+                    full_sensor_size=list(self._full_sensor_size) if self._tile_sampling else [0,0])))
         if _loan_phase == 1:
             for _i in range(len(self._tex_bands)):
                 glActiveTexture(GL_TEXTURE0 + _i)
@@ -10779,6 +11118,9 @@ class SensorAccumulator:
 
     def destroy(self):
         from OpenGL.GL import glDeleteTextures, glDeleteProgram, glDeleteBuffers
+        if getattr(self, '_light_field_information', None) is not None:
+            self._light_field_information.close()
+            self._light_field_information = None
         if self._source_worker is not None:
             self._source_worker.stop()
             self._source_worker.join(timeout=1.0)
@@ -10836,6 +11178,11 @@ class SensorAccumulator:
             glBindTexture(GL_TEXTURE_3D, tex)
             glClearTexImage(tex, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, zero)
         glBindTexture(GL_TEXTURE_3D, 0)
+        if self._light_field_information is not None:
+            if self._light_field_information.scalar_visit_buffer:
+                from camera_designer.studio_scalar_visits import clear as clear_scalar_visits
+                clear_scalar_visits(self._light_field_information.scalar_visit_buffer)
+            self._light_field_information.note_field_reset()
         # _fwd_frame is intentionally NOT reset — seeds must stay unique across resets
 
     # ------------------------------------------------------------------

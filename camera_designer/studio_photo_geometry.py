@@ -22,15 +22,27 @@ def camera_geometry_key(camera, target_default):
             float(camera.get("aperture_rotation_radians", 0)))
 
 
-def prepare_photo_geometry(config, vertices, material_ids, pbr, *, material_lineage_out=None):
+def prepare_photo_geometry(config, vertices, material_ids, pbr, *, material_lineage_out=None,
+                           response_lineage_out=None, prepare_sources=True):
+    if response_lineage_out is not None and config.get('light_field_information') != 'evaluated-responses-v1':
+        raise ValueError('response lineage copies require evaluated-responses-v1 opt-in')
     transport = config.get("transport", "fixed:1")
-    wavelengths = [.5875618] if transport == "fixed:1" else [.450, .550, .650]
+    optical_outside_policy=config.get("optical_outside_policy",
+        "game-transparent-outside-authored-v1" if transport=="fixed:8" else "error")
+    if optical_outside_policy not in ("error","game-transparent-outside-authored-v1") or (transport!="fixed:8" and optical_outside_policy!="error"):
+        raise ValueError('unsupported optical outside-spectrum policy')
+    wavelengths = ([.5875618] if transport == "fixed:1" else
+                   [.650, .550, .450, .590, .365, .395, .850, .940] if transport == "fixed:8" else
+                   [.650, .550, .450, .850] if transport == "fixed:4" else [.450, .550, .650])
     policy = config.get("sphere_coverage", "mesh")
     budget = config.get("triangle_budget", 250000)
     regions = None
     if policy == "exact":
         regions = validate_sphere_regions(config.get("analytic_spheres"), vertices, material_ids, pbr)
     camera = config.get("camera", {})
+    camera_visible = config.get("camera_visible", True)
+    if type(camera_visible) is not bool:
+        raise ValueError("camera_visible must be boolean")
     preset = thin_lens_housing_preset(camera)
     checker = config.get("checker", {})
     checker_pos = checker.get("center_m", [0, 0, .30])
@@ -64,8 +76,13 @@ def prepare_photo_geometry(config, vertices, material_ids, pbr, *, material_line
         scene_object=scene_object,
         wavelengths_um=wavelengths,
         camera_frame=camera_frame,
+        include_camera_geometry=camera_visible,
     )
     object_offset = len(scene[0])
+    response_lineage = None
+    if response_lineage_out is not None:
+        from .studio_response_lineage import NativeResponseLineage
+        response_lineage = NativeResponseLineage(object_offset)
     scene, original_indices = append_saved_studio_mesh_to_gpu_scene(
         scene, vertices, material_ids, pbr,
         scale_m=float(config.get("scale_m", .025)),
@@ -74,11 +91,14 @@ def prepare_photo_geometry(config, vertices, material_ids, pbr, *, material_line
         spectral_emission_rgb=(transport == "fixed:3"),
         boundary_media=config.get("boundary_media"),
         optical_media=config.get("optical_media"),
+        optical_outside_policy=optical_outside_policy,
         region_media=config.get("region_media"),
         material_authoring=config.get("material_authoring"),
         canonical_volume_optics=config.get("canonical_volume_optics"),
         return_index_map=True,
         material_lineage_out=material_lineage_out,
+        response_lineage_out=response_lineage,
+        response_source=(1, 'subject'),
     )
     # Real emissive fixture geometry (the Studio light housings/panels),
     # appended through the exact same function used for the saved marble
@@ -96,18 +116,22 @@ def prepare_photo_geometry(config, vertices, material_ids, pbr, *, material_line
             material_authoring=fixtures.get("material_authoring"),
             emitter_profiles=fixtures.get("emitter_profiles"),
             boundary_media=fx_boundary, optical_media=fx_optics,
+            optical_outside_policy=optical_outside_policy,
             advanced_surface_mask=advanced_surface_triangles(fixtures),
             wavelengths_um=wavelengths,
             spectral_emission_rgb=(transport == "fixed:3"),
             material_lineage_out=material_lineage_out,
             lineage_source=(fixtures["material_ids"], np.asarray(fixtures["pbr"],np.float32).reshape(-1,16)),
+            response_lineage_out=response_lineage,
+            response_source=(2, 'fixtures'),
         )
     input_count = len(scene[0])
     spheres = np.zeros((0, 8), np.float32)
     if regions is not None:
         scene, spheres = pack_sphere_regions(scene, original_indices, object_offset, regions,
-            scale_m=float(config.get("scale_m", .025)), center_m=config.get("object_center_m", [0,0,.18]))
-    if fixtures is not None:
+            scale_m=float(config.get("scale_m", .025)), center_m=config.get("object_center_m", [0,0,.18]),
+            response_lineage_out=response_lineage)
+    if fixtures is not None and prepare_sources:
         from .studio_native_emitters import native_emissive_sources, sampling_settings
         sampling=sampling_settings(config)
         sources = native_emissive_sources(scene, wavelengths,ray_budget=sampling['ray_budget'],seed=sampling['seed'])
@@ -115,6 +139,7 @@ def prepare_photo_geometry(config, vertices, material_ids, pbr, *, material_line
         scene = (*scene[:7], sources)
     stats = geometry_statistics(input_triangles=input_count, packed_triangles=len(scene[0]),
         sphere_count=len(spheres), policy=policy, budget=budget)
+    stats['optical_outside_policy']=optical_outside_policy
     if fixtures is not None:
         from .studio_native_emitters import VERSION
         stats['emissive_sampling'] = {'version': VERSION, 'root_samples': len(scene[7]),
@@ -139,6 +164,10 @@ def prepare_photo_geometry(config, vertices, material_ids, pbr, *, material_line
         "front_clearance_m": float(preset.aperture_stop.thickness_m),
         "optics": "analytical thin lens; native nonrefractive housing behind pupil",
     }
+    if response_lineage_out is not None:
+        response_lineage_out.update(response_lineage.snapshot(
+            geometry_sha256=config.get('geometry_sha256'), revision=config.get('live_revision'),
+            fixture_parts=(fixtures or {}).get('response_lineage')))
     return scene, spheres, stats, checker_pos
 
 

@@ -312,6 +312,20 @@ def test_percentile_specular_mode_clips_only_values_above_chosen_white():
     np.testing.assert_array_equal(rgb, original)
 
 
+def test_exposure_iso_and_top_quarter_linear_clip_preserve_raw_sensor_values():
+    rgb = np.repeat(np.arange(1., 101.)[None, :, None], 3, axis=2)
+    original = rgb.copy()
+    params = {"normalization": "percentile", "normalization_percentile": 75.,
+              "tone_curve": "linear", "exposure": 0.}
+    base, white = render_linear_srgb(rgb, params)
+    boosted, boosted_white = render_linear_srgb(rgb, dict(params, exposure=1.))
+    assert white == pytest.approx(75.25)
+    assert boosted_white == white
+    assert 25 <= np.count_nonzero(base[0, :, 0] == 255) <= 26
+    assert np.count_nonzero(boosted[0, :, 0] == 255) > 25
+    np.testing.assert_array_equal(rgb, original)
+
+
 def test_percentile_defaults_legacy_auto99_and_black_are_stable():
     assert normalize_display_params()["normalization_percentile"] == 99.
     assert normalize_display_params({"normalization": "specular"})["normalization_percentile"] == 95.

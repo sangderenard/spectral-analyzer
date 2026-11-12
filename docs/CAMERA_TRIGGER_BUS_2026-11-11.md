@@ -53,6 +53,16 @@ admission errors for settings outside this camera-light contract. The same graph
 also drives a manual Flash pulse in the Phong preview through a browser image
 adapter for the original Pygame `RoutingGridView`.
 
+Three optional `mod:1`–`mod:3` source nodes are camera-triggered modulators.
+Their samples come from `signal_generator_v2`'s `ConstantPhasePath`, sine/warped/
+harmonic manifolds, linear/piecewise ramps, and `ADSREnvelope`. Each Flash rising
+edge starts the selected waveform; repeat count and spacing restart it within
+the same camera event. Attack, decay, sustain level, sustain time and release are
+explicit controls. The resulting arrays enter the same `GraphSolver` as Flash
+and are patched to named light or rack receivers through the original mixer.
+Generator settings are a separate bounded camera contract alongside the saved
+`RoutingGraph`; they do not replace graph gain, phase, delay or fan-out.
+
 No existing `peanut` / optical-slave receiver was found in the checked camera or
 signal-graph source. If peanut means an optical slave, connect an actual detected
 light signal and its threshold/rearm/latency behavior; do not relabel an electrical

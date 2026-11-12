@@ -618,13 +618,15 @@ def _fixed8_studio_tick_frames(frames, seconds, substeps):
     return result
 
 
-def _timed_exposure_program(frames, fixtures, seconds, trigger_graph=None, trigger_timing=None):
+def _timed_exposure_program(frames, fixtures, seconds, trigger_graph=None, trigger_timing=None, trigger_generators=None):
     """Attach Shop cutoff and routed trigger states to one camera exposure."""
     from camera_software.exposure_timing import ExposureSlice, ExposureFrame, CameraTimeline, ExposureBarrier
     triggers = fixtures.get('trigger_emitters', [])
     pulse_duration=0.0
     if triggers:
         from camera_software.trigger_bus import make_camera_trigger_graph, resolve_camera_trigger_bus, validate_flash_illumination_graph
+        from camera_software.trigger_generators import generator_tail_s, validate_generators
+        generator_specs=validate_generators(trigger_generators)
         timing=trigger_timing or {'shop_cutoff_lead_s':.001,'flash_duration_s':.010}
         pre=float(timing['shop_cutoff_lead_s'])
         pulse_duration=float(timing['flash_duration_s'])
@@ -644,7 +646,7 @@ def _timed_exposure_program(frames, fixtures, seconds, trigger_graph=None, trigg
         maximum_delay=validate_flash_illumination_graph(graph,step_s=step)
         if any(abs(round(value/step)*step-value)>1e-8 for value in [pre,pulse_duration]):
             raise ValueError('camera flash timing and wire delays require 0.1 ms precision')
-        window=pulse_end+maximum_delay+step
+        window=pulse_end+maximum_delay+generator_tail_s(generator_specs)+step
         count=int(np.ceil(window/step-1e-9))
         if count>50000:raise ValueError('camera flash routing exceeds the five-second delayed control window')
         grid_slices=tuple(ExposureSlice(frame_id=0,slice_id=i,t0=i*step,t1=(i+1)*step,
@@ -655,7 +657,7 @@ def _timed_exposure_program(frames, fixtures, seconds, trigger_graph=None, trigg
             flash_active=pre<=i*step<pulse_end,sensor_integrating=i*step>=pre,
             camera_id='studio-flash-control',causality_id=i)for i in range(count))
         control=ExposureFrame(frame_id=0,t0=0,t1=count*step,slices=grid_slices,camera_id='studio-flash-control')
-        routed=resolve_camera_trigger_bus(control,graph,receivers,flash_signal_mode='level')
+        routed=resolve_camera_trigger_bus(control,graph,receivers,flash_signal_mode='level',generators=generator_specs)
         signal=routed.signals
         changes=set()
         for i in range(1,count):
@@ -829,7 +831,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
         if transport == 'fixed:8' and exposure_substeps > 1:
             timed_frames = _fixed8_studio_tick_frames(timed_frames, seconds, exposure_substeps)
         timed_frames,timed_barrier=_timed_exposure_program(timed_frames,config['fixtures'],seconds,
-            config.get('camera_trigger_graph'),config.get('camera_trigger_timing'))
+            config.get('camera_trigger_graph'),config.get('camera_trigger_timing'),config.get('camera_trigger_generators'))
     material_lineage = [] if receive_light_field else None
     response_lineage={} if response_requested else None
     scene, sphere_regions, geometry_stats, checker_pos = prepare_photo_geometry(initial_config, vertices, material_ids, pbr, **({"material_lineage_out": material_lineage} if material_lineage is not None else {}), **({"response_lineage_out":response_lineage} if response_requested else {}))

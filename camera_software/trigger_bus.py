@@ -1,6 +1,6 @@
 """Camera exposure signals on Pluck's existing mixer and GraphSolver.
 
-This is the zero-delay wire-bus seam, not another exposure scheduler or light
+This is a bounded camera control bus, not another exposure scheduler or light
 transport engine. The caller retains the original ExposureFrame. A result is a
 complex control signal per named receiver and slice, not emitted photon energy.
 """
@@ -17,13 +17,14 @@ from network_materializer import compile_nodes, routing_edge_to_tensor_edge
 from routing_engine import EdgeTransferSpec, RoutingGraph, RouterInstance, TensorPortContract
 
 from .exposure_timing import ExposureFrame
+from .trigger_generators import GENERATOR_KEYS, camera_generator_signals, validate_generators
 
 
 CAMERA_TRIGGER_PORTS = ("Sync", "Flash", "Gate")
 
 
 def validate_flash_illumination_graph(graph: RoutingGraph, *, step_s: float = .0001) -> float:
-    """Admit finite, bounded Flash-only light routes on the camera time grid."""
+    """Admit finite delayed routes from Flash and camera-triggered modulators."""
     active=[edge for edge in graph.edges if abs(edge.weight)>1e-12]
     keys=set(graph.node_keys())
     if any(edge.src_key not in keys or edge.dst_key not in keys for edge in active):
@@ -32,6 +33,8 @@ def validate_flash_illumination_graph(graph: RoutingGraph, *, step_s: float = .0
         raise ValueError("camera flash wire delay must be finite and nonnegative")
     if any(edge.src_key in ("Sync", "Gate") for edge in active):
         raise ValueError("light trigger receivers currently require a Flash-sourced graph")
+    if any(edge.dst_key in GENERATOR_KEYS for edge in active):
+        raise ValueError("camera generator nodes are authored signal sources")
     delays=[edge.delay_s for edge in active if edge.delay_s>0]
     if any(abs(round(value/step_s)*step_s-value)>1e-8 for value in delays):
         raise ValueError("camera wire delays require 0.1 ms precision")
@@ -49,15 +52,15 @@ def validate_flash_illumination_graph(graph: RoutingGraph, *, step_s: float = .0
     return sum(delays)
 
 
-def make_camera_trigger_graph(receiver_keys: Iterable[str], *, bus_keys: Iterable[str] = ()) -> RoutingGraph:
+def make_camera_trigger_graph(receiver_keys: Iterable[str], *, bus_keys: Iterable[str] = (), generator_keys: Iterable[str] = ()) -> RoutingGraph:
     """Register camera, wire-bus and exact receiver identities, initially unpatched.
 
     Sync is one at the first slice, Flash carries the scheduler's flash_weight,
-    and Gate is one while the sensor integrates. Nothing generates new timing or
-    assumes what a receiver does with these signals. Patch with set_weight(), or
-    the existing RoutingGridView. Save through RoutingGraph.to_dict().
+    and Gate is one while the sensor integrates. Optional generator nodes receive
+    camera-triggered sample arrays from the existing Spectral signal fields.
+    Patch with set_weight() or RoutingGridView; save via RoutingGraph.to_dict().
     """
-    keys = [*CAMERA_TRIGGER_PORTS, *bus_keys, *receiver_keys]
+    keys = [*CAMERA_TRIGGER_PORTS, *bus_keys, *receiver_keys, *generator_keys]
     if any(not isinstance(key, str) or not key for key in keys):
         raise ValueError("trigger bus node keys must be non-empty strings")
     if len(set(keys)) != len(keys):
@@ -94,7 +97,7 @@ class CameraTriggerBusResult:
 
 
 def resolve_camera_trigger_bus(
-    frame: ExposureFrame, graph: RoutingGraph, receiver_keys: Iterable[str], *, flash_signal_mode="weighted"
+    frame: ExposureFrame, graph: RoutingGraph, receiver_keys: Iterable[str], *, flash_signal_mode="weighted", generators=None
 ) -> CameraTriggerBusResult:
     """Resolve a camera-authored exposure through the canonical graph runtime.
 
@@ -107,6 +110,8 @@ def resolve_camera_trigger_bus(
     """
     keys = graph.node_keys()
     receivers = list(receiver_keys)
+    generator_specs = validate_generators(generators)
+    generator_keys = {item["key"] for item in generator_specs}
     if len(set(keys)) != len(keys) or any(not isinstance(key, str) or not key for key in keys):
         raise ValueError("trigger bus node keys must be unique non-empty strings")
     if len(set(receivers)) != len(receivers) or not receivers:
@@ -114,6 +119,8 @@ def resolve_camera_trigger_bus(
     missing = (set(CAMERA_TRIGGER_PORTS) | set(receivers)) - set(keys)
     if missing:
         raise ValueError(f"unregistered trigger bus nodes: {sorted(missing)}")
+    if generator_keys - set(keys):
+        raise ValueError("camera generator settings name an unregistered routing source")
     if graph.param_edges or graph.meta_edges:
         raise ValueError("trigger wire bus does not consume parameter or meta edges")
     if graph.feedback.enabled or graph.latency_compensation:
@@ -123,6 +130,8 @@ def resolve_camera_trigger_bus(
             raise ValueError("trigger bus edge refers to an unregistered node")
         if edge.dst_key in CAMERA_TRIGGER_PORTS:
             raise ValueError("camera-authored source ports cannot receive patched signals")
+        if edge.dst_key in GENERATOR_KEYS:
+            raise ValueError("camera generator nodes cannot receive patched signals")
         if not math.isfinite(edge.weight) or not math.isfinite(edge.angle_rad):
             raise ValueError("trigger bus gains and phase must be finite")
         if not math.isfinite(edge.delay_s) or edge.delay_s < 0 or getattr(edge, "delay_samples", 0) < 0:
@@ -165,6 +174,8 @@ def resolve_camera_trigger_bus(
                                for s in frame.slices], dtype=torch.complex128),
         "Gate": torch.tensor([float(s.sensor_integrating) for s in frame.slices], dtype=torch.complex128),
     }
+    inputs.update({key: torch.tensor(series, dtype=torch.complex128)
+                   for key, series in camera_generator_signals(frame, generator_specs).items() if key in keys})
     values = compiled.process_window(inputs, n_frames=n)
     if any(not torch.isfinite(value).all() for value in values.values()):
         raise ValueError("trigger bus resolved a non-finite signal")

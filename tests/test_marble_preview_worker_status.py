@@ -74,3 +74,27 @@ def test_delayed_amplitude_routes_into_real_exposure_intervals():
     assert [r['gain'] for r in finished['emitter_profiles']['records']]==[15.0,0.0,0.0]
     assert abs(sum(barrier.timeline.slices[i].exposure_slice.flash_weight
                    for i in barrier.timeline.flash_slices)-1.0)<1e-12
+
+
+def test_repeated_generator_modulates_light_on_exposure_timeline():
+    import pytest
+    from camera_software.trigger_bus import make_camera_trigger_graph
+    from camera_software.trigger_generators import GENERATOR_KEYS
+    frames=[{'t0':0.0,'t1':1.0,'pbr':[0.0]*32,
+             'emitter_profiles':{'version':1,'records':[{'material':0,'gain':8.0}]}}]
+    fixtures={'shop_material_ids':[], 'trigger_emitters':[
+        {'material':0,'receiver':'studio:0','frame_gain':True}]}
+    graph=make_camera_trigger_graph(['studio:0'],generator_keys=GENERATOR_KEYS)
+    graph.set_weight('mod:1','studio:0',.5)
+    spec={'key':'mod:1','enabled':True,'kind':'ramp_down','frequency_hz':0,
+          'phase_deg':0,'tension':1,'attack_ms':0,'decay_ms':0,
+          'sustain':1,'hold_ms':10,'release_ms':0,'repeat_count':2,
+          'repeat_interval_ms':10,'level':1}
+    intervals,_=worker._timed_exposure_program(frames,fixtures,1.0,graph.to_dict(),
+                                               trigger_generators=[spec])
+    def gain_at(t):
+        row=next(row for row in intervals if row['t0']<=t<row['t1'])
+        return row['emitter_profiles']['records'][0]['gain']
+    assert gain_at(.00205)==pytest.approx(3.6,abs=.01)
+    assert gain_at(.01205)==pytest.approx(3.6,abs=.01)
+    assert gain_at(.02205)==0

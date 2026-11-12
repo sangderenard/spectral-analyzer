@@ -72,7 +72,7 @@ def sensor_method(name):
 @pytest.mark.parametrize("method", ["__init__", "set_camera", "set_lens"])
 @pytest.mark.parametrize("focus", [-1., 0., .0005, .001, .005, .009, .019, .02, 1., 10., 100.])
 def test_all_cpu_entry_points_use_one_mm_numerical_floor(method, focus):
-    obj = SimpleNamespace()
+    obj = SimpleNamespace(_light_field_information=None)
     kwargs = dict(focus_dist=focus)
     if method == "set_camera":
         kwargs.update(camera_eye=[0, 0, 0], camera_target=[0, 0, 1], fov_deg=52)
@@ -83,7 +83,7 @@ def test_all_cpu_entry_points_use_one_mm_numerical_floor(method, focus):
 
 @pytest.mark.parametrize("method", ["set_camera", "set_lens"])
 def test_omitted_focus_does_not_reset_existing_lens(method):
-    obj = SimpleNamespace(_focus_dist=.005)
+    obj = SimpleNamespace(_focus_dist=.005, _light_field_information=None)
     kwargs = dict(camera_eye=[0, 0, 0], camera_target=[0, 1, 0], fov_deg=52) if method == "set_camera" else {}
     sensor_method(method)(obj, **kwargs)
     assert obj._focus_dist == .005
@@ -146,3 +146,24 @@ def test_existing_tilt_horizon_guard_is_finite_and_unchanged(denominator):
     assert result["fd_eff"] == pytest.approx(.001 / max(.005, denominator))
     assert np.isfinite(result["focus_pt"]).all()
     assert 0 < result["focus_pt"][2] <= .2 + 1e-14
+
+
+def test_constructor_accepts_tilt_without_followup_camera_mutation():
+    cls=next(n for n in renderer_tree().body if isinstance(n,ast.ClassDef) and n.name=='SensorAccumulator')
+    init=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='__init__')
+    assert 'lens_tilt' in [a.arg for a in init.args.kwonlyargs]
+    assignments=[n for n in init.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Attribute) and t.attr in ('_tilt_shift','_lens_tilt') for t in n.targets)]
+    obj=SimpleNamespace()
+    ns=dict(np=np,self=obj,tilt_shift=(.3,-.2),lens_tilt=(.1,-.15))
+    exec(compile(ast.Module(body=assignments,type_ignores=[]),'sensor-movements-init','exec'),ns)
+    np.testing.assert_allclose(obj._tilt_shift,[.3,-.2])
+    np.testing.assert_allclose(obj._lens_tilt,[.1,-.15])
+
+
+def test_studio_worker_passes_movements_into_real_sensor_and_live_lens():
+    for filename,call_name in [('marble_preview_worker.py','SensorAccumulator'),('marble_live_worker.py','set_lens')]:
+        tree=ast.parse((ROOT/'camera_designer'/filename).read_text(encoding='utf-8'))
+        calls=[n for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute) and n.func.attr==call_name]
+        assert len(calls)==1
+        names={k.arg for k in calls[0].keywords}
+        assert {'tilt_shift','lens_tilt'} <= names

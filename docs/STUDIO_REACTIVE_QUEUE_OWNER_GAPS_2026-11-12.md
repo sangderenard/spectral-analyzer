@@ -86,7 +86,8 @@ optics, raw records, outer attachment, Phong application or hardware readiness.
 
 Turing receiver branch `codex/camera-pair-receiver-20261112` contains the existing
 bounded record index as `b99d7f9d` and the explicit camera query extension as
-`72f91419`. `cameraQuerySegments: true` requires the v2 pair envelope and a
+`72f91419`, with conservative clipping correction `2d605524`.
+`cameraQuerySegments: true` requires the v2 pair envelope and a
 positive `recordIndexBytes` budget; both remain opt-in. Support bit 4 means only
 derived query-parametric geometry. Copied endpoint/segment support bits 1/2
 retain their prior meaning. Unresolved intervals publish no guessed traversal.
@@ -111,6 +112,11 @@ python tests/studio_scene_response_transport_check.py C:\Users\alber\turing-vect
 
 All four passed: exact v2 pairs with and without the new query index, and exact
 v1 forward/reactive segments through both the updated and original index.
+Review caught an extreme-coordinate case where float64 entry/exit parameters
+collapse to equality. The shared walker now marks that ambiguous geometry
+unavailable, without tolerance or invented cells; strictly disjoint intervals
+stay empty. Both query and copied-segment regressions passed, including exact
+word preservation. The receiver's index suite now has 18 passing cases.
 No live job, GPU compilation/link, render, push, or deployment was performed.
 The reactive gaps above are not permission denials or hardware failures; the
 necessary execution/provenance contracts are not yet implemented. Nothing here

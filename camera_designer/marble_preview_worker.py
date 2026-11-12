@@ -624,23 +624,62 @@ def _timed_exposure_program(frames, fixtures, seconds, trigger_graph=None, trigg
     triggers = fixtures.get('trigger_emitters', [])
     pulse_duration=0.0
     if triggers:
-        from camera_software.trigger_bus import make_camera_trigger_graph, resolve_camera_trigger_bus
+        from camera_software.trigger_bus import make_camera_trigger_graph, resolve_camera_trigger_bus, validate_flash_illumination_graph
         timing=trigger_timing or {'shop_cutoff_lead_s':.001,'flash_duration_s':.010}
         pre=float(timing['shop_cutoff_lead_s'])
         pulse_duration=float(timing['flash_duration_s'])
         pulse_end=pre+pulse_duration
         if not 0<pre<pulse_end<seconds:raise ValueError('camera trigger timing is outside shutter interval')
+        receivers=[item['receiver'] for item in triggers]
+        if trigger_graph is None:
+            graph=make_camera_trigger_graph(receivers)
+            for receiver in receivers:graph.set_weight('Flash',receiver,1.0)
+        else:
+            from routing_engine import RoutingGraph
+            graph=RoutingGraph.from_dict(trigger_graph)
+        # The existing mixer operates on a uniform time series. Resolve only
+        # the bounded camera pulse and its delayed tail, then split the native
+        # exposure intervals where that actual graph output changes.
+        step=.0001
+        maximum_delay=validate_flash_illumination_graph(graph,step_s=step)
+        if any(abs(round(value/step)*step-value)>1e-8 for value in [pre,pulse_duration]):
+            raise ValueError('camera flash timing and wire delays require 0.1 ms precision')
+        window=pulse_end+maximum_delay+step
+        count=int(np.ceil(window/step-1e-9))
+        if count>50000:raise ValueError('camera flash routing exceeds the five-second delayed control window')
+        grid_slices=tuple(ExposureSlice(frame_id=0,slice_id=i,t0=i*step,t1=(i+1)*step,
+            shutter_mode=0,shutter_open=1,shutter_center_u=.5,shutter_center_v=.5,
+            shutter_softness=0,exposure_weight=step,
+            flash_weight=step/pulse_duration if pre<=i*step<pulse_end else 0,
+            sensor_weight=step if i*step>=pre else 0,
+            flash_active=pre<=i*step<pulse_end,sensor_integrating=i*step>=pre,
+            camera_id='studio-flash-control',causality_id=i)for i in range(count))
+        control=ExposureFrame(frame_id=0,t0=0,t1=count*step,slices=grid_slices,camera_id='studio-flash-control')
+        routed=resolve_camera_trigger_bus(control,graph,receivers,flash_signal_mode='level')
+        signal=routed.signals
+        changes=set()
+        for i in range(1,count):
+            if i*step<seconds and any(abs(signal[key][i]-signal[key][i-1])>1e-10 for key in receivers):
+                changes.add(round(i*step,4))
         bounds = sorted({0.0, pre, pulse_end, float(seconds),
-                         *(float(value) for frame in frames for value in (frame['t0'],frame['t1']))})
+                         *(float(value) for frame in frames for value in (frame['t0'],frame['t1'])),*changes})
         intervals = []
         for t0,t1 in zip(bounds,bounds[1:]):
             if t1 <= t0:continue
-            original = next((frame for frame in frames if frame['t0'] <= t0 and frame['t1'] >= t1), None)
+            original = next((frame for frame in frames if frame['t0'] <= t0+1e-9 and frame['t1'] >= t1-1e-9), None)
             if original is None:raise ValueError('timed exposure frame bundle has a gap')
             profiles = {'version':1,'records':[dict(record) for record in original['emitter_profiles']['records']]}
+            by_material={record['material']:record for record in profiles['records']}
             if t0 < pulse_end:
                 for record in profiles['records']:
                     if record['material'] in fixtures['shop_material_ids']:record['gain']=0.0
+            index=min(count-1,int(t0/step+1e-8))
+            for trigger in triggers:
+                material=trigger['material']
+                if material not in by_material:raise ValueError('triggered material has no named emitter source')
+                base=(next(record['gain'] for record in original['emitter_profiles']['records']
+                           if record['material']==material) if trigger.get('frame_gain') else trigger['gain'])
+                by_material[material]['gain']=base*abs(signal[trigger['receiver']][index]) if t0<count*step else 0.0
             intervals.append({**original,'t0':t0,'t1':t1,'emitter_profiles':profiles,
                               'sensor_integrating':t0>=pre,'flash_active':pre<=t0<pulse_end})
     else:
@@ -654,23 +693,6 @@ def _timed_exposure_program(frames, fixtures, seconds, trigger_graph=None, trigg
         scene_version_id=i,camera_id='studio-photo',causality_id=i)
         for i,item in enumerate(intervals))
     frame=ExposureFrame(frame_id=0,t0=0.0,t1=float(seconds),slices=slices,camera_id='studio-photo')
-    if triggers:
-        receivers=[item['receiver'] for item in triggers]
-        if trigger_graph is None:
-            graph=make_camera_trigger_graph(receivers)
-            for receiver in receivers:graph.set_weight('Flash',receiver,1.0)
-        else:
-            from routing_engine import RoutingGraph
-            graph=RoutingGraph.from_dict(trigger_graph)
-        routed=resolve_camera_trigger_bus(frame,graph,receivers)
-        for index,item in enumerate(intervals):
-            if not item['flash_active']:continue
-            by_material={record['material']:record for record in item['emitter_profiles']['records']}
-            for trigger in triggers:
-                if abs(routed.signals[trigger['receiver']][index])>1e-12:
-                    if trigger['material'] not in by_material:
-                        raise ValueError('triggered Shop material has no named emitter source')
-                    by_material[trigger['material']]['gain']=trigger['gain']
     return intervals,ExposureBarrier(CameraTimeline.from_exposure_frame(frame))
 
 

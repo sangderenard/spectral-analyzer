@@ -44,13 +44,14 @@ result = resolve_camera_trigger_bus(existing_exposure_frame, graph, ["Key", "Fil
 
 ## Boundaries that remain
 
-This first consumer is an instantaneous wire bus. It rejects delay, latency
-compensation, feedback knobs, parameter/meta edges, nonlinear saturation and wide
-transfers instead of ignoring those settings. The original mixer still shows its
-full controls. A future host must surface these explicit admission errors.
-The existing solver has delayed transport, but acyclic `run_schedule` shifts within
-one window; a camera receiver needs a defined persistent time contract before
-using that as a cross-exposure flash delay. No new scheduler is justified.
+The Studio consumer now admits finite nonnegative delays on the original graph's
+uniform 0.1 ms control grid, limited to a five-second pulse and delayed tail.
+It rejects variable-length delayed slices, delayed cycles, Sync/Gate-sourced
+illumination, parameter/meta edges, nonlinear saturation and wide transfers.
+The original mixer still shows its full controls; the host surfaces explicit
+admission errors for settings outside this camera-light contract. The same graph
+also drives a manual Flash pulse in the Phong preview through a browser image
+adapter for the original Pygame `RoutingGridView`.
 
 No existing `peanut` / optical-slave receiver was found in the checked camera or
 signal-graph source. If peanut means an optical slave, connect an actual detected
@@ -63,7 +64,9 @@ capture eye/target. Its recorded geometry version is
 The thick-lens lab separately uses `SceneCameraCoordinator`, `CameraTimeline` and
 `ExposureBarrier`. Studio does not yet run that whole camera program, and this
 adapter does not pretend to install refractive lens surfaces or run fixture
-emission. The direct mixer surface is not mounted into Studio's browser UI.
+emission. The mixer is mounted in Studio's browser through the original Pygame
+event handlers. The browser relays pointer events and receives a PNG and the
+original `RoutingGraph` serialization; it does not own a second graph solver.
 
 `seconds` remains the Studio worker's wall-clock compute budget. Photographic
 time belongs to `camera_light_burst.exposure_time_s`, already authoritative in

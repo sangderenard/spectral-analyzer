@@ -88,11 +88,10 @@ def test_nonzero_scene_time_and_single_slice_keep_original_boundaries():
     assert result.signals["Key"] == (1,)
 
 
-@pytest.mark.parametrize("bad", ["delay", "negative_delay", "feedback", "nonfinite", "source", "transfer", "unknown"])
+@pytest.mark.parametrize("bad", ["negative_delay", "feedback", "nonfinite", "source", "transfer", "unknown"])
 def test_unsupported_patch_is_not_silently_ignored(bad):
     graph = make_camera_trigger_graph(["Key"])
     graph.set_weight("Flash", "Key", 1)
-    if bad == "delay": graph.edges[0].delay_s = 0.001
     if bad == "negative_delay": graph.edges[0].delay_s = -0.001
     if bad == "feedback": graph.feedback.enabled = True
     if bad == "nonfinite": graph.edges[0].weight = float("nan")
@@ -100,6 +99,18 @@ def test_unsupported_patch_is_not_silently_ignored(bad):
     if bad == "transfer": graph.edges[0].transfer_spec.cable_count = 2
     if bad == "unknown": graph.edges[0].dst_key = "Missing"
     with pytest.raises(ValueError): resolve_camera_trigger_bus(frame(), graph, ["Key"])
+
+
+def test_uniform_camera_delay_uses_the_existing_graph_solver_and_level_preview():
+    graph = make_camera_trigger_graph(["Key"])
+    graph.set_weight("Flash", "Key", 0.5)
+    graph.set_delay_s("Flash", "Key", 0.005)
+    exposure=frame(duration=0.02)  # four 5 ms slices
+    weighted=resolve_camera_trigger_bus(exposure,graph,["Key"])
+    assert weighted.frame is exposure
+    assert weighted.signals["Key"] == pytest.approx((0,0.25,0.25,0))
+    level=resolve_camera_trigger_bus(exposure,graph,["Key"],flash_signal_mode="level")
+    assert level.signals["Key"] == pytest.approx((0,0.5,0.5,0))
 
 
 def test_repeated_resolve_does_not_accumulate_or_change_camera():

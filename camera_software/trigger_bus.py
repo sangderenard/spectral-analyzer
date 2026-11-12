@@ -22,6 +22,33 @@ from .exposure_timing import ExposureFrame
 CAMERA_TRIGGER_PORTS = ("Sync", "Flash", "Gate")
 
 
+def validate_flash_illumination_graph(graph: RoutingGraph, *, step_s: float = .0001) -> float:
+    """Admit finite, bounded Flash-only light routes on the camera time grid."""
+    active=[edge for edge in graph.edges if abs(edge.weight)>1e-12]
+    keys=set(graph.node_keys())
+    if any(edge.src_key not in keys or edge.dst_key not in keys for edge in active):
+        raise ValueError("camera flash route names an unregistered node")
+    if any(not math.isfinite(edge.delay_s) or edge.delay_s<0 for edge in active):
+        raise ValueError("camera flash wire delay must be finite and nonnegative")
+    if any(edge.src_key in ("Sync", "Gate") for edge in active):
+        raise ValueError("light trigger receivers currently require a Flash-sourced graph")
+    delays=[edge.delay_s for edge in active if edge.delay_s>0]
+    if any(abs(round(value/step_s)*step_s-value)>1e-8 for value in delays):
+        raise ValueError("camera wire delays require 0.1 ms precision")
+    if delays:
+        links={key:[] for key in graph.node_keys()}
+        for edge in active:links[edge.src_key].append(edge.dst_key)
+        visiting=set();visited=set()
+        def walk(key):
+            if key in visiting:raise ValueError("delayed camera flash routing cannot contain a cycle")
+            if key in visited:return
+            visiting.add(key)
+            for other in links[key]:walk(other)
+            visiting.remove(key);visited.add(key)
+        for key in links:walk(key)
+    return sum(delays)
+
+
 def make_camera_trigger_graph(receiver_keys: Iterable[str], *, bus_keys: Iterable[str] = ()) -> RoutingGraph:
     """Register camera, wire-bus and exact receiver identities, initially unpatched.
 
@@ -67,14 +94,14 @@ class CameraTriggerBusResult:
 
 
 def resolve_camera_trigger_bus(
-    frame: ExposureFrame, graph: RoutingGraph, receiver_keys: Iterable[str]
+    frame: ExposureFrame, graph: RoutingGraph, receiver_keys: Iterable[str], *, flash_signal_mode="weighted"
 ) -> CameraTriggerBusResult:
     """Resolve a camera-authored exposure through the canonical graph runtime.
 
-    This first consumer accepts instantaneous scalar linear wiring, including
-    gain, phase, fan-out, fan-in and the solver's algebraic loops. Delays,
-    nonlinear receivers, feedback settings and wide transfers need a persistent
-    time-domain consumer; reject them rather than silently drop their settings.
+    The default Flash source retains the camera's physical flash_weight. A
+    manual control preview can request a unit-level pulse without changing the
+    frame or its weights. Delays are measured on the supplied frame's uniform
+    time grid; variable-duration slices cannot represent them faithfully.
     A future optical-slave/peanut receiver must be driven by detected light, not
     by relabeling a direct electrical wire as optical detection.
     """
@@ -98,8 +125,8 @@ def resolve_camera_trigger_bus(
             raise ValueError("camera-authored source ports cannot receive patched signals")
         if not math.isfinite(edge.weight) or not math.isfinite(edge.angle_rad):
             raise ValueError("trigger bus gains and phase must be finite")
-        if edge.delay_s != 0 or getattr(edge, "delay_samples", 0) != 0:
-            raise ValueError("trigger wire bus requires zero delay; delayed receivers need persistent camera time")
+        if not math.isfinite(edge.delay_s) or edge.delay_s < 0 or getattr(edge, "delay_samples", 0) < 0:
+            raise ValueError("trigger wire delay must be finite and nonnegative")
         if edge.saturation or edge.edge_kind not in ("signal", "control"):
             raise ValueError("trigger wire bus requires linear signal/control edges")
         if edge.tensor_contract != TensorPortContract() or edge.transfer_spec != EdgeTransferSpec():
@@ -117,6 +144,12 @@ def resolve_camera_trigger_bus(
             raise ValueError("trigger bus requires finite, contiguous camera slices")
     if frame.slices[-1].t1 != frame.t1 or len(set(frame.causality_keys)) != n:
         raise ValueError("trigger bus requires complete, unique camera slice identities")
+    if flash_signal_mode not in ("weighted", "level"):
+        raise ValueError("unknown camera Flash signal mode")
+    if any(edge.delay_s > 0 or getattr(edge, "delay_samples", 0) > 0 for edge in graph.edges):
+        dt=frame.dt/n
+        if any(abs(item.dt-dt)>max(1e-10,dt*1e-6) for item in frame.slices):
+            raise ValueError("delayed camera routing requires uniform camera slices")
 
     # Use the very same RoutingEdges that the mixer edits, via the permanent
     # materializer entry. No parallel graph traversal or exposure weighting.
@@ -128,7 +161,8 @@ def resolve_camera_trigger_bus(
     )
     inputs = {
         "Sync": torch.tensor([1.0] + [0.0] * (n - 1), dtype=torch.complex128),
-        "Flash": torch.tensor([s.flash_weight for s in frame.slices], dtype=torch.complex128),
+        "Flash": torch.tensor([s.flash_weight if flash_signal_mode=="weighted" else float(s.flash_active)
+                               for s in frame.slices], dtype=torch.complex128),
         "Gate": torch.tensor([float(s.sensor_integrating) for s in frame.slices], dtype=torch.complex128),
     }
     values = compiled.process_window(inputs, n_frames=n)

@@ -2,6 +2,7 @@
 
 Usage: python tests/studio_scene_response_transport_check.py <turing-root>
 Add --require-record-index to also verify the existing optional cell lookup.
+Add --camera-pairs to round-trip the exact v2 interval/response buffers instead.
 No HTTP server, GL context, shader compilation, rendering or scene is started.
 """
 import base64
@@ -24,12 +25,15 @@ const indexed=process.argv[2]==='true';
 const result=await receiveSceneResponses(fixture.manifest,payload,{
   sceneRevision:fixture.manifest.scene_revision,information:'evaluated-responses-v1',
   recordIndexBytes:indexed?1024*1024:0});
-assert.deepEqual(Array.from(result.nativeRows),fixture.native);
+if(fixture.cameraPairs){
+  assert.deepEqual(Array.from(result.cameraRhsRows),fixture.native);
+  assert.equal(result.nativeRows.length,0);
+}else assert.deepEqual(Array.from(result.nativeRows),fixture.native);
 assert.equal(result.applicationReady,false);
 assert.equal(result.metadata.physical_completeness_claim,false);
 assert.equal(result.memory.gpuBytes,0);
 for(let row=0;row<2;row++){
-  assert.equal(result.index[row*20+11],1);
+  assert.equal(result.index[row*20+11],fixture.cameraPairs?0:1);
   assert.deepEqual(Array.from(result.index.slice(row*20+16,row*20+19)),[0xffffffff,0xffffffff,0xffffffff]);
 }
 if(indexed){
@@ -41,7 +45,8 @@ if(indexed){
   for(let x=0;x<32;x++)assert.deepEqual([...result.recordIndex.records([x,16,16])],
     [{row:0,support:2},{row:1,support:2}]);
 }
-console.log(JSON.stringify({result:'PASS',records:2,exactNativeWords:256,
+console.log(JSON.stringify({result:'PASS',records:2,exactNativeWords:fixture.native.length,
+  cameraPairs:fixture.cameraPairs,
   crossingReferences:indexed?64:null,applicationReady:false,gpuBytes:0}));
 '''
 
@@ -66,11 +71,26 @@ def main():
     rows[:, 7:9] = [4, 6]; rows[:, 32] = 0x80000001; rows[:, 104] = 0x7fc12345
     store.consume_forward(dict(scene_revision='a'*64, stream_id='fixture', sequence=0,
         source_sha256='b'*64, transport_scene_sha256='c'*64, primitive_identity_offsets=[112, 113]), rows)
+    camera_pairs='--camera-pairs' in sys.argv
+    if camera_pairs:
+        if '--require-record-index' in sys.argv:raise ValueError('camera interval spatial indexing is not implemented')
+        store.invalidate_scene('f'*64)
+        intervals=np.zeros((2,128),dtype='<u4');responses=np.zeros_like(intervals)
+        intervals[:,6]=3;intervals[:,40]=7;intervals[:,126]=2
+        intervals[:,12:15]=np.asarray([1,0,0],np.float32).view(np.uint32)
+        intervals[:,5]=4;intervals[:,48]=0x80000001;intervals[:,80]=0x40000002
+        responses[:,1]=0x80000000;responses[:,2]=0x7fc12345
+        responses[:,96]=1;responses[:,108]=3;responses[:,120]=8
+        store.consume_camera_pairs(dict(scene_revision='f'*64,stream_id='fixture-pairs',sequence=0,
+            source_sha256='b'*64,transport_scene_sha256='c'*64,
+            version='native-camera-intervals-v1',response_schema='native-camera-response-copies-v1',
+            complete_dispatch_observation=True,application_ready=False,row_count=2),intervals,responses)
+        rows=np.concatenate([intervals,responses],axis=1)
     manifest, payload = store.snapshot()
     assert store.retained_entries == 2
     completed = subprocess.run(['node', '--input-type=module', '-e', JS, str(decoder),
         str('--require-record-index' in sys.argv).lower()],
-        input=json.dumps(dict(manifest=manifest, payload=base64.b64encode(payload).decode(),
+        input=json.dumps(dict(manifest=manifest, payload=base64.b64encode(payload).decode(),cameraPairs=camera_pairs,
                              native=rows.reshape(-1).tolist())),
         text=True, capture_output=True, check=True, timeout=30)
     print(completed.stdout.strip())

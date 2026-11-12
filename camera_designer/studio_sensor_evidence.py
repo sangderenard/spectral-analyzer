@@ -288,7 +288,10 @@ class StudioResponseEvidence(CameraIntervalObserver):
         if struct.unpack('<II', response_header)[1]:
             raise RuntimeError('camera response copies incomplete: storage overflow')
         responses = GL.glGetBufferSubData(GL.GL_SHADER_STORAGE_BUFFER, 8, count * WORDS * 4) if count else b''
-        metadata = dict(self.identity, response_schema='native-camera-response-copies-v1',
+        if len(payload)!=count*WORDS*4 or len(responses)!=count*WORDS*4:
+            raise RuntimeError('camera response copies incomplete: truncated paired readback')
+        metadata = dict(self.identity, stream_id=self.stream_id,source_sha256=dispatch_identity.get('source_sha256'),
+                        response_schema='native-camera-response-copies-v1',
                         response_weighting='original_path_throughput_not_availability_premultiplied',
                         camera_sample_key=['dispatch_identity','invocation_word15','sample_word2'],
                         denominator='original_camera_samples_not_response_rows',

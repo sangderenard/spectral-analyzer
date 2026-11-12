@@ -12,6 +12,18 @@ from .studio_directional_field import stencil_directions
 from .studio_response_lineage import copied_recipient, recipient_id
 
 SCHEMA='studio-scene-responses-v1'
+PAIR_SCHEMA='studio-scene-responses-v2'
+PAIR_CODEC='native-camera-response-pairs-v2'
+CAMERA_PAIR_CONTRACT=dict(version=PAIR_CODEC,row_words=256,
+    interval_schema='native-camera-intervals-v1',interval_offset_words=0,interval_words=128,
+    response_schema='native-camera-response-copies-v1',response_offset_words=128,response_words=128,
+    alignment='same-dispatch-row-ordinal',attachment='native-only-unlocated',application_ready=False)
+
+
+def _camera_pair_contract_valid(value):
+    return (isinstance(value,dict) and value.keys()==CAMERA_PAIR_CONTRACT.keys() and
+            all(type(value[key]) is type(expected) and value[key]==expected
+                for key,expected in CAMERA_PAIR_CONTRACT.items()))
 INDEX_WORDS=20
 FAMILIES={1:'forward',2:'reactive',3:'camera_rhs_summands',4:'camera_complete_sample'}
 CODECS={1:'evaluated-forward-responses-v1',2:'evaluated-forward-responses-v1',
@@ -70,6 +82,7 @@ class SceneResponseStore:
         self._context_next=0;self._seen={};self._watermarks={};self._serial=0
         self.scalar_retention=dict(mode='latest cumulative native snapshot; no cross-epoch accumulation',superseded_snapshots=0,discarded_epochs=0,discarded_entries=0,evicted_entries=0,discarded_identity_digest='',recent_discards=[],omitted_discard_identities=0)
         self.evicted=0;self.duplicates=0;self.invalidated=0;self.incomplete_dispatches=0
+        self.camera_pairs=False
 
     @property
     def retained_entries(self):return int(np.count_nonzero(self.used))
@@ -115,10 +128,16 @@ class SceneResponseStore:
             transport_scene_sha256=metadata.get('transport_scene_sha256'),
             live_revision=metadata.get('live_revision'),film_response=metadata.get('film_response'),
             reactive_queue=json.loads(_json(metadata.get('reactive_queue'))),
-            semantics=('native camera summands; already path-throughput weighted; do not divide prefix or add beside parent total'
+            semantics=('paired native camera interval and RHS attributes; additions/multipliers are not summed together; not radiance'
                        if family==3 else 'completed native camera sample before pixel averaging; view/prefix-conditioned, not local radiance'
                        if family==4 else 'native weighted transport packet/attribute; not automatically radiance'),
             physical_scene_identity=scene)
+        if family==3:
+            context['camera_observation']=dict(interval_schema=metadata.get('version'),
+                response_schema=metadata.get('response_schema'),shared_band0_path=metadata.get('shared_band0_path'),
+                complete_dispatch_observation=metadata.get('complete_dispatch_observation'),
+                response_weighting=metadata.get('response_weighting'),denominator=metadata.get('denominator'),
+                camera_sample_key=metadata.get('camera_sample_key'),excludes=metadata.get('excludes'))
         encoded=_json(context).encode()
         if len(encoded)>65536:raise MemoryError('native context exceeds bounded metadata limit')
         digest=hashlib.sha256(encoded).hexdigest()
@@ -245,7 +264,7 @@ class SceneResponseStore:
         self._context_refs[cid]+=1
         self._drop(slot)
         words=np.asarray(payload,dtype='<u4').reshape(-1)
-        if len(words) not in (128,384):raise ValueError('unsupported native scene payload stride')
+        if len(words) not in (128,256,384):raise ValueError('unsupported native scene payload stride')
         index=np.zeros(20,dtype='<u4');index[:4]=[family,semantic,cid,0]
         index[4]=recipient[0];index[5]=np.asarray(recipient[1],np.int32).view(np.uint32)
         index[6]=np.asarray(primitive,np.int32).view(np.uint32);index[7]=int(event_present)
@@ -326,6 +345,49 @@ class SceneResponseStore:
     def __call__(self, metadata, rows):
         return self.consume_forward(metadata, rows)
 
+    def consume_camera_pairs(self,metadata,intervals,responses):
+        """Retain the actual aligned buffers, not a guessed raster attachment.
+
+        V2 is exactly 128 interval words followed by 128 response words. No
+        third row, endpoint, recipient, radiance or sample weight is invented.
+        The native-only partition prevents these observations evicting surface
+        samples. Existing raw fields retain entry/current/first-hit identity.
+        """
+        if (metadata.get('version')!=CAMERA_PAIR_CONTRACT['interval_schema'] or
+            metadata.get('response_schema')!=CAMERA_PAIR_CONTRACT['response_schema'] or
+            metadata.get('complete_dispatch_observation') is not True or
+            metadata.get('application_ready') is not False):
+            raise ValueError('explicit complete native camera pair receipt required')
+        a=np.frombuffer(intervals,dtype='<u4');b=np.frombuffer(responses,dtype='<u4')
+        if a.size%128 or a.size!=b.size:raise ValueError('unaligned or truncated native camera pairs')
+        a=a.reshape(-1,128);b=b.reshape(-1,128)
+        if type(metadata.get('row_count')) is not int or metadata['row_count']!=len(a):
+            raise ValueError('camera pair row count mismatch')
+        # Validate only identity/geometry needed for storage. Response values,
+        # evaluated-presence bits and availability states stay unaltered.
+        if (not np.isfinite(a[:,12:15].view(np.float32)).all() or
+            np.any((a[:,6]<1)|(a[:,6]>8)) or
+            np.any((a[:,40]==0)|(a[:,40]>((1<<a[:,6])-1))) or
+            np.any((a[:,126]!=0)&(a[:,126]!=1)&(a[:,126]!=2)&(a[:,126]!=0xffffffff))):
+            raise ValueError('invalid camera pair direction, primitive or active band identity')
+        if not len(a):return
+        if np.any(self.used & (self.length==384)):
+            raise ValueError('legacy opaque camera rows cannot be mixed with actual v2 pairs')
+        cid,watermark,sequence=self._begin(metadata,3,native_only=True)
+        self.camera_pairs=True
+        pair=np.empty(256,dtype='<u4') # One bounded scratch row, not a batch copy.
+        for ordinal,(interval,response) in enumerate(zip(a,b)):
+            pair[:128]=interval;pair[128:]=response
+            self._put(family=3,semantic=1,cid=cid,payload=pair,
+                event_key=f'camera-pair:{metadata["stream_id"]}:{sequence}:{ordinal}'.encode(),
+                recipient=(0,-1),primitive=int(interval[126].view(np.int32)),
+                position=np.zeros(3,np.float32),position_present=False,
+                direction=interval[12:15].view(np.float32),direction_semantics=2,event_present=True)
+        self._watermarks[watermark]=sequence
+        if cid is not None and self._context_refs.get(cid)==0:
+            _,digest,charge=self._contexts.pop(cid);self._context_keys.pop(digest,None)
+            self._context_refs.pop(cid);self._context_bytes-=charge
+
     def consume_scalar_cells(self, metadata, cells):
         """Consume exact original scalar cell slabs, no sums across snapshots."""
         if metadata.get('scene_revision',metadata.get('scene_sha256'))!=self.scene_revision:
@@ -373,12 +435,15 @@ class SceneResponseStore:
             m['complete_snapshot']=True
 
     def snapshot(self, application=None):
+        rhs_stride=1024 if self.camera_pairs else 1536
+        codecs=dict(CODECS)
+        if self.camera_pairs:codecs[3]=PAIR_CODEC
         slots=np.flatnonzero(self.used);slots=slots[np.argsort(self.order[slots])]
         index=self.index[slots].copy();native_count=0;rhs_count=0
         for i,slot in enumerate(slots):
             if self.length[slot]==128:index[i,3]=native_count;native_count+=1
             else:index[i,3]=rhs_count;rhs_count+=1
-        total=index.nbytes+native_count*512+rhs_count*1536+self._scalar_bytes
+        total=index.nbytes+native_count*512+rhs_count*rhs_stride+self._scalar_bytes
         body=bytearray(total);body[:index.nbytes]=index.tobytes()
         native_offset=index.nbytes;rhs_offset=native_offset+native_count*512
         a=native_offset;b=rhs_offset
@@ -386,18 +451,18 @@ class SceneResponseStore:
             size=int(self.length[slot])*4;data=self.native[slot,:int(self.length[slot])].tobytes()
             if size==512:body[a:a+size]=data;a+=size
             else:body[b:b+size]=data;b+=size
-        scalar_offset=rhs_offset+rhs_count*1536
+        scalar_offset=rhs_offset+rhs_count*rhs_stride
         if self._scalar_count:body[scalar_offset:]=self._scalar[:self._scalar_count].tobytes()
         payload=bytes(body)
         contexts=[dict(id=cid,**value[0]) for cid,value in sorted(self._contexts.items()) if self._context_refs[cid]>0]
-        manifest=dict(schema=SCHEMA,scene_revision=self.scene_revision,publication_sequence=self._serial,
+        manifest=dict(schema=PAIR_SCHEMA if self.camera_pairs else SCHEMA,scene_revision=self.scene_revision,publication_sequence=self._serial,
             response_lineage=json.loads(_json(self.lineage_provider())),
             response_lineage_scene_revision=self.scene_revision,
             byte_order='little',payload_bytes=len(payload),payload_sha256=hashlib.sha256(payload).hexdigest(),
-            families={str(k):dict(name=v,codec=CODECS[k]) for k,v in FAMILIES.items()},contexts=contexts,
+            families={str(k):dict(name=v,codec=codecs[k]) for k,v in FAMILIES.items()},contexts=contexts,
             sections=[dict(name='scene_index',offset=0,stride=80,count=len(slots)),
                       dict(name='native_rows',offset=native_offset,stride=512,count=native_count),
-                      dict(name='camera_rhs_rows',offset=rhs_offset,stride=1536,count=rhs_count),
+                      dict(name='camera_rhs_rows',offset=rhs_offset,stride=rhs_stride,count=rhs_count),
                       dict(name='scalar_cells',offset=scalar_offset,stride=24,count=self._scalar_count)],
             scalar_snapshot=None if self._scalar_metadata is None else dict(metadata=self._scalar_metadata,retention=self.scalar_retention,
                 semantics='original cumulative scalar deposit columns; no directional or material-radiance claim'),
@@ -420,6 +485,7 @@ class SceneResponseStore:
             complete_retained_snapshot=True,physical_completeness_claim=False,application_ready=False,
             rules=['native families and summands are not summed together','presence is not coverage or radiance validity',
                    'camera prefix throughput is retained, not divided out','pixel coordinates are optional provenance, never the scene index key'])
+        if self.camera_pairs:manifest['camera_pair_contract']=dict(CAMERA_PAIR_CONTRACT)
         if application is not None:
             appmeta,approws=application
             apparray=np.asarray(approws)
@@ -434,15 +500,20 @@ class SceneResponseStore:
 
 
 def validate_scene_response_snapshot(manifest,payload):
-    if manifest.get('schema')!=SCHEMA or manifest.get('byte_order')!='little':raise ValueError('unsupported scene response envelope')
+    schema=manifest.get('schema');pairs=schema==PAIR_SCHEMA
+    if schema not in (SCHEMA,PAIR_SCHEMA) or manifest.get('byte_order')!='little':raise ValueError('unsupported scene response envelope')
+    if (pairs and not _camera_pair_contract_valid(manifest.get('camera_pair_contract')) or
+        not pairs and 'camera_pair_contract' in manifest):raise ValueError('invalid camera pair contract')
     if manifest.get('payload_bytes')!=len(payload) or manifest.get('payload_sha256')!=hashlib.sha256(payload).hexdigest():
         raise ValueError('scene response length/hash mismatch')
     sections=manifest.get('sections',[])
-    expected={'scene_index':80,'native_rows':512,'camera_rhs_rows':1536,'scalar_cells':24}
+    expected={'scene_index':80,'native_rows':512,'camera_rhs_rows':1024 if pairs else 1536,'scalar_cells':24}
     if 'application' in manifest:expected['application_rows']=48
     if [s.get('name') for s in sections]!=list(expected):raise ValueError('scene response section order mismatch')
     if manifest.get('application_ready') is not False:raise ValueError('raw typed rows are not application-ready')
-    if manifest.get('families')!={str(k):dict(name=v,codec=CODECS[k]) for k,v in FAMILIES.items()}:raise ValueError('invalid family codecs')
+    codecs=dict(CODECS)
+    if pairs:codecs[3]=PAIR_CODEC
+    if manifest.get('families')!={str(k):dict(name=v,codec=codecs[k]) for k,v in FAMILIES.items()}:raise ValueError('invalid family codecs')
     found={};end=0
     for section in sections:
         name=section.get('name');stride=section.get('stride');count=section.get('count');offset=section.get('offset')
@@ -487,6 +558,15 @@ def validate_scene_response_snapshot(manifest,payload):
         if row[11] and not np.isfinite(row[8:11].view(np.float32)).all():raise ValueError('invalid present position')
         if not np.isfinite(row[12:15].view(np.float32)).all():raise ValueError('invalid direction')
         if int(row[15]) not in (1,2) or int(row[7]) not in (0,1):raise ValueError('invalid scene response semantics')
+        if pairs and family==3:
+            interval=np.frombuffer(payload,dtype='<u4',count=128,
+                offset=found[section]['offset']+int(row[3])*1024)
+            if (row[1]!=1 or row[4]!=0 or row[5]!=0xffffffff or row[6]!=interval[126] or
+                row[7]!=1 or np.any(row[8:12]!=0) or row[15]!=2 or
+                np.any(row[16:19]!=0xffffffff) or not np.array_equal(row[12:15],interval[12:15]) or
+                int(interval[126]) not in (0,1,2,0xffffffff) or
+                not 1<=int(interval[6])<=8 or not 0<int(interval[40])<(1<<int(interval[6]))):
+                raise ValueError('camera pair index is not an exact native-only observation')
     if len(references)!=found['native_rows']['count']+found['camera_rhs_rows']['count']:raise ValueError('orphan native payload')
     scalar=manifest.get('scalar_snapshot')
     if scalar is None:

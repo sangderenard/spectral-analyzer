@@ -144,6 +144,8 @@ def run_live_sensor(accumulator, renderer, field, output, digest, config,
                                            fov_deg=camera["fov_degrees"])
                     accumulator.set_lens(aperture_radius=camera["aperture_radius_m"],
                                          focus_dist=camera["focus_distance_m"],
+                                         tilt_shift=camera.get("tilt_shift", (0.0, 0.0)),
+                                         lens_tilt=camera.get("lens_tilt", (0.0, 0.0)),
                                          n_blades=camera.get("aperture_blades", 0),
                                          aperture_rot=camera.get("aperture_rotation_radians", 0))
                     if field.get('forward_response_owner') is not None:

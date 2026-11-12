@@ -8,6 +8,7 @@ from camera_software.exposure_timing import CameraExposureScheduler
 from camera_software.trigger_bus import (
     make_camera_trigger_graph, make_camera_trigger_panel, resolve_camera_trigger_bus,
 )
+from camera_software.trigger_generators import GENERATOR_KEYS, camera_generator_signals, validate_generators
 from routing_engine import RoutingGraph
 
 
@@ -88,11 +89,10 @@ def test_nonzero_scene_time_and_single_slice_keep_original_boundaries():
     assert result.signals["Key"] == (1,)
 
 
-@pytest.mark.parametrize("bad", ["delay", "negative_delay", "feedback", "nonfinite", "source", "transfer", "unknown"])
+@pytest.mark.parametrize("bad", ["negative_delay", "feedback", "nonfinite", "source", "transfer", "unknown"])
 def test_unsupported_patch_is_not_silently_ignored(bad):
     graph = make_camera_trigger_graph(["Key"])
     graph.set_weight("Flash", "Key", 1)
-    if bad == "delay": graph.edges[0].delay_s = 0.001
     if bad == "negative_delay": graph.edges[0].delay_s = -0.001
     if bad == "feedback": graph.feedback.enabled = True
     if bad == "nonfinite": graph.edges[0].weight = float("nan")
@@ -100,6 +100,56 @@ def test_unsupported_patch_is_not_silently_ignored(bad):
     if bad == "transfer": graph.edges[0].transfer_spec.cable_count = 2
     if bad == "unknown": graph.edges[0].dst_key = "Missing"
     with pytest.raises(ValueError): resolve_camera_trigger_bus(frame(), graph, ["Key"])
+
+
+def test_uniform_camera_delay_uses_the_existing_graph_solver_and_level_preview():
+    graph = make_camera_trigger_graph(["Key"])
+    graph.set_weight("Flash", "Key", 0.5)
+    graph.set_delay_s("Flash", "Key", 0.005)
+    exposure=frame(duration=0.02)  # four 5 ms slices
+    weighted=resolve_camera_trigger_bus(exposure,graph,["Key"])
+    assert weighted.frame is exposure
+    assert weighted.signals["Key"] == pytest.approx((0,0.25,0.25,0))
+    level=resolve_camera_trigger_bus(exposure,graph,["Key"],flash_signal_mode="level")
+    assert level.signals["Key"] == pytest.approx((0,0.5,0.5,0))
+
+
+def test_repeated_camera_modulator_routes_through_the_original_solver():
+    spec={"key":"mod:1","enabled":True,"kind":"ramp_down","frequency_hz":0,
+          "phase_deg":0,"tension":1,"attack_ms":0,"decay_ms":0,
+          "sustain":1,"hold_ms":10,"release_ms":0,"repeat_count":2,
+          "repeat_interval_ms":10,"level":1}
+    graph=make_camera_trigger_graph(["Key"],generator_keys=GENERATOR_KEYS)
+    graph.set_weight("mod:1","Key",.5)
+    exposure=frame(duration=.04)  # 10 ms slices, Flash active on first two
+    signal=camera_generator_signals(exposure,[spec])["mod:1"]
+    # Each Flash rising edge starts two ramp-down triggers, not a free-running oscillator.
+    assert signal[0]==pytest.approx(1)
+    assert signal[1]==pytest.approx(1)
+    assert signal[2]==pytest.approx(0)
+    routed=resolve_camera_trigger_bus(exposure,graph,["Key"],generators=[spec])
+    assert routed.signals["Key"]==pytest.approx((.5,.5,0,0))
+    with pytest.raises(ValueError,match="tail exceeds"):
+        validate_generators([{**spec,"repeat_interval_ms":200,"repeat_count":16}])
+
+
+def test_wave_phase_and_envelope_controls_change_camera_signal():
+    base={"key":"mod:1","enabled":True,"kind":"sine","frequency_hz":25,
+          "phase_deg":0,"tension":1,"attack_ms":0,"decay_ms":0,
+          "sustain":1,"hold_ms":20,"release_ms":0,"repeat_count":1,
+          "repeat_interval_ms":20,"level":1}
+    exposure=frame(duration=.04)
+    pure=camera_generator_signals(exposure,[base])["mod:1"]
+    phase_up=camera_generator_signals(exposure,[{**base,"phase_deg":90}])["mod:1"]
+    phase_down=camera_generator_signals(exposure,[{**base,"phase_deg":270}])["mod:1"]
+    assert pure[0]==pytest.approx(1)
+    assert phase_up[0]==pytest.approx(.5,abs=1e-10)  # real part of a +90° analytic sine
+    assert phase_down[0]==pytest.approx(.5,abs=1e-10)
+    changed=camera_generator_signals(exposure,[{**base,"phase_deg":180}])["mod:1"]
+    assert changed[0]==pytest.approx(0)
+    warped=camera_generator_signals(exposure,[{**base,"kind":"warped","tension":4}])["mod:1"]
+    assert warped[1]!=pytest.approx(pure[1])
+    assert camera_generator_signals(exposure,[{**base,"sustain":0}])["mod:1"]==[0]*4
 
 
 def test_repeated_resolve_does_not_accumulate_or_change_camera():

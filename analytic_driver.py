@@ -1183,7 +1183,7 @@ class RoutingGridView:
                 if self._active_cell is not None:
                     ri, ci = self._active_cell
                     held  = pygame.key.get_pressed()
-                    shift = held[K_LSHIFT] or held[K_RSHIFT]
+                    shift = held[K_LSHIFT] or held[K_RSHIFT] or bool(getattr(event, "mod", 0) & pygame.KMOD_SHIFT)
                     cur   = _read_cell(ri, ci)
                     _write_cell(ri, ci, _clamp(_snap(cur, shift)))
                 self._drag_cell = None
@@ -1202,7 +1202,7 @@ class RoutingGridView:
 
         elif event.type == MOUSEMOTION and self._drag_cell is not None:
             held  = pygame.key.get_pressed()
-            shift = held[K_LSHIFT] or held[K_RSHIFT]
+            shift = held[K_LSHIFT] or held[K_RSHIFT] or bool(getattr(event, "mod", 0) & pygame.KMOD_SHIFT)
             dy    = self._drag_y0 - event.pos[1]
             raw   = self._drag_val0 + _delta_from_dy(dy, shift)
             new_v = _clamp(_snap(raw, shift))
@@ -1222,7 +1222,7 @@ class RoutingGridView:
                 self._pending_click = None
                 # Apply the motion that just arrived
                 held  = pygame.key.get_pressed()
-                shift = held[K_LSHIFT] or held[K_RSHIFT]
+                shift = held[K_LSHIFT] or held[K_RSHIFT] or bool(getattr(event, "mod", 0) & pygame.KMOD_SHIFT)
                 dy    = self._drag_y0 - event.pos[1]
                 raw   = self._drag_val0 + _delta_from_dy(dy, shift)
                 new_v = _clamp(_snap(raw, shift))
@@ -1234,7 +1234,7 @@ class RoutingGridView:
             if self._routing_tab == "export":
                 return False
             held  = pygame.key.get_pressed()
-            shift = held[K_LSHIFT] or held[K_RSHIFT]
+            shift = held[K_LSHIFT] or held[K_RSHIFT] or bool(getattr(event, "mod", 0) & pygame.KMOD_SHIFT)
             # scroll up (event.y > 0) → show earlier rows/cols → decrease offset
             if shift:
                 self._scroll_col = max(0, min(

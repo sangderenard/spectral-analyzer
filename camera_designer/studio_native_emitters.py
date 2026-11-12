@@ -224,6 +224,8 @@ def install_timed_light_frame(field, sensor, baseline_scene, current_scene, *,
     The sensor texture and its pass counter remain owned by the exposure.  The
     forward field is rebuilt by the caller for this interval only.
     """
+    from .studio_forward_responses import require_queue_idle
+    require_queue_idle(field)
     if sensor._row_off != 0:
         raise RuntimeError('timed light state requires a complete sensor sweep')
     base_geom,_,_,base_triangles=baseline_scene[:4]
@@ -292,6 +294,8 @@ def area_nee_records(sources, geom, shade, materials, triangles):
 
 def install_source_population(renderer,field,sensor,scene,wavelengths,settings,index,*,ray_jobs):
     """Refresh the original forward SSBO and its camera-only NEE view atomically at a sweep boundary."""
+    from .studio_forward_responses import require_queue_idle
+    require_queue_idle(field)
     from OpenGL import GL
     from .studio_directional_field import scene_digest
     seed=(settings['seed']+index)%2147483648

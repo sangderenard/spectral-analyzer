@@ -7687,6 +7687,7 @@ def _gpu_ray_field_prebuilt(
     surface_transport: Optional[str] = None, # explicit shared opaque PBR correction
     light_field_internal_media: bool = False, # explicit v6 observer; canonical optics unchanged
     light_field_information: Optional[str] = None, # explicit additional-data opt-in
+    light_field_reactive_queue: Optional[str] = None, # explicit native queue ancestry/consumption
     forward_response_consumer: Optional[SceneResponseConsumer] = None, # synchronous typed scene retention
     forward_response_identity: Optional[dict[str, object]] = None, # actual population/scene ancestry
     forward_response_reserved_bytes: Optional[int] = None, # measured external allocations
@@ -7722,6 +7723,10 @@ def _gpu_ray_field_prebuilt(
             raise ValueError('scene consumer must retain typed native scalar cells')
         if type(forward_response_reserved_bytes) is not int or forward_response_reserved_bytes<0:
             raise ValueError('measured external response reservations required')
+    queue_ancestry=light_field_reactive_queue is not None
+    if queue_ancestry and (light_field_reactive_queue!='native-ancestry-v1' or
+            light_field_information!='evaluated-responses-v1' or not light_field_internal_media):
+        raise ValueError('native queue ancestry requires explicit v6 evaluated responses')
     if surface_transport not in (None,'studio-pbr-mixture-v1'):raise ValueError('unsupported surface_transport')
     volume_shader_source = None
     if volume_extinction is not None:
@@ -7781,6 +7786,12 @@ def _gpu_ray_field_prebuilt(
     counter    = np.zeros(5, np.uint32)
     _pending_cap   = max(0, min(int(dispatch_batch * 4), 1 << 18))
     _pending_bytes = max(64, _pending_cap * 16 * 4)
+    if queue_ancestry:
+        from camera_designer.studio_forward_responses import queued_ray_storage_plan
+        from OpenGL.GL import GL_MAX_SHADER_STORAGE_BLOCK_SIZE
+        queue_plan=queued_ray_storage_plan(int(dispatch_batch),int(max_bounces),
+            max_ssbo_bytes=int(glGetIntegerv(GL_MAX_SHADER_STORAGE_BLOCK_SIZE)))
+        _pending_cap=queue_plan['capacity'];_pending_bytes=queue_plan['buffer_bytes']
 
     # ── n_layers spectral accumulation textures (one per film layer) ─────
     zero = np.array([0], np.uint32)
@@ -7822,8 +7833,9 @@ def _gpu_ray_field_prebuilt(
     glBufferData(GL_SHADER_STORAGE_BUFFER, source_records.nbytes, source_records, GL_STATIC_DRAW)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, ssbo[5])
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[6])
-    glBufferData(GL_SHADER_STORAGE_BUFFER, _pending_bytes, None, GL_DYNAMIC_DRAW)
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo[6])
+    if not queue_ancestry:
+        glBufferData(GL_SHADER_STORAGE_BUFFER, _pending_bytes, None, GL_DYNAMIC_DRAW)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo[6])
     try:
         from material_db import _EMISSION_DB as _ep_db
         _ep_tensor = _ep_db.build_gpu_tensor()
@@ -7928,12 +7940,38 @@ def _gpu_ray_field_prebuilt(
             response_word_offset_bytes=int(np.prod(dims))*8+scalar_column_bytes
             scalar_visit_buffer=allocate_scalar_visits(dims,extra_bytes=scalar_column_bytes+response_tail_bytes)
             from camera_designer.studio_forward_responses import copy_forward_responses
-            shader_source,_=copy_forward_responses(shader_source,terminal_only=True,shared_scalar_buffer=True,precleared_rows=True)
-            from camera_designer.studio_forward_responses import specialize_prebuilt_forward
-            shader_source=specialize_prebuilt_forward(shader_source)
+            if queue_ancestry:
+                from camera_designer.studio_forward_responses import with_queued_ray_ancestry
+                shader_source=with_queued_ray_ancestry(shader_source)
+            shader_source,_=copy_forward_responses(shader_source,terminal_only=True,shared_scalar_buffer=True,precleared_rows=True,queue_ancestry=queue_ancestry)
+            if not queue_ancestry:
+                from camera_designer.studio_forward_responses import specialize_prebuilt_forward
+                shader_source=specialize_prebuilt_forward(shader_source)
             from camera_designer.studio_forward_responses import admit_shader_storage
             from OpenGL.GL import GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS
             response_resource_receipt=admit_shader_storage(shader_source,int(glGetIntegerv(GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS)))
+            if queue_ancestry:
+                # Admit the larger existing queue before allocating it, using
+                # the same measured resource contract as the response owner.
+                from camera_designer.studio_response_factory import field_reserved_bytes,publication_working_reserve
+                from camera_designer.studio_forward_responses import dispatch_storage_plan,QUEUE_VALIDATION_BYTES
+                queue_admission_state=dict(ssbo=ssbo,native_pbr_ssbo=native_pbr_ssbo,
+                    tex_bands=tex_bands,dims=dims,directional_record=directional_record,
+                    scalar_visit_buffer=scalar_visit_buffer,volume_extinction=volume_record)
+                reserved=field_reserved_bytes(queue_admission_state,(packed_geom,packed_shade,mat_buf,bvh_nodes,
+                    bvh_ids,context_buf,native_pbr,source_records,sphere_data,region_data,_ep_tensor,_ctx))
+                reserved+=publication_working_reserve(queue_admission_state)
+                reserved+=int(dims[0])*int(dims[1])*n_layers*16-response_tail_bytes
+                dispatch_storage_plan(int(dispatch_batch),int(max_bounces),
+                    reserved_bytes=reserved+forward_response_reserved_bytes+_pending_bytes,
+                    consumer_bytes=QUEUE_VALIDATION_BYTES,
+                    max_ssbo_bytes=int(glGetIntegerv(GL_MAX_SHADER_STORAGE_BLOCK_SIZE)))
+                from OpenGL.GL import glGetBufferParameteriv,GL_BUFFER_SIZE
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER,ssbo[6])
+                glBufferData(GL_SHADER_STORAGE_BUFFER,_pending_bytes,None,GL_DYNAMIC_DRAW)
+                if int(glGetBufferParameteriv(GL_SHADER_STORAGE_BUFFER,GL_BUFFER_SIZE))!=_pending_bytes:
+                    raise MemoryError('native queue allocation incomplete')
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER,6,ssbo[6])
         prog = _prog((shader_source, GL_COMPUTE_SHADER))
         prebuilt_linked=glGetProgramiv(prog,GL_LINK_STATUS)
     except BaseException:
@@ -8001,7 +8039,8 @@ def _gpu_ray_field_prebuilt(
             _pending_cap=_pending_cap,source_buf=source_records,
             response_identity=dict(forward_response_identity),response_dispatch_serial=0,scalar_clear_epoch=0,
             response_resource_receipt=response_resource_receipt,response_stream_id=uuid.uuid4().hex,response_initial_warmup=True,
-            response_entry_contract='studio-prebuilt-forward-only-v1',
+            response_entry_contract='studio-prebuilt-forward-reactive-v2' if queue_ancestry else 'studio-prebuilt-forward-only-v1',
+            response_queue_owner=dict(phase='idle',logical_ray_base=0) if queue_ancestry else None,
             response_program_sha256=__import__('hashlib').sha256(shader_source.encode()).hexdigest(),
             response_transport_scene_sha256=scene_digest(packed_geom,packed_shade,native_pbr,mat_buf,context_buf,bmin,bmax,sphere_data,*([region_data] if region_data is not None else [])))
         reserved=field_reserved_bytes(response_state,(packed_geom,packed_shade,mat_buf,bvh_nodes,bvh_ids,context_buf,native_pbr,source_records,sphere_data,region_data))
@@ -8012,7 +8051,7 @@ def _gpu_ray_field_prebuilt(
         try:
             response_owner=ForwardResponseCopies(ray_count=int(dispatch_batch),bounce_limit=int(max_bounces),
                 reserved_bytes=reserved+forward_response_reserved_bytes,consume=forward_response_consumer,
-                borrowed_buffer=scalar_visit_buffer,offset_bytes=response_word_offset_bytes)
+                borrowed_buffer=scalar_visit_buffer,offset_bytes=response_word_offset_bytes,queue_ancestry=queue_ancestry)
             response_state['forward_response_owner']=response_owner
             response_state['response_auxiliary_layout']=dict(binding=23,total_bytes=response_word_offset_bytes+response_tail_bytes,
                 visits=dict(offset_bytes=0,byte_length=int(np.prod(dims))*8),
@@ -8034,6 +8073,7 @@ def _gpu_ray_field_prebuilt(
         'batch_off':  glGetUniformLocation(prog, b'uBatchOffset'),
         'total_rays': glGetUniformLocation(prog, b'uTotalRaysPerSource'),
     }
+    if response_state is not None:response_state['locs']=locs
 
     # ── Initial dispatch ──────────────────────────────────────────────────
     _n_init = max(128, int(initial_rays)) if n_src else 0
@@ -8081,6 +8121,7 @@ def _gpu_ray_field_prebuilt(
         'response_resource_receipt':(response_state or {}).get('response_resource_receipt'),
         'response_entry_contract':(response_state or {}).get('response_entry_contract'),
         'response_reactive_queue':(response_state or {}).get('response_reactive_queue'),
+        'response_queue_owner':(response_state or {}).get('response_queue_owner'),
         'response_stream_id':(response_state or {}).get('response_stream_id'),
         'response_transport_scene_sha256':(response_state or {}).get('response_transport_scene_sha256'),
         'response_program_sha256':(response_state or {}).get('response_program_sha256'),
@@ -8118,6 +8159,8 @@ def _update_prebuilt_geometry(state, packed_geom, packed_shade, mat_buf,
     sensor history after this update. Both forward and sensor tracers retain
     these same SSBO identities, so neither can see a stale camera-body BVH.
     """
+    from camera_designer.studio_forward_responses import require_queue_idle
+    require_queue_idle(state)
     from OpenGL.GL import (
         GL_SHADER_STORAGE_BUFFER, GL_STATIC_DRAW, glFinish, glBindBuffer,
         glBufferData, glUseProgram, glGetUniformLocation, glUniform1i, glUniform3f,
@@ -8241,6 +8284,9 @@ def _begin_prebuilt_responses(state,seed,offset,count,total):
     metadata['dispatch']['root_coverage_scope']='complete source coverage candidate' if total>=len(state['source_buf']) else 'partial root sweep; typed observations only'
     metadata['dispatch']['warmup']=bool(state.get('response_initial_warmup',False))
     metadata['dispatch']['auxiliary_layout']=state['response_auxiliary_layout']
+    if state.get('response_entry_contract')=='studio-prebuilt-forward-reactive-v2':
+        from camera_designer.studio_forward_responses import begin_native_queue
+        begin_native_queue(state,metadata)
     owner.begin(state['prog'],metadata)
     state['response_dispatch_serial']+=1
 
@@ -8253,6 +8299,8 @@ def _gpu_pump_prebuilt(state: dict, n_rays: int = 8192) -> None:
     """
     if state is None or not state.get('n_sources', 0):
         return
+    from camera_designer.studio_forward_responses import require_queue_idle
+    require_queue_idle(state)
     from OpenGL.GL import (
         GL_SHADER_STORAGE_BARRIER_BIT, GL_SHADER_IMAGE_ACCESS_BARRIER_BIT,
         GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_READ_WRITE, GL_TEXTURE_3D,
@@ -8316,6 +8364,8 @@ def _gpu_pump_prebuilt(state: dict, n_rays: int = 8192) -> None:
         if state.get('forward_response_owner') is not None:_consume_prebuilt_scalar_columns(state)
     except BaseException:
         abort_root_dispatch(record)
+        from camera_designer.studio_forward_responses import abort_native_queue
+        abort_native_queue(state)
         raise
     glUseProgram(0)
 
@@ -8324,6 +8374,8 @@ def _clear_prebuilt(state: dict, *, preserve_directional_history=False) -> None:
     """Zero all 4 accumulation textures in a prebuilt GPU state."""
     if state is None:
         return
+    from camera_designer.studio_forward_responses import require_queue_idle
+    require_queue_idle(state)
     from OpenGL.GL import (
         GL_TEXTURE_3D, GL_RED_INTEGER, GL_UNSIGNED_INT,
         glBindTexture, glClearTexImage,

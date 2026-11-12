@@ -1,5 +1,11 @@
 # Reactive queue ownership and dispatch gaps
 
+Follow-up: the opt-in ownership/provenance implementation is now described in
+`STUDIO_NATIVE_QUEUE_ANCESTRY_OWNER_2026-11-12.md`. The evidence below records the
+earlier forward-only state; it is not a claim that those code gaps remain in
+the new isolated version. Hardware execution and complete-data readiness are
+still unverified.
+
 Read-only source assessment at Spectral `c68d27deaf29a6b06058ec97ffce455f852a0a6b`.
 No queue scheduler, optical law, shader entry, GPU dispatch or permission was
 changed by this assessment. The evaluated-response hardware hold remains.

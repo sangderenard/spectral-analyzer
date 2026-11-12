@@ -18,7 +18,7 @@ def test_progressive_raw_moments_are_weighted_and_reset(monkeypatch):
     raw[:6]=[100,0,0,100,0,0]
     monkeypatch.setattr(GL,'glMemoryBarrier',lambda *a:None,raising=False)
     monkeypatch.setattr(GL,'glBindBuffer',lambda *a:None,raising=False)
-    monkeypatch.setattr(GL,'glGetBufferSubData',lambda *a:raw.tobytes(),raising=False)
+    monkeypatch.setattr(GL,'glGetBufferSubData',lambda target,offset,size:raw.tobytes()[offset:offset+size],raising=False)
     monkeypatch.setattr(GL,'glClearBufferData',lambda *a:None,raising=False)
     record=dict(estimator=f.ROOT_ESTIMATOR,source_root_count=3,grid_size=32,bin_count=6,buffer=1,voxel_volume_m3=1)
     settings=dict(ray_budget=128,seed=42)

@@ -13,6 +13,8 @@ from .studio_response_lineage import copied_recipient, recipient_id
 
 SCHEMA='studio-scene-responses-v1'
 PAIR_SCHEMA='studio-scene-responses-v2'
+ANCESTRY_SCHEMA='studio-scene-responses-v3'
+from .studio_forward_responses import FORWARD_ANCESTRY_CONTRACT
 PAIR_CODEC='native-camera-response-pairs-v2'
 CAMERA_PAIR_CONTRACT=dict(version=PAIR_CODEC,row_words=256,
     interval_schema='native-camera-intervals-v1',interval_offset_words=0,interval_words=128,
@@ -24,6 +26,39 @@ def _camera_pair_contract_valid(value):
     return (isinstance(value,dict) and value.keys()==CAMERA_PAIR_CONTRACT.keys() and
             all(type(value[key]) is type(expected) and value[key]==expected
                 for key,expected in CAMERA_PAIR_CONTRACT.items()))
+def _exact_contract(value, expected):
+    if type(value) is not type(expected):return False
+    if isinstance(expected,dict):
+        return value.keys()==expected.keys() and all(_exact_contract(value[k],v) for k,v in expected.items())
+    return value==expected
+
+
+def _validate_forward_ancestry(row, context):
+    if not _exact_contract(context.get('forward_ancestry_contract'),FORWARD_ANCESTRY_CONTRACT):
+        raise ValueError('invalid forward ancestry contract')
+    q=context.get('dispatch',{}).get('native_queue')
+    if not isinstance(q,dict) or q.get('version')!='native-queued-ancestry-v1':raise ValueError('missing native queue context')
+    parent=q.get('parent_dispatch')
+    if not isinstance(parent,dict):raise ValueError('missing parent dispatch')
+    for k in ('generation','logical_ray_base','capacity','source_root_count'):
+        if type(q.get(k)) is not int or not 0<=q[k]<=0xffffffff:raise ValueError('invalid native queue bounds')
+    for k in ('dispatch_id','population_index','ray_offset','ray_count','total_rays','bounce_limit','seed'):
+        if type(parent.get(k)) is not int or parent[k]<0:raise ValueError('invalid parent dispatch bounds')
+    if (not q['source_root_count'] or parent['ray_count']<1 or parent['bounce_limit']<1 or
+        parent['ray_offset']+parent['ray_count']>parent['total_rays'] or
+        q['logical_ray_base']+q['capacity']>0xffffffff or q['generation']!=parent['dispatch_id'] or
+        not isinstance(parent.get('root_sampling'),dict)):raise ValueError('invalid parent dispatch identity')
+    if int(row[1])==1:
+        if np.any(row[[101,102,103,125,126,127]]):raise ValueError('forward rows cannot invent queued ancestry')
+    elif int(row[1])==2:
+        weight=float(row[125].view(np.float32));ray=int(row[102])
+        if (int(row[2])>=q['capacity'] or int(row[101])!=q['generation'] or
+            not parent['ray_offset']<=ray<parent['ray_offset']+parent['ray_count'] or
+            int(row[3])!=ray%q['source_root_count'] or int(row[103])>=parent['bounce_limit']-1 or
+            not np.isfinite(weight) or not 0<=weight<=1 or int(row[126]) not in (1,2) or
+            int(row[127])>=0x80000000):raise ValueError('queued ancestry disagrees with actual parent dispatch')
+    else:raise ValueError('invalid forward ancestry family')
+
 INDEX_WORDS=20
 FAMILIES={1:'forward',2:'reactive',3:'camera_rhs_summands',4:'camera_complete_sample'}
 CODECS={1:'evaluated-forward-responses-v1',2:'evaluated-forward-responses-v1',
@@ -82,7 +117,7 @@ class SceneResponseStore:
         self._context_next=0;self._seen={};self._watermarks={};self._serial=0
         self.scalar_retention=dict(mode='latest cumulative native snapshot; no cross-epoch accumulation',superseded_snapshots=0,discarded_epochs=0,discarded_entries=0,evicted_entries=0,discarded_identity_digest='',recent_discards=[],omitted_discard_identities=0)
         self.evicted=0;self.duplicates=0;self.invalidated=0;self.incomplete_dispatches=0
-        self.camera_pairs=False
+        self.camera_pairs=False;self.forward_ancestry=False
 
     @property
     def retained_entries(self):return int(np.count_nonzero(self.used))
@@ -117,7 +152,8 @@ class SceneResponseStore:
         if sequence<=watermark:raise ValueError('duplicate or stale native dispatch')
         transport=metadata.get('transport_scene_sha256')
         if not isinstance(transport,str) or not transport:raise ValueError('exact assembled transport scene identity required')
-        dispatch=metadata.get('dispatch',{})
+        # Retained dispatch/queue ancestry must not alias the owner's next job.
+        dispatch=json.loads(_json(metadata.get('dispatch',{})))
         source=metadata.get('source_sha256',dispatch.get('source_sha256'))
         if not isinstance(source,str) or not source:raise ValueError('native source identity required')
         context=dict(scene_revision=scene,source_sha256=source,stream_id=stream,sequence=sequence,
@@ -132,6 +168,8 @@ class SceneResponseStore:
                        if family==3 else 'completed native camera sample before pixel averaging; view/prefix-conditioned, not local radiance'
                        if family==4 else 'native weighted transport packet/attribute; not automatically radiance'),
             physical_scene_identity=scene)
+        if metadata.get('version')=='evaluated-forward-responses-v2':
+            context['forward_ancestry_contract']=json.loads(_json(metadata.get('forward_ancestry_contract')))
         if family==3:
             context['camera_observation']=dict(interval_schema=metadata.get('version'),
                 response_schema=metadata.get('response_schema'),shared_band0_path=metadata.get('shared_band0_path'),
@@ -287,6 +325,13 @@ class SceneResponseStore:
         if array.size%128:raise ValueError('truncated native forward rows')
         array=array.reshape(-1,128)
         if not len(array):return
+        ancestry=metadata.get('version')=='evaluated-forward-responses-v2'
+        if ancestry:
+            if np.any(self.used & (self.length==384)) or (not self.forward_ancestry and np.any(self.used & np.isin(self.index[:,0],[1,2]))):
+                raise ValueError('cannot mix retained legacy rows with forward ancestry')
+            for row in array:_validate_forward_ancestry(row,metadata)
+        elif self.forward_ancestry or 'forward_ancestry_contract' in metadata:
+            raise ValueError('cannot mix forward response ancestry versions')
         if np.any(~np.isin(array[:,1],[1,2])) or not np.isfinite(array[:,21:30].view(np.float32)).all():raise ValueError('invalid forward batch')
         lineage=self.lineage_provider();recipients=np.zeros((len(array),2),np.int64)
         for ordinal,row in enumerate(array):
@@ -298,6 +343,7 @@ class SceneResponseStore:
         native_only=not any(self._retention_class(rec,row[21:24].view(np.float32),int(row[5].view(np.int32))>=0,forward_row=row)=='surface'
                             for rec,row in zip(recipients,array))
         cid,watermark,sequence=self._begin(metadata,1,native_only=native_only)
+        if ancestry:self.forward_ancestry=True;self.camera_pairs=True
         for ordinal,row in enumerate(array):
             family=int(row[1])
             if family not in (1,2):raise ValueError('unknown original transport path family')
@@ -438,6 +484,7 @@ class SceneResponseStore:
         rhs_stride=1024 if self.camera_pairs else 1536
         codecs=dict(CODECS)
         if self.camera_pairs:codecs[3]=PAIR_CODEC
+        if self.forward_ancestry:codecs[1]=codecs[2]='evaluated-forward-responses-v2'
         slots=np.flatnonzero(self.used);slots=slots[np.argsort(self.order[slots])]
         index=self.index[slots].copy();native_count=0;rhs_count=0
         for i,slot in enumerate(slots):
@@ -455,7 +502,7 @@ class SceneResponseStore:
         if self._scalar_count:body[scalar_offset:]=self._scalar[:self._scalar_count].tobytes()
         payload=bytes(body)
         contexts=[dict(id=cid,**value[0]) for cid,value in sorted(self._contexts.items()) if self._context_refs[cid]>0]
-        manifest=dict(schema=PAIR_SCHEMA if self.camera_pairs else SCHEMA,scene_revision=self.scene_revision,publication_sequence=self._serial,
+        manifest=dict(schema=ANCESTRY_SCHEMA if self.forward_ancestry else PAIR_SCHEMA if self.camera_pairs else SCHEMA,scene_revision=self.scene_revision,publication_sequence=self._serial,
             response_lineage=json.loads(_json(self.lineage_provider())),
             response_lineage_scene_revision=self.scene_revision,
             byte_order='little',payload_bytes=len(payload),payload_sha256=hashlib.sha256(payload).hexdigest(),
@@ -486,6 +533,7 @@ class SceneResponseStore:
             rules=['native families and summands are not summed together','presence is not coverage or radiance validity',
                    'camera prefix throughput is retained, not divided out','pixel coordinates are optional provenance, never the scene index key'])
         if self.camera_pairs:manifest['camera_pair_contract']=dict(CAMERA_PAIR_CONTRACT)
+        if self.forward_ancestry:manifest['forward_ancestry_contract']=json.loads(_json(FORWARD_ANCESTRY_CONTRACT))
         if application is not None:
             appmeta,approws=application
             apparray=np.asarray(approws)
@@ -500,12 +548,14 @@ class SceneResponseStore:
 
 
 def validate_scene_response_snapshot(manifest,payload):
-    schema=manifest.get('schema');pairs=schema==PAIR_SCHEMA
-    if schema not in (SCHEMA,PAIR_SCHEMA) or manifest.get('byte_order')!='little':raise ValueError('unsupported scene response envelope')
+    schema=manifest.get('schema');ancestry=schema==ANCESTRY_SCHEMA;pairs=schema in (PAIR_SCHEMA,ANCESTRY_SCHEMA)
+    if schema not in (SCHEMA,PAIR_SCHEMA,ANCESTRY_SCHEMA) or manifest.get('byte_order')!='little':raise ValueError('unsupported scene response envelope')
     if (pairs and not _camera_pair_contract_valid(manifest.get('camera_pair_contract')) or
         not pairs and 'camera_pair_contract' in manifest):raise ValueError('invalid camera pair contract')
     if manifest.get('payload_bytes')!=len(payload) or manifest.get('payload_sha256')!=hashlib.sha256(payload).hexdigest():
         raise ValueError('scene response length/hash mismatch')
+    if (ancestry and not _exact_contract(manifest.get('forward_ancestry_contract'),FORWARD_ANCESTRY_CONTRACT) or
+        not ancestry and 'forward_ancestry_contract' in manifest):raise ValueError('invalid forward ancestry envelope')
     sections=manifest.get('sections',[])
     expected={'scene_index':80,'native_rows':512,'camera_rhs_rows':1024 if pairs else 1536,'scalar_cells':24}
     if 'application' in manifest:expected['application_rows']=48
@@ -513,6 +563,7 @@ def validate_scene_response_snapshot(manifest,payload):
     if manifest.get('application_ready') is not False:raise ValueError('raw typed rows are not application-ready')
     codecs=dict(CODECS)
     if pairs:codecs[3]=PAIR_CODEC
+    if ancestry:codecs[1]=codecs[2]='evaluated-forward-responses-v2'
     if manifest.get('families')!={str(k):dict(name=v,codec=codecs[k]) for k,v in FAMILIES.items()}:raise ValueError('invalid family codecs')
     found={};end=0
     for section in sections:
@@ -525,7 +576,8 @@ def validate_scene_response_snapshot(manifest,payload):
     for c in manifest.get('contexts',[]):
         if type(c.get('id')) is not int or c['id']<0 or c.get('scene_revision')!=manifest.get('scene_revision') or not isinstance(c.get('source_sha256'),str) or not c['source_sha256'] or not isinstance(c.get('transport_scene_sha256'),str) or not c['transport_scene_sha256']:
             raise ValueError('invalid scene context')
-    context_ids={c['id'] for c in manifest.get('contexts',[])}
+    context_by_id={c['id']:c for c in manifest.get('contexts',[])}
+    context_ids=set(context_by_id)
     if len(context_ids)!=len(manifest.get('contexts',[])):raise ValueError('duplicate context identity')
     index=np.frombuffer(payload,dtype='<u4',count=found['scene_index']['count']*20).reshape(-1,20)
     if manifest.get('retention',{}).get('retained_entries')!=len(index):raise ValueError('retention count mismatch')
@@ -558,6 +610,10 @@ def validate_scene_response_snapshot(manifest,payload):
         if row[11] and not np.isfinite(row[8:11].view(np.float32)).all():raise ValueError('invalid present position')
         if not np.isfinite(row[12:15].view(np.float32)).all():raise ValueError('invalid direction')
         if int(row[15]) not in (1,2) or int(row[7]) not in (0,1):raise ValueError('invalid scene response semantics')
+        if ancestry and family in (1,2):
+            native=np.frombuffer(payload,dtype='<u4',count=128,offset=found[section]['offset']+int(row[3])*512)
+            if int(native[1])!=family:raise ValueError('forward payload family mismatch')
+            _validate_forward_ancestry(native,context_by_id[int(row[2])])
         if pairs and family==3:
             interval=np.frombuffer(payload,dtype='<u4',count=128,
                 offset=found[section]['offset']+int(row[3])*1024)

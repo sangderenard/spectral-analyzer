@@ -3,7 +3,7 @@ import hashlib,json,os,re,time,uuid
 from pathlib import Path
 import numpy as np
 from .studio_response_product import response_lock,_atomic
-from .studio_scene_responses import validate_scene_response_snapshot,SCHEMA,PAIR_SCHEMA
+from .studio_scene_responses import validate_scene_response_snapshot,SCHEMA,PAIR_SCHEMA,ANCESTRY_SCHEMA
 NAME=re.compile(r'^light-scene-response-([0-9a-f]{32})\.bin$')
 MAX_BYTES=64*1024*1024
 MAX_FILES=3
@@ -29,7 +29,7 @@ class SceneResponsePublisher:
                 if path.is_symlink() or path.stat().st_size>8*1024*1024:return False
                 receipt=json.loads(path.read_text(encoding='utf-8'));name=receipt['name']
                 if (not isinstance(name,str) or not NAME.fullmatch(name) or name in names
-                        or receipt.get('schema') not in (SCHEMA,PAIR_SCHEMA) or receipt.get('digest')!=self.digest
+                        or receipt.get('schema') not in (SCHEMA,PAIR_SCHEMA,ANCESTRY_SCHEMA) or receipt.get('digest')!=self.digest
                         or not isinstance(receipt.get('metadata'),dict)
                         or receipt.get('metadata',{}).get('schema')!=receipt.get('schema')
                         or path not in (sidecar_path(self.output/name),sidecar_path(self.output/name).with_suffix('.retired'))

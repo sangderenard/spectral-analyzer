@@ -103,6 +103,7 @@ def rebind_response_owner(accumulator,state,camera):
             from camera_designer.studio_forward_responses import dispatch_storage_plan
             forward.plan=dispatch_storage_plan(forward.ray_count,forward.bounce_limit,
                 reserved_bytes=reserved-forward.plan['buffer_bytes']+int(getattr(owner,'_allocated_bytes',0)),
+                consumer_bytes=forward.plan['consumer_bytes'],
                 max_ssbo_bytes=forward.plan['buffer_bytes'],budget_bytes=MEMORY_BUDGET_BYTES)
         consumer=getattr(owner.consume,'target',owner.consume)
         if consumer is not None:consumer.reserved_bytes=reserved

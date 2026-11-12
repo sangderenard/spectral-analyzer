@@ -26,7 +26,8 @@ def test_exact_actual_response_is_evaluated_once(region,corrected):
 @pytest.mark.parametrize('spheres',[False,True])
 @pytest.mark.parametrize('terminal_only',[False,True])
 @pytest.mark.parametrize('region',[False,True])
-def test_copied_response_compiles_offline_without_gpu(tmp_path,region,terminal_only,spheres):
+@pytest.mark.parametrize('queue_ancestry',[False,True])
+def test_copied_response_compiles_offline_without_gpu(tmp_path,region,terminal_only,spheres,queue_ancestry):
     import shutil,subprocess
     from camera_designer.spectral_sensor_basis import FIXED3_SPECTRAL_GLSL
     from camera_designer.studio_diffuse_surface import STUDIO_DIFFUSE_GLSL
@@ -43,7 +44,13 @@ def test_copied_response_compiles_offline_without_gpu(tmp_path,region,terminal_o
         source=with_sphere_regions(source)
     from camera_designer.studio_scalar_visits import with_scalar_visits
     from camera_designer.studio_scalar_columns import with_scalar_columns
-    source,seams=copy_forward_responses(with_scalar_columns(with_scalar_visits(with_opaque_pbr(source)),3,shared=True),terminal_only=terminal_only,shared_scalar_buffer=True,precleared_rows=True)
+    source=with_opaque_pbr(source)
+    if queue_ancestry:
+        from camera_designer.studio_directional_field import recording_shader
+        from camera_designer.studio_directional_media import with_internal_medium_recording
+        from camera_designer.studio_forward_responses import with_queued_ray_ancestry
+        source=with_queued_ray_ancestry(with_internal_medium_recording(recording_shader(source,estimator='track-length-root-sweep-v1')))
+    source,seams=copy_forward_responses(with_scalar_columns(with_scalar_visits(source),3,shared=True),terminal_only=terminal_only,shared_scalar_buffer=True,precleared_rows=True,queue_ancestry=queue_ancestry)
     path=tmp_path/'forward_responses.comp';path.write_text(source,encoding='utf-8')
     result=subprocess.run([shutil.which('glslangValidator'),str(path)],capture_output=True,text=True,timeout=20)
     assert result.returncode==0,result.stdout+result.stderr

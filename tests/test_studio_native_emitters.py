@@ -65,6 +65,21 @@ def test_slice_cannot_turn_on_unprepared_spectral_band():
         reweight_native_sources(roots,scene[1],scene[2],fixture((1.,2.,0.))[2])
 
 
+def test_timed_geometry_slice_moves_prepared_roots_without_changing_exposure_energy():
+    scene=fixture((1.,2.,3.))
+    roots=native_emissive_sources(scene,[.45,.55,.65],ray_budget=120)
+    baseline=(*scene,None,None,None,roots)
+    moved_geom=scene[0].copy()
+    moved_geom[:,:3]+=[.25,-.5,.75]
+    moved_triangles=scene[3]+[.25,-.5,.75]
+    current=(moved_geom,scene[1],scene[2],moved_triangles)
+    _,_,moved=timed_light_buffers(baseline,current)
+    np.testing.assert_allclose(moved[:,:3]-roots[:,:3],
+        np.tile([.25,-.5,.75],(len(roots),1)),atol=2e-7)
+    np.testing.assert_allclose(moved[:,4:7],roots[:,4:7],atol=2e-7)
+    np.testing.assert_array_equal(moved[:,10],roots[:,10])
+
+
 def test_timed_light_frame_installs_same_sources_for_forward_and_camera_without_sensor_clear(monkeypatch):
     from OpenGL import GL
     scene=fixture((1.,2.,3.))
@@ -116,6 +131,14 @@ def test_real_studio_scene_prepares_dark_light_for_later_timed_emission():
     lit,_,_,_=prepare_photo_geometry({**config,"fixtures":{**fixture,"pbr":actual.tolist()}},
         subject,np.array([0],np.int32),subject_pbr,prepare_sources=False)
     assert np.count_nonzero(timed_light_buffers(baseline,lit)[2][:,10])>0
+    displaced={**fixture,"vertices":[v+(.01 if i%3==0 else 0.)
+                                     for i,v in enumerate(fixture['vertices'])],
+               "pbr":actual.tolist()}
+    moving,_,_,_=prepare_photo_geometry({**config,"fixtures":displaced},
+        subject,np.array([0],np.int32),subject_pbr,prepare_sources=False)
+    moved_roots=timed_light_buffers(baseline,moving)[2]
+    np.testing.assert_allclose(moved_roots[:,0]-baseline[7][:,0],
+                               np.full(len(moved_roots),.01),atol=2e-6)
 
 
 def test_two_fixture_materials_retain_distinct_native_ownership_across_light_changes():

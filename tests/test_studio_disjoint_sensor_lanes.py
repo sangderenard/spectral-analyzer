@@ -82,7 +82,8 @@ def test_n_lanes_dispatch_and_commit_only_after_all_owners_finish(monkeypatch):
             events.append(('closed',))
         def confirm_detector_integration_committed(self, index):
             events.append(('committed',))
-    def install(state, sensor, baseline, current):
+    monkeypatch.setattr(studio_native_emitters, 'timed_light_buffers',lambda baseline,current: (None,None,None))
+    def install(state, sensor, baseline, current, **kwargs):
         events.append(('install', state['index']))
         return np.zeros((state['index'] + 1, 12), np.float32)
     monkeypatch.setattr(studio_native_emitters, 'install_timed_light_frame', install)
@@ -91,7 +92,7 @@ def test_n_lanes_dispatch_and_commit_only_after_all_owners_finish(monkeypatch):
              for i in range(4)]
     interval = {'t0': 1., 't1': 3., 'sensor_integrating': True}
     rays, sites = worker._dispatch_timed_sensor_lanes(
-        lanes, interval, 0, prepare_scene=lambda camera: camera,
+        lanes, interval, 0, prepare_scene=lambda camera, fallback_geometry=None: (camera,[]),
         renderer=Renderer(), barrier=Barrier(), sweeps=2,
         finish=lambda: events.append(('finish',)))
     assert (rays, sites) == (10, 96)
@@ -100,6 +101,25 @@ def test_n_lanes_dispatch_and_commit_only_after_all_owners_finish(monkeypatch):
     assert max(i for i, e in enumerate(events) if e[0] == 'forward') < events.index(('materialized',))
     assert max(i for i, e in enumerate(events) if e[0] == 'sensor') < events.index(('closed',))
     assert events[-1] == ('committed',)
+    for lane in lanes:
+        lane['installed_fixture_geometry']={'vertices':[0,0,0]}
+        lane['installed_geometry_revision']=0
+    attempts=[]
+    def incompatible(camera, fallback_geometry=None):
+        attempts.append(fallback_geometry is None)
+        if fallback_geometry is None:raise ValueError('timed geometry slice changed packed triangle ownership')
+        return camera,[]
+    worker._dispatch_timed_sensor_lanes(lanes, interval, 1,
+        prepare_scene=incompatible,renderer=Renderer(),barrier=Barrier(),sweeps=1,
+        finish=lambda:events.append(('finish',)),geometry_revision=1)
+    assert attempts==[True,False]*len(lanes)
+    assert all(lane['stale_geometry_slices']==1 for lane in lanes)
+    attempts.clear()
+    worker._dispatch_timed_sensor_lanes(lanes, interval, 2,
+        prepare_scene=incompatible,renderer=Renderer(),barrier=Barrier(),sweeps=1,
+        finish=lambda:events.append(('finish',)),geometry_revision=1)
+    assert attempts==[False]*len(lanes)
+    assert all(lane['stale_geometry_slices']==2 for lane in lanes)
 
 
 def test_sensor_seed_namespace_keeps_single_sensor_and_uniquely_packs_n_lanes():

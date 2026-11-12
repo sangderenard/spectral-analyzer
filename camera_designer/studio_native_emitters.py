@@ -148,8 +148,8 @@ def timed_light_buffers(baseline_scene, current_scene):
     """Map the current emitter powers onto stable prepared native material IDs."""
     base_geom,base_shade,base_mat,base_triangles=baseline_scene[:4]
     geom,shade,mat,triangles=current_scene[:4]
-    if not np.array_equal(geom[:,:15],base_geom[:,:15]) or not np.array_equal(triangles,base_triangles):
-        raise ValueError('timed light frame changed native geometry')
+    if geom.shape!=base_geom.shape or triangles.shape!=base_triangles.shape:
+        raise ValueError('timed geometry slice changed packed triangle ownership')
     base_ids=np.ascontiguousarray(base_shade[:,14]).view(np.uint32)
     current_ids=np.ascontiguousarray(shade[:,14]).view(np.uint32)
     adjusted_mat=np.array(base_mat,copy=True).reshape(-1,32,12)
@@ -167,10 +167,58 @@ def timed_light_buffers(baseline_scene, current_scene):
     adjusted_shade=np.array(shade,copy=True)
     adjusted_shade[:,14]=base_shade[:,14]
     roots=reweight_native_sources(baseline_scene[7],base_shade,base_mat,adjusted_mat)
+    if not np.array_equal(triangles,base_triangles):
+        roots=relocate_native_sources(roots,base_triangles,triangles)
     return adjusted_shade,adjusted_mat,roots
 
 
-def install_timed_light_frame(field, sensor, baseline_scene, current_scene):
+def relocate_native_sources(roots, old_triangles, new_triangles):
+    """Carry prepared emitter samples through a triangle slice's local frame."""
+    out=np.array(roots,copy=True)
+    if not len(out):return out
+    ids=out[:,7].astype(np.int64)-1
+    if np.any(ids<0) or np.any(ids>=len(old_triangles)):
+        raise ValueError('timed source triangle identity left the geometry slice')
+    old=np.asarray(old_triangles,np.float64)[ids]
+    new=np.asarray(new_triangles,np.float64)[ids]
+    def basis(tris):
+        edge=tris[:,1]-tris[:,0]
+        other=tris[:,2]-tris[:,0]
+        normal=np.cross(edge,other)
+        area2=np.linalg.norm(normal,axis=1)
+        edge_length=np.linalg.norm(edge,axis=1)
+        if np.any(area2<=1e-12) or np.any(edge_length<=1e-12):
+            raise ValueError('timed emitter triangle became degenerate')
+        tangent=edge/edge_length[:,None]
+        normal=normal/area2[:,None]
+        return tangent,np.cross(normal,tangent),normal,area2
+    old_u,old_v,old_n,old_area=basis(old)
+    new_u,new_v,new_n,new_area=basis(new)
+    offset=out[:,:3].astype(np.float64)-old[:,0]
+    edge1=old[:,1]-old[:,0]
+    edge2=old[:,2]-old[:,0]
+    a=np.einsum('ij,ij->i',edge1,edge1)
+    b=np.einsum('ij,ij->i',edge1,edge2)
+    c=np.einsum('ij,ij->i',edge2,edge2)
+    d=np.einsum('ij,ij->i',offset,edge1)
+    e=np.einsum('ij,ij->i',offset,edge2)
+    determinant=a*c-b*b
+    if np.any(determinant<=1e-24):raise ValueError('timed emitter barycentric frame is singular')
+    v=(d*c-e*b)/determinant
+    w=(e*a-d*b)/determinant
+    out[:,:3]=(new[:,0]+v[:,None]*(new[:,1]-new[:,0])+w[:,None]*(new[:,2]-new[:,0])).astype(np.float32)
+    direction=out[:,4:7].astype(np.float64)
+    direction=(np.einsum('ij,ij->i',direction,old_u)[:,None]*new_u+
+               np.einsum('ij,ij->i',direction,old_v)[:,None]*new_v+
+               np.einsum('ij,ij->i',direction,old_n)[:,None]*new_n)
+    out[:,4:7]=(direction/np.linalg.norm(direction,axis=1)[:,None]).astype(np.float32)
+    out[:,10]=(out[:,10].astype(np.float64)*new_area/old_area).astype(np.float32)
+    if not np.isfinite(out).all():raise ValueError('timed emitter relocation is nonfinite')
+    return out
+
+
+def install_timed_light_frame(field, sensor, baseline_scene, current_scene, *,
+                              installed_scene=None, renderer=None, sphere_regions=None):
     """Install one captured light state in both native readers at a sweep boundary.
 
     The sensor texture and its pass counter remain owned by the exposure.  The
@@ -182,6 +230,21 @@ def install_timed_light_frame(field, sensor, baseline_scene, current_scene):
     adjusted_shade,adjusted_mat,roots=timed_light_buffers(baseline_scene,current_scene)
     if len(roots)!=field['n_sources'] or len(roots)!=sensor._nee_source_count:
         raise ValueError('timed light frame changed the prepared source population')
+    installed=installed_scene if installed_scene is not None else baseline_scene
+    geometry_changed=(not np.array_equal(current_scene[0][:,:15],installed[0][:,:15]) or
+                      not np.array_equal(current_scene[3],installed[3]))
+    if geometry_changed:
+        if renderer is None or sphere_regions is None:
+            raise ValueError('timed geometry slice needs the native scene uploader')
+        from material_db import MaterialDatabase
+        nodes,ids=renderer._build_gpu_bvh(current_scene[3])
+        margin=np.asarray([.02,.02,.04],np.float32)
+        bounds=(current_scene[6][0]-margin,current_scene[6][1]+margin)
+        renderer._update_prebuilt_geometry(field,current_scene[0],adjusted_shade,adjusted_mat,
+            nodes,ids,current_scene[4],bounds,sphere_regions,
+            native_pbr=MaterialDatabase.instance().build_tensors()['pbr'])
+        sensor.set_scene_geometry(n_tris=len(current_scene[3]),n_bvh_nodes=len(nodes),
+            bmin=bounds[0],bmax=bounds[1],n_spheres=len(sphere_regions))
     from OpenGL import GL
     GL.glFinish()
     for binding,data in ((9,adjusted_shade),(10,adjusted_mat),(5,roots)):
@@ -189,7 +252,7 @@ def install_timed_light_frame(field, sensor, baseline_scene, current_scene):
         GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER,field['ssbo'][binding])
         GL.glBufferData(GL.GL_SHADER_STORAGE_BUFFER,data.nbytes,data,GL.GL_STATIC_DRAW)
     GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER,0)
-    sensor.set_nee_spectral_sources(roots,field['ssbo'][5],area_scene=(base_geom,adjusted_shade,adjusted_mat,base_triangles))
+    sensor.set_nee_spectral_sources(roots,field['ssbo'][5],area_scene=(current_scene[0],adjusted_shade,adjusted_mat,current_scene[3]))
     field['source_buf']=roots
     return roots
 

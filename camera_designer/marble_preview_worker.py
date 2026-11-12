@@ -140,14 +140,49 @@ def _require_disjoint_lane_roots(scenes):
 
 
 def _dispatch_timed_sensor_lanes(lanes, interval, slice_id, *, prepare_scene,
-                                 renderer, barrier, sweeps, finish):
+                                 renderer, barrier, sweeps, finish, geometry_revision=0):
     """Pack one captured slice into every independent field and sensor owner."""
     from camera_designer.studio_native_emitters import install_timed_light_frame
     admitted = []
     for lane in lanes:
-        current_scene = prepare_scene(lane['camera'])
+        installed_geometry=lane.get('installed_fixture_geometry')
+        stale=lane.get('unsupported_geometry_revision')==geometry_revision
+        if stale:
+            lane['stale_geometry_slices']=lane.get('stale_geometry_slices',0)+1
+            try:
+                current_scene,current_spheres=prepare_scene(lane['camera'],installed_geometry)
+                from camera_designer.studio_native_emitters import timed_light_buffers
+                timed_light_buffers(lane['scene'],current_scene)
+            except ValueError:
+                current_scene=lane.get('installed_scene',lane['scene'])
+                current_spheres=lane['installed_spheres']
+        else:
+            try:
+                current_scene,current_spheres=prepare_scene(lane['camera'])
+                # Prove that the captured triangle slice can retain the prepared
+                # source identity before changing either GPU reader.
+                if geometry_revision!=lane.get('installed_geometry_revision',0):
+                    from camera_designer.studio_native_emitters import timed_light_buffers
+                    timed_light_buffers(lane['scene'],current_scene)
+            except ValueError:
+                if geometry_revision==lane.get('installed_geometry_revision',0):raise
+                lane['unsupported_geometry_revision']=geometry_revision
+                lane['stale_geometry_slices']=lane.get('stale_geometry_slices',0)+1
+                try:
+                    current_scene,current_spheres=prepare_scene(lane['camera'],installed_geometry)
+                    from camera_designer.studio_native_emitters import timed_light_buffers
+                    timed_light_buffers(lane['scene'],current_scene)
+                except ValueError:
+                    current_scene=lane.get('installed_scene',lane['scene'])
+                    current_spheres=lane['installed_spheres']
         roots = install_timed_light_frame(lane['state'], lane['accumulator'],
-                                          lane['scene'], current_scene)
+                                          lane['scene'], current_scene,
+                                          installed_scene=lane.get('installed_scene',lane['scene']),
+                                          renderer=renderer,sphere_regions=current_spheres)
+        lane['installed_scene']=current_scene
+        lane['installed_spheres']=current_spheres
+        if not stale and lane.get('unsupported_geometry_revision')!=geometry_revision:
+            lane['installed_geometry_revision']=geometry_revision
         seed = lane['state']['_pump_seed']
         renderer._clear_prebuilt(lane['state'])
         lane['state']['_pump_seed'] = seed
@@ -751,6 +786,10 @@ def run(payload: Path, config_path: Path, output: Path, *,
                 or config.get("live") or tiles or total_frames != 1 or cooperative or receive_light_field):
             raise ValueError("timed exposure requires one ordinary RGB fixture photograph")
         import copy
+        initial_camera=initial_config['camera']
+        initial_config={**initial_config,'camera':{**initial_camera,
+            'eye_m':np.asarray(initial_camera.get('eye_m',[0,0,.07]),np.float32).tolist(),
+            'target_m':np.asarray(initial_camera.get('target_m',config.get('checker',{}).get('center_m',[0,0,.30])),np.float32).tolist()}}
         initial_config = {**initial_config, 'fixtures': copy.deepcopy(initial_config['fixtures'])}
         fixture = initial_config["fixtures"]
         if not fixture.get("emissive_material_ids"):
@@ -1153,29 +1192,51 @@ def run(payload: Path, config_path: Path, output: Path, *,
                 field_ray_jobs = 0
                 sensor_sites = 0
                 prepared_scene_cache = {'key': None, 'scenes': {}}
+                active_fixture_geometry={'vertices':config['fixtures']['vertices'],
+                                         'material_ids':config['fixtures']['material_ids']}
+                geometry_revision=0
+                last_geometry_capture=None
+                for lane in lane_records:
+                    lane['installed_fixture_geometry']=active_fixture_geometry
+                    lane['installed_geometry_revision']=0
+                    lane['installed_spheres']=lane['spheres']
                 for interval_index, interval in enumerate(timed_frames):
                     dt = float(interval['t1']) - float(interval['t0'])
                     if not np.isfinite(dt) or dt <= 0:
                         raise ValueError('timed exposure needs positive finite state intervals')
-                    fixture = {**config['fixtures'], 'pbr': interval['pbr'],
+                    held_key=interval.get('_held_frame_key',interval_index)
+                    if 'vertices' in interval and held_key!=last_geometry_capture:
+                        active_fixture_geometry={'vertices':interval['vertices'],
+                                                 'material_ids':interval['material_ids']}
+                        geometry_revision+=1
+                        last_geometry_capture=held_key
+                    fixture = {**config['fixtures'], **active_fixture_geometry, 'pbr': interval['pbr'],
                                'emitter_profiles': interval['emitter_profiles']}
-                    def prepare_lane_scene(lane_camera):
+                    def prepare_lane_scene(lane_camera, fallback_geometry=None):
                         held_key = interval.get('_held_frame_key', interval_index)
                         if prepared_scene_cache['key'] != held_key:
                             prepared_scene_cache['key'] = held_key
                             prepared_scene_cache['scenes'].clear()
-                        lane_key = id(lane_camera)
+                        lane_key = (id(lane_camera),id(fallback_geometry))
                         if lane_key not in prepared_scene_cache['scenes']:
-                            prepared_scene_cache['scenes'][lane_key] = prepare_photo_geometry(
-                            {**config, 'camera': lane_camera, 'fixtures': fixture,
+                            lane_fixture=({**fixture,**fallback_geometry} if fallback_geometry is not None else fixture)
+                            lane_scene,lane_spheres,_,_=prepare_photo_geometry(
+                            {**config, 'camera': lane_camera, 'fixtures': lane_fixture,
                              'transport': lane_camera.get('sensor_transport', transport)},
-                            vertices, material_ids, pbr, prepare_sources=False)[0]
+                            vertices, material_ids, pbr, prepare_sources=False)
+                            prepared_scene_cache['scenes'][lane_key]=(lane_scene,lane_spheres)
                         return prepared_scene_cache['scenes'][lane_key]
                     sweeps = max(1, int(round(dt * exposure_substeps / seconds)))
                     launched, submitted = _dispatch_timed_sensor_lanes(
                         lane_records, interval, interval_index,
                         prepare_scene=prepare_lane_scene, renderer=renderer,
-                        barrier=timed_barrier, sweeps=sweeps, finish=glFinish)
+                        barrier=timed_barrier, sweeps=sweeps, finish=glFinish,
+                        geometry_revision=geometry_revision)
+                    if any(lane.get('installed_geometry_revision')==geometry_revision and
+                           lane.get('unsupported_geometry_revision')!=geometry_revision for lane in lane_records):
+                        for lane in lane_records:
+                            if lane.get('installed_geometry_revision')==geometry_revision:
+                                lane['installed_fixture_geometry']=active_fixture_geometry
                     field_ray_jobs += launched
                     sensor_sites += submitted
                     epoch += 1
@@ -1219,6 +1280,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
                                 hdr=status['frames'][-1]['hdr'] if done else None), *lane_statuses]
                             status['sensor_lanes'][0]['calibration_regions'] = status.get('calibration_regions')
                         status['exposure_state_frames'] = interval_index + 1
+                        status['stale_geometry_slices'] = sum(lane.get('stale_geometry_slices',0) for lane in lane_records)
                         status['exposure_integrated_seconds'] = float(interval['t1'])
                         if config.get('calibration_regions'):
                             calibration_history.append({

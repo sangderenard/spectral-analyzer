@@ -29,7 +29,7 @@ def test_actual_queue_composition_copies_parent_without_new_optics(regions,pbr):
     for expression in ('packet.z * clamp(reflectivity, 0.0, 1.0)',
                        'min(packet.z * sqrt(lambda_d / r_edge) * 0.3, packet.z * 0.5)',
                        'min(bounces_rem, uMaxBounces)','normalize(pr.dir_bounces.xyz)'):
-        assert queued.count(expression)==source.count(expression)==1
+        assert queued.count(expression)==source.count(expression)==(2 if pbr and expression.startswith('min(packet.z') else 1)
     assert 'reactive_main(ray_id, rng);' in queued and 'reactive_main(gid, rng);' not in queued
     assert 'studio_record_root_weight=uintBitsToFloat(pr.studio_sampling.x);' in queued
     assert 'uvec4(uStudioParentDispatch,ray_id,uint(_ray_idx),0u)' in queued
@@ -49,7 +49,7 @@ def test_queue_admission_uses_native_enqueue_bound_without_shrinking_jobs():
     with pytest.raises(MemoryError):queued_ray_storage_plan(512,6,max_ssbo_bytes=100)
     with pytest.raises(ValueError):queued_ray_storage_plan(True,6,max_ssbo_bytes=100)
     large=queued_ray_storage_plan(8192,200,max_ssbo_bytes=1024*1024*1024)
-    with pytest.raises(MemoryError,match='peak requires'):
+    with pytest.raises(MemoryError,match='peak requires|SSBO limit'):
         dispatch_storage_plan(8192,200,reserved_bytes=large['buffer_bytes'],max_ssbo_bytes=1024*1024*1024)
 
 

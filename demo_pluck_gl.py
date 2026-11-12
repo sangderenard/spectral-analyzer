@@ -7938,7 +7938,7 @@ def _gpu_ray_field_prebuilt(
             from camera_designer.studio_scalar_columns import with_scalar_columns
             shader_source=with_scalar_columns(shader_source,n_layers,shared=True)
             scalar_column_bytes=int(np.prod(dims))*n_layers*16
-            response_tail_bytes=8+int(dispatch_batch)*int(max_bounces)*512
+            response_tail_bytes=8+2*int(dispatch_batch)*int(max_bounces)*512
             response_word_offset_bytes=int(np.prod(dims))*8+scalar_column_bytes
             scalar_visit_buffer=allocate_scalar_visits(dims,extra_bytes=scalar_column_bytes+response_tail_bytes)
             from camera_designer.studio_forward_responses import copy_forward_responses

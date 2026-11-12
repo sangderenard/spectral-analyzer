@@ -113,3 +113,29 @@ parent debit. Sequential debits change later edge weights by vertex order;
 same-parent offers normalized to one budget preserve ratios but introduce an
 allocation rule. Neither is an existing cascade parameter. Do not silently choose
 one. Fluorescence is independently additive and not fixed by a diffraction patch.
+
+## Approved proportional diffraction budget
+
+The owner subsequently approved computing all three edge offers from the same
+incident energy and scaling proportionally only when total offers exceed that
+energy. This supersedes the pending allocation choice above.
+
+The explicit corrected-Studio PBR composer now preserves native Keller offers,
+eligibility, cone sampling, phase, bounce bounds and single-generation queue.
+Successful queue writes alone debit the parent; rejected writes cannot consume
+parent energy. The PBR branch follows edge processing, so its break/continue no
+longer bypasses diffraction. Ordinary unspecialized Pluck source is unchanged.
+Fluorescence remains separately additive and is not claimed energy-conserving.
+
+Actual debit is copied into an explicit kind2 response row before subsequent
+BSDF factor reuse. Response admission and the shared buffer tail both reserve
+two rows per ray-bounce, rejecting insufficient budgets rather than shrinking
+work or silently dropping this record. Metadata identifies intermediate debit
+rows; they are not terminal samples. Unknown/malformed packets retain existing
+validity checks. The additional response data remains opt-in.
+
+CPU/offline checks: 91 tests passed across budget, PBR, joint observer, queue and
+response copies; 81 additional factory/retention/config/volume tests passed.
+Float32 oracle added with bounded rounding tolerance, not bit-exact conservation.
+Offline shader compilation is not GPU driver link or execution evidence.
+No GPU, render, live deployment, or server restart performed.

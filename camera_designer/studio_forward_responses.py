@@ -108,7 +108,11 @@ def copy_forward_responses(source, *, terminal_only=False, shared_scalar_buffer=
             seams.append(dict(kind=kind,path=path,expression=expr))
             outgoing='outgoing' if 'studio_pbr_weight(' in expr or expr.startswith('weight*studio_reflector_rho(') else 'rd'
             terminal=copy(5,validity=terminal_valid,direction=outgoing,termination=terminal_status) if 'studio_pbr_weight(' in expr else ''
-            return '{ studio_response_begin(packet,rd,currentMedium); float studio_copied_factor=('+expr+'); packet.z*=studio_copied_factor; '+copy(kind,'studio_copied_factor',direction=outgoing)+terminal+' }'
+            record=copy(kind,'studio_copied_factor',direction=outgoing)
+            if expr=='studio_edge_remainder' and terminal_only:
+                # Preserve the debit before a later BSDF factor reuses stage2.
+                record+=f'studio_response_copy(2u,{path}u,{ray},{root},bounce,hit,packet,ro,hp,rd,currentMedium,studio_copied_factor,{terminal_valid},0u);'
+            return '{ studio_response_begin(packet,rd,currentMedium); float studio_copied_factor=('+expr+'); packet.z*=studio_copied_factor; '+record+terminal+' }'
         hit_seam='int hit = nearest_hit(ro, rd, best);'
         kind=('(srf_selected_sphere>=0?1:0)' if spheres else '0')
         owner=('srf_selected_sphere' if spheres else '-1')
@@ -202,7 +206,7 @@ def with_queued_ray_ancestry(source):
         raise ValueError('native root-sweep recorder required for copied replay weight')
     if (source.count('spawn_edge_diffraction(hp, rd, packet, bounce,')!=3 or
         source.count('append_pending_ray(')!=4 or
-        source.count('int bounces_rem = uMaxBounces - bounce - 1;')!=2 or
+        source.count('int bounces_rem = uMaxBounces - bounce - 1;')!=(3 if 'float studio_edge_offer(' in source else 2) or
         source.count('atomicAdd(pending_count, 1u)')!=1):
         raise ValueError('native enqueue count/bounce bounds changed; storage plan must be re-established')
     def once(old,new):
@@ -251,7 +255,7 @@ def with_queued_ray_ancestry(source):
 
 def dispatch_storage_plan(ray_count, bounce_limit, *, reserved_bytes, consumer_bytes=0,
                           budget_bytes=512*1024*1024, max_ssbo_bytes=128*1024*1024):
-    """Preflight terminal copies only; never bound volume-march history this way.
+    """Preflight terminal and diffraction-debit copies; not volume-march history.
 
     Peak includes the GPU buffer and one synchronous immutable readback. The
     consumer must declare its additional staging/retained storage separately.
@@ -260,7 +264,7 @@ def dispatch_storage_plan(ray_count, bounce_limit, *, reserved_bytes, consumer_b
     args=(ray_count,bounce_limit,reserved_bytes,consumer_bytes,budget_bytes,max_ssbo_bytes)
     if any(type(x) is not int for x in args) or min(ray_count,bounce_limit,budget_bytes,max_ssbo_bytes)<1 or min(reserved_bytes,consumer_bytes)<0:
         raise ValueError('invalid explicit response storage admission')
-    rows=ray_count*bounce_limit
+    rows=2*ray_count*bounce_limit # terminal plus explicit diffraction debit, bounded per bounce
     if rows>0xfffffffe:raise MemoryError('response row counter capacity exceeded')
     buffer_bytes=HEADER_BYTES+rows*ROW_BYTES
     peak=reserved_bytes+consumer_bytes+2*buffer_bytes
@@ -351,7 +355,7 @@ class ForwardResponseCopies:
         rows=np.frombuffer(raw,dtype=np.uint32).reshape(count,128)
         rows.setflags(write=False)
         metadata=dict(self.pending,version=ANCESTRY_VERSION if self.queue_ancestry else VERSION,row_count=count,row_stride_bytes=ROW_BYTES,
-                      row_semantics='terminal packet or native disposition; factors are attributes',
+                      row_semantics='terminal packet, native disposition, or explicit kind2 diffraction debit; other factors are attributes',
                       independent_sample_count=None)
         if self.queue_ancestry:validate_queue_rows(metadata,rows)
         try:self.consume(metadata,rows)

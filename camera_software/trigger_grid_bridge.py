@@ -33,15 +33,18 @@ class CameraTriggerGrid:
         self.buses = tuple(buses)
         self.generators = validate_generators(generators)
         expected = (*CAMERA_TRIGGER_PORTS, *self.buses, *self.receivers, *GENERATOR_KEYS)
-        if len(expected) > 160:
-            raise ValueError("camera routing grid exceeds 160 named nodes")
+        if len(expected) > 200:
+            raise ValueError("camera routing grid exceeds 200 named nodes")
         graph = make_camera_trigger_graph(self.receivers, bus_keys=self.buses, generator_keys=GENERATOR_KEYS)
         if saved is not None:
             restored = RoutingGraph.from_dict(saved)
-            if tuple(restored.node_keys()) == expected[:-len(GENERATOR_KEYS)]:
-                for key in GENERATOR_KEYS:restored.add_node(key)
-            if tuple(restored.node_keys()) != expected:
+            if not set(restored.node_keys()) <= set(expected):
                 raise ValueError("saved camera routing nodes do not match the current light bus")
+            for key in expected:
+                if key not in restored.node_keys():
+                    if not (key.startswith("filter:studio:") or key in GENERATOR_KEYS):
+                        raise ValueError("saved camera routing nodes do not match the current light bus")
+                    restored.add_node(key)
             graph = restored
         self.graph = graph
         self.patch, self.view = make_camera_trigger_panel(graph)

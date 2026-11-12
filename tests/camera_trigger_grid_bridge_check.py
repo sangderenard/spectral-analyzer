@@ -44,6 +44,15 @@ def main():
     assert grid.graph.get_weight("Flash", "rack:center") == 0
     saved = CameraTriggerGrid(["shop:17"]).frame()["graph"]
     assert CameraTriggerGrid(["shop:17"], saved=saved).frame()["graph"] == saved
+    colour=CameraTriggerGrid(["shop:17", "filter:studio:0:r"], saved=saved)
+    assert colour.graph.node_keys()[-1] == "filter:studio:0:r"
+    colour.graph.set_weight("mod:1", "filter:studio:0:r", 1)
+    assert "filter:studio:0:r" in colour.pulse()["signals"]
+    intensity = {**mod, "key":"mod:2", "kind":"sine", "frequency_hz":30}
+    colour.generators = (mod, intensity)
+    colour.graph.set_weight("mod:2", "shop:17", 1)
+    routed = colour.pulse()["signals"]
+    assert routed["filter:studio:0:r"][1:11] != routed["shop:17"][1:11]
     try:
         CameraTriggerGrid(["shop:18"], saved=saved)
     except ValueError as error:

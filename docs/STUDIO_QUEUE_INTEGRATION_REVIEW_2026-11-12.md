@@ -85,3 +85,31 @@ No GPU link, compute dispatch, optical render, live request, push or deployment
 was performed. Complete-data/render readiness remains unestablished. Announce
 hardware activity beforehand; show any eventual actual render only once the
 complete-data constraint has been met.
+
+## Resumed joint-extinction lane, 2026-11-12
+
+The retained joint observer now integrates the installed material extinction and
+ExtinctionGrid over the grid's existing traversal, including material-only
+intervals outside that grid. Primary transport helpers and RNG calls remain
+unchanged. Invalid or incomplete traversal is unknown, not a vacuum remainder.
+The production prebuilt assembly previously installed its internal observer
+before replacing the source with the volume variant, losing the observer. The
+observer now attaches after final source selection. A test executes that actual
+AST statement without importing the renderer or creating GL state.
+
+Verification on the retained worktree:
+- 52 tests passed: joint observer, directional media, forward response copying.
+- 64 tests passed: volume extinction, internal config, native source control,
+  queue ancestry/transport and opaque PBR.
+- Offline GLSL checks in those tests are syntax compilation, not driver linking.
+
+The worker's joint-volume admission remains closed pending real device validation;
+no GPU link, dispatch, render, server change or deployment was done. Source-side
+success is not screen completeness or application readiness.
+
+Diffraction remains pending a real allocation choice: native per-edge offers
+can each be half the parent while leaving it untouched. The user authorized
+parent debit. Sequential debits change later edge weights by vertex order;
+same-parent offers normalized to one budget preserve ratios but introduce an
+allocation rule. Neither is an existing cascade parameter. Do not silently choose
+one. Fluorescence is independently additive and not fixed by a diffraction patch.

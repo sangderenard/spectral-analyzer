@@ -3,7 +3,7 @@ import ast
 from pathlib import Path
 
 
-def native_control_source(root):
+def native_control_source(root, *, volume_extinction=False):
     from camera_designer.spectral_sensor_basis import FIXED3_SPECTRAL_GLSL
     from camera_designer.studio_diffuse_surface import STUDIO_DIFFUSE_GLSL
     from camera_designer.studio_spectral_reflector import STUDIO_REFLECTOR_GLSL
@@ -24,4 +24,7 @@ def native_control_source(root):
     # Same existing prebuilt assembly branches, information option absent.
     source=with_opaque_pbr(scope['_GPU_RAY_FIELD_REGION_CS'])
     source=recording_shader(source,stencil=12,grid_size=64,estimator='track-length-root-sweep-v1',independent_bounds=True,quantization_divisor=16777216)
+    if volume_extinction:
+        from camera_designer.studio_volume_extinction import transport_shader
+        source=transport_shader(source)
     return with_internal_medium_recording(source)

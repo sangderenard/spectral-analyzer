@@ -7898,9 +7898,6 @@ def _gpu_ray_field_prebuilt(
         directional_record['materials'] = native_pbr.copy()
         directional_record['scene_sha256'] = scene_digest(packed_geom,packed_shade,native_pbr,source_records,mat_buf,context_buf,bmin,bmax,sphere_data,*([region_data] if region_data is not None else []))
         shader_source = recording_shader(shader_source, stencil=light_field_stencil, grid_size=light_field_grid_size, estimator=light_field_estimator, independent_bounds=light_field_region is not None, quantization_divisor=directional_quantization_divisor)
-        if light_field_internal_media:
-            from camera_designer.studio_directional_media import with_internal_medium_recording
-            shader_source=with_internal_medium_recording(shader_source)
     if volume_extinction is not None:
         from camera_designer.studio_volume_extinction import allocate as allocate_volume
         volume_record = allocate_volume(volume_extinction)
@@ -7908,6 +7905,11 @@ def _gpu_ray_field_prebuilt(
         if directional_record is not None:
             directional_record['volume_extinction'] = volume_extinction.metadata()
             directional_record['scene_sha256'] = scene_digest(packed_geom,packed_shade,native_pbr,source_records,mat_buf,context_buf,bmin,bmax,sphere_data,*([region_data] if region_data is not None else []),volume_extinction.bounds_m,volume_extinction.sigma_t_m_inv)
+    # Apply the observer to the final transport source, not the pre-grid
+    # candidate that the volume specialization replaces above.
+    if record_directional and light_field_internal_media:
+        from camera_designer.studio_directional_media import with_internal_medium_recording
+        shader_source=with_internal_medium_recording(shader_source)
     scalar_visit_buffer=None
     scalar_columns=None
     prog=0

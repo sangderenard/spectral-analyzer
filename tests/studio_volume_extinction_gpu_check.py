@@ -6,7 +6,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-def oracle(sigma, bounds, a, b):
+def oracle(sigma, bounds, a, b, *, material_sigma=0.):
     """Independent cell-plane event integration, not the GPU DDA algorithm."""
     a, b, bounds = (np.asarray(x, np.float64) for x in (a, b, bounds))
     delta = b - a
@@ -22,7 +22,7 @@ def oracle(sigma, bounds, a, b):
     for left, right in zip(events, events[1:]):
         midpoint = a + delta * ((left + right) / 2)
         q = np.floor((midpoint - bounds[0]) / (bounds[1] - bounds[0]) * sigma.shape[::-1]).astype(int)
-        value = sigma[tuple(q[::-1])] if np.all(q >= 0) and np.all(q < sigma.shape[::-1]) else 0.
+        value = material_sigma + (sigma[tuple(q[::-1])] if np.all(q >= 0) and np.all(q < sigma.shape[::-1]) else 0.)
         distance = (right - left) * length
         weight = -np.expm1(-value * distance) / value if value else distance
         integral += trans * weight

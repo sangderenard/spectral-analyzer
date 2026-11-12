@@ -3,6 +3,7 @@
 Usage: python tests/studio_scene_response_transport_check.py <turing-root>
 Add --require-record-index to also verify the existing optional cell lookup.
 Add --camera-pairs to round-trip the exact v2 interval/response buffers instead.
+Add --camera-query-segments to also check opt-in, derived query geometry.
 No HTTP server, GL context, shader compilation, rendering or scene is started.
 """
 import base64
@@ -24,7 +25,7 @@ const payload=bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLen
 const indexed=process.argv[2]==='true';
 const result=await receiveSceneResponses(fixture.manifest,payload,{
   sceneRevision:fixture.manifest.scene_revision,information:'evaluated-responses-v1',
-  recordIndexBytes:indexed?1024*1024:0});
+  recordIndexBytes:indexed?1024*1024:0,cameraQuerySegments:fixture.cameraQuerySegments});
 if(fixture.cameraPairs){
   assert.deepEqual(Array.from(result.cameraRhsRows),fixture.native);
   assert.equal(result.nativeRows.length,0);
@@ -38,15 +39,19 @@ for(let row=0;row<2;row++){
 }
 if(indexed){
   assert.ok(result.recordIndex,'requested existing record-index implementation is required');
-  assert.equal(result.recordIndex.stats.segmentRows,2);
+  assert.equal(result.recordIndex.stats.segmentRows,fixture.cameraQuerySegments?0:2);
+  if(fixture.cameraQuerySegments){
+    assert.equal(result.recordIndex.stats.cameraQueryRows,2);
+    assert.equal(result.recordIndex.stats.cameraQueryUnavailableRows,0);
+  }
   assert.equal(result.recordIndex.stats.pointRows,0);
   assert.equal(result.recordIndex.stats.references,64);
   assert.equal(result.recordIndex.energyStatements,false);
   for(let x=0;x<32;x++)assert.deepEqual([...result.recordIndex.records([x,16,16])],
-    [{row:0,support:2},{row:1,support:2}]);
+    [{row:0,support:fixture.cameraQuerySegments?4:2},{row:1,support:fixture.cameraQuerySegments?4:2}]);
 }
 console.log(JSON.stringify({result:'PASS',records:2,exactNativeWords:fixture.native.length,
-  cameraPairs:fixture.cameraPairs,
+  cameraPairs:fixture.cameraPairs,cameraQuerySegments:fixture.cameraQuerySegments,
   crossingReferences:indexed?64:null,applicationReady:false,gpuBytes:0}));
 '''
 
@@ -71,13 +76,23 @@ def main():
     rows[:, 7:9] = [4, 6]; rows[:, 32] = 0x80000001; rows[:, 104] = 0x7fc12345
     store.consume_forward(dict(scene_revision='a'*64, stream_id='fixture', sequence=0,
         source_sha256='b'*64, transport_scene_sha256='c'*64, primitive_identity_offsets=[112, 113]), rows)
-    camera_pairs='--camera-pairs' in sys.argv
+    camera_query_segments='--camera-query-segments' in sys.argv
+    camera_pairs='--camera-pairs' in sys.argv or camera_query_segments
     if camera_pairs:
-        if '--require-record-index' in sys.argv:raise ValueError('camera interval spatial indexing is not implemented')
+        if '--require-record-index' in sys.argv and not camera_query_segments:
+            raise ValueError('camera query geometry requires explicit --camera-query-segments')
         store.invalidate_scene('f'*64)
         intervals=np.zeros((2,128),dtype='<u4');responses=np.zeros_like(intervals)
         intervals[:,6]=3;intervals[:,40]=7;intervals[:,126]=2
         intervals[:,12:15]=np.asarray([1,0,0],np.float32).view(np.uint32)
+        if camera_query_segments:
+            intervals[:,4]=6  # Actual nonnegative query hit, not the first-hit field.
+            intervals[:,8:11]=np.asarray([-1,.5,.5],np.float32).view(np.uint32)
+            intervals[:,11]=np.float32(1.5).view(np.uint32)
+            intervals[:,12:15]=np.asarray([2,0,0],np.float32).view(np.uint32)
+            intervals[:,32]=[4,7]  # Geometry does not imply surface evaluation or coverage.
+            intervals[:,115]=17
+            intervals[:,116:119]=np.asarray([999,999,999],np.float32).view(np.uint32)
         intervals[:,5]=4;intervals[:,48]=0x80000001;intervals[:,80]=0x40000002
         responses[:,1]=0x80000000;responses[:,2]=0x7fc12345
         responses[:,96]=1;responses[:,108]=3;responses[:,120]=8
@@ -89,8 +104,9 @@ def main():
     manifest, payload = store.snapshot()
     assert store.retained_entries == 2
     completed = subprocess.run(['node', '--input-type=module', '-e', JS, str(decoder),
-        str('--require-record-index' in sys.argv).lower()],
+        str('--require-record-index' in sys.argv or camera_query_segments).lower()],
         input=json.dumps(dict(manifest=manifest, payload=base64.b64encode(payload).decode(),cameraPairs=camera_pairs,
+                             cameraQuerySegments=camera_query_segments,
                              native=rows.reshape(-1).tolist())),
         text=True, capture_output=True, check=True, timeout=30)
     print(completed.stdout.strip())

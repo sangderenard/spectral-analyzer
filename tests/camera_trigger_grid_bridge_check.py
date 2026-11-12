@@ -2,15 +2,20 @@
 from pathlib import Path
 import os
 import sys
+import subprocess
+import json
 
-os.environ["SDL_VIDEODRIVER"] = "dummy"
+video_driver_before = os.environ.get("SDL_VIDEODRIVER")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from camera_software.trigger_grid_bridge import CameraTriggerGrid
 from routing_engine import RoutingGraph
+import pygame
 
 
 def main():
+    assert os.environ.get("SDL_VIDEODRIVER") == video_driver_before
+    assert not pygame.display.get_init()
     grid = CameraTriggerGrid(["shop:17"], ["rack:center"])
     first = grid.frame()
     assert first["image"].startswith("data:image/png;base64,")
@@ -59,6 +64,13 @@ def main():
         assert "do not match" in str(error)
     else:
         raise AssertionError("stale material receiver was accepted")
+    assert os.environ.get("SDL_VIDEODRIVER") == video_driver_before
+    assert not pygame.display.get_init()
+    assert pygame.display.get_surface() is None
+    # Render workers inherit the service environment after the grid is opened.
+    inherited = subprocess.check_output([sys.executable, "-c",
+        "import json, os; print(json.dumps(os.environ.get('SDL_VIDEODRIVER')))"])
+    assert json.loads(inherited) == video_driver_before
     print("PASS: original N×N grid image, event editing, serialization and receiver identity")
 
 

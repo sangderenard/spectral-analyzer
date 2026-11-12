@@ -8,10 +8,7 @@ from __future__ import annotations
 
 import base64
 from io import BytesIO
-import os
 from threading import RLock
-
-os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame
 from PIL import Image
@@ -48,10 +45,10 @@ class CameraTriggerGrid:
             graph = restored
         self.graph = graph
         self.patch, self.view = make_camera_trigger_panel(graph)
-        pygame.display.init()
+        # The grid draws into CPU Surfaces, not a display. Never select an SDL
+        # video driver here: this module is imported by the service, whose
+        # later OpenGL render workers inherit its environment.
         pygame.font.init()
-        if pygame.display.get_surface() is None:
-            pygame.display.set_mode((1, 1))
 
     def frame(self):
         with self.lock:

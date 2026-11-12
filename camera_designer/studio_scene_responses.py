@@ -4,6 +4,7 @@ Storage/indexing only: no response evaluation, estimator mixing, optical replay,
 normalization or pixel-image product. Exact native payload bits are retained.
 """
 from collections import OrderedDict
+from fractions import Fraction
 import hashlib
 import json
 import numpy as np
@@ -56,7 +57,7 @@ class SceneResponseStore:
         self.lineage_provider=lineage_provider
         self.bounds=None if bounds is None else np.asarray(bounds,np.float64)
         self.dimensions=None if dimensions is None else np.asarray(dimensions,np.int64)
-        if self.bounds is not None and (self.bounds.shape!=(2,3) or self.dimensions.shape!=(3,) or np.any(self.bounds[1]<=self.bounds[0]) or np.any(self.dimensions<=0)):
+        if self.bounds is not None and (self.bounds.shape!=(2,3) or not np.isfinite(self.bounds).all() or self.dimensions.shape!=(3,) or np.any(self.bounds[1]<=self.bounds[0]) or np.any(self.dimensions<=0)):
             raise ValueError('invalid existing world index bounds')
         self.recipient_namespaces=frozenset(recipient_namespaces)
         if not self.recipient_namespaces.issubset({1,2,3}):raise ValueError("invalid recipient scope")
@@ -186,20 +187,49 @@ class SceneResponseStore:
         self._drop(int(slots[np.argmin(self.order[slots])]))
         return True
 
-    def _retention_class(self,recipient,position,position_present):
-        # Keep the existing explicit category/endpoint ROI restriction. A
-        # missing endpoint is not a point at zero or evidence inside the ROI.
-        # Its raw path fields remain intact, with no spatial support claim.
+    def _forward_segment_overlaps_bounds(self,row):
+        # Existing terminal/disposition codec: actual entry origin at 117,
+        # entry direction at 114 and finite hit at 21. This is retention of an
+        # already traversed segment, not another trace or an energy estimate.
+        if self.bounds is None or int(row[0]) not in (5,6) or int(row[5].view(np.int32))<0:return False
+        direction=row[114:117].view(np.float32)
+        start=row[117:120].view(np.float32).astype(np.float64)
+        end=row[21:24].view(np.float32).astype(np.float64)
+        if not np.isfinite(direction).all() or not np.any(direction!=0) or not np.isfinite(start).all() or not np.isfinite(end).all():return False
+        if np.array_equal(start,end):return False
+        # Only three slab comparisons are needed. Use the exact finite IEEE
+        # coordinates: float64 ratios can collapse a real short overlap to a
+        # point when the native endpoints are far outside a small ROI.
+        first,last=Fraction(0),Fraction(1)
+        for axis in range(3):
+            lo,hi=self.bounds[:,axis]
+            if end[axis]==start[axis]:
+                # Match the existing half-open endpoint/cell convention.
+                if start[axis]<lo or start[axis]>=hi:return False
+            else:
+                origin=Fraction(float(start[axis]))
+                delta=Fraction(float(end[axis]))-origin
+                a=(Fraction(float(lo))-origin)/delta;b=(Fraction(float(hi))-origin)/delta
+                first=max(first,min(a,b));last=min(last,max(a,b))
+                if not last>first:return False
+        return last>first
+
+    def _retention_class(self,recipient,position,position_present,*,forward_row=None):
+        # Categories stay explicit. A finite forward/reactive segment crossing
+        # the ROI also qualifies, without moving its endpoint into the ROI.
+        # A missing endpoint remains unlocated, never an infinite miss ray.
         if recipient[0]!=0 and recipient[0] not in self.recipient_namespaces:return None
         if position_present:
             p=np.asarray(position,np.float64)
             if not np.isfinite(p).all():raise ValueError('invalid present native position')
-            if self.bounds is not None and not (np.all(p>=self.bounds[0]) and np.all(p<self.bounds[1])):return None
+            if self.bounds is not None and not (np.all(p>=self.bounds[0]) and np.all(p<self.bounds[1])):
+                if forward_row is None or not self._forward_segment_overlaps_bounds(forward_row):return None
         return 'native_only' if recipient[0]==0 or not position_present else 'surface'
 
     def _put(self, *, family,semantic,cid,payload,event_key,recipient,primitive,
              position,position_present,direction,direction_semantics,event_present):
-        retention_class=self._retention_class(recipient,position,position_present)
+        retention_class=self._retention_class(recipient,position,position_present,
+            forward_row=payload if family in (1,2) else None)
         if retention_class is None:
             self.omitted_out_of_scope+=1;return
         if cid is None:
@@ -224,7 +254,7 @@ class SceneResponseStore:
         index[11]=bool(position_present and finite_position)
         index[12:15]=np.asarray(direction,np.float32).view(np.uint32);index[15]=direction_semantics
         index[16:20]=0xffffffff
-        if index[11] and self.bounds is not None:
+        if index[11] and self.bounds is not None and np.all(position>=self.bounds[0]) and np.all(position<self.bounds[1]):
             cell=np.floor((np.asarray(position)-self.bounds[0])/(self.bounds[1]-self.bounds[0])*self.dimensions).astype(np.int64)
             if np.all(cell>=0) and np.all(cell<self.dimensions):index[16:19]=cell.astype(np.uint32)
         d=np.asarray(direction,np.float64)
@@ -246,7 +276,7 @@ class SceneResponseStore:
             hit=int(row[5].view(np.int32))
             rec=copied_recipient(lineage,hit,primitive,owner) if primitive>=0 else (0,-1)
             recipient_id(*rec);recipients[ordinal]=rec
-        native_only=not any(self._retention_class(rec,row[21:24].view(np.float32),int(row[5].view(np.int32))>=0)=='surface'
+        native_only=not any(self._retention_class(rec,row[21:24].view(np.float32),int(row[5].view(np.int32))>=0,forward_row=row)=='surface'
                             for rec,row in zip(recipients,array))
         cid,watermark,sequence=self._begin(metadata,1,native_only=native_only)
         for ordinal,row in enumerate(array):
@@ -385,7 +415,7 @@ class SceneResponseStore:
                     surface_evicted_entries=self.evicted_surface_entries,native_only_evicted_entries=self.evicted_native_only_entries,
                     native_only_context_discarded_entries=self.native_only_context_discarded_entries,
                     native_only_application_available=False,
-                    scope='known endpoints obey configured bounds/categories; unlocated rows have no claimed spatial support'),
+                    scope='configured categories; endpoint or actual finite forward/reactive segment overlaps bounds; unlocated rows have no claimed spatial support'),
                 omitted_out_of_scope=self.omitted_out_of_scope,unavailable_on_eviction=True),
             complete_retained_snapshot=True,physical_completeness_claim=False,application_ready=False,
             rules=['native families and summands are not summed together','presence is not coverage or radiance validity',

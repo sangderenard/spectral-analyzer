@@ -167,14 +167,14 @@ class ArenaHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path in ("/", "/wave_arena_web_demo.html"):
             self._send(200, PAGE.read_bytes(), "text/html; charset=utf-8")
-        elif self.path == "/api/state":
+        elif self.path == "/api/wave_arena":
             with self.server.arena_lock:
                 self._json(200, self.server.arena.snapshot())
         else:
             self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
-        if self.path not in ("/api/configure", "/api/step"):
+        if self.path != "/api/wave_arena":
             self._json(404, {"error": "not found"})
             return
         try:
@@ -185,10 +185,13 @@ class ArenaHandler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("expected a JSON object")
             with self.server.arena_lock:
-                if self.path == "/api/configure":
+                operation = payload.pop("op", None)
+                if operation == "configure":
                     self.server.arena.configure(payload)
-                else:
+                elif operation == "step":
                     self.server.arena.step(int(payload.get("count", 1)))
+                else:
+                    raise ValueError("op must be configure or step")
                 result = self.server.arena.snapshot()
             self._json(200, result)
         except (ValueError, TypeError, json.JSONDecodeError) as exc:

@@ -15905,6 +15905,8 @@ static bool wave_arena_tick(WaveArena& arena)
                         return false;
                     arena.progress.absorbed_power +=
                         material_progress.absorbed_power;
+                    arena.progress.material_absorbed_power +=
+                        material_progress.material_absorbed_power;
                 }
                 if (!propagate(0.5*arena.dz))
                     return false;
@@ -15930,6 +15932,7 @@ static bool wave_arena_tick(WaveArena& arena)
                         const double power = static_cast<double>(re[start+i])*re[start+i]
                             + static_cast<double>(im[start+i])*im[start+i];
                         arena.progress.absorbed_power += power * removed;
+                        arena.progress.material_absorbed_power += power * removed;
                         re[start+i] = static_cast<float>(re[start+i] * factor);
                         im[start+i] = static_cast<float>(im[start+i] * factor);
                     }
@@ -15946,6 +15949,8 @@ static bool wave_arena_tick(WaveArena& arena)
                     &field_progress);
                 arena.progress.absorbed_power +=
                     field_progress.absorbed_power;
+                arena.progress.numerical_border_absorbed_power +=
+                    field_progress.numerical_border_absorbed_power;
             }
         }
     }
@@ -20674,6 +20679,10 @@ int ray_pipeline_wave_checkpoint_restore(
         arena.progress.field_power = descriptor.field_power;
         arena.progress.border_power = descriptor.border_power;
         arena.progress.absorbed_power = descriptor.absorbed_power;
+        arena.progress.material_absorbed_power =
+            descriptor.material_absorbed_power;
+        arena.progress.numerical_border_absorbed_power =
+            descriptor.numerical_border_absorbed_power;
         for (int b = 0; b < 32; ++b) {
             auto& lane = arena.spectral_lanes[static_cast<size_t>(b)];
             lane.frequency_hz = descriptor.frequency_hz[b];
@@ -20893,6 +20902,9 @@ int ray_pipeline_get_wave_arena_snapshot(const RayPipelineState* ps,
     out->field_power = arena.progress.field_power;
     out->border_power = arena.progress.border_power;
     out->absorbed_power = arena.progress.absorbed_power;
+    out->material_absorbed_power = arena.progress.material_absorbed_power;
+    out->numerical_border_absorbed_power =
+        arena.progress.numerical_border_absorbed_power;
     for (int b = 0; b < 32; ++b) {
         const auto& lane = arena.spectral_lanes[static_cast<size_t>(b)];
         out->frequency_hz[b] = lane.frequency_hz;

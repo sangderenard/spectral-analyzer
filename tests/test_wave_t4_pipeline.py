@@ -101,12 +101,18 @@ def test_wave_arena_bulk_extinction_uses_complex_index_per_band():
         _wait(tracer)
         snapshot=tracer.wave_arena_field_snapshot(0,0,0,0)
         field=np.asarray(snapshot['re'])+1j*np.asarray(snapshot['im'])
-        return float(np.sum(np.abs(field)**2))
-    clear=propagate(0.)
-    absorbed=propagate(.001)
+        return float(np.sum(np.abs(field)**2)),tracer.wave_arena_stats()[0]
+    clear,clear_stats=propagate(0.)
+    absorbed,absorbed_stats=propagate(.001)
     assert clear>0.
     assert absorbed/clear==pytest.approx(
         np.exp(-4*np.pi*.001*4e-6/550e-9),rel=.03,
+    )
+    assert clear_stats['material_absorbed_power']==0.
+    assert absorbed_stats['material_absorbed_power']>0.
+    assert absorbed_stats['absorbed_power']==pytest.approx(
+        absorbed_stats['material_absorbed_power']
+        +absorbed_stats['numerical_border_absorbed_power'],rel=1e-6,
     )
 
 

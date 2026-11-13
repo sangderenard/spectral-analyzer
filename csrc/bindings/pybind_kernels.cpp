@@ -3725,6 +3725,9 @@ struct PyRayTracer
             d["field_power"] = s.field_power;
             d["border_power"] = s.border_power;
             d["absorbed_power"] = s.absorbed_power;
+            d["material_absorbed_power"] = s.material_absorbed_power;
+            d["numerical_border_absorbed_power"] =
+                s.numerical_border_absorbed_power;
             py::list lanes;
             for (int b = 0; b < s.bands; ++b) {
                 py::dict lane;

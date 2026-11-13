@@ -526,6 +526,7 @@ bool absorb_exact(int nx,
         }
     }
     progress->absorbed_power += removed;
+    progress->numerical_border_absorbed_power += removed;
     ++progress->completed_steps;
     return measure_exact<B>(nx, ny, config, re, im, progress);
 }
@@ -703,6 +704,7 @@ bool aperture_material_exact(int nx,
         }
     }
     progress->absorbed_power += removed;
+    progress->material_absorbed_power += removed;
     return true;
 }
 

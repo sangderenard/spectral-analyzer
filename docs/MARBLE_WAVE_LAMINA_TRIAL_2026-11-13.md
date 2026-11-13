@@ -12,7 +12,8 @@ sample configuration, not a rendered picture or a wave material bounce.
 T4 now accepts a per-lane imaginary index alongside the existing per-lane
 real index. During each native angular-spectrum step it applies the
 Beer–Lambert field factor `exp(-2π k dz / λ_vacuum)` and records the removed
-power in the existing absorbed-power counter. A one-lane and a three-lane
+power in the existing absorbed-power counter. Material attenuation and
+numerical border loss now also have separate counters. A one-lane and a three-lane
 field trial compare resulting power against the analytical attenuation.
 The scalar `n_imag` on a scale context also now affects the field. The
 existing aperture material operator remains separate from bulk extinction.
@@ -40,14 +41,16 @@ normal, authored region transition and coherent source identity. The
 approximately 79 µm cells across 20.2 mm. The existing field graph can
 branch, but coherent fan-in remains uninstalled. Multiple reflections from
 bubble walls therefore do **not** yet recombine into structural color.
-Numerical border absorption and material absorption currently share one
-counter; a structural-loss ledger must distinguish heat from reflection,
+The new material-loss counter does not yet identify geometry-induced
+structural loss: a structural ledger must still distinguish heat from reflection,
 transmission and energy leaving the observed aperture. No structural color,
 structural absorption, or full Studio exposure is claimed by this trial.
 
 The next native handoff is T3 hit → authenticated region transition →
-wave lamina patch, using exact sphere and authored rod/dye/bubble boundaries
-already present in Studio. T4 should return both field products to T1/T5
+wave lamina patch. Studio's GPU scene has exact sphere and authored
+rod/dye/bubble boundary classification; the native T3 path does not yet
+consume that complete region contract, so source parity is an admission gate.
+T4 should return both field products to T1/T5
 with coherence and power preserved. Recombination needs the existing graph's
 coherent reception gate completed before any interference image is claimed.
 

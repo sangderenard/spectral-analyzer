@@ -1332,6 +1332,8 @@ struct WaveArenaSnapshot {
     double boundary_output_ray_power;
     int boundary_linked_from_arena;
     int boundary_linked_to_arena;
+    double material_absorbed_power;
+    double numerical_border_absorbed_power;
 };
 
 /* Same-process managed-time checkpoint for mutable T4 wave state.

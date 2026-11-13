@@ -668,6 +668,49 @@ def test_native_wave_fanout_conserves_power_and_is_link_order_invariant():
     )
 
 
+def test_native_bubble_interface_branches_coherent_field_products():
+    from camera_software.complex_optical_operators import (
+        TransverseBasis, compile_normal_dielectric_field_pair,
+    )
+    wavelengths=np.array([450e-9,550e-9,650e-9])
+    tracer=_tracer(wavelengths)
+    source_basis=TransverseBasis.from_direction((0.,0.,1.))
+    reflection_basis=TransverseBasis.from_direction((0.,0.,-1.))
+    reflection,transmission=compile_normal_dielectric_field_pair(
+        source_basis,reflection_basis,source_basis,(0.,0.,-1.),
+        (1.52,1.53,1.54),(1.,1.,1.),material_name='authored-air-bubble',
+    )
+    contexts=[]
+    for center_z,axis,n_real in (
+        (-8e-6,(0.,0.,1.),1.52),
+        (-8e-6,(0.,0.,-1.),1.52),
+        (8e-6,(0.,0.,1.),1.),
+    ):
+        payload=np.asarray((0.,0.,0.,*axis),np.float64)
+        contexts.append(tracer.add_scale_context(
+            np.asarray((0.,0.,center_z)),16e-6,1,2e-6,8,
+            n_real,0.,1,payload,
+        ))
+    for destination,artifact in ((1,reflection),(2,transmission)):
+        tracer.add_wave_context_interface_link(
+            contexts[0],contexts[destination],int(artifact.coordinate_map),
+            artifact.jones.real,artifact.jones.imag,
+        )
+    tracer.ensure_pipeline(max_children=1,min_amplitude=1e-12)
+    tracer.submit_rays(
+        np.asarray([[0.,0.,-.001]]),np.asarray([[0.,0.,1.]]),
+        np.ones((1,3),np.complex128),max_bounces=1,min_amplitude=1e-12,
+    )
+    _wait(tracer)
+    source,reflected,transmitted=tracer.wave_arena_stats()
+    assert source['generation']==reflected['generation']==transmitted['generation']==1
+    seeded=(reflected['boundary']['seeded_field_power']
+            +transmitted['boundary']['seeded_field_power'])
+    assert seeded==pytest.approx(source['field_power'],rel=2e-5)
+    records=tracer.drain_records(16)
+    assert np.count_nonzero(np.asarray(records['kind'])==3)==2
+
+
 def test_native_wave_link_api_rejects_fanin_and_cycles_before_pipeline_build():
     tracer = _tracer(np.array([550e-9]))
     payload = np.asarray(

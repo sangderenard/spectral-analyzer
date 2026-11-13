@@ -32,6 +32,11 @@ A cold normal-incidence dielectric field-pair compiler now uses the existing
 products for an authored interface. The bubble test verifies their combined
 power is one at each of three wavelengths. This preserves coherent phase
 and supplies a real boundary operator for a future local mesh-bounce lamina.
+The authored-index pair also ran as two native T4 field links from a host
+patch into reflected host and transmitted air patches. Both destinations
+advanced, emitted field records, and their seeded powers summed to the
+source power within the trial tolerance. This is one bubble interface,
+not a full bubble with multiple walls or recombination.
 
 ## Boundary still missing
 
@@ -56,5 +61,5 @@ coherent reception gate completed before any interference image is claimed.
 
 Verification: `python -m pytest tests/test_wave_t4_pipeline.py
 tests/test_studio_optical_media.py tests/test_optical_transport_graph.py
-tests/test_complex_optical_operators.py -q` passed 94 tests, including the
+tests/test_complex_optical_operators.py -q` passed 95 tests, including the
 per-lane native attenuation trial, after the native rebuild.

@@ -501,6 +501,27 @@ def test_installer_places_real_angular_arena_without_registering_surrogate_lens(
     assert arena_contract["longitudinal_extent_m"] == pytest.approx(9.6e-4)
 
 
+def test_wave_context_carries_authored_complex_index_lanes_to_native_payload():
+    nodes,links=wave_context_nodes(
+        "marble.local-lamina",3,center_m=(0.,0.,0.),
+        radius_m=32e-6,longitudinal_step_m=1e-6,longitudinal_steps=20,
+        medium_n_by_lane=(1.52,1.53,1.54),
+        medium_n_imag_by_lane=(0.,.0001,.0002),
+    )
+    graph=compile_optical_graph(OpticalTransportGraphSpec(
+        nodes=nodes,links=links,
+        entry_keys=(nodes[0].key,),product_keys=(nodes[-1].key,),
+    ))
+    tracer=_RecordingTracer()
+    install_optical_graph(tracer,graph,exact_t2_registered=False)
+    payload=tracer.contexts[0]["payload"]
+    assert payload[6:9].tolist()==pytest.approx([57_415_645.,1.,3.])
+    assert payload[9:12].tolist()==pytest.approx([1.52,1.53,1.54])
+    assert payload[12:15].tolist()==pytest.approx([0.,.0001,.0002])
+    with pytest.raises(ValueError,match="per-lane real indices"):
+        wave_context_nodes("invalid",3,medium_n_imag_by_lane=(0.,0.,0.))
+
+
 def test_installer_lowers_field_to_field_edge_to_native_persistent_link():
     first_nodes, first_links = wave_context_nodes(
         "bench.first", 4, center_m=(0.0, 0.0, -8.0e-6),

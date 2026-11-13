@@ -870,6 +870,7 @@ struct WaveArena {
     double           wavelengths_m[32] = {};
     double           fixed_wavelengths_m[32] = {};
     double           n_real_by_lane[32] = {};
+    double           n_imag_by_lane[32] = {};
     /* Persistent T4 numerical state buffer. T4 remains pipeline-scheduled:
      * WaveIntent enters the stage, this state is updated in place, and a
      * continuation returns to T1. */

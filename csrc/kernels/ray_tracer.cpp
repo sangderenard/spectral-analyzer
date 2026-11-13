@@ -15170,6 +15170,8 @@ static void wave_arena_build(
     arena.band_specialization = wave_t4::specialization_index(arena.n_bands);
     for (int b = 0; b < arena.n_bands; ++b)
         arena.n_real_by_lane[b] = arena.n_real;
+    for (int b = 0; b < arena.n_bands; ++b)
+        arena.n_imag_by_lane[b] = std::max(0.0, ctx.n_imag);
     constexpr double medium_lane_magic = 57415645.0; /* "WAVE" */
     if (ctx.payload
         && ctx.payload_size_bytes >= (int)(9*sizeof(double))) {
@@ -15191,6 +15193,14 @@ static void wave_arena_build(
                 if (std::isfinite(p[indices_offset+b])
                     && p[indices_offset+b] > 0.0)
                     arena.n_real_by_lane[b] = p[indices_offset+b];
+            const int imag_offset = indices_offset + payload_bands;
+            if (ctx.payload_size_bytes >=
+                    (int)((imag_offset+payload_bands)*sizeof(double))) {
+                for (int b = 0; b < arena.n_bands; ++b)
+                    if (std::isfinite(p[imag_offset+b])
+                        && p[imag_offset+b] >= 0.0)
+                        arena.n_imag_by_lane[b] = p[imag_offset+b];
+            }
         }
     }
     for (int b = 0; b < arena.n_bands; ++b) {
@@ -15901,6 +15911,29 @@ static bool wave_arena_tick(WaveArena& arena)
             } else {
                 if (!propagate(arena.dz))
                     return false;
+            }
+            for (int lane0 = 0; lane0 < active; lane0 += arena.n_bands) {
+                if (arena.lane_step[static_cast<size_t>(lane0 / arena.n_bands)] < 0)
+                    continue;
+                for (int b = 0; b < arena.n_bands; ++b) {
+                    const int lane = lane0 + b;
+                    const double extinction = arena.n_imag_by_lane[b];
+                    if (!(extinction > 0.0)) continue;
+                    const double vacuum_wavelength =
+                        arena.wavelengths_m[lane] * arena.n_real_by_lane[b];
+                    if (!(vacuum_wavelength > 0.0)) return false;
+                    const double factor = std::exp(-TWO_PI * extinction
+                        * arena.dz / vacuum_wavelength);
+                    const double removed = 1.0 - factor * factor;
+                    const size_t start = static_cast<size_t>(lane) * npix;
+                    for (size_t i = 0; i < npix; ++i) {
+                        const double power = static_cast<double>(re[start+i])*re[start+i]
+                            + static_cast<double>(im[start+i])*im[start+i];
+                        arena.progress.absorbed_power += power * removed;
+                        re[start+i] = static_cast<float>(re[start+i] * factor);
+                        im[start+i] = static_cast<float>(im[start+i] * factor);
+                    }
+                }
             }
             for (int lane0 = 0; lane0 < active;
                  lane0 += arena.n_bands) {

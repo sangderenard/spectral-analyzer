@@ -84,6 +84,116 @@ def test_empty_space_crossing_routes_through_t4():
     assert tracer.drain_wave_exit_states(16).shape == (0, 160)
 
 
+def test_wave_arena_bulk_extinction_uses_complex_index_per_band():
+    wavelengths=np.array([550e-9])
+    def propagate(k):
+        tracer=_tracer(wavelengths)
+        tracer.add_scale_context(
+            np.array([0.,0.,0.]), 32e-6, 1, 1e-6, 4,
+            1.52, k, 1,
+            np.array([0.,0.,0.,0.,0.,1.]),
+        )
+        tracer.ensure_pipeline(max_children=1,min_amplitude=1e-12)
+        tracer.submit_rays(
+            np.array([[0.,0.,-50e-6]]),np.array([[0.,0.,1.]]),
+            np.array([[1.+0.j]]),max_bounces=1,min_amplitude=1e-12,
+        )
+        _wait(tracer)
+        snapshot=tracer.wave_arena_field_snapshot(0,0,0,0)
+        field=np.asarray(snapshot['re'])+1j*np.asarray(snapshot['im'])
+        return float(np.sum(np.abs(field)**2))
+    clear=propagate(0.)
+    absorbed=propagate(.001)
+    assert clear>0.
+    assert absorbed/clear==pytest.approx(
+        np.exp(-4*np.pi*.001*4e-6/550e-9),rel=.03,
+    )
+
+
+def test_wave_arena_bulk_extinction_preserves_separate_authored_lanes():
+    wavelengths=np.array([450e-9,550e-9,650e-9])
+    extinction=(.0005,0.,.001)
+    def propagate(with_extinction):
+        tracer=_tracer(wavelengths)
+        payload=np.asarray([
+            0.,0.,0.,0.,0.,1.,57_415_645.,1.,3.,
+            1.52,1.53,1.54,
+            *(extinction if with_extinction else (0.,0.,0.)),
+        ],np.float64)
+        tracer.add_scale_context(
+            np.array([0.,0.,0.]),32e-6,1,1e-6,4,
+            1.52,0.,1,payload,
+        )
+        tracer.ensure_pipeline(max_children=1,min_amplitude=1e-12)
+        tracer.submit_rays(
+            np.array([[0.,0.,-50e-6]]),np.array([[0.,0.,1.]]),
+            np.ones((1,3),np.complex128),max_bounces=1,
+            min_amplitude=1e-12,
+        )
+        _wait(tracer)
+        powers=[]
+        for band in range(3):
+            state=tracer.wave_arena_field_snapshot(0,0,0,band)
+            field=np.asarray(state['re'])+1j*np.asarray(state['im'])
+            powers.append(float(np.sum(np.abs(field)**2)))
+        return np.asarray(powers)
+    clear=propagate(False)
+    absorbed=propagate(True)
+    assert np.all(clear>0.)
+    expected=np.exp(-4*np.pi*np.asarray(extinction)*4e-6/wavelengths)
+    assert absorbed/clear==pytest.approx(expected,rel=.03)
+
+
+def test_exact_compound_lens_routes_to_local_marble_surface_wave_patch():
+    from camera_designer.compound_optics import CompoundLens
+    from camera_designer.scene_builder import build_tracer
+    from camera_software.camera_designer_bridge import camera_manifest_to_designer_preset
+    from camera_software.camera_manifest import resolve_camera_manifest
+    from camera_software.optical_transport_graph import (
+        compile_compound_lens_graph, install_optical_graph,
+    )
+
+    preset=camera_manifest_to_designer_preset(resolve_camera_manifest())
+    wavelengths=(.45,.55,.65)
+    tracer,_=build_tracer(
+        preset,[],scene_object={"type":"sphere","pos":[-.25,0.,0.],
+                                "radius":.01},wavelengths_um=wavelengths,
+    )
+    lens=CompoundLens.from_preset(
+        preset,wavelengths_um=wavelengths,axial_scale=-1.,
+    )
+    # The patch is an 8-um transverse lamina extending 0.1 mm in front of the
+    # sensor-facing sphere interface. Its curvature sag is about 3.2 nm.
+    # It uses the physical exterior medium;
+    # the material bounce remains a separate T3 boundary event.
+    graph=compile_compound_lens_graph(
+        lens,lane_count=3,transport_direction="backward",
+        wave_regions=(("marble.exterior-lamina",{
+            "center_m":(-.23995,0.,0.),"axis":(-1.,0.,0.),
+            "radius_m":8e-6,"longitudinal_step_m":5e-6,
+            "longitudinal_steps":20,
+            "medium_n_by_lane":(1.,1.,1.),
+            "medium_n_imag_by_lane":(0.,0.,0.),
+        }),),
+    )
+    install_optical_graph(tracer,graph,exact_t2_registered=True)
+    tracer.ensure_pipeline(max_children=1,min_amplitude=1e-12,
+                           wave_grid_dx_m=.2e-6)
+    tracer.submit_rays(
+        np.array([[0.,0.,0.]]),np.array([[-1.,0.,0.]]),
+        np.ones((1,3),np.complex128),
+        color_flags=np.array([64],np.uint8),
+        max_bounces=4,min_amplitude=1e-12,
+    )
+    _wait(tracer,timeout_s=30.)
+    arena=tracer.wave_arena_stats()[0]
+    assert arena["generation"]>0
+    assert arena["sample_pitch_m"]<=.45e-6/2
+    assert sum(arena["field_active"])>0
+    records=tracer.drain_records(64)
+    assert 3 in np.asarray(records["kind"]).tolist()
+
+
 def test_wave_transaction_checkpoint_restores_and_replays_native_field_state():
     tracer = _tracer(np.array([550e-9]))
     _add_arena(tracer)

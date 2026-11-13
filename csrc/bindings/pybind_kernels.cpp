@@ -691,6 +691,7 @@ struct PyRayTracer
     bool        _gpu_all_stages  = false;
     bool        _gpu_skip_record_readback = false;
     bool        _capture_wave_exit_states = false;
+    double      _wave_grid_dx_m = 2e-6;
     std::string _shader_dir;
     uint64_t    _gl_display_hglrc = 0;  /* Pygame display HGLRC for WGL object sharing */
     uint64_t    _gl_display_hdc   = 0;  /* Pygame display HDC for pixel-format matching */
@@ -726,6 +727,7 @@ struct PyRayTracer
             cfg.gpu_all_stages              = _gpu_all_stages;
             cfg.gpu_skip_record_readback    = _gpu_skip_record_readback;
             cfg.capture_wave_exit_states    = _capture_wave_exit_states;
+            cfg.wave_grid_dx_m = _wave_grid_dx_m;
             cfg.sensor_mipmap_enabled = _sensor_mipmap_enabled;
             cfg.sensor_mipmap_max_nodes = _sensor_mipmap_max_nodes;
             cfg.sensor_mipmap_max_depth = _sensor_mipmap_max_depth;
@@ -1793,8 +1795,11 @@ struct PyRayTracer
         bool                 use_gpu_compute = false,
         bool                 gpu_all_stages  = false,
         std::string          shader_dir      = "",
-        bool                 capture_wave_exit_states = false)
+        bool                 capture_wave_exit_states = false,
+        double               wave_grid_dx_m = 2e-6)
     {
+        if (!std::isfinite(wave_grid_dx_m) || wave_grid_dx_m <= 0.0)
+            throw std::invalid_argument("wave_grid_dx_m must be finite and positive");
         {
             std::lock_guard<std::mutex> lk(_pipeline_mu);
             if (!_pipeline) {
@@ -1802,6 +1807,7 @@ struct PyRayTracer
                 _use_gpu_compute = use_gpu_compute;
                 _gpu_all_stages  = gpu_all_stages;
                 _capture_wave_exit_states = capture_wave_exit_states;
+                _wave_grid_dx_m = wave_grid_dx_m;
                 if (!shader_dir.empty()) _shader_dir = shader_dir;
             }
         }
@@ -7013,6 +7019,7 @@ intersect it are not launched.)doc")
              py::arg("gpu_all_stages") = false,
              py::arg("shader_dir") = "",
              py::arg("capture_wave_exit_states") = false,
+             py::arg("wave_grid_dx_m") = 2e-6,
 R"doc(Force creation of the persistent ray pipeline without submitting rays.
 Use this on the display thread when the pipeline needs to share with the
 currently-bound OpenGL display context. Set capture_wave_exit_states before

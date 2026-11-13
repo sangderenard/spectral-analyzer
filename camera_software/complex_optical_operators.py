@@ -408,6 +408,62 @@ def compile_normal_transmission_interface(
     )
 
 
+def compile_normal_dielectric_field_pair(
+    source_basis: TransverseBasis,
+    reflected_basis: TransverseBasis,
+    transmitted_basis: TransverseBasis,
+    interface_normal: Sequence[float],
+    n_incident_by_lane: Sequence[float],
+    n_transmitted_by_lane: Sequence[float],
+    *,
+    material_name: str,
+) -> tuple[RigidFieldInterface, RigidFieldInterface]:
+    """Lower an authored normal dielectric boundary to both coherent products.
+
+    The existing dielectric_interface law owns Fresnel amplitude and phase.
+    Bulk complex-index attenuation belongs to each adjacent T4 arena, so this
+    real-index interface retains the Studio weak-extinction admission regime.
+    """
+    incident = np.asarray(n_incident_by_lane, np.float64).reshape(-1)
+    transmitted = np.asarray(n_transmitted_by_lane, np.float64).reshape(-1)
+    if (not len(incident) or incident.shape != transmitted.shape
+        or np.any(~np.isfinite(incident)) or np.any(~np.isfinite(transmitted))
+        or np.any(incident <= 0.0) or np.any(transmitted <= 0.0)):
+        raise ValueError("dielectric field pair requires matching positive index lanes")
+    normal = _unit(interface_normal, name="interface normal")
+    if abs(float(np.dot(source_basis.k, normal))) < 1.0-1.0e-8:
+        raise ValueError("dielectric field pair requires a normal local patch")
+    if float(np.dot(source_basis.k, transmitted_basis.k)) < 1.0-1.0e-8:
+        raise ValueError("transmitted field basis must follow incident direction")
+    if float(np.dot(source_basis.k, reflected_basis.k)) > -1.0+1.0e-8:
+        raise ValueError("reflected field basis must reverse incident direction")
+    if float(np.dot(source_basis.k, normal)) > 0.0:
+        normal = -normal
+    world_reflection = np.eye(3)-2.0*np.outer(normal, normal)
+    reflect_map = _rigid_field_map(source_basis, reflected_basis, world_reflection)
+    transmit_map = _rigid_field_map(source_basis, transmitted_basis, np.eye(3))
+    reflection = []
+    transmission = []
+    for ni, nt in zip(incident, transmitted):
+        boundary = dielectric_interface(source_basis.k, normal, ni, nt)
+        reflection.append(
+            _basis_matrix(boundary.reflected_basis, reflected_basis)
+            @ boundary.reflection.matrix
+            @ _basis_matrix(source_basis, boundary.incident_basis)
+        )
+        transmission.append(
+            _basis_matrix(boundary.transmitted_basis, transmitted_basis)
+            @ boundary.transmission.matrix
+            @ _basis_matrix(source_basis, boundary.incident_basis)
+        )
+    return (
+        RigidFieldInterface(reflect_map, np.stack(reflection), source_basis,
+                            reflected_basis, "dielectric-reflection", material_name),
+        RigidFieldInterface(transmit_map, np.stack(transmission), source_basis,
+                            transmitted_basis, "dielectric-transmission", material_name),
+    )
+
+
 def basis_change(
     source: TransverseBasis,
     destination: TransverseBasis,

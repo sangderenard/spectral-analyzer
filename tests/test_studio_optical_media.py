@@ -2,7 +2,9 @@ import copy
 import math
 import numpy as np
 import pytest
-from camera_designer.studio_optical_media import validate_optical_media, optical_extinction
+from camera_designer.studio_optical_media import (
+    validate_optical_media, optical_extinction, wave_medium_from_regions,
+)
 from camera_designer.scene_builder import append_saved_studio_mesh_to_gpu_scene
 
 
@@ -36,6 +38,39 @@ def test_sigma_interpolation_no_silent_extrapolation_or_roughness_coupling():
     assert optical_extinction(r,.365,outside_policy='game-transparent-outside-authored-v1')==0
     sigma=lambda nm:optical_extinction(r,nm/1000)*4*math.pi/(nm*1e-9)
     assert sigma(475)==pytest.approx((sigma(400)+sigma(550))/2)
+
+
+def test_wave_medium_preserves_host_rod_dye_and_bubble_optics():
+    pbr=np.zeros((3,16),np.float32)
+    pbr[:,5]=1;pbr[:,6]=[1.52,1.54,1.52]
+    records=[
+        {'material':i,'wavelengths_nm':[450.,550.,650.],
+         'transmittance':trans,'reference_thickness_mm':1.,'concentration':1.}
+        for i,trans in enumerate(([1.,1.,1.],[.8,.7,.6],[.9,.5,.2]))
+    ]
+    optics=validate_optical_media({'version':1,'materials':records},pbr,[0,1,2])
+    regions={'version':1,'regions':[
+        {'start':0,'count':1,'mode':'host','material':0},
+        {'start':1,'count':1,'mode':'glass_rod','material':1},
+        {'start':2,'count':1,'mode':'injection_dye','material':2},
+        {'start':3,'count':1,'mode':'air_bubble','material':-1},
+    ]}
+    wavelengths=(.45,.55,.65)
+    host=wave_medium_from_regions(regions,optics,pbr,{0},wavelengths)
+    rod=wave_medium_from_regions(regions,optics,pbr,{0,1},wavelengths)
+    dye=wave_medium_from_regions(regions,optics,pbr,{0,2},wavelengths)
+    bubble=wave_medium_from_regions(regions,optics,pbr,{0,3},wavelengths)
+    assert host[0]==pytest.approx((1.52,)*3)
+    assert host[1]==pytest.approx((0.,)*3)
+    assert rod[0]==pytest.approx((1.54,)*3)
+    assert rod[1]==pytest.approx(tuple(optical_extinction(optics[1],w) for w in wavelengths))
+    assert dye[0]==host[0]
+    assert dye[1]==pytest.approx(tuple(optical_extinction(optics[2],w) for w in wavelengths))
+    assert bubble==((1.,)*3,(0.,)*3)
+    for w,k,t in zip(wavelengths,dye[1],records[2]['transmittance']):
+        assert math.exp(-4*math.pi*k*.001/(w*1e-6))==pytest.approx(t)
+    with pytest.raises(ValueError,match='resolved'):
+        wave_medium_from_regions(regions,optics,pbr,{0,1,2},wavelengths)
 
 
 @pytest.mark.parametrize('key,value',[('reference_thickness_mm',0),('reference_thickness_mm',float('nan')),

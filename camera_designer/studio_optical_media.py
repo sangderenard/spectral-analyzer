@@ -82,6 +82,47 @@ def optical_extinction(record, wavelength_um, *, outside_policy="error"):
     return float(np.interp(nm,w,sigma)) * nm*1e-9/(4*math.pi)
 
 
+def wave_medium_from_regions(regions, optics, pbr, active_region_ids, wavelengths_um):
+    """Lower an already validated Studio region state to T4 complex indices.
+
+    The caller obtains active region IDs from the authored boundary traversal;
+    this function does not infer membership from display colors or triangle IDs.
+    A rod replaces the host dielectric. Injection dye adds bulk extinction to
+    the host while leaving its real index unchanged, matching Studio's region
+    transport contract. Interface scattering remains a separate field edge.
+    """
+    entries = regions['regions']
+    active = set(active_region_ids)
+    if any(type(i) is not int or i < 0 or i >= len(entries) for i in active):
+        raise ValueError('active wave region ID outside authored membership')
+    wavelengths = np.asarray(wavelengths_um, np.float64).reshape(-1)
+    if not len(wavelengths) or not np.isfinite(wavelengths).all() or np.any(wavelengths <= 0):
+        raise ValueError('wave wavelengths must be finite and positive')
+    if 0 not in active:
+        if active:
+            raise ValueError('subject regions cannot be active outside the host')
+        return tuple(1.0 for _ in wavelengths), tuple(0.0 for _ in wavelengths)
+    selected = [entries[i] for i in sorted(active)]
+    if any(r['mode'] == 'air_bubble' for r in selected[1:]):
+        if len(selected) != 2:
+            raise ValueError('bubble wave state overlaps another interior region')
+        return tuple(1.0 for _ in wavelengths), tuple(0.0 for _ in wavelengths)
+    rods = [r for r in selected[1:] if r['mode'] == 'glass_rod']
+    dyes = [r for r in selected[1:] if r['mode'] == 'injection_dye']
+    if len(rods) > 1 or (rods and dyes):
+        raise ValueError('wave patch needs resolved rod/dye membership')
+    base = rods[0] if rods else selected[0]
+    material = base['material']
+    if material not in optics:
+        raise ValueError('missing authored wave optical medium')
+    real = float(np.asarray(pbr)[material, 6])
+    if not math.isfinite(real) or real <= 0:
+        raise ValueError('invalid authored wave refractive index')
+    imag = tuple(sum(optical_extinction(optics[r['material']], float(w))
+                     for r in ([base] + dyes)) for w in wavelengths)
+    return tuple(real for _ in wavelengths), imag
+
+
 def validate_region_absorption_bound(regions, optics):
     """Conservative upper bound for additive dye mixtures under real-n Fresnel.
 

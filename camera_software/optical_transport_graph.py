@@ -434,6 +434,7 @@ def wave_context_nodes(
     medium_n_real: float = 1.0,
     medium_n_imag: float = 0.0,
     medium_n_by_lane: Sequence[float] | None = None,
+    medium_n_imag_by_lane: Sequence[float] | None = None,
     aperture_material: Any | None = None,
 ) -> tuple[tuple[OpticalNodeSpec, ...], tuple[OpticalLinkSpec, ...]]:
     """Return explicit complex-ray→field→complex-ray T4 boundary modules."""
@@ -492,6 +493,15 @@ def wave_context_nodes(
         physical["medium_n_by_lane"] = tuple(
             float(value) for value in lane_indices
         )
+    if medium_n_imag_by_lane is not None:
+        if medium_n_by_lane is None:
+            raise ValueError("per-lane extinction requires per-lane real indices")
+        lane_extinction = np.asarray(medium_n_imag_by_lane, np.float64).reshape(-1)
+        if (lane_extinction.size != lane_count
+            or np.any(~np.isfinite(lane_extinction))
+            or np.any(lane_extinction < 0.0)):
+            raise ValueError("wave arena extinction must match nonnegative lanes")
+        physical["medium_n_imag_by_lane"] = tuple(float(v) for v in lane_extinction)
     if aperture_material is not None:
         graph_parameters = getattr(aperture_material, "graph_parameters", None)
         wave_payload = getattr(aperture_material, "wave_payload", None)
@@ -675,6 +685,10 @@ def install_optical_graph(
                 [0.0, 0.0, 0.0, axis[0], axis[1], axis[2]],
                 np.float64,
             )
+        if "medium_n_imag_by_lane" in descriptor:
+            payload = np.ascontiguousarray([
+                *payload, *descriptor["medium_n_imag_by_lane"],
+            ], np.float64)
         payloads.append(payload)
         context_id = int(add_context(
             pos=np.ascontiguousarray(center, np.float64),

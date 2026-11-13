@@ -4725,6 +4725,45 @@ struct PyRayTracer
         return out;
     }
 
+    py::dict resolve_studio_wave_interface(
+        int hit_triangle,
+        py::array_t<double, py::array::c_style | py::array::forcecast> hit_position,
+        py::array_t<double, py::array::c_style | py::array::forcecast> incoming_direction,
+        py::array_t<double, py::array::c_style | py::array::forcecast> frequencies_hz,
+        double margin_wavelengths)
+    {
+        const auto p = hit_position.request(), d = incoming_direction.request();
+        const auto f = frequencies_hz.request();
+        if (p.ndim != 1 || p.size != 3 || d.ndim != 1 || d.size != 3
+            || f.ndim != 1 || f.size < 1 || f.size > _n_bands)
+            throw std::invalid_argument("Studio wave interface requires a hit point, direction and transport frequencies");
+        py::array_t<double> before_re(f.size), before_im(f.size);
+        py::array_t<double> after_re(f.size), after_im(f.size);
+        RtStudioWaveInterface result{};
+        const int rc = ray_tracer_resolve_studio_wave_interface(
+            handle, hit_triangle, static_cast<const double*>(p.ptr),
+            static_cast<const double*>(d.ptr), static_cast<int>(f.size),
+            static_cast<const double*>(f.ptr), margin_wavelengths, &result,
+            before_re.mutable_data(), before_im.mutable_data(),
+            after_re.mutable_data(), after_im.mutable_data());
+        if (rc != SK_OK)
+            throw std::invalid_argument("native Studio wave interface is not an authenticated resolved hit");
+        py::dict out;
+        out["triangle_id"] = result.triangle_id;
+        out["region_id"] = result.region_id;
+        out["outward_normal"] = py::make_tuple(
+            result.outward_normal[0], result.outward_normal[1],
+            result.outward_normal[2]);
+        out["margin_m"] = result.margin_m;
+        out["before_base_material"] = result.before_base_material;
+        out["after_base_material"] = result.after_base_material;
+        out["before_n_real"] = std::move(before_re);
+        out["before_n_imag"] = std::move(before_im);
+        out["after_n_real"] = std::move(after_re);
+        out["after_n_imag"] = std::move(after_im);
+        return out;
+    }
+
     /** Project a (N, 14) float32 multiscale segment array onto a coherent
      *  complex sensor image.  Returns (out_re, out_im) each shape
      *  (n_bands, sensor_h, sensor_w) float32, accumulative (NOT zeroed here).
@@ -7721,6 +7760,11 @@ back-face: - -> +) instead of material-equality toggles.
         .def("resolve_studio_medium", &PyRayTracer::resolve_studio_medium,
              py::arg("position"), py::arg("direction"), py::arg("frequencies_hz"),
              "Resolve native real/imaginary medium indices for a ray-side point.")
+        .def("resolve_studio_wave_interface", &PyRayTracer::resolve_studio_wave_interface,
+             py::arg("hit_triangle"), py::arg("hit_position"),
+             py::arg("incoming_direction"), py::arg("frequencies_hz"),
+             py::arg("margin_wavelengths"),
+             "Classify an authored T3 hit and both wavelength-tuned sides for T4.")
         .def("project_coherent", &PyRayTracer::project_coherent,
              py::arg("segs"),
              py::arg("n_bands"),

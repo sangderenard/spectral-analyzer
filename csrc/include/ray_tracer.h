@@ -1111,6 +1111,37 @@ SK_API int ray_tracer_resolve_studio_medium(
     double* out_n_imag
 );
 
+/* Classify an actual T3 hit on an authored Studio interface for T4 admission.
+ * The triangle ID is compared against the installed region triangle lists;
+ * exact spheres use their owner triangle. The caller supplies the hit point,
+ * incoming direction, transport frequencies and a margin in wavelengths.
+ * Both sides are resolved from the same authenticated geometry as T3. The
+ * returned margin is the largest vacuum wavelength times margin_wavelengths;
+ * it sizes a local patch, not a whole-subject wave arena. */
+typedef struct {
+    int triangle_id;
+    int region_id;
+    double outward_normal[3];
+    double margin_m;
+    int before_base_material;
+    int after_base_material;
+} RtStudioWaveInterface;
+
+SK_API int ray_tracer_resolve_studio_wave_interface(
+    const RayTracerState* st,
+    int hit_triangle,
+    const double hit_position[3],
+    const double incoming_direction[3],
+    int n_frequencies,
+    const double* frequencies_hz,
+    double margin_wavelengths,
+    RtStudioWaveInterface* out_interface,
+    double* out_before_n_real,
+    double* out_before_n_imag,
+    double* out_after_n_real,
+    double* out_after_n_imag
+);
+
 /**
  * Project a multiscale segment buffer onto a coherent complex sensor image.
  *

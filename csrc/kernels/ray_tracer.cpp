@@ -2506,6 +2506,111 @@ int ray_tracer_resolve_studio_medium(
     return SK_OK;
 }
 
+int ray_tracer_resolve_studio_wave_interface(
+    const RayTracerState* st, int hit_triangle,
+    const double hit_position[3], const double incoming_direction[3],
+    int n_frequencies, const double* frequencies_hz,
+    double margin_wavelengths, RtStudioWaveInterface* out_interface,
+    double* out_before_n_real, double* out_before_n_imag,
+    double* out_after_n_real, double* out_after_n_imag)
+{
+    if (!st || !hit_position || !incoming_direction || !frequencies_hz
+        || !out_interface || !out_before_n_real || !out_before_n_imag
+        || !out_after_n_real || !out_after_n_imag)
+        return SK_ERR_NULL_STATE;
+    if (hit_triangle < 0 || hit_triangle >= static_cast<int>(st->tris.size())
+        || hit_triangle >= static_cast<int>(st->studio_triangle_region_ids.size())
+        || st->studio_triangle_region_ids[static_cast<size_t>(hit_triangle)] < 0
+        || n_frequencies < 1 || n_frequencies > st->n_bands
+        || n_frequencies > 32 || !std::isfinite(margin_wavelengths)
+        || margin_wavelengths <= 0.0)
+        return SK_ERR_DIM_MISMATCH;
+    const V3d hit(hit_position[0], hit_position[1], hit_position[2]);
+    const V3d incoming(incoming_direction[0], incoming_direction[1],
+                       incoming_direction[2]);
+    if (!hit.allFinite() || !incoming.allFinite()
+        || incoming.squaredNorm() <= 0.0)
+        return SK_ERR_DIM_MISMATCH;
+    const Triangle& owner = st->tris[static_cast<size_t>(hit_triangle)];
+    bool on_surface = false;
+    for (const auto& sphere : st->studio_spheres) {
+        if (sphere.owner_triangle != hit_triangle) continue;
+        const double tolerance = std::max(1.0e-12, sphere.radius * 1.0e-8);
+        on_surface = std::abs((hit - sphere.center).norm() - sphere.radius)
+            <= tolerance;
+        break;
+    }
+    if (!on_surface && owner.edge1.squaredNorm() > 0.0
+        && owner.edge2.squaredNorm() > 0.0) {
+        const V3d relative = hit - owner.v0;
+        const double a = owner.edge1.dot(owner.edge1);
+        const double b = owner.edge1.dot(owner.edge2);
+        const double c = owner.edge2.dot(owner.edge2);
+        const double determinant = a*c - b*b;
+        if (determinant > 0.0) {
+            const double u = (c*relative.dot(owner.edge1)
+                              - b*relative.dot(owner.edge2)) / determinant;
+            const double v = (a*relative.dot(owner.edge2)
+                              - b*relative.dot(owner.edge1)) / determinant;
+            const double tolerance = std::max(
+                1.0e-12, std::sqrt(std::max(a, c))*1.0e-8);
+            on_surface = u >= -1.0e-8 && v >= -1.0e-8
+                && u + v <= 1.0 + 1.0e-8
+                && std::abs(relative.dot(owner.normal)) <= tolerance;
+        }
+    }
+    if (!on_surface) return SK_ERR_DIM_MISMATCH;
+    double longest_wavelength = 0.0;
+    for (int lane = 0; lane < n_frequencies; ++lane) {
+        if (!std::isfinite(frequencies_hz[lane]) || frequencies_hz[lane] <= 0.0)
+            return SK_ERR_DIM_MISMATCH;
+        longest_wavelength = std::max(
+            longest_wavelength, st->speed_m_s / frequencies_hz[lane]);
+    }
+    const double margin = longest_wavelength * margin_wavelengths;
+    if (!std::isfinite(margin) || margin <= 0.0)
+        return SK_ERR_DIM_MISMATCH;
+
+    const V3d normal = studio_outward_normal(*st, hit_triangle, hit);
+    if (!normal.allFinite() || normal.squaredNorm() < 0.5)
+        return SK_ERR_DIM_MISMATCH;
+    const V3d ray = incoming.normalized();
+    const double offset = studio_region_epsilon(hit);
+    const V3d before = hit - offset * ray;
+    const V3d after = hit + offset * ray;
+    const double before_pos[3] = {before.x(), before.y(), before.z()};
+    const double after_pos[3] = {after.x(), after.y(), after.z()};
+    const double direction[3] = {ray.x(), ray.y(), ray.z()};
+    std::vector<double> before_re(static_cast<size_t>(n_frequencies));
+    std::vector<double> before_im(static_cast<size_t>(n_frequencies));
+    std::vector<double> after_re(static_cast<size_t>(n_frequencies));
+    std::vector<double> after_im(static_cast<size_t>(n_frequencies));
+    int before_base = -1, after_base = -1;
+    if (ray_tracer_resolve_studio_medium(
+            st, before_pos, direction, n_frequencies, frequencies_hz,
+            &before_base, before_re.data(), before_im.data()) != SK_OK
+        || ray_tracer_resolve_studio_medium(
+            st, after_pos, direction, n_frequencies, frequencies_hz,
+            &after_base, after_re.data(), after_im.data()) != SK_OK)
+        return SK_ERR_DIM_MISMATCH;
+    RtStudioWaveInterface result{};
+    result.triangle_id = hit_triangle;
+    result.region_id = st->studio_triangle_region_ids[
+        static_cast<size_t>(hit_triangle)];
+    result.outward_normal[0] = normal.x();
+    result.outward_normal[1] = normal.y();
+    result.outward_normal[2] = normal.z();
+    result.margin_m = margin;
+    result.before_base_material = before_base;
+    result.after_base_material = after_base;
+    *out_interface = result;
+    std::copy(before_re.begin(), before_re.end(), out_before_n_real);
+    std::copy(before_im.begin(), before_im.end(), out_before_n_imag);
+    std::copy(after_re.begin(), after_re.end(), out_after_n_real);
+    std::copy(after_im.begin(), after_im.end(), out_after_n_imag);
+    return SK_OK;
+}
+
 static inline cd mat_refl_for_ray(
     const RayTracerState& st, int mat_idx, int lane, const RayIntent& ray)
 {

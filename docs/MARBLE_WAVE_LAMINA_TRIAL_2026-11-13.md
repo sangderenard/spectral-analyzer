@@ -97,3 +97,20 @@ native suite (`test_studio_sphere_regions.py`, `test_studio_optical_media.py`,
 `test_wave_t4_pipeline.py`, `test_studio_atlas_rest.py`,
 `test_native_small_surface_transport.py`, and `test_studio_region_gpu.py`)
 passed 73 tests; this is no claim of a rendered exposure.
+
+## Authored interface classification (2026-11-13)
+
+`ray_tracer_resolve_studio_wave_interface` now compares a T3 triangle ID
+against the installed Studio region triangle lists. Exact spheres use their
+owner triangle. It rejects a point that is not on the claimed triangle or
+sphere, resolves the incoming and outgoing media with the existing native
+region resolver, and returns the region ID, outward normal, complex indices
+for every requested transport frequency, and a local margin sized from the
+longest wavelength. The Python binding exposes the same query. Focused tests
+cover host, dye, and bubble mesh boundaries and an exact bubble sphere.
+
+This is the authenticated **interface classification** needed by the context
+handler. It does not yet create a T4 patch at every hit, encode the local
+surface into a field operator, or return reflected/transmitted fields to T1/T5.
+Those remain the next transport steps; an interface query alone is not a
+wave-traversed subject or a photograph.

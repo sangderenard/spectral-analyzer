@@ -107,6 +107,29 @@ def test_native_t3_resolves_host_dye_and_bubble_from_authored_surfaces():
             )
             assert medium['n_real'][0] == pytest.approx(expected_n)
             assert medium['n_imag'][0] == pytest.approx(expected_k)
+        for start, expected_before, expected_after in (
+            (0, 1., 1.5),
+            (len(host), 1.5, 1.5),
+            (len(host) + len(dye), 1.5, 1.),
+        ):
+            tri_id = next(i for i in range(start, start + 12)
+                          if normals[i, 2] == 1.)
+            point = triangles[tri_id].mean(axis=0)
+            interface = tracer.resolve_studio_wave_interface(
+                tri_id, point, np.array([0., 0., -1.]), frequency, 8.)
+            assert interface['region_id'] == start // 12
+            assert interface['margin_m'] == pytest.approx(8 * 550e-9)
+            assert interface['before_n_real'][0] == pytest.approx(expected_before)
+            assert interface['after_n_real'][0] == pytest.approx(expected_after)
+        dye_interface = tracer.resolve_studio_wave_interface(
+            len(host) + 10, triangles[len(host) + 10].mean(axis=0),
+            np.array([0., 0., -1.]), frequency, 8.)
+        assert dye_interface['before_n_imag'][0] == pytest.approx(0.)
+        assert dye_interface['after_n_imag'][0] == pytest.approx(1e-7)
+        with pytest.raises(ValueError, match='authenticated resolved hit'):
+            tracer.resolve_studio_wave_interface(
+                0, np.array([.1, .1, .1]),
+                np.array([0., 0., -1.]), frequency, 8.)
     finally:
         tracer.stop_pipeline()
 
@@ -143,6 +166,13 @@ def test_native_exact_sphere_competes_with_host_mesh_and_resolves_bubble():
                 np.asarray(point, np.float64),
                 np.array([1., 0., 0.], np.float64), frequency)
             assert medium['n_real'][0] == pytest.approx(expected)
+        interface = tracer.resolve_studio_wave_interface(
+            12, np.array([.0003, 0., 0.]),
+            np.array([1., 0., 0.]), frequency, 8.)
+        assert interface['region_id'] == 1
+        assert interface['before_n_real'][0] == pytest.approx(1.)
+        assert interface['after_n_real'][0] == pytest.approx(1.5)
+        assert interface['outward_normal'] == pytest.approx((1., 0., 0.))
         tracer.submit_rays(
             np.array([[0., 0., 0.]], np.float64),
             np.array([[1., 0., 0.]], np.float64),

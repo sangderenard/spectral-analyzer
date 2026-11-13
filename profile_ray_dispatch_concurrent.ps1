@@ -1,5 +1,6 @@
 param([int]$JobCount=4,[int]$Batches=2000,[switch]$Split,
       [int]$GpuRays=10000,[int]$GpuWindow=30000,[int]$GpuBatches=0,
+      [ValidateSet('mixed','gpu','cpu')][string]$Mode='mixed',
       [int]$Grid=1,[int]$Bands=4,[string]$OutputDirectory='')
 $ErrorActionPreference = 'Stop'
 if ($JobCount -lt 1 -or $JobCount -gt 8 -or $Batches -lt 1) {
@@ -12,7 +13,7 @@ New-Item -ItemType Directory -Path $root -Force | Out-Null
 $jobs = @()
 $names = @('a','b','c','d','e','f','g','h') | Select-Object -First $JobCount
 foreach ($name in $names) {
-    $mode = if ($Split) { if ($name -in @('a','b','c','d')) {'gpu'} else {'cpu'} } else {'mixed'}
+    $mode = if ($Split) { if ($name -in @('a','b','c','d')) {'gpu'} else {'cpu'} } else {$Mode}
     $rays = if ($mode -eq 'gpu') {$GpuRays} else {10000}
     $window = if ($mode -eq 'gpu') {$GpuWindow} else {30000}
     $runs = if ($mode -eq 'gpu' -and $GpuBatches -gt 0) {$GpuBatches} else {$Batches}

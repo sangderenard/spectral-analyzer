@@ -452,7 +452,7 @@ class CoherentReceptionPool:
         self._pending: dict[OpticalReceptionKey, _PendingReception] = {}
         self._closed: set[OpticalReceptionKey] = set()
 
-    def _state(self, key: OpticalReceptionKey) -> _PendingReception:
+    def _validate_key(self, key: OpticalReceptionKey) -> None:
         key.validate()
         if key.state_generation != self.state_generation:
             raise RuntimeError("stale optical reception state generation")
@@ -464,6 +464,8 @@ class CoherentReceptionPool:
             raise ValueError("reception key does not match its compiled descriptor")
         if key in self._closed:
             raise RuntimeError("optical reception key is already closed")
+
+    def _state(self, key: OpticalReceptionKey) -> _PendingReception:
         state = self._pending.get(key)
         if state is None:
             if len(self._pending) >= self.descriptor.capacity:
@@ -473,30 +475,35 @@ class CoherentReceptionPool:
 
     def accept(self, contribution: OpticalFieldContribution) -> None:
         owned = contribution.detached()
-        state = self._state(owned.key)
+        self._validate_key(owned.key)
         product_id = int(owned.predecessor_product_id)
         if product_id not in self._expected:
             raise ValueError("contribution came from an undeclared predecessor")
-        if product_id in state.completed:
+        state = self._pending.get(owned.key)
+        if state is not None and product_id in state.completed:
             raise RuntimeError("contribution arrived after predecessor completion")
         if int(owned.grid_id) != self.descriptor.grid_id:
             raise ValueError("incompatible reception field grid; resampling is forbidden")
-        slot = state.contributions.setdefault(product_id, {})
+        slot = state.contributions.get(product_id) if state is not None else None
         contribution_id = int(owned.contribution_id)
-        if contribution_id in slot:
+        if slot is not None and contribution_id in slot:
             raise RuntimeError("duplicate optical reception contribution")
         # Validate the exact basis transform before retaining the contribution.
         basis_change(owned.basis, self.destination_basis)
+        if state is None:
+            state = self._state(owned.key)
+        slot = state.contributions.setdefault(product_id, {})
         slot[contribution_id] = owned
 
     def complete(
         self, credit: OpticalCompletionCredit
     ) -> ClosedOpticalReception | None:
         credit.validate()
-        state = self._state(credit.key)
+        self._validate_key(credit.key)
         product_id = int(credit.predecessor_product_id)
         if product_id not in self._expected:
             raise ValueError("completion came from an undeclared predecessor")
+        state = self._state(credit.key)
         if product_id in state.completed:
             raise RuntimeError("duplicate optical reception completion")
         state.completed.add(product_id)

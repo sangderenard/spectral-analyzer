@@ -61,7 +61,7 @@ import time as _time
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
-import torch
+from signal_tensor_backend import tensor as torch, COMPLEX, FLOAT64, FLOAT32, INT64, BOOL
 from scipy.io import wavfile
 
 from parametric_curve import (
@@ -598,8 +598,8 @@ class _ChannelState:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_display_polylines(curve: ParametricCurve, steps: int = 512) -> list:
-    t_flat = torch.linspace(0.0, 1.0, steps, dtype=torch.float64)
-    v_flat = curve.evaluate_normalized(t_flat).abs().to(torch.float64)
+    t_flat = torch.linspace(0.0, 1.0, steps, dtype=FLOAT64)
+    v_flat = curve.evaluate_normalized(t_flat).abs().to(FLOAT64)
     sorted_pts = sorted(curve.points, key=lambda p: p.t)
     raw_chains = _split_into_chains(sorted_pts)
     polys = []
@@ -656,10 +656,10 @@ def _downsample_env_to_pts(arr, w_px: int) -> list:
 
 
 def _downsample_signal_lane_pts(sig: torch.Tensor | Any, w_px: int, lane: int) -> list:
-    sig_t = torch.as_tensor(sig, dtype=torch.complex128).reshape(-1)
+    sig_t = torch.as_tensor(sig, dtype=COMPLEX).reshape(-1)
     if sig_t.numel() <= 0:
         return []
-    arr_np = torch.view_as_real(sig_t)[:, lane].to(torch.float64).detach().cpu().numpy()
+    arr_np = torch.view_as_real(sig_t)[:, lane].to(FLOAT64).detach().cpu().numpy()
     n = len(arr_np)
     if n == 0:
         return []
@@ -677,14 +677,14 @@ def _downsample_signal_lane_pts(sig: torch.Tensor | Any, w_px: int, lane: int) -
 
 def _downsample_analytic_pts(sig) -> list:
     """Convert complex signal to (t_frac, re_norm, im_norm) triples, peak-normalised. No reduction."""
-    sig_t = torch.as_tensor(sig, dtype=torch.complex128).reshape(-1)
+    sig_t = torch.as_tensor(sig, dtype=COMPLEX).reshape(-1)
     if sig_t.numel() <= 0:
         return []
     peak = float(torch.max(torch.abs(sig_t)).item())
     if peak < 1e-12:
         peak = 1.0
-    real_np = torch.view_as_real(sig_t)[:, 0].to(torch.float64).detach().cpu().numpy() / peak
-    imag_np = torch.view_as_real(sig_t)[:, 1].to(torch.float64).detach().cpu().numpy() / peak
+    real_np = torch.view_as_real(sig_t)[:, 0].to(FLOAT64).detach().cpu().numpy() / peak
+    imag_np = torch.view_as_real(sig_t)[:, 1].to(FLOAT64).detach().cpu().numpy() / peak
     n = len(real_np)
     return [(i / n, float(real_np[i]), float(imag_np[i])) for i in range(n)]
 
@@ -2136,7 +2136,7 @@ class ParametricCurveEditor:
         state = self._channel_state(channel_key)
         x0, _, pw, _ = self._prect(0)
         w_px = max(64, int(pw))
-        _ZERO = torch.zeros(0, dtype=torch.complex128)
+        _ZERO = torch.zeros(0, dtype=COMPLEX)
 
         if channel_key == "B":
             analytic_sig = state.display_signals.get("analytic")
@@ -2159,7 +2159,7 @@ class ParametricCurveEditor:
                 else:
                     _angle   = self._phase_slot * (2.0 * math.pi / max(2, self._phase_rotation_steps))
                     slot_sig = analytic_sig * torch.exp(
-                        torch.tensor(1j * _angle, dtype=torch.complex128)
+                        torch.tensor(1j * _angle, dtype=COMPLEX)
                     )
                 self._sig_re_pts   = _downsample_signal_lane_pts(slot_sig, w_px, 0)
                 self._sig_im_pts   = _downsample_signal_lane_pts(slot_sig, w_px, 1)
@@ -2198,7 +2198,7 @@ class ParametricCurveEditor:
         base = self._curves[self.focused_panel].name or f"channel_{channel_key.lower()}"
         stamp = _time.strftime("%Y%m%d_%H%M%S")
         path = os.path.join(self.library_folder, f"{base}_{channel_key}_{stamp}.wav")
-        frames = torch.view_as_real(torch.as_tensor(sig, dtype=torch.complex128).reshape(-1))
+        frames = torch.view_as_real(torch.as_tensor(sig, dtype=COMPLEX).reshape(-1))
         wavfile.write(path, _PREVIEW_SR, frames.detach().cpu().numpy().astype(_np.float64, copy=False))
         print(f"[save] analytic wav -> {path}")
         return path

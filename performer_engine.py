@@ -40,8 +40,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
-import torch
-from torch import Tensor
+from signal_tensor_backend import tensor as torch, Tensor, COMPLEX, FLOAT64, FLOAT32, INT64, BOOL
 
 _2PI = 2.0 * math.pi
 
@@ -136,11 +135,11 @@ def init_driver_state(cfg: DriverConfig) -> DriverState:
     where *h* is 0-based (harmonic index 1, 2, … H).
     """
     dev = cfg.device
-    h_k = torch.arange(1, cfg.H + 1, dtype=torch.float64, device=dev)  # (H,)
+    h_k = torch.arange(1, cfg.H + 1, dtype=FLOAT64, device=dev)  # (H,)
     phase_acc = h_k.unsqueeze(0) * cfg.phase_origin.unsqueeze(1)         # (D, H)
     return DriverState(
         phase_acc=phase_acc,
-        t_pos=torch.zeros(cfg.D, dtype=torch.float64, device=dev),
+        t_pos=torch.zeros(cfg.D, dtype=FLOAT64, device=dev),
     )
 
 
@@ -183,7 +182,7 @@ def _chirp(cfg: DriverConfig, t_abs: Tensor) -> Tensor:
     """Compute chirp frequency deviation for all drivers.  (D, T) float64."""
     D, T_len = t_abs.shape
     dev = cfg.device
-    delta = torch.zeros(D, T_len, dtype=torch.float64, device=dev)
+    delta = torch.zeros(D, T_len, dtype=FLOAT64, device=dev)
     fs, fe = cfg.chirp_f_start, cfg.chirp_f_end
 
     # Linear: lerp start→end over note_duration
@@ -221,7 +220,7 @@ def _parametric_curve_series(
     """Evaluate selected packed parametric curves for drivers with valid rows."""
     D, T = t_norm.shape
     dev = t_norm.device
-    out = torch.zeros(D, T, dtype=torch.float64, device=dev)
+    out = torch.zeros(D, T, dtype=FLOAT64, device=dev)
     if packed is None or row_map is None or row_map.numel() == 0:
         return out
 
@@ -239,7 +238,7 @@ def _parametric_curve_series(
     )
     if eval_out.ndim == 1:
         eval_out = eval_out.unsqueeze(0)
-    out[valid] = eval_out.real.to(torch.float64)
+    out[valid] = eval_out.real.to(FLOAT64)
     return out
 
 
@@ -278,7 +277,7 @@ def driver_synthesis_step(
     D, H, V = cfg.D, cfg.H, cfg.V
     dev = cfg.device
     T = chunk_T
-    cdtype = torch.complex128
+    cdtype = COMPLEX
 
     if D == 0:
         empty_d = torch.zeros(0, T, dtype=cdtype, device=dev)
@@ -290,7 +289,7 @@ def driver_synthesis_step(
     active = active_override if active_override is not None else cfg.active
 
     # ── Time axis ─────────────────────────────────────────────────────────
-    local_t = torch.arange(T, dtype=torch.float64, device=dev) / sr      # (T,)
+    local_t = torch.arange(T, dtype=FLOAT64, device=dev) / sr      # (T,)
     t_abs = state.t_pos.unsqueeze(1) + local_t.unsqueeze(0)               # (D, T)
 
     # ── Instantaneous frequency ───────────────────────────────────────────
@@ -340,8 +339,8 @@ def driver_synthesis_step(
 
     # ── Pre-delay mask ────────────────────────────────────────────────────
     sample_global = (
-        (state.t_pos * sr).to(torch.int64).unsqueeze(1)
-        + torch.arange(T, dtype=torch.int64, device=dev).unsqueeze(0)
+        (state.t_pos * sr).to(INT64).unsqueeze(1)
+        + torch.arange(T, dtype=INT64, device=dev).unsqueeze(0)
     )                                                                      # (D, T)
     out = out * (sample_global >= cfg.pre_delay_samples.unsqueeze(1))
 
@@ -397,7 +396,7 @@ def build_fm_mod(
     T = voice_signals.shape[1]
     dev = cfg.device
 
-    fm = torch.zeros(D, T, dtype=torch.float64, device=dev)
+    fm = torch.zeros(D, T, dtype=FLOAT64, device=dev)
     src_idx = cfg.fm_source_voice[has_fm].clamp(min=0)
     src = voice_signals[src_idx]                                          # (n, T)
 
@@ -424,9 +423,9 @@ def build_am_mod(
     T = voice_signals.shape[1]
     dev = cfg.device
 
-    am = torch.zeros(D, T, dtype=torch.float64, device=dev)
+    am = torch.zeros(D, T, dtype=FLOAT64, device=dev)
     src_idx = cfg.am_source_voice[has_am].clamp(min=0)
-    mag = voice_signals[src_idx].abs().to(torch.float64)                  # (n, T)
+    mag = voice_signals[src_idx].abs().to(FLOAT64)                  # (n, T)
     peak = mag.amax(dim=1, keepdim=True).clamp(min=1e-12)
     am[has_am] = cfg.am_depth[has_am].unsqueeze(1) * (mag / peak)
     return am
@@ -497,7 +496,7 @@ def multi_level_driver_step(
 
     D, V, T = cfg.D, cfg.V, chunk_T
     dev = cfg.device
-    cdtype = torch.complex128
+    cdtype = COMPLEX
 
     all_out = torch.zeros(D, T, dtype=cdtype, device=dev)
     voice_out = torch.zeros(V, T, dtype=cdtype, device=dev)
@@ -512,7 +511,7 @@ def multi_level_driver_step(
         level_set = set(level_voices)
         level_mask = torch.tensor(
             [int(cfg.voice_idx[d].item()) in level_set for d in range(D)],
-            dtype=torch.bool, device=dev,
+            dtype=BOOL, device=dev,
         )
         active_this = cfg.active & level_mask
 

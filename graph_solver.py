@@ -3,7 +3,7 @@
 Core rules:
 * run_schedule() runs the full KPN batch schedule over n_frames samples
 * step() resolves one dt sample (training path only)
-* all arithmetic is torch.complex128
+* all arithmetic is COMPLEX
 * nodes receive whole tensors and may transform them directly
 * edges contribute by ordinary complex multiplication with broadcast semantics
 * zero-delay linear regions solve exactly
@@ -523,11 +523,9 @@ if PROFILE_TIMING and PROFILE_REPORT_INTERVAL_S > 0:
 if PROFILE_TIMING and TRACE_EVENTS:
     _T.register_exit_handlers()
 
-import torch
-import torch.nn as nn
-from torch import Tensor
+from signal_tensor_backend import tensor as torch, Tensor, nn, COMPLEX, FLOAT64, FLOAT32, INT64, BOOL, CPU
 
-_CDTYPE = torch.complex128
+_CDTYPE = COMPLEX
 
 
 def _canonical_complex(x: Tensor | complex | float | int) -> Tensor:
@@ -855,7 +853,7 @@ class AnalyticArchetype(nn.Module):
         super().__init__()
         self.archetype_key = str(archetype_key)
         self.state_width = int(state_width)
-        self.device = device or torch.device("cpu")
+        self.device = device or CPU
         self._node_keys: list[str] = []
         self.node_index: Dict[str, int] = {}
         self._lock = threading.Lock()  # guards registration only
@@ -918,7 +916,7 @@ class AnalyticArchetype(nn.Module):
             result = forward_fn(x_batch, mods, state_batch, keys)
             y_batch, new_state = result if isinstance(result, tuple) else (result, None)
             if new_state is not None and self.state_bank is not None:
-                idx_t = torch.tensor(indices, dtype=torch.long, device=self.device)
+                idx_t = torch.tensor(indices, dtype=INT64, device=self.device)
                 with torch.no_grad():
                     self.state_bank[idx_t] = new_state.detach()
         else:
@@ -1411,7 +1409,7 @@ class LevelGrid(nn.Module):
         if gains is None:
             gains = torch.zeros(n_src, n_dst, dtype=_CDTYPE)
         self.gains = nn.Parameter(gains.to(_CDTYPE))
-        tm = trainable_mask if trainable_mask is not None else torch.zeros(n_src, n_dst, dtype=torch.bool)
+        tm = trainable_mask if trainable_mask is not None else torch.zeros(n_src, n_dst, dtype=BOOL)
         self.register_buffer("trainable_mask", tm)
 
     # ── index helpers ─────────────────────────────────────────────────────────
@@ -2028,7 +2026,7 @@ class GraphSolver(nn.Module):
         use_z_cache: bool = True,
         interp_mode: str = "none",
         timing_offset: float = 0.0,
-        device: torch.device = torch.device("cpu"),
+        device: torch.device = CPU,
         archetypes: Optional[Dict[str, "AnalyticArchetype"]] = None,
         fifo_bank: Optional[Any] = None,
     ) -> None:

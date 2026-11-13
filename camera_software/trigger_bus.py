@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import math
 from typing import Iterable
 
-import torch
+from signal_tensor_backend import tensor as torch, Tensor, nn, COMPLEX, FLOAT64, FLOAT32, INT64, BOOL, CPU
 
 from graph_solver import TensorNode
 from network_materializer import compile_nodes, routing_edge_to_tensor_edge
@@ -169,12 +169,12 @@ def resolve_camera_trigger_bus(
         output_node_keys=receivers,
     )
     inputs = {
-        "Sync": torch.tensor([1.0] + [0.0] * (n - 1), dtype=torch.complex128),
+        "Sync": torch.tensor([1.0] + [0.0] * (n - 1), dtype=COMPLEX),
         "Flash": torch.tensor([s.flash_weight if flash_signal_mode=="weighted" else float(s.flash_active)
-                               for s in frame.slices], dtype=torch.complex128),
-        "Gate": torch.tensor([float(s.sensor_integrating) for s in frame.slices], dtype=torch.complex128),
+                               for s in frame.slices], dtype=COMPLEX),
+        "Gate": torch.tensor([float(s.sensor_integrating) for s in frame.slices], dtype=COMPLEX),
     }
-    inputs.update({key: torch.tensor(series, dtype=torch.complex128)
+    inputs.update({key: torch.tensor(series, dtype=COMPLEX)
                    for key, series in camera_generator_signals(frame, generator_specs).items() if key in keys})
     values = compiled.process_window(inputs, n_frames=n)
     if any(not torch.isfinite(value).all() for value in values.values()):

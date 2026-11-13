@@ -41,6 +41,28 @@ def main():
     mod_grid.graph.set_weight("mod:1", "shop:17", 1)
     mod_pulse=mod_grid.pulse()["signals"]["shop:17"]
     assert mod_pulse[1] == 1 and mod_pulse[2] > 0 and mod_pulse[11] == 1
+    radio=CameraTriggerGrid(["shop:17", "studio:0"], ["rack:center"])
+    measured={"status":"live", "rms":.4,"bands":[.25,.75],"frame":"1024"}
+    initial=radio.radio(measured)
+    assert initial["active"] == []
+    radio.graph.set_weight("radio:rms", "rack:center", .5)
+    radio.graph.set_weight("rack:center", "shop:17", .5)
+    routed=radio.radio(measured)
+    assert routed["active"] == ["shop:17"] and abs(routed["gains"]["shop:17"]-.1)<1e-12
+    assert routed["transport_contract"]["engine"] == "graph_solver"
+    expected_execution = os.environ.get("SPECTRAL_RADIO_EXECUTION", "interpreted")
+    assert routed["transport_contract"]["execution"] == expected_execution
+    if expected_execution == "numpy":
+        assert routed["transport_contract"]["source_digest"]
+        assert type(radio._radio_runtime.solver).__name__ == "GraphSolver"
+    assert radio.radio({"status":"stale"})["active"] == []
+    restored=CameraTriggerGrid(["shop:17", "studio:0"], ["rack:center"], saved=radio.graph.to_dict())
+    assert abs(restored.radio(measured)["gains"]["shop:17"]-.1)<1e-12
+    assert restored.pulse()["signals"]["shop:17"] == [0]*250
+    restored.graph.set_delay_s("radio:rms", "rack:center", .005)
+    try: restored.radio(measured)
+    except ValueError as error: assert "zero-delay" in str(error)
+    else: raise AssertionError("invented audio timing from browser polls")
     wide=CameraTriggerGrid([f"studio:{i}" for i in range(20)])
     wide.frame()
     wide.event("wheel", wheel_y=-1, shift=True)

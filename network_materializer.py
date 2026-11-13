@@ -55,14 +55,12 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
-import torch.nn as nn
-from torch import Tensor
+from signal_tensor_backend import tensor as torch, Tensor, nn, COMPLEX, FLOAT64, FLOAT32, INT64, BOOL, CPU, BACKEND
 
 if TYPE_CHECKING:
     from analytic_driver import AnalyticPatch
 
-_CDTYPE = torch.complex128
+_CDTYPE = COMPLEX
 
 
 def _block_len(x: Tensor) -> int:
@@ -135,6 +133,7 @@ class CompiledGraph:
     solver: object
     output_node_keys: list[str]
     module_registry: dict[str, nn.Module]
+    execution: str = "interpreted"
 
     def _select_products(
         self,
@@ -157,11 +156,17 @@ class CompiledGraph:
     ) -> Dict[str, torch.Tensor]:
         """Process one tensor window without projecting away complex state."""
 
+        feeds = inputs or {}
+        if self.execution == "numpy":
+            feeds = {key: value.data if isinstance(value, Tensor) else value
+                     for key, value in feeds.items()}
         values = self.solver.run_schedule(
-            inputs or {},
+            feeds,
             n_frames=max(1, int(n_frames)),
             on_progress=on_progress,
         )
+        if self.execution == "numpy":
+            values = {key: torch.tensor(value, dtype=_CDTYPE) for key, value in values.items()}
         return self._select_products(values, product_keys)
 
     def process_sample(
@@ -172,6 +177,8 @@ class CompiledGraph:
     ) -> Dict[str, torch.Tensor]:
         """Advance a stateful context by one causal sample."""
 
+        if self.execution == "numpy":
+            raise ValueError("NumPy graph product currently supports process_window, not training steps")
         values = self.solver.step(inputs or {})
         return self._select_products(values, product_keys)
 
@@ -188,7 +195,9 @@ class CompiledGraph:
         return {
             "schema": "complex-network-context-v1",
             "engine": "graph_solver",
-            "representation": "torch.complex128",
+            "execution": self.execution,
+            "source_digest": getattr(type(self.solver), "__numpy_lowering_digest__", None),
+            "representation": "torch.complex128" if BACKEND == "torch" else "abstract.complex128",
             "sample_rate": float(self.solver.sample_rate),
             "entry": "named_complex_ports",
             "exit": "named_complex_products",
@@ -211,6 +220,7 @@ def compile_nodes(
     sample_rate: float,
     *,
     output_node_keys: "Optional[List[str]]" = None,
+    execution: str = "interpreted",
 ) -> CompiledGraph:
     """Construct a GraphSolver runtime bundle from pre-built nodes and edges.
 
@@ -236,7 +246,21 @@ def compile_nodes(
     except Exception:
         fifo_bank = None
 
-    solver = _gs.GraphSolver(nodes=nodes, edges=edges, sample_rate=float(sample_rate), fifo_bank=fifo_bank)
+    if execution not in ("interpreted", "numpy"):
+        raise ValueError("graph execution must be interpreted or numpy")
+    solver_type = _gs.GraphSolver
+    if execution == "numpy":
+        if BACKEND != "abstract":
+            raise ValueError("NumPy lowering requires the AbstractTensor source backend")
+        if any(node.transform is not None or getattr(node, "analytic_module", None) is not None
+               or getattr(node, "archetype_key", None) for node in nodes):
+            raise ValueError("NumPy deployment currently accepts linear nodes without analytic modules")
+        if any(edge.delay_s or edge.delay_samples or edge.saturation_fn is not None
+               or edge.fifo_bank is not None or edge.activity_contract
+               or edge.src_addresses or edge.dst_addresses for edge in edges):
+            raise ValueError("NumPy deployment currently accepts zero-delay local linear edges")
+        solver_type = _numpy_graph_solver_class()
+    solver = solver_type(nodes=nodes, edges=edges, sample_rate=float(sample_rate), fifo_bank=fifo_bank)
 
     node_keys = {node.key for node in nodes}
     if output_node_keys is not None:
@@ -255,7 +279,41 @@ def compile_nodes(
         solver=solver,
         output_node_keys=out_keys,
         module_registry=module_registry,
+        execution=execution,
     )
+
+
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
+def _numpy_graph_solver_class():
+    """Instantiate the existing compiler's product, never a second solver.
+
+    The process-local product keeps its source digest; no compiler intermediates
+    are written into the repository. Reload the process to pick up source edits.
+    """
+    import inspect
+    from src.compiler.fused_program_python_backend import lower_functions_to_numpy
+
+    gs = _import_gs()
+    product = lower_functions_to_numpy(
+        [], namespace=vars(gs),
+        owned=lambda value: getattr(value, "__module__", None) == gs.__name__,
+        subclass_methods={
+            gs.GraphSolver: tuple(name for name, value in gs.GraphSolver.__dict__.items()
+                                  if inspect.isfunction(value)),
+            gs.TensorEdge: ("apply",),
+        },
+    )
+    scope = {name: vars(gs)[name] for name in product.injected if name in vars(gs)}
+    missing = set(product.injected) - set(scope)
+    if missing:
+        raise ValueError(f"NumPy graph product requires unbound host names: {sorted(missing)}")
+    exec(compile(product.source, f"<graph_solver_numpy_{product.digest}>", "exec"), scope)
+    solver_type = scope["GraphSolver"]
+    solver_type.__numpy_lowering_digest__ = product.digest
+    return solver_type
 
 # ---------------------------------------------------------------------------
 # Lazy imports — kept at function scope to avoid hard circular dependencies
@@ -339,7 +397,7 @@ class KnobDrivenModule(nn.Module):
                 val = float(raw)
                 stored = math.log(max(abs(val), 1e-12)) if k.is_log else val
                 self.params[safe_key] = nn.Parameter(
-                    torch.tensor(stored, dtype=torch.float64)
+                    torch.tensor(stored, dtype=FLOAT64)
                 )
                 self._knob_is_log[safe_key] = bool(k.is_log)
             else:
@@ -369,17 +427,17 @@ class LFOTorchNode(nn.Module):
     def __init__(self, lfo, sample_rate: float) -> None:
         super().__init__()
         self.shape = str(getattr(lfo, "shape", "Sine"))
-        self.rate_hz = nn.Parameter(torch.tensor(float(getattr(lfo, "rate_hz", 1.0)), dtype=torch.float64))
-        self.depth = nn.Parameter(torch.tensor(float(getattr(lfo, "depth", 1.0)), dtype=torch.float64))
-        self.phase_offset = nn.Parameter(torch.tensor(float(getattr(lfo, "phase_offset", 0.0)), dtype=torch.float64))
-        self.register_buffer("_sample_rate", torch.tensor(float(sample_rate), dtype=torch.float64))
-        self.register_buffer("_sample_idx", torch.tensor(0, dtype=torch.int64))
+        self.rate_hz = nn.Parameter(torch.tensor(float(getattr(lfo, "rate_hz", 1.0)), dtype=FLOAT64))
+        self.depth = nn.Parameter(torch.tensor(float(getattr(lfo, "depth", 1.0)), dtype=FLOAT64))
+        self.phase_offset = nn.Parameter(torch.tensor(float(getattr(lfo, "phase_offset", 0.0)), dtype=FLOAT64))
+        self.register_buffer("_sample_rate", torch.tensor(float(sample_rate), dtype=FLOAT64))
+        self.register_buffer("_sample_idx", torch.tensor(0, dtype=INT64))
 
     def reset(self) -> None:
         self._sample_idx.zero_()
 
     def _wave(self, sample_offsets: Tensor) -> Tensor:
-        t = sample_offsets.to(torch.float64) / self._sample_rate
+        t = sample_offsets.to(FLOAT64) / self._sample_rate
         ph = 2.0 * math.pi * self.rate_hz * t + self.phase_offset
         cycle = torch.remainder(ph / (2.0 * math.pi), 1.0)
         if self.shape == "Triangle":
@@ -396,7 +454,7 @@ class LFOTorchNode(nn.Module):
         n = max(1, int(n_samples))
         dev = device or self._sample_idx.device
         start = self._sample_idx.to(device=dev)
-        offsets = start + torch.arange(n, dtype=torch.int64, device=dev)
+        offsets = start + torch.arange(n, dtype=INT64, device=dev)
         self._sample_idx.add_(n)
         return self._wave(offsets)
 
@@ -428,9 +486,9 @@ class ParamTorchNode(nn.Module):
     def __init__(self, param_node) -> None:
         super().__init__()
         self.extractor = str(getattr(param_node, "extractor", "magnitude"))
-        self.register_buffer("default_value", torch.tensor(float(getattr(param_node, "default_value", 0.0)), dtype=torch.float64))
-        self.register_buffer("low", torch.tensor(float(getattr(param_node, "low", 0.0)), dtype=torch.float64))
-        self.register_buffer("high", torch.tensor(float(getattr(param_node, "high", 1.0)), dtype=torch.float64))
+        self.register_buffer("default_value", torch.tensor(float(getattr(param_node, "default_value", 0.0)), dtype=FLOAT64))
+        self.register_buffer("low", torch.tensor(float(getattr(param_node, "low", 0.0)), dtype=FLOAT64))
+        self.register_buffer("high", torch.tensor(float(getattr(param_node, "high", 1.0)), dtype=FLOAT64))
 
     def forward(self, x: Tensor) -> Tensor:
         z = x.to(_CDTYPE)
@@ -439,15 +497,15 @@ class ParamTorchNode(nn.Module):
         if bool(torch.all(z.abs() == 0.0).item()):
             val = torch.ones_like(z.real) * self.default_value
         elif self.extractor == "real":
-            val = z.real.to(torch.float64)
+            val = z.real.to(FLOAT64)
         elif self.extractor == "imag":
-            val = z.imag.to(torch.float64)
+            val = z.imag.to(FLOAT64)
         elif self.extractor == "phase":
-            val = torch.angle(z).to(torch.float64)
+            val = torch.angle(z).to(FLOAT64)
         elif self.extractor == "energy":
-            val = (z.abs() ** 2).to(torch.float64)
+            val = (z.abs() ** 2).to(FLOAT64)
         else:
-            val = z.abs().to(torch.float64)
+            val = z.abs().to(FLOAT64)
         lo = torch.minimum(self.low, self.high)
         hi = torch.maximum(self.low, self.high)
         return val.clamp(lo, hi).to(_CDTYPE)
@@ -459,9 +517,9 @@ class ControlSliderTorchNode(nn.Module):
     def __init__(self, slider) -> None:
         super().__init__()
         self.is_log = bool(getattr(slider, "is_log", False))
-        self.value = nn.Parameter(torch.tensor(float(getattr(slider, "value", 0.5)), dtype=torch.float64))
-        self.register_buffer("low", torch.tensor(float(getattr(slider, "low", 0.0)), dtype=torch.float64))
-        self.register_buffer("high", torch.tensor(float(getattr(slider, "high", 1.0)), dtype=torch.float64))
+        self.value = nn.Parameter(torch.tensor(float(getattr(slider, "value", 0.5)), dtype=FLOAT64))
+        self.register_buffer("low", torch.tensor(float(getattr(slider, "low", 0.0)), dtype=FLOAT64))
+        self.register_buffer("high", torch.tensor(float(getattr(slider, "high", 1.0)), dtype=FLOAT64))
 
     def forward(self, x: Tensor) -> Tensor:  # noqa: ARG002
         v = self.value.clamp(0.0, 1.0)
@@ -478,17 +536,17 @@ class LFOChannelTorchNode(nn.Module):
     def __init__(self, channel: dict, sample_rate: float) -> None:
         super().__init__()
         self.shape = str(channel.get("shape", "Sine"))
-        self.rate_hz = nn.Parameter(torch.tensor(float(channel.get("rate_hz", 1.0)), dtype=torch.float64))
-        self.amplitude = nn.Parameter(torch.tensor(float(channel.get("amplitude", 1.0)), dtype=torch.float64))
-        self.phase_offset = nn.Parameter(torch.tensor(float(channel.get("phase_offset", 0.0)), dtype=torch.float64))
-        self.register_buffer("_sample_rate", torch.tensor(float(sample_rate), dtype=torch.float64))
-        self.register_buffer("_sample_idx", torch.tensor(0, dtype=torch.int64))
+        self.rate_hz = nn.Parameter(torch.tensor(float(channel.get("rate_hz", 1.0)), dtype=FLOAT64))
+        self.amplitude = nn.Parameter(torch.tensor(float(channel.get("amplitude", 1.0)), dtype=FLOAT64))
+        self.phase_offset = nn.Parameter(torch.tensor(float(channel.get("phase_offset", 0.0)), dtype=FLOAT64))
+        self.register_buffer("_sample_rate", torch.tensor(float(sample_rate), dtype=FLOAT64))
+        self.register_buffer("_sample_idx", torch.tensor(0, dtype=INT64))
 
     def reset(self) -> None:
         self._sample_idx.zero_()
 
     def _wave(self, sample_offsets: Tensor) -> Tensor:
-        t = sample_offsets.to(torch.float64) / self._sample_rate
+        t = sample_offsets.to(FLOAT64) / self._sample_rate
         ph = 2.0 * math.pi * self.rate_hz * t + self.phase_offset
         cycle = torch.remainder(ph / (2.0 * math.pi), 1.0)
         if self.shape == "Triangle":
@@ -505,7 +563,7 @@ class LFOChannelTorchNode(nn.Module):
         n = max(1, int(n_samples))
         dev = device or self._sample_idx.device
         start = self._sample_idx.to(device=dev)
-        offsets = start + torch.arange(n, dtype=torch.int64, device=dev)
+        offsets = start + torch.arange(n, dtype=INT64, device=dev)
         self._sample_idx.add_(n)
         return self._wave(offsets)
 
@@ -535,9 +593,9 @@ class PitchQuantizerTorchNode(nn.Module):
             handle = self.handle if lane_idx == 0 else _copy.deepcopy(self.handle)
             hz_in = lane.real.detach().cpu().numpy()
             outs.append(handle.process_series(hz_in, hz_in, domain="hz", dt=self.dt))
-        real_lanes = torch.as_tensor(np.stack(outs, axis=0), dtype=torch.float64, device=z.device)
+        real_lanes = torch.as_tensor(np.stack(outs, axis=0), dtype=FLOAT64, device=z.device)
         real = _unflatten_time_lanes(real_lanes, original_shape)
-        return torch.complex(real, z.imag.to(torch.float64)).to(_CDTYPE)
+        return torch.complex(real, z.imag.to(FLOAT64)).to(_CDTYPE)
 
 
 class InterauralTorchNode(nn.Module):
@@ -546,10 +604,10 @@ class InterauralTorchNode(nn.Module):
     def __init__(self, module, channel: int) -> None:
         super().__init__()
         suffix = "" if channel == 1 else "_ch2"
-        self.azimuth = nn.Parameter(torch.tensor(float(getattr(module, f"iau_azimuth{suffix}", 0.0)), dtype=torch.float64))
-        self.elevation = nn.Parameter(torch.tensor(float(getattr(module, f"iau_elevation{suffix}", 0.0)), dtype=torch.float64))
-        self.distance = nn.Parameter(torch.tensor(float(getattr(module, f"iau_distance{suffix}", 0.0)), dtype=torch.float64))
-        self.width = nn.Parameter(torch.tensor(float(getattr(module, f"iau_width{suffix}", 0.0)), dtype=torch.float64))
+        self.azimuth = nn.Parameter(torch.tensor(float(getattr(module, f"iau_azimuth{suffix}", 0.0)), dtype=FLOAT64))
+        self.elevation = nn.Parameter(torch.tensor(float(getattr(module, f"iau_elevation{suffix}", 0.0)), dtype=FLOAT64))
+        self.distance = nn.Parameter(torch.tensor(float(getattr(module, f"iau_distance{suffix}", 0.0)), dtype=FLOAT64))
+        self.width = nn.Parameter(torch.tensor(float(getattr(module, f"iau_width{suffix}", 0.0)), dtype=FLOAT64))
         self.channel = int(channel)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -592,9 +650,9 @@ class PrecomputedSeriesTorchNode(nn.Module):
             arr = arr.reshape(1, arr.shape[0], 1)
         elif arr.ndim == 2:
             arr = arr[:, :, None]
-        tensor = torch.as_tensor(arr, dtype=torch.float64)
+        tensor = torch.as_tensor(arr, dtype=FLOAT64)
         self.register_buffer("series", tensor)
-        self.register_buffer("_sample_idx", torch.tensor(0, dtype=torch.int64))
+        self.register_buffer("_sample_idx", torch.tensor(0, dtype=INT64))
         self.dtype = dtype
 
     def reset(self) -> None:
@@ -604,7 +662,7 @@ class PrecomputedSeriesTorchNode(nn.Module):
         n = max(1, int(n_samples))
         dev = device or self.series.device
         idx0 = int(self._sample_idx.item())
-        idx = torch.arange(idx0, idx0 + n, dtype=torch.long, device=dev)
+        idx = torch.arange(idx0, idx0 + n, dtype=INT64, device=dev)
         idx = torch.clamp(idx, 0, int(self.series.shape[1]) - 1)
         self._sample_idx.add_(n)
         real = self.series.to(device=dev)[:, idx, ...]
@@ -623,7 +681,7 @@ class GranularVoiceNode(nn.Module):
         self.voice = voice
         self.sample_rate = float(sample_rate)
         self.duration = float(duration)
-        self.register_buffer("_sample_idx", torch.tensor(0, dtype=torch.int64))
+        self.register_buffer("_sample_idx", torch.tensor(0, dtype=INT64))
         self._buffer: Optional[Tensor] = None
 
     def reset(self) -> None:
@@ -727,8 +785,8 @@ def routing_edge_to_tensor_edge(e) -> "TensorEdge":
 
     w = complex(e.weight) * cmath.exp(1j * float(e.angle_rad))
     weight = torch.complex(
-        torch.tensor(w.real, dtype=torch.float64),
-        torch.tensor(w.imag, dtype=torch.float64),
+        torch.tensor(w.real, dtype=FLOAT64),
+        torch.tensor(w.imag, dtype=FLOAT64),
     )
 
     src_port = str(e.item_slot) if getattr(e, "item_slot", "") else str(getattr(e, "src_port", ""))

@@ -19,7 +19,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, ClassVar, Optional
-import torch
+from signal_tensor_backend import tensor as torch, Tensor, COMPLEX, FLOAT64, FLOAT32, INT64, BOOL
 import numpy as np
 import pygame
 from scipy.signal import resample_poly as _scipy_resample_poly

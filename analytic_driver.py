@@ -39,7 +39,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, ClassVar, Optional
-import torch
+from signal_tensor_backend import tensor as torch, COMPLEX, FLOAT64
 import numpy as np
 import pygame
 from scipy.signal import resample_poly as _scipy_resample_poly
@@ -1653,7 +1653,7 @@ class EditorCanvas:
                     if cancel.is_set():
                         return
                     _phase_origins = torch.linspace(
-                        0.0, 2.0 * math.pi, _N_PHASE, endpoint=False, dtype=torch.float64
+                        0.0, 2.0 * math.pi, _N_PHASE, endpoint=False, dtype=FLOAT64
                     )
                     csig_batch = _synthesize_voice_batched(
                         voice_snap, patch_snap, lfo_map, p_map, _phase_origins,
@@ -1675,7 +1675,7 @@ class EditorCanvas:
                     amp_total = amp_total / amp_peak if amp_peak > 1e-9 else np.zeros_like(amp_total, dtype=np.float64)
                     base_chirp = _compute_knob_chirp_deviation_series(voice_snap, n_sig, patch_snap.duration)
                     chirp_curve = snap["curves"][1]
-                    t_norm = torch.linspace(0.0, 1.0, n_sig, dtype=torch.float64)
+                    t_norm = torch.linspace(0.0, 1.0, n_sig, dtype=FLOAT64)
                     chirp_env_curve = chirp_curve.evaluate_normalized(t_norm).real.clamp(0.0, 1.0)
                     chirp_env_hz = chirp_curve.to_physical(chirp_env_curve).detach().cpu().numpy().astype(np.float64, copy=False)
                     chirp_total_hz = base_chirp + chirp_env_hz
@@ -1686,13 +1686,13 @@ class EditorCanvas:
                     chirp_env_norm = np.clip((chirp_env_hz - v_lo) / span, 0.0, 1.0)
                     chirp_total_norm = np.clip((chirp_total_hz - v_lo) / span, 0.0, 1.0)
                     raw = {
-                        "analytic": torch.as_tensor(csig, dtype=torch.complex128).reshape(-1),
-                        "amplitude_bias": torch.zeros(n_sig, dtype=torch.complex128),
-                        "amplitude": torch.as_tensor(env_arr, dtype=torch.complex128).reshape(-1),
-                        "amplitude_total": torch.as_tensor(amp_total, dtype=torch.complex128).reshape(-1),
-                        "chirp_bias": torch.as_tensor(chirp_bias_norm, dtype=torch.complex128).reshape(-1),
-                        "chirp": torch.as_tensor(chirp_env_norm, dtype=torch.complex128).reshape(-1),
-                        "chirp_total": torch.as_tensor(chirp_total_norm, dtype=torch.complex128).reshape(-1),
+                        "analytic": torch.as_tensor(csig, dtype=COMPLEX).reshape(-1),
+                        "amplitude_bias": torch.zeros(n_sig, dtype=COMPLEX),
+                        "amplitude": torch.as_tensor(env_arr, dtype=COMPLEX).reshape(-1),
+                        "amplitude_total": torch.as_tensor(amp_total, dtype=COMPLEX).reshape(-1),
+                        "chirp_bias": torch.as_tensor(chirp_bias_norm, dtype=COMPLEX).reshape(-1),
+                        "chirp": torch.as_tensor(chirp_env_norm, dtype=COMPLEX).reshape(-1),
+                        "chirp_total": torch.as_tensor(chirp_total_norm, dtype=COMPLEX).reshape(-1),
                     }
                 data = {
                     "csig":       csig,
@@ -1752,7 +1752,7 @@ class EditorCanvas:
             # Push batch before refreshing B so _refresh_render_points can use it
             csig_batch = data.get("csig_batch")
             if csig_batch is not None and csig_batch.shape[1] > 0:
-                editor._csig_batch    = torch.as_tensor(csig_batch, dtype=torch.complex128)
+                editor._csig_batch    = torch.as_tensor(csig_batch, dtype=COMPLEX)
                 editor._csig_batch_np = csig_batch  # stable numpy ref for lazy widget creation
                 if editor._gl_wave_widget is not None:
                     editor._gl_wave_widget.update_data(csig_batch)

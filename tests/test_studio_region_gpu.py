@@ -46,6 +46,27 @@ def test_scene_append_projects_region_optics_into_native_gpu_records():
     assert result[0][0,11]==4097 # legacy common geometry marker preserved
 
 
+def test_native_t5_scene_handoff_keeps_authored_region_identity():
+    from camera_designer.studio_t5_scene import native_t5_scene_inputs
+    from mat_flags import MAT_FLAG_EMISSIVE, MAX_SPECTRAL_BANDS
+    geom=np.zeros((4,16),np.float32)
+    shade=np.zeros((4,16),np.float32)
+    shade[:,14]=np.arange(4,dtype=np.int32).view(np.float32)
+    geom[:,3]=[-1,-7,-12,0]
+    geom[:,7]=[2,3,1,0]
+    geom[3,15]=np.array([MAT_FLAG_EMISSIVE],np.uint32).view(np.float32)[0]
+    materials=np.zeros((4*MAX_SPECTRAL_BANDS,12),np.float32)
+    materials[3*MAX_SPECTRAL_BANDS,5]=1
+    tri=np.zeros((4,3,3),np.float32)
+    tri[:,1,0]=1;tri[:,2,1]=1
+    scene=(geom,shade,materials,tri,np.empty((0,8),np.float32),{},
+           (np.zeros(3,np.float32),np.ones(3,np.float32)),np.empty((0,12),np.float32))
+    native=native_t5_scene_inputs(scene,[.55])
+    np.testing.assert_array_equal(native['boundary_tags'],geom[:,[3,7]])
+    np.testing.assert_array_equal(native['region_records'][:,:2],[[0,0],[2,1],[3,-1]])
+    np.testing.assert_array_equal(native['emitter_tri_ids'],[3])
+
+
 def test_region_thresholds_are_coordinated_and_scale_relative():
     from camera_designer.studio_region_gpu import with_region_media, with_region_spheres
     from camera_designer.studio_boundary_media import STUDIO_BOUNDARY_GLSL

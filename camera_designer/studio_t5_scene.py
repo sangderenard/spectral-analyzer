@@ -10,6 +10,7 @@ from __future__ import annotations
 import numpy as np
 
 from mat_flags import MAT_FLAG_EMISSIVE, MAX_SPECTRAL_BANDS
+from .studio_region_gpu import region_records_from_geometry, validate_region_records
 
 
 def native_t5_scene_inputs(scene: tuple, wavelengths_um) -> dict:
@@ -38,6 +39,17 @@ def native_t5_scene_inputs(scene: tuple, wavelengths_um) -> dict:
     emitter_ids = np.ascontiguousarray(np.flatnonzero(emitter_mask), np.int32)
     if not len(emitter_ids):
         raise ValueError("native T5 needs authored emissive Studio triangles")
+    # Keep the authenticated Studio boundary identity when lowering the scene.
+    # The native T3 consumer must resolve these tags before it can claim media
+    # parity; geometry and a material index alone lose bubble/rod/dye ownership.
+    boundary_tags = np.ascontiguousarray(geom[:, [3, 7]], np.float32)
+    if not np.isfinite(boundary_tags).all():
+        raise ValueError("Studio boundary tags must be finite")
+    region_records = region_records_from_geometry(geom)
+    if region_records is None:
+        region_records = np.empty((0, 4), np.float32)
+    else:
+        region_records = validate_region_records(region_records, geom, shade, n_mats)
     return {
         "verts": np.ascontiguousarray(tri.reshape(-1, 9), np.float64),
         "normals": np.ascontiguousarray(geom[:, 12:15], np.float64),
@@ -48,4 +60,6 @@ def native_t5_scene_inputs(scene: tuple, wavelengths_um) -> dict:
         "emitter_tri_ids": emitter_ids,
         "bounds_min": np.ascontiguousarray(bounds[0], np.float32),
         "bounds_max": np.ascontiguousarray(bounds[1], np.float32),
+        "boundary_tags": boundary_tags,
+        "region_records": np.ascontiguousarray(region_records, np.float32),
     }

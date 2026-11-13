@@ -31,6 +31,7 @@ from camera_software.optical_transport_contracts import (
     OpticalSolveReport,
     OpticalTimingSpec,
 )
+from camera_software.physical_aperture import LivePhysicalAperture
 
 
 def _lens(lane_count: int) -> CompoundLens:
@@ -156,6 +157,46 @@ def test_wave_context_defaults_to_vector_fft_and_absorbing_padding():
     assert descriptor["state_layout"] == "solid-contiguous-state-block"
     assert descriptor["allocation"] == "cold-only"
     assert compiled.contract()["graph_stats"]["edges"] == 5
+
+
+def test_aperture_inside_exact_lens_carries_stop_medium_into_native_arena():
+    from camera_software.camera_designer_bridge import camera_manifest_to_designer_preset
+    from camera_software.camera_manifest import resolve_camera_manifest
+
+    preset = camera_manifest_to_designer_preset(resolve_camera_manifest())
+    lens = CompoundLens.from_preset(
+        preset, wavelengths_um=(0.45, 0.55, 0.65), axial_scale=-1.0,
+    )
+    payload = lens.build_gpu_payload()
+    stop = next(
+        surface for surface in range(int(payload[1]))
+        if int(payload[8 + surface * 8 + 6]) & 1
+    )
+    spectral_base = int(payload[6]) + stop * int(payload[7])
+    expected = payload[spectral_base:spectral_base + 3]
+    aperture = LivePhysicalAperture.circular_hole(
+        "test.stop", opening_radius_m=20e-6,
+        assembly_radius_m=50e-6, thickness_m=4e-6,
+    )
+    region = {
+        "center_m": (-preset.aperture_stop.z_pos, 0.0, 0.0),
+        "axis": (1.0, 0.0, 0.0),
+        "radius_m": 60e-6,
+        "longitudinal_step_m": 1e-6,
+        "longitudinal_steps": 4,
+        "aperture_material": aperture,
+    }
+    graph = compile_compound_lens_graph(
+        lens, lane_count=3, wave_regions=(("test.stop", region),),
+    )
+    descriptor = graph.t4_descriptors["test.stop.arena"]
+    assert np.allclose(descriptor["medium_n_by_lane"], expected)
+    tracer = _RecordingTracer()
+    install_optical_graph(tracer, graph, exact_t2_registered=True)
+    native = tracer.contexts[0]
+    assert native["n_real"] == pytest.approx(expected[0])
+    assert native["payload"][19] == 3
+    assert np.allclose(native["payload"][20:23], expected)
 
 
 def test_periodic_fft_boundary_requires_explicit_authoring():

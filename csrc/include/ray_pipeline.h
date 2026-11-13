@@ -97,6 +97,12 @@ struct RayIntent {
     uint8_t          bdpt_stream       = 0u;
     uint8_t          bdpt_strategy     = 0u;
 
+    /* CPU exact-conic continuation after an interior T4 aperture. The
+     * original T2 triangle identifies the immutable PLENS payload; the
+     * surface index is the first surface after the wave region. */
+    int              lens_resume_hit_tri = -1;
+    int              lens_resume_si = -1;
+
     /* Scalar amplitude fast-path: when amp_n_bands > 0 the amp Eigen vector
      * is NOT allocated.  All bands carry (amp_scalar, 0i).  Only valid for
      * initial submissions; GPU child intents are packed directly from SSBO.

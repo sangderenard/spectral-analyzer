@@ -1,5 +1,27 @@
 # Exact lens and aperture wave-region boundary (2026-11-13)
 
+## 2026-11-13 traversal correction
+
+The CPU T2 evaluator now yields at the entrance plane of a physical T4
+ScaleContext when a parametric lens stop lies in that arena. Its continuation
+retains the original exact-conic payload triangle and next surface index;
+after T4, T1 routes it back to T2 without intersecting an interior absorber.
+The test below now passes scene-to-sensor and sensor-to-scene with one and eight
+spectral lanes. The scene-side reverse ray exits past the first lens surface;
+the forward ray reaches sensor-side geometry after the wave crossing.
+
+The optical graph also supplies the stop's authored refractive indices to the
+wave arena, including per-lane values through an optional tail on the existing
+APTR payload. The native T4 exit records optical path using that medium. A
+full-GPU T1/T2/T3 request with this interior stop is rejected at pipeline
+creation: the GPU intent ABI does not yet carry the resume state.
+
+The following is the original failure receipt, retained for the history of
+the boundary. The remaining field-to-ray-to-field Jones continuation failures
+are still recorded in `WAVE_CONTINUATION_ENERGY_AUDIT_2026-11-09.md`.
+
+## Original failing receipt
+
 The focused native acceptance test in `tests/test_wave_t4_pipeline.py` builds
 the canonical four-group camera from its manifest, registers its exact conic
 transport through `build_tracer`, compiles a physical circular aperture into a

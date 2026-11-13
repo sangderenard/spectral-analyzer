@@ -651,6 +651,16 @@ def install_optical_graph(
             payload = np.ascontiguousarray(
                 descriptor["aperture_payload"], np.float64
             )
+            if "medium_n_by_lane" in descriptor:
+                # APTR retains its 19-value prefix. Its optional tail carries
+                # the same lane indices that a WAVE-only payload would carry.
+                lane_indices = np.asarray(
+                    descriptor["medium_n_by_lane"], np.float64
+                ).reshape(-1)
+                payload = np.ascontiguousarray(
+                    [*payload, float(len(lane_indices)), *lane_indices],
+                    np.float64,
+                )
         elif "medium_n_by_lane" in descriptor:
             lane_indices = np.asarray(
                 descriptor["medium_n_by_lane"], np.float64
@@ -1175,6 +1185,43 @@ def compile_compound_lens_graph(
         ))
     for region_key, raw_parameters in authored_regions:
         parameters = dict(raw_parameters)
+        if "aperture_material" in parameters and "center_m" in parameters:
+            # The aperture can sit between exact refracting surfaces. The
+            # native T4 arena must march through the stop's authored optical
+            # medium, including its per-lane dispersion, rather than silently
+            # treating the interior of the lens as vacuum.
+            center = np.asarray(parameters["center_m"], np.float64).reshape(-1)
+            if center.size == 3:
+                n_surfaces = int(payload[1])
+                n_lanes = int(payload[5])
+                spectral_offset = int(payload[6])
+                spectral_stride = int(payload[7])
+                for surface in range(n_surfaces):
+                    base = 8 + 8 * surface
+                    if int(payload[base + 6]) & 1 == 0:
+                        continue
+                    if abs(float(center[0]) - float(payload[base])) > 1e-6:
+                        continue
+                    if n_lanes:
+                        start = spectral_offset + surface * spectral_stride
+                        stop_medium = tuple(
+                            float(value) for value in payload[start:start+n_lanes]
+                        )
+                    else:
+                        stop_medium = (float(payload[base + 2]),) * lane_count
+                    if "medium_n_by_lane" in parameters:
+                        authored = np.asarray(
+                            parameters["medium_n_by_lane"], np.float64
+                        ).reshape(-1)
+                        if authored.size != lane_count or not np.allclose(
+                            authored, stop_medium, rtol=1e-5, atol=1e-6
+                        ):
+                            raise ValueError(
+                                "aperture wave medium disagrees with exact lens stop"
+                            )
+                    parameters["medium_n_by_lane"] = stop_medium
+                    parameters["medium_n_real"] = stop_medium[0]
+                    break
         if "propagation" in parameters:
             parameters["propagation"] = WavePropagationStyle(
                 parameters["propagation"]

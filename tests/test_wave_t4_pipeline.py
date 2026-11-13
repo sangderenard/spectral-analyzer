@@ -295,11 +295,9 @@ def test_compiled_optical_graph_installs_and_drives_native_t4():
     assert sum(arena["field_active"]) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="exact T2 lens traversal jumps across the interior aperture T4 region",
-)
-def test_exact_compound_lens_routes_through_physical_aperture_wave_region():
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("lane_count", [1, 8])
+def test_exact_compound_lens_routes_through_physical_aperture_wave_region(reverse, lane_count):
     from camera_designer.compound_optics import CompoundLens
     from camera_designer.scene_builder import build_tracer
     from camera_software.camera_designer_bridge import camera_manifest_to_designer_preset
@@ -311,7 +309,7 @@ def test_exact_compound_lens_routes_through_physical_aperture_wave_region():
     from camera_software.physical_aperture import LivePhysicalAperture
 
     preset = camera_manifest_to_designer_preset(resolve_camera_manifest())
-    wavelengths_um = (0.55,)
+    wavelengths_um = tuple(np.linspace(0.45, 0.65, lane_count))
     tracer, _ = build_tracer(
         preset, [], wavelengths_um=wavelengths_um,
     )
@@ -326,7 +324,7 @@ def test_exact_compound_lens_routes_through_physical_aperture_wave_region():
     )
     graph = compile_compound_lens_graph(
         lens,
-        lane_count=1,
+        lane_count=lane_count,
         wave_regions=(("doublet.aperture", {
             "center_m": (-preset.aperture_stop.z_pos, 0.0, 0.0),
             "axis": (1.0, 0.0, 0.0),
@@ -343,9 +341,10 @@ def test_exact_compound_lens_routes_through_physical_aperture_wave_region():
     assert receipt.wave_arenas[0].node_key == "doublet.aperture.arena"
     tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
     tracer.submit_rays(
-        np.array([[-0.22, 0.0, 0.0]]),
-        np.array([[1.0, 0.0, 0.0]]),
-        np.array([[1.0 + 0.0j]]),
+        np.array([[0.0 if reverse else -0.22, 0.0, 0.0]]),
+        np.array([[-1.0 if reverse else 1.0, 0.0, 0.0]]),
+        np.ones((1, lane_count), np.complex128),
+        color_flags=np.array([64 if reverse else 0], np.uint8),
         max_bounces=4,
         min_amplitude=1e-12,
     )
@@ -353,6 +352,16 @@ def test_exact_compound_lens_routes_through_physical_aperture_wave_region():
     arena = tracer.wave_arena_stats()[0]
     assert arena["generation"] > 0
     assert sum(arena["field_active"]) > 0
+    records = tracer.drain_records(64)
+    kinds = np.asarray(records["kind"])
+    assert 3 in kinds.tolist()
+    if reverse:
+        misses = np.asarray(records["pos"])[kinds == 2]
+        assert len(misses) == 1
+        assert misses[0, 0] < -0.17
+    else:
+        strikes = np.asarray(records["seg_start"])[kinds == 0]
+        assert np.any(strikes[:, 0] > -0.06)
 
 
 def test_wave_boundary_preserves_power_tilt_and_authored_axial_extent():

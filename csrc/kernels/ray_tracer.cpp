@@ -1557,6 +1557,8 @@ struct ParametricLensTraceInfo {
     double last_eta_t = 1.0;
     double throughput_multiplier = 1.0;
     int reason = BDPT_OPT_REFRACTION;
+    int pause_arena_id = -1;
+    int resume_si = -1;
     std::vector<BdptOpticalEventRecord> events;
 };
 
@@ -1566,7 +1568,9 @@ static inline bool apply_parametric_lens_from_f32(
     V3d& pos, V3d& dir, VXcd& amp,
     double* path_len,
     bool is_backward = false,
-    ParametricLensTraceInfo* trace_info = nullptr);
+    ParametricLensTraceInfo* trace_info = nullptr,
+    const std::deque<WaveArena>* wave_arenas = nullptr,
+    int start_si = 0);
 
 static inline void apply_manifold_transfer_from_payload(
     const RayTracerState& st,
@@ -7326,7 +7330,9 @@ static inline bool apply_parametric_lens_from_f32(
     V3d& pos, V3d& dir, VXcd& amp,
     double* path_len,
     bool is_backward,
-    ParametricLensTraceInfo* trace_info)
+    ParametricLensTraceInfo* trace_info,
+    const std::deque<WaveArena>* wave_arenas,
+    int start_si)
 {
     ParametricLensTraceInfo local_trace{};
     if (!p) return true;
@@ -7378,7 +7384,8 @@ static inline bool apply_parametric_lens_from_f32(
 
     /* Backward rays traverse surfaces in reverse order with swapped
      * refractive indices (sensor side → scene side). */
-    for (int si = 0; si < n_surf; ++si) {
+    if (start_si < 0 || start_si >= n_surf) return true;
+    for (int si = start_si; si < n_surf; ++si) {
         const int s = is_backward ? (n_surf - 1 - si) : si;
         const int    sb    = 8 + s * 8;
         const double x_v   = (double)p[sb + 0];
@@ -7399,6 +7406,51 @@ static inline bool apply_parametric_lens_from_f32(
         const double ap_r  = (double)p[sb + 4];
         const double k     = (double)p[sb + 5];
         const bool is_stop = ((int)p[sb + 6] & 1) != 0;
+
+        /* The stop may lie inside a ScaleContext. Yield to the native T4
+         * arena at its entrance plane before seeking through the stop. The
+         * exact conic evaluator resumes at the following surface after T4
+         * returns, using this same immutable payload. */
+        if (is_stop && start_si == 0 && wave_arenas) {
+            for (const WaveArena& arena : *wave_arenas) {
+                if (std::abs(arena.axis_z.x()) < 0.999
+                    || std::abs(rd.x()) <= 1e-12)
+                    continue;
+                if (std::abs(arena.center.x() - x_v) > arena.half_depth + 1e-6)
+                    continue;
+                const double axial = rd.dot(arena.axis_z);
+                if (std::abs(axial) <= 1e-12) continue;
+                const double sign = axial > 0.0 ? 1.0 : -1.0;
+                const V3d entry = arena.center
+                    - sign * arena.half_depth * arena.axis_z;
+                const double t = (entry - rp).dot(arena.axis_z) / axial;
+                if (t <= 2e-7 || t >= (x_v-rp.x())/rd.x()) continue;
+                const V3d crossing = rp + t*rd;
+                const V3d radial = crossing - entry;
+                const double u = radial.dot(arena.axis_x);
+                const double v = radial.dot(arena.axis_y);
+                if (std::abs(u) > arena.radius || std::abs(v) > arena.radius)
+                    continue;
+                opl += n_bf*t;
+                local_trace.geom_len += t;
+                local_trace.opl = opl;
+                local_trace.pause_arena_id = arena.id;
+                local_trace.resume_si = si + 1;
+                if (path_len) {
+                    const double c0 = st.speed_m_s > EPS
+                        ? st.speed_m_s : 299792458.0;
+                    for (int b = 0; b < (int)amp.size() && b < st.n_bands; ++b) {
+                        const double phase = TWO_PI * st.freq_hz_vec[b] * opl / c0;
+                        amp[b] *= cd(std::cos(phase), std::sin(phase));
+                    }
+                    *path_len += opl;
+                }
+                pos = crossing;
+                dir = rd;
+                if (trace_info) *trace_info = local_trace;
+                return false;
+            }
+        }
 
         /* Seek to exact parametric surface.
          *
@@ -15122,14 +15174,23 @@ static void wave_arena_build(
     if (ctx.payload
         && ctx.payload_size_bytes >= (int)(9*sizeof(double))) {
         const double* p = static_cast<const double*>(ctx.payload);
-        const int payload_bands = static_cast<int>(p[8]);
-        if (p[6] == medium_lane_magic && p[7] == 1.0
+        /* APTR keeps its original 19-value material ABI; an optional
+         * [lane_count, lane_indices...] tail describes the surrounding
+         * medium when the aperture lies inside a dispersive lens element. */
+        const bool aperture_lanes = p[6] == aperture_payload_magic
+            && p[7] == 1.0
+            && ctx.payload_size_bytes >= (int)(20*sizeof(double));
+        const int count_offset = aperture_lanes ? aperture_payload_values : 8;
+        const int indices_offset = count_offset + 1;
+        const int payload_bands = static_cast<int>(p[count_offset]);
+        if ((aperture_lanes || (p[6] == medium_lane_magic && p[7] == 1.0))
             && payload_bands == arena.n_bands
             && ctx.payload_size_bytes
-                >= (int)((9+payload_bands)*sizeof(double))) {
+                >= (int)((indices_offset+payload_bands)*sizeof(double))) {
             for (int b = 0; b < arena.n_bands; ++b)
-                if (std::isfinite(p[9+b]) && p[9+b] > 0.0)
-                    arena.n_real_by_lane[b] = p[9+b];
+                if (std::isfinite(p[indices_offset+b])
+                    && p[indices_offset+b] > 0.0)
+                    arena.n_real_by_lane[b] = p[indices_offset+b];
         }
     }
     for (int b = 0; b < arena.n_bands; ++b) {
@@ -16044,7 +16105,9 @@ static ChildRay wave_arena_extract(
     child.intent.pos = exit_pos;
     child.intent.dir = exit_dir;
     child.intent.amp = exit_amp;
-    child.intent.path_len += (physical_exit - src.pos).norm();
+    const int path_band = continuous_single ? state_lane : 0;
+    child.intent.path_len += (physical_exit - src.pos).norm()
+        * arena.n_real_by_lane[static_cast<size_t>(path_band)];
     child.intent.bounce += 1;
     child.intent.bounces_left = std::max(0, src.bounces_left - 1);
     if (child.intent.bdpt_vertex < 0xFFFFu)
@@ -16102,7 +16165,7 @@ static ChildRay wave_arena_extract(
             lane.meta.frequency_hz = spectral.frequency_hz > 0.0
                 ? spectral.frequency_hz
                 : arena.speed_m_s/std::max(
-                    arena.wavelengths_m[b]*arena.n_real, 1.0e-30);
+                    arena.wavelengths_m[b]*arena.n_real_by_lane[b], 1.0e-30);
             /* child.intent.path_len is the lineage OPL accumulator (index-
              * weighted inside exact parametric-lens traversal, geometric
              * distance elsewhere -- see RayIntent::launch_time comment in
@@ -16566,6 +16629,23 @@ static void pipeline_intersector(RayPipelineState& ps)
             const V3d pos0 = intent.pos;
             const V3d dir  = intent.dir;
 
+            if (intent.lens_resume_si >= 0) {
+                /* T4 has already crossed the aperture. Return the unchanged
+                 * ray lineage directly to T2's remaining conic surfaces;
+                 * querying the proxy BVH here would hit an interior absorber. */
+                HitRecord hr;
+                hr.ray = intent;
+                hr.seg_start = pos0;
+                hr.incoming_dir = dir;
+                hr.path_at_seg_start = intent.path_len;
+                hr.hit_tri = intent.lens_resume_hit_tri;
+                hr.hit_pos = pos0;
+                hr.hit_n = -dir;
+                hr.amp_propagated = intent.amp;
+                hit_batch.push_back(std::move(hr));
+                continue;
+            }
+
             double t_hit   = 1e18;
             int    hit_tri = -1;
             if (has_bvh) {
@@ -16865,8 +16945,10 @@ static void pipeline_refiner(RayPipelineState& ps)
             rh.base        = hr;
             rh.refined_pos = hr.hit_pos;
             rh.refined_n   = hr.hit_n;
-            rh.was_parametric = apply_parametric_surface_point(
-                st, hr.hit_tri, hr.hit_pos, rh.refined_pos, rh.refined_n);
+            rh.was_parametric = hr.ray.lens_resume_si >= 0
+                ? true
+                : apply_parametric_surface_point(
+                    st, hr.hit_tri, hr.hit_pos, rh.refined_pos, rh.refined_n);
             if (hr.incoming_dir.dot(rh.refined_n) > 0.0)
                 rh.refined_n = -rh.refined_n;
 
@@ -16914,7 +16996,10 @@ static void pipeline_refiner(RayPipelineState& ps)
                             hr.ray.bdpt_stream == BDPT_SIDE_SENSOR
                                 || ((hr.ray.color_flag
                                      & RT_COLOR_FLAG_REVERSE_OPTICS) != 0u),
-                            &lens_trace);
+                            &lens_trace,
+                            hr.ray.lens_resume_si < 0 ? &ps.arenas : nullptr,
+                            hr.ray.lens_resume_si < 0
+                                ? 0 : hr.ray.lens_resume_si);
                         lens_trace_valid = true;
                     } else if (magic == 14946.0f || magic == 14947.0f ||
                                magic == 14950.0f || magic == 14951.0f) {
@@ -16975,6 +17060,32 @@ static void pipeline_refiner(RayPipelineState& ps)
                         pipeline_finish_ray(ps);
                         continue;
                     }
+                    if (lens_trace.pause_arena_id >= 0) {
+                        WaveIntent wi;
+                        wi.ray = hr.ray;
+                        wi.ray.pos = tpos;
+                        wi.ray.dir = tdir;
+                        wi.ray.amp = std::move(tamp);
+                        wi.ray.path_len = tpl;
+                        wi.ray.lens_resume_hit_tri = hr.hit_tri;
+                        wi.ray.lens_resume_si = lens_trace.resume_si;
+                        wi.ray.interaction_flags |=
+                            (1u << SCALE_CONTEXT_KIND_WAVE_HELMHOLTZ);
+                        wi.arena_id = lens_trace.pause_arena_id;
+                        wi.complex.frequency_hz = wi.ray.spectral_frequency_hz;
+                        wi.complex.spectral_pdf =
+                            std::max<double>(wi.ray.spectral_pdf, 1.0e-30);
+                        wi.complex.transport_jacobian = 1.0;
+                        wi.complex.coherence_id = wi.ray.tag;
+                        wi.complex.sample_id = wi.ray.bdpt_subpath_id;
+                        wi.complex.source_lane = wi.ray.spectral_lane_id;
+                        wi.complex.flags = complex_transport::LaneActive
+                            | (wi.ray.spectral_resolved
+                                ? complex_transport::ContinuousSample : 0u)
+                            | complex_transport::Coherent;
+                        ps.Q_wave.push(std::move(wi));
+                        continue;
+                    }
                     if (hr.ray.bdpt_subpath_id != 0u) {
                         BdptPdfRecord pr{};
                         pr.subpath_id = hr.ray.bdpt_subpath_id;
@@ -16997,10 +17108,15 @@ static void pipeline_refiner(RayPipelineState& ps)
                     ri.amp            = std::move(tamp);
                     ri.path_len       = tpl;
                     ri.medium_mat_idx = -1;
-                    ri.bounce        += 1;
-                    ri.bounces_left   = std::max(0, hr.ray.bounces_left - 1);
-                    if (ri.bdpt_vertex < 0xFFFFu)
-                        ri.bdpt_vertex += 1u;
+                    if (hr.ray.lens_resume_si < 0) {
+                        ri.bounce += 1;
+                        ri.bounces_left =
+                            std::max(0, hr.ray.bounces_left - 1);
+                        if (ri.bdpt_vertex < 0xFFFFu)
+                            ri.bdpt_vertex += 1u;
+                    }
+                    ri.lens_resume_hit_tri = -1;
+                    ri.lens_resume_si = -1;
                     if (ri.priority > 1.0f)
                         ps.Q_intent.push_front(std::move(ri));
                     else
@@ -17863,6 +17979,41 @@ RayPipelineState* ray_pipeline_create(
         wave_arena_build(ps->arenas.back(),
                          (int)ps->arenas.size() - 1,
                          ctx, ps->cfg, *st);
+    }
+    if (ps->cfg.use_gpu_compute && ps->cfg.gpu_all_stages
+        && !ps->arenas.empty()) {
+        for (size_t gid = 0;
+             gid < st->tri_group_parametric_payload.size(); ++gid) {
+            if (gid >= st->tri_group_parametric_kind.size()
+                || st->tri_group_parametric_kind[gid]
+                    != TRI_PARAM_SURFACE_PARAMETRIC_LENS)
+                continue;
+            const auto& bytes = st->tri_group_parametric_payload[gid];
+            if (bytes.size() < 8*sizeof(float)) continue;
+            const float* payload =
+                reinterpret_cast<const float*>(bytes.data());
+            if (payload[0] != 14949.0f) continue;
+            const int count = static_cast<int>(payload[1]);
+            if (count < 1 || bytes.size()
+                    < static_cast<size_t>(8 + count*8)*sizeof(float))
+                continue;
+            for (int surface = 0; surface < count; ++surface) {
+                const int base = 8 + surface*8;
+                if ((static_cast<int>(payload[base+6]) & 1) == 0)
+                    continue;
+                for (const WaveArena& arena : ps->arenas) {
+                    if (std::abs(arena.center.x() - payload[base])
+                            > arena.half_depth + 1e-6
+                        || std::abs(arena.axis_z.x()) < 0.999)
+                        continue;
+                    fprintf(stderr,
+                            "[T2/T4] GPU all-stages interior stop handoff "
+                            "requires a resume intent ABI; use CPU stages\n");
+                    delete ps;
+                    return nullptr;
+                }
+            }
+        }
     }
     auto arena_for_context = [&](int context_id) -> int {
         for (int arena_id = 0;

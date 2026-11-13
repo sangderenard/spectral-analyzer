@@ -12,9 +12,9 @@ import time
 from typing import Any, Iterable, Mapping, Optional
 
 import numpy as np
-import torch
+from signal_tensor_backend import tensor as torch, Tensor, COMPLEX, FLOAT64, FLOAT32, INT64, BOOL
 
-_CDTYPE = torch.complex128
+_CDTYPE = COMPLEX
 
 
 @dataclass(frozen=True)
@@ -118,14 +118,14 @@ def _as_tensor_product(
     origin_node: str = "",
     dtype: Optional[torch.dtype] = None,
 ) -> RenderProduct:
-    if isinstance(value, torch.Tensor):
+    if isinstance(value, Tensor):
         tensor = value.detach().clone()
         if dtype is not None:
             tensor = tensor.to(dtype)
     else:
         arr = np.asarray(value)
         if dtype is None:
-            dtype = _CDTYPE if np.iscomplexobj(arr) else torch.float32
+            dtype = _CDTYPE if np.iscomplexobj(arr) else FLOAT32
         tensor = torch.as_tensor(arr, dtype=dtype)
     return RenderProduct(
         key=key,

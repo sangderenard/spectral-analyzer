@@ -57,8 +57,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-import torch
-from torch import Tensor
+from signal_tensor_backend import tensor as torch, Tensor, COMPLEX, FLOAT64, FLOAT32, INT64, BOOL
 
 from parametric_curve import ParametricCurve
 from performer_engine import (
@@ -206,9 +205,9 @@ def _build_parametric_driver_batches(
     )
     return (
         packed_env,
-        torch.tensor(env_row, dtype=torch.int64, device=device),
+        torch.tensor(env_row, dtype=INT64, device=device),
         packed_chirp,
-        torch.tensor(chirp_row, dtype=torch.int64, device=device),
+        torch.tensor(chirp_row, dtype=INT64, device=device),
     )
 
 
@@ -409,10 +408,10 @@ def build_driver_config(
         am_depth_list.append(float(am.depth_amp) if am else 0.0)
 
     # ── Tensor constructors ──────────────────────────────────────────────────
-    def _ft(lst):  return torch.tensor(lst, dtype=torch.float64, device=device)
-    def _it(lst):  return torch.tensor(lst, dtype=torch.int64,   device=device)
-    def _bt(lst):  return torch.tensor(lst, dtype=torch.bool,    device=device)
-    def _ft2(lst): return torch.tensor(lst, dtype=torch.float64, device=device)
+    def _ft(lst):  return torch.tensor(lst, dtype=FLOAT64, device=device)
+    def _it(lst):  return torch.tensor(lst, dtype=INT64,   device=device)
+    def _bt(lst):  return torch.tensor(lst, dtype=BOOL,    device=device)
+    def _ft2(lst): return torch.tensor(lst, dtype=FLOAT64, device=device)
 
     cfg = DriverConfig(
         D=D, H=H, K=K, V=V, device=device,
@@ -452,10 +451,10 @@ def build_driver_config(
 
 def _empty_config(V: int, device: torch.device) -> DriverConfig:
     """Return a zero-slot DriverConfig when there are no active driver slots."""
-    def _ft():   return torch.zeros(0, dtype=torch.float64, device=device)
-    def _it():   return torch.zeros(0, dtype=torch.int64,   device=device)
-    def _bt():   return torch.zeros(0, dtype=torch.bool,    device=device)
-    def _ft2(h): return torch.zeros(0, h, dtype=torch.float64, device=device)
+    def _ft():   return torch.zeros(0, dtype=FLOAT64, device=device)
+    def _it():   return torch.zeros(0, dtype=INT64,   device=device)
+    def _bt():   return torch.zeros(0, dtype=BOOL,    device=device)
+    def _ft2(h): return torch.zeros(0, h, dtype=FLOAT64, device=device)
 
     return DriverConfig(
         D=0, H=1, K=5, V=V, device=device,

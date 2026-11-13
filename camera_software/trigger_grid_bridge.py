@@ -10,7 +10,7 @@ import base64
 import math
 import json
 import re
-import torch
+from signal_tensor_backend import tensor as torch, Tensor, nn, COMPLEX, FLOAT64, FLOAT32, INT64, BOOL, CPU
 from io import BytesIO
 from threading import RLock
 
@@ -160,7 +160,7 @@ class CameraTriggerGrid:
                     sample_rate=1, output_node_keys=list(self.receivers))
                 self._radio_signature = signature
             resolved = self._radio_runtime.process_window(
-                {key: torch.tensor([value], dtype=torch.complex128) for key, value in inputs.items()}, n_frames=1)
+                {key: torch.tensor([value], dtype=COMPLEX) for key, value in inputs.items()}, n_frames=1)
             if any(not torch.isfinite(value).all() for value in resolved.values()):
                 raise ValueError("radio routing resolved a non-finite signal")
             # Reachability only selects overridden receivers. GraphSolver owns

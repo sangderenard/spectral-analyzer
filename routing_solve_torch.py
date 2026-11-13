@@ -6,8 +6,8 @@ stays in the original module — this module only replaces the compute path.
 
 Precision contract
 ------------------
-* All signal tensors are **torch.complex128** (backed by float64 real+imag).
-* All scalar parameter series are **torch.float64**.
+* All signal tensors are **COMPLEX** (backed by float64 real+imag).
+* All scalar parameter series are **FLOAT64**.
 * No dtype downcasting anywhere.  No approximations.  If the numpy path does
   it, the torch path does the same arithmetic in the same precision.
 
@@ -21,8 +21,7 @@ from __future__ import annotations
 import math
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
-import torch
-from torch import Tensor
+from signal_tensor_backend import tensor as torch, Tensor, COMPLEX, FLOAT64, FLOAT32, INT64, BOOL, CPU
 
 # Re-use the graph dataclasses — no need to redefine them.
 from routing_engine import (
@@ -34,8 +33,8 @@ from routing_engine import (
     RouterInstance,
 )
 
-_CDTYPE = torch.complex128
-_FDTYPE = torch.float64
+_CDTYPE = COMPLEX
+_FDTYPE = FLOAT64
 
 def _meta_endpoint_key(graph: RoutingGraph, owner_key: str, port_key: str) -> str:
     """Pick a concrete graph node for one metaedge endpoint.
@@ -306,7 +305,7 @@ def solve_routing_complex(
         for _comp_indices in _work:
             _comp_set = {node_keys[i] for i in _comp_indices}
             _sub_keys = [node_keys[i] for i in _comp_indices]
-            _idx_t = torch.tensor(_comp_indices, dtype=torch.long, device=dev)
+            _idx_t = torch.tensor(_comp_indices, dtype=INT64, device=dev)
             _sub_Src = Src[_idx_t]
             _sub_edges = [
                 e for e in edges
@@ -401,8 +400,8 @@ def solve_routing_complex(
     li_idx = [i for i in range(N) if i not in nl_idx]
 
     if has_transforms and nl_idx and li_idx:
-        nl_t = torch.tensor(nl_idx, dtype=torch.long, device=dev)
-        li_t = torch.tensor(li_idx, dtype=torch.long, device=dev)
+        nl_t = torch.tensor(nl_idx, dtype=INT64, device=dev)
+        li_t = torch.tensor(li_idx, dtype=INT64, device=dev)
 
         W_ll = W_inst[li_t][:, li_t]
         W_ln = W_inst[li_t][:, nl_t]
@@ -812,7 +811,7 @@ def synthesize_lfo_csig(
     n: int,
     sr: float,
     t_offset: float = 0.0,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device = CPU,
 ) -> Tensor:
     """Synthesize an LFO as a complex128 analytic signal.
 
@@ -836,7 +835,7 @@ def synthesize_lfo_channel_csig(
     n: int,
     sr: float,
     t_offset: float = 0.0,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device = CPU,
 ) -> Tensor:
     """Synthesize one LFO channel dict to complex128 analytic signal.
 
@@ -921,7 +920,7 @@ def compute_envelope(
     n: int,
     duration: float,
     env_type: str = "adsr",
-    device: torch.device = torch.device("cpu"),
+    device: torch.device = CPU,
 ) -> Tensor:
     """Evaluate an envelope at n exact sample positions.  (n,) float64.
 
@@ -1183,7 +1182,7 @@ class RoutingMixerTorch:
         self,
         graph: RoutingGraph,
         sample_rate: float = 48_000.0,
-        device: torch.device = torch.device("cpu"),
+        device: torch.device = CPU,
     ) -> None:
         self._graph = graph
         self._sr = float(sample_rate)

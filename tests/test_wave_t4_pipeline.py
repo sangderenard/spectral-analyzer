@@ -295,6 +295,66 @@ def test_compiled_optical_graph_installs_and_drives_native_t4():
     assert sum(arena["field_active"]) == 1
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="exact T2 lens traversal jumps across the interior aperture T4 region",
+)
+def test_exact_compound_lens_routes_through_physical_aperture_wave_region():
+    from camera_designer.compound_optics import CompoundLens
+    from camera_designer.scene_builder import build_tracer
+    from camera_software.camera_designer_bridge import camera_manifest_to_designer_preset
+    from camera_software.camera_manifest import resolve_camera_manifest
+    from camera_software.optical_transport_graph import (
+        compile_compound_lens_graph,
+        install_optical_graph,
+    )
+    from camera_software.physical_aperture import LivePhysicalAperture
+
+    preset = camera_manifest_to_designer_preset(resolve_camera_manifest())
+    wavelengths_um = (0.55,)
+    tracer, _ = build_tracer(
+        preset, [], wavelengths_um=wavelengths_um,
+    )
+    lens = CompoundLens.from_preset(
+        preset, wavelengths_um=wavelengths_um, axial_scale=-1.0,
+    )
+    aperture = LivePhysicalAperture.circular_hole(
+        "doublet.aperture",
+        opening_radius_m=20e-6,
+        assembly_radius_m=50e-6,
+        thickness_m=4e-6,
+    )
+    graph = compile_compound_lens_graph(
+        lens,
+        lane_count=1,
+        wave_regions=(("doublet.aperture", {
+            "center_m": (-preset.aperture_stop.z_pos, 0.0, 0.0),
+            "axis": (1.0, 0.0, 0.0),
+            "radius_m": 60e-6,
+            "longitudinal_step_m": 1e-6,
+            "longitudinal_steps": 4,
+            "aperture_material": aperture,
+        }),),
+    )
+    receipt = install_optical_graph(
+        tracer, graph, exact_t2_registered=True,
+    )
+    assert len(receipt.wave_arenas) == 1
+    assert receipt.wave_arenas[0].node_key == "doublet.aperture.arena"
+    tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+    tracer.submit_rays(
+        np.array([[-0.22, 0.0, 0.0]]),
+        np.array([[1.0, 0.0, 0.0]]),
+        np.array([[1.0 + 0.0j]]),
+        max_bounces=4,
+        min_amplitude=1e-12,
+    )
+    _wait(tracer, timeout_s=30.0)
+    arena = tracer.wave_arena_stats()[0]
+    assert arena["generation"] > 0
+    assert sum(arena["field_active"]) > 0
+
+
 def test_wave_boundary_preserves_power_tilt_and_authored_axial_extent():
     tracer = _tracer(np.array([550e-9]))
     radius = 64.0e-6

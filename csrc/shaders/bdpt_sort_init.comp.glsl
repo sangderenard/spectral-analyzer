@@ -31,8 +31,8 @@ layout(std430, binding = 3) coherent buffer SortCountsBuf { uint  sort_counts[];
 
 uniform int nv;       /* actual vertex count (from ssbo_t3_meta readback) */
 uniform int npad;     /* padded count = next power of 2 >= nv             */
-uniform int base_idx; /* chunk offset — dispatches larger than the GL max
-                         workgroup count are split into sequential chunks  */
+/* Chunk offset: dispatches larger than the GL workgroup limit are split. */
+uniform int base_idx;
 
 void main() {
     int V = base_idx + int(gl_GlobalInvocationID.x);

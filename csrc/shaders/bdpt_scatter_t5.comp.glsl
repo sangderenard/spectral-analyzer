@@ -39,6 +39,16 @@ uniform int bdpt_spectral_base;
 uniform int bdpt_pdf_base;
 uniform int bdpt_optical_base;
 
+/* On the tested Vulkan path, a bit-cast float ID flowing directly into the
+ * camera-side binary-search key missed an otherwise matching row. Reconstitute the
+ * 31-bit ID in two exactly representable 16-bit pieces before key arithmetic.
+ * This is the identity for every valid subpath ID, including IDs above 2^24. */
+uint exact_subpath_id(float packed_id) {
+    uint bits = floatBitsToUint(packed_id);
+    return (uint(float(bits >> 16u)) << 16u) |
+           uint(float(bits & 0xffffu));
+}
+
 int find_sorted_pos(uint stream, uint sid, uint vi) {
     uint key_hi = (stream << 31) | (sid & 0x7fffffffu);
     uint key_lo = vi << 16;
@@ -60,7 +70,7 @@ int find_sorted_pos(uint stream, uint sid, uint vi) {
 
 void scatter_spectral(uint r) {
     int rb = bdpt_spectral_base + int(r) * BDPT_SPECTRAL_STRIDE;
-    uint sid = floatBitsToUint(bdpt_verts[rb + 0]);
+    uint sid = exact_subpath_id(bdpt_verts[rb + 0]);
     uint vi_band = floatBitsToUint(bdpt_verts[rb + 1]);
     uint vi = (vi_band >> 16) & 0xffffu;
     uint band = vi_band & 0xffffu;
@@ -176,7 +186,7 @@ void scatter_pdf_to_stream(uint stream, uint sid, uint vi,
 
 void scatter_pdf(uint r) {
     int rb = bdpt_pdf_base + int(r) * BDPT_PDF_STRIDE;
-    uint sid = floatBitsToUint(bdpt_verts[rb + 0]);
+    uint sid = exact_subpath_id(bdpt_verts[rb + 0]);
     uint packed_vm = floatBitsToUint(bdpt_verts[rb + 1]);
     uint vi = packed_vm & 0xffffu;
     float pf = bdpt_verts[rb + 2];
@@ -193,7 +203,7 @@ void scatter_pdf(uint r) {
 
 void scatter_optical(uint r) {
     int rb = bdpt_optical_base + int(r) * BDPT_OPTICAL_STRIDE;
-    uint sid = floatBitsToUint(bdpt_verts[rb + 0]);
+    uint sid = exact_subpath_id(bdpt_verts[rb + 0]);
     uint packed_ve = floatBitsToUint(bdpt_verts[rb + 1]);
     uint vi = packed_ve & 0xffffu;
     uint packed_rf = floatBitsToUint(bdpt_verts[rb + 2]);

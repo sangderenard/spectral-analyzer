@@ -123,6 +123,38 @@ def _once(source,old,new):
     if source.count(old)!=1:raise ValueError('opaque PBR shader seam changed: '+old[:80])
     return source.replace(old,new,1)
 
+def _conserved_edge_budget(source):
+    """User-approved same-incident offers, proportional budget, actual debit.
+
+    Only the explicitly corrected Studio source is specialized. Native edge
+    eligibility, Keller offers, directions, phase and queue bounds are retained.
+    """
+    start=source.index('void spawn_edge_diffraction(')
+    stop=source.index('    // Keller diffraction-cone direction',start)
+    prefix=source[start:stop]
+    offer=prefix.replace('void spawn_edge_diffraction(', 'float studio_edge_offer(',1)
+    offer=offer.replace('return;', 'return 0.0;')+'    return keller;\n}\n'
+    globals_='bool studio_edge_enqueued=false;\nfloat studio_edge_share=0.0;\n'
+    source=source[:start]+globals_+offer+source[start:]
+    source=_once(source, '    // Keller diffraction-cone direction (random azimuth, same polar angle as rd)',
+        '    keller=studio_edge_share;\n    if(!(keller>0.0))return;\n    // Keller diffraction-cone direction (random azimuth, same polar angle as rd)')
+    stored='    pending_rays[idx].normal_triid = vec4(hit_normal, uintBitsToFloat(uint(tri_id)));'
+    source=_once(source,stored,stored+'\n    studio_edge_enqueued=true;')
+    calls=[]
+    for a,b in [('v0_e','v1_e'),('v1_e','v2_e'),('v2_e','v0_e')]:
+        calls.append(f'            spawn_edge_diffraction(hp, rd, packet, bounce, {a}, {b}, n, hit, rng);')
+    old='\n'.join(calls)
+    new='            vec3 offers=vec3(0.0);\n'
+    for i,(a,b) in enumerate([('v0_e','v1_e'),('v1_e','v2_e'),('v2_e','v0_e')]):
+        new+=f'            if(uPendingCap>0)offers[{i}]=studio_edge_offer(hp,rd,packet,bounce,{a},{b},n,hit,rng);\n'
+    new+='            float total=offers.x+offers.y+offers.z;\n            float scale=total>packet.z?packet.z/total:1.0;\n            vec3 shares=offers*scale;\n            float sent=0.0;\n'
+    for i,call in enumerate(calls):
+        new+=f'            studio_edge_share=shares[{i}];studio_edge_enqueued=false;\n'+call+'\n'
+        new+='            if(studio_edge_enqueued)sent+=studio_edge_share;\n'
+    new+='            float studio_edge_remainder=packet.z>0.0?max(0.0,1.0-sent/packet.z):1.0;\n            packet.z*=studio_edge_remainder;'
+    return _once(source,old,new)
+
+
 def with_opaque_pbr(source,*,camera=False):
     """Compose only on explicit corrected Studio jobs; old sources stay intact."""
     if 'bool studio_pbr_opaque(' in source:raise ValueError('opaque PBR helper already installed')
@@ -138,7 +170,10 @@ def with_opaque_pbr(source,*,camera=False):
     else:
         anchor='        if(spectral_reflector)reflectivity=studio_reflector_rho(tri,packet.x,cos_i);'
         if source.count(anchor)!=2:raise ValueError('forward/reactive opaque material seam changed')
-        source=source.replace(anchor,anchor+'\n'+FORWARD,1)
+        source=_conserved_edge_budget(source)
+        # Native edges must run before opaque PBR can break or continue.
+        edge_end='        if ((mat_flags_bits & MAT_FLAG_ABSORBER) != 0u) break;'
+        source=_once(source,edge_end,edge_end+'\n'+FORWARD)
         location=source.index('void reactive_main(uint gid, inout uint rng) {')
         source=source[:location]+source[location:].replace(anchor,anchor+'\n'+FORWARD.replace('path_len+=best;',''),1)
         # A finite bounce budget is the work bound. No positive weighted packet

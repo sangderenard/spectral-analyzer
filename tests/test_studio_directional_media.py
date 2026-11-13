@@ -66,7 +66,7 @@ def test_observer_receives_entry_packet_and_scalar_and_beer_are_unchanged(region
         assert "studio_record_root_weight" in result and "uStudioRecordMin" in result
 
 
-def test_unimplemented_grid_composition_and_changed_laws_fail_closed():
+def test_incomplete_grid_composition_and_changed_laws_fail_closed():
     recorded = recording_shader(canonical_source())
     with pytest.raises(ValueError, match="joint attenuation"):
         with_internal_medium_recording(recorded, volume_extinction=True)

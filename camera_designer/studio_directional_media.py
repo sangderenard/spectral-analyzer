@@ -81,6 +81,52 @@ def _replace_once(source, old, new):
     return source.replace(old, new, 1)
 
 
+def _joint_volume_glsl(source):
+    """Specialize the installed ExtinctionGrid traversal for observation only.
+
+    The grid is declared additional extinction. The authoritative material
+    coefficient is constant within each actual traced segment, so adding it in
+    each existing grid interval integrates their product, not two integrals.
+    Keep the original transport helper byte-for-byte and fail if it changes.
+    """
+    from camera_designer.studio_volume_extinction import GLSL
+    if source.count(GLSL) != 1:
+        raise ValueError("joint attenuation requires the exact installed ExtinctionGrid helper")
+    begin = GLSL.index("vec2 studio_volume_path(")
+    end = GLSL.index("float studio_volume_transmit(")
+    helper = GLSL[begin:end]
+    helper = _replace_once(helper, "vec2 studio_volume_path(vec3 a, vec3 b) {",
+        "vec2 studio_record_volume_path(vec3 a, vec3 b, float material_sigma) {")
+    helper = _replace_once(helper, "if(!(meters>0.0))return vec2(1.0,0.0);",
+        "if(any(isnan(delta)) || any(isinf(delta)) || isnan(meters) || isinf(meters) ||\n"
+        "       (meters==0.0 && any(notEqual(delta,vec3(0.0)))))return vec2(uintBitsToFloat(0x7fc00000u));\n"
+        "    if(!(meters>0.0))return vec2(1.0,0.0);\n"
+        "    if(isnan(material_sigma) || material_sigma<0.0)return vec2(uintBitsToFloat(0x7fc00000u));\n"
+        "    if(isinf(material_sigma))return vec2(0.0);")
+    outside = "vec2(exp(-material_sigma*meters),studio_record_medium_integral(material_sigma,0.0,meters))"
+    if helper.count("vec2(1.0,meters)") != 2:
+        raise ValueError("canonical ExtinctionGrid outside intervals changed")
+    helper = helper.replace("vec2(1.0,meters)", outside)
+    helper = _replace_once(helper, "float cursor=first,transmit=1.0,integral=first;",
+        "float cursor=first,transmit=exp(-material_sigma*first),integral=studio_record_medium_integral(material_sigma,0.0,first);")
+    helper = _replace_once(helper,
+        "float sigma=studio_sigma_t[(q.z*uVolumeExtinctionDims.y+q.y)*uVolumeExtinctionDims.x+q.x];",
+        "float sigma=material_sigma+studio_sigma_t[(q.z*uVolumeExtinctionDims.y+q.y)*uVolumeExtinctionDims.x+q.x];")
+    helper = _replace_once(helper, "float attenuation=exp(-tau);",
+        "float attenuation=span>0.0?exp(-tau):1.0;")
+    helper = _replace_once(helper,
+        "float weighted= tau<0.001 ? span*(1.0-tau*0.5+tau*tau/6.0) : (1.0-attenuation)/sigma;",
+        "float weighted=studio_record_medium_integral(sigma,0.0,span);")
+    helper = _replace_once(helper,
+        "if(next>=last)return vec2(transmit,integral+transmit*(meters-last));",
+        "if(next>=last)return vec2(transmit*exp(-material_sigma*(meters-last)),integral+transmit*studio_record_medium_integral(material_sigma,0.0,meters-last));")
+    helper = _replace_once(helper,
+        "return vec2(transmit,integral+transmit*(meters-cursor));",
+        "// Incomplete traversal is unknown, never a vacuum remainder.\n"
+        "    return vec2(uintBitsToFloat(0x7fc00000u));")
+    return helper
+
+
 def with_internal_medium_recording(source, *, volume_extinction=False):
     """Specialize an already assembled directional forward shader.
 
@@ -88,22 +134,41 @@ def with_internal_medium_recording(source, *, volume_extinction=False):
     starts before the two canonical Beer updates and receives entry throughput.
     The scalar splat remains under its original exterior-only guard.
 
-    An optional ExtinctionGrid is not silently multiplied with a separate Beer
-    integral: the product needs integration over both cell partitions. Until
-    that composition is supplied, explicitly refuse this combination.
+    If the exact ExtinctionGrid specialization is already installed, derive an
+    observer-only joint integral from its own cell traversal. Primary material
+    and grid attenuation, packet arithmetic and scalar splats stay untouched.
+    Host admission remains a separate gate; this is not hardware validation.
     """
-    if volume_extinction or "studio_volume_path(" in source or "studio_sigma_t[" in source:
-        raise ValueError("internal directional recording with ExtinctionGrid requires joint attenuation integration")
     if "studio_record_medium_integral(" in source:
         raise ValueError("internal directional recording is already installed")
+    joint_volume = volume_extinction or "studio_volume_path(" in source or "studio_sigma_t[" in source
     helpers = medium_rate_glsl(source) + INTEGRAL_GLSL
+    if joint_volume:
+        helpers += _joint_volume_glsl(source)
     source = _replace_once(source, "void studio_record_segment(vec3 a,vec3 b,vec4 packet) {",
         helpers + "\nvoid studio_record_segment(vec3 a,vec3 b,vec4 packet,int medium) {\n"
         "    if(medium < -1)return; // invalid ownership is not air or glass\n"
         "    float studio_record_sigma=studio_record_medium_sigma(medium,packet.x);\n"
         "    if(isnan(studio_record_sigma) || studio_record_sigma<0.0)return;")
-    source = _replace_once(source, "studio_record_track(q,d,packet,next-cursor);",
-        "studio_record_track(q,d,packet,studio_record_medium_integral(studio_record_sigma,cursor,next));")
+    if joint_volume:
+        failure = re.findall(r"atomicOr\(studio_directional\[\d+\],2\);", source)
+        if len(failure) != 1:
+            raise ValueError("canonical directional incomplete-traversal marker changed")
+        source = _replace_once(source,
+            "float length_m=length(delta);\n    if(!(length_m>0.0))return;",
+            "float length_m=length(delta);\n"
+            "    if(any(isnan(delta)) || any(isinf(delta)) || isnan(length_m) || isinf(length_m) ||\n"
+            "       (length_m==0.0 && any(notEqual(delta,vec3(0.0))))) { " + failure[0] + "return; }\n"
+            "    if(!(length_m>0.0))return;")
+        source = _replace_once(source,
+            "studio_record_track(q,d,packet,studio_volume_transmit(a,a+d*cursor)*studio_volume_path(a+d*cursor,a+d*next).y);",
+            "{ vec2 entry=studio_record_volume_path(a,a+d*cursor,studio_record_sigma);\n"
+            "          vec2 within=studio_record_volume_path(a+d*cursor,a+d*next,studio_record_sigma);\n"
+            "          if(any(isnan(entry)) || any(isnan(within)) || any(isinf(entry)) || any(isinf(within))) { " + failure[0] + "return; }\n"
+            "          studio_record_track(q,d,packet,entry.x*within.y); }")
+    else:
+        source = _replace_once(source, "studio_record_track(q,d,packet,next-cursor);",
+            "studio_record_track(q,d,packet,studio_record_medium_integral(studio_record_sigma,cursor,next));")
     # The recorder was deliberately co-located with the old air-only scalar
     # splats. Remove only that observer call; do not relax the scalar guards.
     for call in ("splat_segment_multiscale(ro, hp, packet, path_len);",

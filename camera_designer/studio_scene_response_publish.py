@@ -3,7 +3,7 @@ import hashlib,json,os,re,time,uuid
 from pathlib import Path
 import numpy as np
 from .studio_response_product import response_lock,_atomic
-from .studio_scene_responses import validate_scene_response_snapshot
+from .studio_scene_responses import validate_scene_response_snapshot,SCHEMA,PAIR_SCHEMA,ANCESTRY_SCHEMA
 NAME=re.compile(r'^light-scene-response-([0-9a-f]{32})\.bin$')
 MAX_BYTES=64*1024*1024
 MAX_FILES=3
@@ -29,7 +29,9 @@ class SceneResponsePublisher:
                 if path.is_symlink() or path.stat().st_size>8*1024*1024:return False
                 receipt=json.loads(path.read_text(encoding='utf-8'));name=receipt['name']
                 if (not isinstance(name,str) or not NAME.fullmatch(name) or name in names
-                        or receipt.get('schema')!='studio-scene-responses-v1' or receipt.get('digest')!=self.digest
+                        or receipt.get('schema') not in (SCHEMA,PAIR_SCHEMA,ANCESTRY_SCHEMA) or receipt.get('digest')!=self.digest
+                        or not isinstance(receipt.get('metadata'),dict)
+                        or receipt.get('metadata',{}).get('schema')!=receipt.get('schema')
                         or path not in (sidecar_path(self.output/name),sidecar_path(self.output/name).with_suffix('.retired'))
                         or type(receipt.get('byte_length')) is not int or not 0<=receipt['byte_length']<=MAX_BYTES
                         or not isinstance(receipt.get('sha256'),str) or not re.fullmatch('[0-9a-f]{64}',receipt['sha256'])):
@@ -83,7 +85,7 @@ class SceneResponsePublisher:
         with response_lock(self.output):
             if not self._room_locked():return self.latest
             name='light-scene-response-'+uuid.uuid4().hex+'.bin';path=self.output/name
-            receipt=dict(schema='studio-scene-responses-v1',digest=self.digest,live_revision=int(live_revision),
+            receipt=dict(schema=metadata['schema'],digest=self.digest,live_revision=int(live_revision),
                 sequence=self.sequence+1,application_ready=False,name=name,byte_length=len(payload),
                 sha256=hashlib.sha256(payload).hexdigest(),metadata=metadata)
             receipt_bytes=json.dumps(receipt,separators=(',',':'),allow_nan=False).encode()

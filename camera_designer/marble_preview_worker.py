@@ -731,6 +731,8 @@ def run(payload: Path, config_path: Path, output: Path, *,
     from camera_designer.studio_forward_field import ForwardFieldPublisher, validate_receive_light_field
     receive_light_field = validate_receive_light_field(config)
     response_requested=config.get("light_field_information")=="evaluated-responses-v1"
+    from camera_designer.studio_response_factory import camera_record_mode
+    camera_pairs=camera_record_mode(config)=='interval-responses-v2'
     if response_requested:
         raise RuntimeError("evaluated scene responses execution held: hardware compile resource validation pending")
     if response_requested and (not receive_light_field or transport!="fixed:3" or tiles or cooperative or bounce_mode!="manual"):
@@ -913,6 +915,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
         surface_transport=surface_transport,
         light_field_internal_media=config.get("light_field_internal_media",False),
         light_field_information=config.get("light_field_information"),
+        light_field_reactive_queue=config.get("light_field_reactive_queue"),
         **(dict(forward_response_consumer=response_consumer,forward_response_identity=dict(scene_revision=retained_scene_identity(config,vertices,material_ids,pbr),population_index=0,source_population_seed=config.get('emitter_sampling',{}).get('seed',42)),
             forward_response_reserved_bytes=response_reservation['total']) if response_requested else {}),
         directional_quantization_divisor=(16777216 if config.get('emitter_sampling',{}).get('refresh_each_sweep') else 65535),
@@ -932,7 +935,7 @@ def run(payload: Path, config_path: Path, output: Path, *,
             current=current_scene_query_metadata(state,response_consumer,state.get('response_live_revision',0))
             try:return build_scene_application(store,film_response=film_response,compile_program=renderer._prog,memory_budget_bytes=application_bytes,current_metadata=current)
             finally:renderer._restore_prebuilt_bindings(state)
-        response_consumer.application_builder=build_recorded_application
+        if not camera_pairs:response_consumer.application_builder=build_recorded_application
         state["_response_extra_arrays"]=(scene,nodes,ids,vertices,material_ids,pbr)
     if receive_light_field:
         state["geometry_sha256"] = config.get("geometry_sha256")
@@ -1047,8 +1050,9 @@ def run(payload: Path, config_path: Path, output: Path, *,
         response_owner=None
         if response_requested:
             from camera_designer.studio_response_factory import make_response_owner
-            response_owner=make_response_owner(config,sensor_state,frame_camera,consume=response_consumer.consume_camera_samples,
-                extra_arrays=sensor_state['_response_extra_arrays'],completed_samples=True,
+            response_owner=make_response_owner(config,sensor_state,frame_camera,
+                consume=response_consumer.consume_camera_pairs if camera_pairs else response_consumer.consume_camera_samples,
+                extra_arrays=sensor_state['_response_extra_arrays'],completed_samples=not camera_pairs,
                 sensor_reserved_bytes=response_reservation['total']-response_consumer.memory_budget_bytes-application_bytes,
                 retention_reserved_bytes=response_consumer.memory_budget_bytes+application_bytes)
             response_owner._response_extra_arrays=sensor_state['_response_extra_arrays']

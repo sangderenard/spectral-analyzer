@@ -26,7 +26,8 @@ def test_exact_actual_response_is_evaluated_once(region,corrected):
 @pytest.mark.parametrize('spheres',[False,True])
 @pytest.mark.parametrize('terminal_only',[False,True])
 @pytest.mark.parametrize('region',[False,True])
-def test_copied_response_compiles_offline_without_gpu(tmp_path,region,terminal_only,spheres):
+@pytest.mark.parametrize('queue_ancestry',[False,True])
+def test_copied_response_compiles_offline_without_gpu(tmp_path,region,terminal_only,spheres,queue_ancestry):
     import shutil,subprocess
     from camera_designer.spectral_sensor_basis import FIXED3_SPECTRAL_GLSL
     from camera_designer.studio_diffuse_surface import STUDIO_DIFFUSE_GLSL
@@ -43,7 +44,13 @@ def test_copied_response_compiles_offline_without_gpu(tmp_path,region,terminal_o
         source=with_sphere_regions(source)
     from camera_designer.studio_scalar_visits import with_scalar_visits
     from camera_designer.studio_scalar_columns import with_scalar_columns
-    source,seams=copy_forward_responses(with_scalar_columns(with_scalar_visits(with_opaque_pbr(source)),3,shared=True),terminal_only=terminal_only,shared_scalar_buffer=True,precleared_rows=True)
+    source=with_opaque_pbr(source)
+    if queue_ancestry:
+        from camera_designer.studio_directional_field import recording_shader
+        from camera_designer.studio_directional_media import with_internal_medium_recording
+        from camera_designer.studio_forward_responses import with_queued_ray_ancestry
+        source=with_queued_ray_ancestry(with_internal_medium_recording(recording_shader(source,estimator='track-length-root-sweep-v1')))
+    source,seams=copy_forward_responses(with_scalar_columns(with_scalar_visits(source),3,shared=True),terminal_only=terminal_only,shared_scalar_buffer=True,precleared_rows=True,queue_ancestry=queue_ancestry)
     path=tmp_path/'forward_responses.comp';path.write_text(source,encoding='utf-8')
     result=subprocess.run([shutil.which('glslangValidator'),str(path)],capture_output=True,text=True,timeout=20)
     assert result.returncode==0,result.stdout+result.stderr
@@ -52,10 +59,10 @@ def test_copied_response_compiles_offline_without_gpu(tmp_path,region,terminal_o
 def test_exact_dispatch_storage_does_not_shrink_original_schedule():
     from camera_designer.studio_forward_responses import dispatch_storage_plan
     plan=dispatch_storage_plan(8192,6,reserved_bytes=0)
-    assert plan['capacity_rows']==49152
-    assert plan['buffer_bytes']==25165832
-    assert plan['peak_bytes']==50331664
-    assert dispatch_storage_plan(512,6,reserved_bytes=0)['buffer_bytes']==1572872
+    assert plan['capacity_rows']==98304
+    assert plan['buffer_bytes']==50331656
+    assert plan['peak_bytes']==100663312
+    assert dispatch_storage_plan(512,6,reserved_bytes=0)['buffer_bytes']==3145736
     with pytest.raises(MemoryError,match='peak requires'):
         dispatch_storage_plan(8192,6,reserved_bytes=500*1024*1024)
     with pytest.raises(MemoryError,match='SSBO limit'):
@@ -65,7 +72,7 @@ def test_exact_dispatch_storage_does_not_shrink_original_schedule():
 def test_terminal_mode_keeps_intermediate_attributes_out_of_row_count():
     source=runpy.run_path(str(Path(__file__).with_name('test_studio_directional_media.py')))['canonical_source']()
     copied,_=copy_forward_responses(with_opaque_pbr(source),terminal_only=True)
-    assert not any('studio_response_copy('+str(k)+'u,' in copied for k in (1,2,3,4))
+    assert not any('studio_response_copy('+str(k)+'u,' in copied for k in (1,3,4))
     assert 'studio_response_stage_factors[0]=(studio_copied_factor)' in copied
     assert copied.count('studio_response_stage_presence=0u;')==3 # declaration and two original loops
     assert copied.count('rand01(rng)')==with_opaque_pbr(source).count('rand01(rng)')
@@ -185,7 +192,7 @@ def test_borrowed_terminal_reset_and_close_never_touch_other_views():
     import numpy as np
     from camera_designer.studio_forward_responses import ForwardResponseCopies
     class SharedGL(FakeResponseGL):
-        def __init__(self):super().__init__();self.data=bytearray([165])*(64+8+512);self.size=len(self.data)
+        def __init__(self):super().__init__();self.data=bytearray([165])*(64+8+1024);self.size=len(self.data)
         def glBufferSubData(self,target,offset,size,data):self.data[offset:offset+size]=data.tobytes()
         def glClearBufferSubData(self,target,internal,offset,size,format_,type_,data):self.data[offset:offset+size]=b'\0'*size
         def glGetBufferSubData(self,target,offset,size):return bytes(self.data[offset:offset+size])
@@ -194,7 +201,7 @@ def test_borrowed_terminal_reset_and_close_never_touch_other_views():
     m=dict(scene_revision='s',population_index=0,source_sha256='h',dispatch_id=0,path_family='forward',ray_offset=0,ray_count=1,bounce_limit=1,seed=1,root_sampling={})
     owner.begin(1,m)
     assert gl.data[:64]==bytes([165])*64
-    assert gl.data[64:]==b'\0'*(8+512)
+    assert gl.data[64:]==b'\0'*(8+1024)
     assert owner.finish()==0
     owner.close();assert gl.deleted==[]
 

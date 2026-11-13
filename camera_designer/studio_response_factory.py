@@ -4,6 +4,15 @@ import numpy as np
 MEMORY_BUDGET_BYTES=512*1024*1024
 
 
+def camera_record_mode(config):
+    """Extra interval evidence is explicit; existing completed samples stay default."""
+    mode=config.get('light_field_camera_records')
+    if mode is None:return 'completed-samples-v1'
+    if mode!='interval-responses-v2' or config.get('light_field_information')!='evaluated-responses-v1':
+        raise ValueError('camera interval records require explicit evaluated-response information opt-in')
+    return mode
+
+
 def identity(value):
     return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
 
@@ -49,6 +58,8 @@ def field_reserved_bytes(state,extra_arrays=()):
 
 
 def make_response_owner(config,state,camera,*,consume,extra_arrays=(),sensor_reserved_bytes=0,completed_samples=False,retention_reserved_bytes=0):
+    mode=camera_record_mode(config)
+    if mode=='interval-responses-v2' and completed_samples:raise ValueError('interval response mode cannot substitute completed samples')
     if config.get('light_field_information') is None:return None
     if config.get('light_field_information')!='evaluated-responses-v1':raise ValueError('unsupported response-copy opt-in')
     if not callable(consume):raise TypeError('synchronous native component consumer is required')
@@ -92,6 +103,7 @@ def rebind_response_owner(accumulator,state,camera):
             from camera_designer.studio_forward_responses import dispatch_storage_plan
             forward.plan=dispatch_storage_plan(forward.ray_count,forward.bounce_limit,
                 reserved_bytes=reserved-forward.plan['buffer_bytes']+int(getattr(owner,'_allocated_bytes',0)),
+                consumer_bytes=forward.plan['consumer_bytes'],
                 max_ssbo_bytes=forward.plan['buffer_bytes'],budget_bytes=MEMORY_BUDGET_BYTES)
         consumer=getattr(owner.consume,'target',owner.consume)
         if consumer is not None:consumer.reserved_bytes=reserved
@@ -178,6 +190,9 @@ class SceneResponseConsumer:
     def consume_camera_samples(self,metadata,rows):
         self._store(metadata).consume_camera_samples(metadata,rows)
         self.current_camera_metadata=dict(metadata)
+    def consume_camera_pairs(self,metadata,intervals,responses):
+        self._store(metadata).consume_camera_pairs(metadata,intervals,responses)
+        # A paired observation is not a completed sample/current RGB query.
     def snapshot(self):
         if self.store is None:raise ValueError('no actual native scene response received')
         application=self.application_builder(self.store) if self.application_builder is not None else None
@@ -214,6 +229,11 @@ def selected_sensor_reservation(config,source_rows,*,retention_bytes):
     readback_work=w*h*bands*8*12
     capacity=w*min(16,h)
     camera_copy=3*(8+capacity*512)+16*capacity+4096
+    if camera_record_mode(config)=='interval-responses-v2':
+        bounces=config.get('max_bounces',4)
+        if type(bounces) is not int or not 1<=bounces<=200:raise ValueError('explicit bounded camera bounce count required')
+        capacity*=bounces+1
+        camera_copy=4*(8+capacity*512)+16*capacity+4096
     return dict(total=retention_bytes+history+outputs+source_copies+readback_work+camera_copy,
         retention=retention_bytes,history=history,outputs=outputs,source_copies=source_copies,
         readback_work=readback_work,camera_copy=camera_copy,width=w,height=h)

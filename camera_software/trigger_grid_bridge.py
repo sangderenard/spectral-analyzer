@@ -7,6 +7,10 @@ a second mixer or changes the graph schema.
 from __future__ import annotations
 
 import base64
+import math
+import json
+import re
+import torch
 from io import BytesIO
 from threading import RLock
 
@@ -17,7 +21,9 @@ from camera_software.trigger_bus import CAMERA_TRIGGER_PORTS, make_camera_trigge
 from camera_software.trigger_bus import resolve_camera_trigger_bus
 from camera_software.exposure_timing import ExposureFrame, ExposureSlice
 from camera_software.trigger_generators import GENERATOR_KEYS, generator_tail_s, validate_generators
-from routing_engine import RoutingGraph
+from routing_engine import RoutingGraph, TensorPortContract, EdgeTransferSpec
+from graph_solver import TensorNode
+from network_materializer import compile_nodes, routing_edge_to_tensor_edge
 
 
 class CameraTriggerGrid:
@@ -26,10 +32,14 @@ class CameraTriggerGrid:
 
     def __init__(self, receivers, buses=(), saved=None, generators=None):
         self.lock = RLock()
+        self._radio_runtime = None
+        self._radio_signature = None
         self.receivers = tuple(receivers)
         self.buses = tuple(buses)
         self.generators = validate_generators(generators)
-        expected = (*CAMERA_TRIGGER_PORTS, *self.buses, *self.receivers, *GENERATOR_KEYS)
+        radio_keys = tuple(key for key in (saved or {}).get("nodes", [])
+                           if isinstance(key, str) and (key == "radio:rms" or re.fullmatch(r"radio:band:([1-9]|[1-9][0-9]|1[01][0-9]|12[0-8])", key)))
+        expected = (*CAMERA_TRIGGER_PORTS, *self.buses, *self.receivers, *GENERATOR_KEYS, *radio_keys)
         if len(expected) > 200:
             raise ValueError("camera routing grid exceeds 200 named nodes")
         graph = make_camera_trigger_graph(self.receivers, bus_keys=self.buses, generator_keys=GENERATOR_KEYS)
@@ -92,3 +102,76 @@ class CameraTriggerGrid:
             return {"step_ms":1,"duration_ms":duration_ms,"shop_cutoff_end_ms":11,
                     "signals":{key:[abs(value) for value in result.signals[key]] for key in self.receivers},
                     "graph":self.graph.to_dict()}
+
+    def radio(self, snapshot):
+        """Patch authenticated Nodus telemetry into the original routing graph.
+
+        NRAD is a sampled level feed, not PCM. No FFT, beat inference, or new
+        light source is introduced here. Timing-sensitive delayed wires need a
+        timestamped signal stream; refusing them is preferable to pretending
+        browser polling is an audio clock.
+        """
+        with self.lock:
+            if snapshot.get("status") != "live":
+                self._radio_runtime = None
+                self._radio_signature = None
+                return {"status": snapshot.get("status", "unavailable"), "active": [], "gains": {}}
+            bands = snapshot.get("bands")
+            rms = snapshot.get("rms")
+            if not isinstance(bands, list) or not 1 <= len(bands) <= 128:
+                raise ValueError("radio requires 1..128 measured spectral bands")
+            if any(type(x) not in (int, float) or not math.isfinite(x) or x < 0 for x in [rms, *bands]):
+                raise ValueError("radio requires finite nonnegative measured levels")
+            inputs = {"radio:rms": rms, **{f"radio:band:{i+1}": value for i, value in enumerate(bands)}}
+            existing = {key for key in self.graph.node_keys() if key.startswith("radio:")}
+            if existing and existing != set(inputs):
+                raise ValueError("radio band layout changed; reset the routing graph before reconnecting")
+            if len(set(self.graph.node_keys()) | set(inputs)) > 200:
+                raise ValueError("camera routing grid exceeds 200 named nodes")
+            added = False
+            for key in inputs:
+                if key not in self.graph.node_keys():
+                    if len(self.graph.node_keys()) >= 200:
+                        raise ValueError("camera routing grid exceeds 200 named nodes")
+                    self.graph.add_node(key)
+                    added = True
+            sources = {key for key in self.graph.node_keys() if key.startswith("radio:")}
+            if sources != set(inputs):
+                raise ValueError("radio band layout changed; reset the routing graph before reconnecting")
+            validate_flash_illumination_graph(self.graph)
+            for edge in self.graph.edges:
+                if edge.dst_key in sources:
+                    raise ValueError("radio measurement source ports cannot receive patched signals")
+                if edge.delay_s or getattr(edge, "delay_samples", 0):
+                    raise ValueError("sampled radio preview requires zero-delay wires; use the timestamped audio bus for delays")
+                if not math.isfinite(edge.weight) or not math.isfinite(edge.angle_rad):
+                    raise ValueError("radio routing gains and phase must be finite")
+                if edge.tensor_contract != TensorPortContract() or edge.transfer_spec != EdgeTransferSpec():
+                    raise ValueError("radio level preview requires scalar identity transport")
+                if edge.saturation or edge.edge_kind not in ("signal", "control"):
+                    raise ValueError("radio level preview requires linear signal/control edges")
+            if self.graph.param_edges or self.graph.meta_edges or self.graph.feedback.enabled or self.graph.latency_compensation:
+                raise ValueError("radio level preview requires the linear routing graph")
+            signature = json.dumps(self.graph.to_dict(), sort_keys=True)
+            if signature != self._radio_signature:
+                self._radio_runtime = compile_nodes(
+                    [TensorNode(key) for key in self.graph.node_keys()],
+                    [routing_edge_to_tensor_edge(edge) for edge in self.graph.edges],
+                    sample_rate=1, output_node_keys=list(self.receivers))
+                self._radio_signature = signature
+            resolved = self._radio_runtime.process_window(
+                {key: torch.tensor([value], dtype=torch.complex128) for key, value in inputs.items()}, n_frames=1)
+            if any(not torch.isfinite(value).all() for value in resolved.values()):
+                raise ValueError("radio routing resolved a non-finite signal")
+            # Reachability only selects overridden receivers. GraphSolver owns
+            # the actual transfer, including chained buses and complex phase.
+            reached = set(sources)
+            while True:
+                more = {edge.dst_key for edge in self.graph.edges if edge.src_key in reached and abs(edge.weight) > 1e-12}
+                if more <= reached: break
+                reached.update(more)
+            result = {"status": "live", "active": [key for key in self.receivers if key in reached],
+                      "gains": {key: abs(complex(resolved[key].reshape(-1)[0].item())) for key in self.receivers},
+                      "frame": snapshot.get("frame"), "transport_contract": self._radio_runtime.transport_contract()}
+            if added: result.update(self.frame())
+            return result

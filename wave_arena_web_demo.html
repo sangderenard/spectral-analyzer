@@ -21,21 +21,22 @@ input[type=range]{width:100%;accent-color:#68d7ef}select{width:100%;padding:9px;
 .guide{margin-top:18px;padding:20px 24px;background:#101d2d;border:1px solid #294157;border-radius:16px}.guide h2{margin-bottom:10px}.guide p{color:#b7c9d9;margin:8px 0}.guide strong{color:#e4f6ff}.guide details{margin-top:10px;color:#a8c2d5}.guide summary{cursor:pointer;color:#8fe2ff}
 @media(max-width:1050px){main{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.panels{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}header{display:block}.badge{display:inline-block;margin-top:12px}}
 </style>
-<header><div><h1>T4 Wave Arena</h1><p>Shape two coherent emitters, then watch the complex field propagate through the native angular-spectrum kernel.</p></div><div class="badge">Native T4 · live field</div></header>
+<header><div><h1>T4 Wave Arena</h1><p>Shape coherent beams, slits, or an annular source, then watch the complex field propagate through the native angular-spectrum kernel.</p></div><div class="badge">Native T4 · live field</div></header>
 <main>
 <aside>
 <h2>Arena setup</h2>
-<div class="control"><label for="preset">Starting setup</label><select id="preset"><option value="interference">Twin beam interference</option><option value="single">Single beam diffraction</option><option value="close">Close coherent pair</option><option value="wide">Wide fringe field</option><option value="violet">Violet tight focus</option></select></div>
+<div class="control"><label for="preset">Starting setup</label><select id="preset"><option value="interference">Twin beam interference</option><option value="single">Single beam diffraction</option><option value="close">Close coherent pair</option><option value="wide">Wide fringe field</option><option value="violet">Violet tight focus</option><option value="slits">Two-slit fringes</option><option value="ring">Infrared ring and centre</option></select></div>
 <button id="loadPreset" class="secondary">Load setup</button>
+<div class="control"><label for="pattern">Source geometry</label><select id="pattern"><option value="pair">Gaussian pair</option><option value="slits">Two slits</option><option value="ring">Annulus and centre</option></select></div>
 <div class="control"><label for="size">Grid</label><select id="size"><option>64</option><option selected>128</option><option>256</option></select></div>
 <div id="controls"></div>
-<div class="actions"><button id="apply">Apply & reset</button><button id="play">Pause</button><button id="single" class="secondary">Step once</button></div>
+<div class="actions"><button id="apply">Apply & reset</button><button id="play">Pause</button><button id="single" class="secondary">Step once</button><button id="savePower" class="secondary">Save power PNG</button><button id="copyLink" class="secondary">Copy setup link</button></div>
 <p class="hint">Changing parameters resets the field. Pause to inspect a frame. Forward and reverse travel alternate so interference can be watched repeatedly.</p>
 </aside>
 <section class="workspace">
 <div class="metrics"><div class="metric"><span>Kernel steps</span><strong id="generation">0</strong></div><div class="metric"><span>Travel</span><strong id="distance">0 mm</strong></div><div class="metric"><span>Direction</span><strong id="direction">Forward</strong></div><div class="metric"><span>Field power / input</span><strong id="retention">—</strong></div></div>
 <div class="panels"><div class="display"><h3>POWER</h3><img id="power" alt="Evolving wave field power"><p>Intensity on a common scale fixed at the initial peak.</p></div><div class="display"><h3>RELATIVE PHASE</h3><img id="phase" alt="Evolving complex phase"><p>Hue shows phase. Uniform piston phase is removed for inspection.</p></div><div class="display"><h3>CHANGE FROM SOURCE</h3><img id="change" alt="Change from initial complex field"><p>Magnitude of the complex difference from the starting field.</p></div></div>
-<div class="guide"><h2>Reading the field</h2><p><strong>Power</strong> is light-field intensity: bright places carry more energy. The beam can spread and interfere even when total field power stays near 1.00000.</p><p><strong>Relative phase</strong> is the wave's local timing. Its rainbow colours mark angle in the complex plane, not the light's visible colour. Watch bands bend where the emitters overlap.</p><p><strong>Change</strong> compares the current complex field with the starting field. It includes phase change, so it can glow where power appears similar.</p><details><summary>Ways to play</summary><p>Try <strong>Single beam diffraction</strong> to see spreading without a second source. Then load <strong>Close coherent pair</strong> and adjust their relative phase: the interference pattern moves. Increase <strong>distance per step</strong> to advance farther each tick; increase <strong>travel range</strong> to let the field evolve longer before reversing. <strong>Pixel pitch</strong> changes the physical width and sampling of the arena. Reset after changing a control.</p><p>The display shows a sampled transverse plane of a propagating field. It is the native T4 angular-spectrum transform with retained field buffers, not a photograph or the full ray-pipeline arena.</p></details></div>
+<div class="guide"><h2>Reading the field</h2><p><strong>Power</strong> is light-field intensity: bright places carry more energy. The beam can spread and interfere even when total field power stays near 1.00000.</p><p><strong>Relative phase</strong> is the wave's local timing. Its rainbow colours mark angle in the complex plane, not the light's visible colour. Watch bands bend where the emitters overlap.</p><p><strong>Change</strong> compares the current complex field with the starting field. It includes phase change, so it can glow where power appears similar.</p><details><summary>Ways to play</summary><p>Try <strong>Two-slit fringes</strong> and vary separation to move the fringe spacing. <strong>Infrared ring and centre</strong> shows that the same field solver handles a nonvisible wavelength; its display colours are explanatory, not an IR photograph. <strong>Close coherent pair</strong> lets relative phase move the interference pattern. Distance per step advances farther each tick; travel range sets the reversal point. Pixel pitch changes the arena's physical width and sampling. Apply to reset after editing a control.</p><p>The display shows a sampled transverse plane of a propagating field. It is the native T4 angular-spectrum transform with retained field buffers, not a photograph or the full ray-pipeline arena.</p></details></div>
 <div id="status" class="status" role="status">Connecting to local wave kernel…</div>
 </section>
 </main>
@@ -48,15 +49,17 @@ const specs=[
   ['waist_fraction','Emitter waist','of grid',0.02,0.25,0.005,0.075],
   ['separation_fraction','Emitter separation','of grid',0,0.3,0.005,0.12],
   ['tilt_fraction','Wavefront tilt scale','of grid',0.1,1,0.01,0.28],
-  ['relative_amplitude','Second emitter strength','×',0,1.5,0.01,0.82],
-  ['relative_phase','Second emitter phase','rad',-3.14,3.14,0.01,0.72],
+  ['relative_amplitude','Secondary source strength','×',0,1.5,0.01,0.82],
+  ['relative_phase','Secondary source phase','rad',-3.14,3.14,0.01,0.72],
 ];
 const presets={
-  interference:{size:128,wavelength_nm:532,pitch_um:1.5,step_um:25,travel_steps:80,waist_fraction:.075,separation_fraction:.12,tilt_fraction:.28,relative_amplitude:.82,relative_phase:.72},
-  single:{size:128,wavelength_nm:532,pitch_um:1.2,step_um:35,travel_steps:110,waist_fraction:.035,separation_fraction:0,tilt_fraction:.65,relative_amplitude:0,relative_phase:0},
-  close:{size:128,wavelength_nm:580,pitch_um:1,step_um:18,travel_steps:140,waist_fraction:.065,separation_fraction:.055,tilt_fraction:.45,relative_amplitude:1,relative_phase:1.57},
-  wide:{size:256,wavelength_nm:650,pitch_um:1.5,step_um:35,travel_steps:120,waist_fraction:.09,separation_fraction:.18,tilt_fraction:.16,relative_amplitude:1,relative_phase:0},
-  violet:{size:128,wavelength_nm:405,pitch_um:.8,step_um:12,travel_steps:130,waist_fraction:.03,separation_fraction:.08,tilt_fraction:.25,relative_amplitude:.9,relative_phase:2.3},
+  interference:{size:128,pattern:'pair',wavelength_nm:532,pitch_um:1.5,step_um:25,travel_steps:80,waist_fraction:.075,separation_fraction:.12,tilt_fraction:.28,relative_amplitude:.82,relative_phase:.72},
+  single:{size:128,pattern:'pair',wavelength_nm:532,pitch_um:1.2,step_um:35,travel_steps:110,waist_fraction:.035,separation_fraction:0,tilt_fraction:.65,relative_amplitude:0,relative_phase:0},
+  close:{size:128,pattern:'pair',wavelength_nm:580,pitch_um:1,step_um:18,travel_steps:140,waist_fraction:.065,separation_fraction:.055,tilt_fraction:.45,relative_amplitude:1,relative_phase:1.57},
+  wide:{size:256,pattern:'pair',wavelength_nm:650,pitch_um:1.5,step_um:35,travel_steps:120,waist_fraction:.09,separation_fraction:.18,tilt_fraction:.16,relative_amplitude:1,relative_phase:0},
+  violet:{size:128,pattern:'pair',wavelength_nm:405,pitch_um:.8,step_um:12,travel_steps:130,waist_fraction:.03,separation_fraction:.08,tilt_fraction:.25,relative_amplitude:.9,relative_phase:2.3},
+  slits:{size:256,pattern:'slits',wavelength_nm:450,pitch_um:.8,step_um:20,travel_steps:120,waist_fraction:.05,separation_fraction:.09,tilt_fraction:.5,relative_amplitude:1,relative_phase:0},
+  ring:{size:128,pattern:'ring',wavelength_nm:850,pitch_um:1.1,step_um:15,travel_steps:120,waist_fraction:.045,separation_fraction:.15,tilt_fraction:.5,relative_amplitude:.55,relative_phase:1.2},
 };
 const byId=id=>document.getElementById(id);
 const controls=byId('controls');
@@ -82,11 +85,18 @@ function present(state){
   status(`Native T4 · ${state.config.size}² grid · ${state.config.wavelength_nm} nm`);
 }
 async function request(payload){if(busy)return;busy=true;try{present(await post('/api/wave_arena',payload))}catch(error){playing=false;byId('play').textContent='Resume';status(error.message,true)}finally{busy=false}}
-byId('apply').onclick=()=>{const config={size:Number(byId('size').value)};for(const [key] of specs)config[key]=Number(byId(key).value);request({op:'configure',...config})};
-byId('loadPreset').onclick=()=>{const config=presets[byId('preset').value];byId('size').value=String(config.size);for(const [key] of specs){byId(key).value=String(config[key]);byId(key).dispatchEvent(new Event('input'))}request({op:'configure',...config})};
+function currentConfig(){const config={size:Number(byId('size').value),pattern:byId('pattern').value};for(const [key] of specs)config[key]=Number(byId(key).value);return config}
+byId('apply').onclick=()=>request({op:'configure',...currentConfig()});
+byId('loadPreset').onclick=()=>{const config=presets[byId('preset').value];byId('size').value=String(config.size);byId('pattern').value=config.pattern;for(const [key] of specs){byId(key).value=String(config[key]);byId(key).dispatchEvent(new Event('input'))}request({op:'configure',...config})};
+byId('savePower').onclick=()=>{const a=document.createElement('a');a.href=byId('power').src;a.download=`t4-wave-power-${seen}.png`;a.click()};
+byId('copyLink').onclick=async()=>{try{const url=new URL(location.href);url.search=new URLSearchParams(currentConfig()).toString();await navigator.clipboard.writeText(url.href);status('Setup link copied')}catch(error){status(String(error.message||error),true)}};
 byId('play').onclick=()=>{playing=!playing;byId('play').textContent=playing?'Pause':'Resume'};
 byId('single').onclick=()=>request({op:'step',count:1});
 async function tick(){if(playing)await request({op:'step',count:1});timer=setTimeout(tick,90)}
-fetch('/api/wave_arena').then(r=>r.json()).then(present).then(tick).catch(error=>status(error.message,true));
+const shared=new URLSearchParams(location.search);
+const sharedConfig=Object.fromEntries([...shared].filter(([key])=>key==='size'||key==='pattern'||specs.some(([name])=>name===key)));
+const startup=Object.keys(sharedConfig).length?post('/api/wave_arena',{op:'configure',...sharedConfig}):fetch('/api/wave_arena').then(r=>{if(!r.ok)throw Error(`HTTP ${r.status}`);return r.json()});
+startup.then(state=>{byId('size').value=String(state.config.size);byId('pattern').value=state.config.pattern;for(const [key] of specs){byId(key).value=String(state.config[key]);byId(key).dispatchEvent(new Event('input'))}present(state);tick()}).catch(error=>status(error.message,true));
+if(location.pathname==='/wave_arena.html'){const nav=document.createElement('script');nav.type='module';nav.src='/site-nav.js';nav.dataset.siteNav='allow';document.head.append(nav)}
 </script>
 </html>

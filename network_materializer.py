@@ -133,6 +133,7 @@ class CompiledGraph:
     solver: object
     output_node_keys: list[str]
     module_registry: dict[str, nn.Module]
+    execution: str = "interpreted"
 
     def _select_products(
         self,
@@ -155,11 +156,17 @@ class CompiledGraph:
     ) -> Dict[str, torch.Tensor]:
         """Process one tensor window without projecting away complex state."""
 
+        feeds = inputs or {}
+        if self.execution == "numpy":
+            feeds = {key: value.data if isinstance(value, Tensor) else value
+                     for key, value in feeds.items()}
         values = self.solver.run_schedule(
-            inputs or {},
+            feeds,
             n_frames=max(1, int(n_frames)),
             on_progress=on_progress,
         )
+        if self.execution == "numpy":
+            values = {key: torch.tensor(value, dtype=_CDTYPE) for key, value in values.items()}
         return self._select_products(values, product_keys)
 
     def process_sample(
@@ -170,6 +177,8 @@ class CompiledGraph:
     ) -> Dict[str, torch.Tensor]:
         """Advance a stateful context by one causal sample."""
 
+        if self.execution == "numpy":
+            raise ValueError("NumPy graph product currently supports process_window, not training steps")
         values = self.solver.step(inputs or {})
         return self._select_products(values, product_keys)
 
@@ -186,6 +195,8 @@ class CompiledGraph:
         return {
             "schema": "complex-network-context-v1",
             "engine": "graph_solver",
+            "execution": self.execution,
+            "source_digest": getattr(type(self.solver), "__numpy_lowering_digest__", None),
             "representation": "torch.complex128" if BACKEND == "torch" else "abstract.complex128",
             "sample_rate": float(self.solver.sample_rate),
             "entry": "named_complex_ports",
@@ -209,6 +220,7 @@ def compile_nodes(
     sample_rate: float,
     *,
     output_node_keys: "Optional[List[str]]" = None,
+    execution: str = "interpreted",
 ) -> CompiledGraph:
     """Construct a GraphSolver runtime bundle from pre-built nodes and edges.
 
@@ -234,7 +246,21 @@ def compile_nodes(
     except Exception:
         fifo_bank = None
 
-    solver = _gs.GraphSolver(nodes=nodes, edges=edges, sample_rate=float(sample_rate), fifo_bank=fifo_bank)
+    if execution not in ("interpreted", "numpy"):
+        raise ValueError("graph execution must be interpreted or numpy")
+    solver_type = _gs.GraphSolver
+    if execution == "numpy":
+        if BACKEND != "abstract":
+            raise ValueError("NumPy lowering requires the AbstractTensor source backend")
+        if any(node.transform is not None or getattr(node, "analytic_module", None) is not None
+               or getattr(node, "archetype_key", None) for node in nodes):
+            raise ValueError("NumPy deployment currently accepts linear nodes without analytic modules")
+        if any(edge.delay_s or edge.delay_samples or edge.saturation_fn is not None
+               or edge.fifo_bank is not None or edge.activity_contract
+               or edge.src_addresses or edge.dst_addresses for edge in edges):
+            raise ValueError("NumPy deployment currently accepts zero-delay local linear edges")
+        solver_type = _numpy_graph_solver_class()
+    solver = solver_type(nodes=nodes, edges=edges, sample_rate=float(sample_rate), fifo_bank=fifo_bank)
 
     node_keys = {node.key for node in nodes}
     if output_node_keys is not None:
@@ -253,7 +279,41 @@ def compile_nodes(
         solver=solver,
         output_node_keys=out_keys,
         module_registry=module_registry,
+        execution=execution,
     )
+
+
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
+def _numpy_graph_solver_class():
+    """Instantiate the existing compiler's product, never a second solver.
+
+    The process-local product keeps its source digest; no compiler intermediates
+    are written into the repository. Reload the process to pick up source edits.
+    """
+    import inspect
+    from src.compiler.fused_program_python_backend import lower_functions_to_numpy
+
+    gs = _import_gs()
+    product = lower_functions_to_numpy(
+        [], namespace=vars(gs),
+        owned=lambda value: getattr(value, "__module__", None) == gs.__name__,
+        subclass_methods={
+            gs.GraphSolver: tuple(name for name, value in gs.GraphSolver.__dict__.items()
+                                  if inspect.isfunction(value)),
+            gs.TensorEdge: ("apply",),
+        },
+    )
+    scope = {name: vars(gs)[name] for name in product.injected if name in vars(gs)}
+    missing = set(product.injected) - set(scope)
+    if missing:
+        raise ValueError(f"NumPy graph product requires unbound host names: {sorted(missing)}")
+    exec(compile(product.source, f"<graph_solver_numpy_{product.digest}>", "exec"), scope)
+    solver_type = scope["GraphSolver"]
+    solver_type.__numpy_lowering_digest__ = product.digest
+    return solver_type
 
 # ---------------------------------------------------------------------------
 # Lazy imports — kept at function scope to avoid hard circular dependencies

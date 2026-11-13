@@ -50,6 +50,11 @@ def main():
     routed=radio.radio(measured)
     assert routed["active"] == ["shop:17"] and abs(routed["gains"]["shop:17"]-.1)<1e-12
     assert routed["transport_contract"]["engine"] == "graph_solver"
+    expected_execution = os.environ.get("SPECTRAL_RADIO_EXECUTION", "interpreted")
+    assert routed["transport_contract"]["execution"] == expected_execution
+    if expected_execution == "numpy":
+        assert routed["transport_contract"]["source_digest"]
+        assert type(radio._radio_runtime.solver).__name__ == "GraphSolver"
     assert radio.radio({"status":"stale"})["active"] == []
     restored=CameraTriggerGrid(["shop:17", "studio:0"], ["rack:center"], saved=radio.graph.to_dict())
     assert abs(restored.radio(measured)["gains"]["shop:17"]-.1)<1e-12

@@ -40,3 +40,24 @@ were already installed. Eight actual GraphSolver schedules ran. This removes
 the prior Torch-free-process blocker for the tested grid path, without a new
 worker or solver. Deployment environment/import wiring and source publication
 remain; no live server was started or restarted by this test.
+
+## Opt-in emitted NumPy radio runtime
+
+With Turing compiler e4eee8ae available, additionally set
+SPECTRAL_RADIO_EXECUTION=numpy before importing the grid. Only the radio preview
+chooses this explicitly; ordinary pulse/general materializer calls remain
+interpreted. compile_nodes(execution="numpy") rejects analytic/nonlinear nodes,
+delays and externally addressed/FIFO edges until those complete deployment
+contracts are validated. No unsupported feature silently falls back.
+
+The existing lower_functions_to_numpy emits the actual GraphSolver and edge
+application methods. Its product is cached once in process memory, with a source
+digest in transport_contract; no generated source/cache is written into a repo.
+CompiledGraph unwraps input tensors and rewraps numeric products at its public
+boundary, preserving original grid consumers. Training/sample stepping is refused
+for this inference-only product; no claim of full graph lowering or LLVM.
+
+Actual Torch-free service interpreter ran the original grid fixture with
+SPECTRAL_TENSOR_BACKEND=abstract, SPECTRAL_RADIO_EXECUTION=numpy and the isolated
+compiler on PYTHONPATH: PASS, including assertions execution=numpy and nonempty
+source_digest. No live restart/deployment or browser capture performed here.

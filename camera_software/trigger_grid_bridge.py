@@ -10,6 +10,7 @@ import base64
 import math
 import json
 import re
+import os
 from signal_tensor_backend import tensor as torch, Tensor, nn, COMPLEX, FLOAT64, FLOAT32, INT64, BOOL, CPU
 from io import BytesIO
 from threading import RLock
@@ -157,7 +158,8 @@ class CameraTriggerGrid:
                 self._radio_runtime = compile_nodes(
                     [TensorNode(key) for key in self.graph.node_keys()],
                     [routing_edge_to_tensor_edge(edge) for edge in self.graph.edges],
-                    sample_rate=1, output_node_keys=list(self.receivers))
+                    sample_rate=1, output_node_keys=list(self.receivers),
+                    execution=os.environ.get("SPECTRAL_RADIO_EXECUTION", "interpreted"))
                 self._radio_signature = signature
             resolved = self._radio_runtime.process_window(
                 {key: torch.tensor([value], dtype=COMPLEX) for key, value in inputs.items()}, n_frames=1)

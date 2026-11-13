@@ -66,3 +66,34 @@ Verification: `python -m pytest tests/test_wave_t4_pipeline.py
 tests/test_studio_optical_media.py tests/test_optical_transport_graph.py
 tests/test_complex_optical_operators.py -q` passed 95 tests, including the
 per-lane native attenuation trial, after the native rebuild.
+
+## Subsequent native T3 region work (2026-11-13)
+
+The CPU T1/T3 kernel now accepts Studio's validated region identities and
+exact sphere owner records through `RayTracer.set_studio_regions` and
+`set_studio_spheres`. It resolves the medium from the first crossing of each
+authored boundary, including host, dye, rod, bubble and standalone material
+roles. Segment propagation uses the resolved base index and additive dye
+extinction. T3 probes both sides of a transmissive hit for its refractive
+indices. Exact sphere intersections compete with mesh triangles, and the
+owner triangle retains its material and region ID. A separate zero-threshold
+membership query prevents the ordinary ray self-hit threshold from erasing
+1 pm sided probes; the transport intersection keeps its original self-hit
+gate. The micrometre triangle test and an exact sphere inside a host cube
+both reach the native T3 pipeline.
+
+`native_t5_scene_inputs` preserves the authored region/sphere records and
+`create_native_t5_tracer` installs them with the existing native tracer. The
+GPU all-stages path refuses Studio region scenes because its T1/T3 shaders
+do not yet consume those records. Axial rod bundles are also refused because
+their affine ownership is not represented by this CPU resolver.
+
+This completes **region-side CPU transport admission only**. It does not
+instantiate wavelength-tuned T4 patches at arbitrary mesh/sphere hits, cover
+all subject interfaces, resolve an authored bundle, or deliver a native Studio
+photo. Coherent fan-in remains the next problem **after** the complete T3 to
+T4 surface handoff, not part of this CPU region result. The focused rebuilt
+native suite (`test_studio_sphere_regions.py`, `test_studio_optical_media.py`,
+`test_wave_t4_pipeline.py`, `test_studio_atlas_rest.py`,
+`test_native_small_surface_transport.py`, and `test_studio_region_gpu.py`)
+passed 73 tests; this is no claim of a rendered exposure.

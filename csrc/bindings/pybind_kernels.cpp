@@ -4661,6 +4661,70 @@ struct PyRayTracer
             throw std::runtime_error("ray_tracer_set_tri_boundary_media failed: rc=" + std::to_string(rc));
     }
 
+    void set_studio_regions(
+        py::array_t<int, py::array::c_style | py::array::forcecast> records,
+        py::array_t<int, py::array::c_style | py::array::forcecast> triangle_region_ids)
+    {
+        if (!handle || _pipeline)
+            throw std::runtime_error("Studio regions must be installed before pipeline creation");
+        const auto r = records.request();
+        const auto ids = triangle_region_ids.request();
+        if (r.ndim != 2 || r.shape[1] != 2 || r.shape[0] < 1 ||
+            ids.ndim != 1 || ids.shape[0] != _n_tris)
+            throw std::invalid_argument("Studio regions require (N,2) records and one ID per triangle");
+        std::vector<RtStudioRegionRecord> native(static_cast<size_t>(r.shape[0]));
+        const int* values = static_cast<const int*>(r.ptr);
+        for (size_t i = 0; i < native.size(); ++i)
+            native[i] = {values[2*i], values[2*i+1]};
+        const int rc = ray_tracer_set_studio_regions(
+            handle, static_cast<int>(native.size()), native.data(),
+            static_cast<const int*>(ids.ptr));
+        if (rc != SK_OK)
+            throw std::invalid_argument("native Studio region ownership was refused");
+    }
+
+    void set_studio_spheres(
+        py::array_t<double, py::array::c_style | py::array::forcecast> records)
+    {
+        if (!handle || _pipeline)
+            throw std::runtime_error("Studio spheres must be installed before pipeline creation");
+        const auto r = records.request();
+        if (r.ndim != 2 || r.shape[1] != 5 || r.shape[0] < 1)
+            throw std::invalid_argument("Studio spheres require (N,5) center/radius/owner records");
+        std::vector<RtStudioSphereRecord> native(static_cast<size_t>(r.shape[0]));
+        const double* values = static_cast<const double*>(r.ptr);
+        for (size_t i = 0; i < native.size(); ++i) {
+            const double* row = values + i * 5;
+            if (!std::isfinite(row[4]) || row[4] != std::floor(row[4]))
+                throw std::invalid_argument("Studio sphere owner must be an exact triangle ID");
+            native[i] = {{row[0], row[1], row[2]}, row[3], static_cast<int>(row[4])};
+        }
+        if (ray_tracer_set_studio_spheres(handle, static_cast<int>(native.size()), native.data()) != SK_OK)
+            throw std::invalid_argument("native exact Studio spheres were refused");
+    }
+
+    py::dict resolve_studio_medium(
+        py::array_t<double, py::array::c_style | py::array::forcecast> position,
+        py::array_t<double, py::array::c_style | py::array::forcecast> direction,
+        py::array_t<double, py::array::c_style | py::array::forcecast> frequencies_hz)
+    {
+        const auto p = position.request(), d = direction.request(), f = frequencies_hz.request();
+        if (p.size != 3 || d.size != 3 || f.ndim != 1 || f.size < 1 || f.size > _n_bands)
+            throw std::invalid_argument("Studio medium query requires a point, direction and transport frequencies");
+        py::array_t<double> real(f.size), imag(f.size);
+        int base = -1;
+        const int rc = ray_tracer_resolve_studio_medium(
+            handle, static_cast<const double*>(p.ptr), static_cast<const double*>(d.ptr),
+            static_cast<int>(f.size), static_cast<const double*>(f.ptr), &base,
+            static_cast<double*>(real.mutable_data()), static_cast<double*>(imag.mutable_data()));
+        if (rc != SK_OK) throw std::runtime_error("native Studio medium ownership is unresolved");
+        py::dict out;
+        out["base_material"] = base;
+        out["n_real"] = std::move(real);
+        out["n_imag"] = std::move(imag);
+        return out;
+    }
+
     /** Project a (N, 14) float32 multiscale segment array onto a coherent
      *  complex sensor image.  Returns (out_re, out_im) each shape
      *  (n_bands, sensor_h, sensor_w) float32, accumulative (NOT zeroed here).
@@ -7648,6 +7712,15 @@ Use -1 for ambient air/vacuum.
 Refraction then uses crossing direction directly (front-face: + -> -,
 back-face: - -> +) instead of material-equality toggles.
 )doc")
+        .def("set_studio_regions", &PyRayTracer::set_studio_regions,
+             py::arg("records"), py::arg("triangle_region_ids"),
+             "Install authenticated Studio region ownership before native pipeline creation.")
+        .def("set_studio_spheres", &PyRayTracer::set_studio_spheres,
+             py::arg("records"),
+             "Install exact Studio sphere boundaries with their material owner triangles.")
+        .def("resolve_studio_medium", &PyRayTracer::resolve_studio_medium,
+             py::arg("position"), py::arg("direction"), py::arg("frequencies_hz"),
+             "Resolve native real/imaginary medium indices for a ray-side point.")
         .def("project_coherent", &PyRayTracer::project_coherent,
              py::arg("segs"),
              py::arg("n_bands"),

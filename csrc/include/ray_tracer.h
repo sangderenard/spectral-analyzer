@@ -1062,6 +1062,55 @@ SK_API int ray_tracer_set_tri_boundary_media(
     int             medium_neg_mat_idx
 );
 
+/* Authenticated Studio volume membership for native CPU T1/T3. Region zero
+ * is the host. Modes are host=0, glass rod=1, injection dye=2, air bubble=3,
+ * standalone dielectric=4;
+ * a bubble has material -1. Each triangle has a region ID or -1 for ordinary
+ * geometry. The native path builds one BVH per region at installation and
+ * resolves membership from geometry on each segment; no material-ID guess or
+ * last-entered stack is used. GPU all-stages submission must refuse this
+ * contract until its region buffer and traversal are wired. */
+typedef struct {
+    int mode;
+    int material_index;
+} RtStudioRegionRecord;
+
+SK_API int ray_tracer_set_studio_regions(
+    RayTracerState* st,
+    int n_regions,
+    const RtStudioRegionRecord* records,
+    const int* triangle_region_ids
+);
+
+/* Exact Studio sphere rows retain the degenerate owner triangle for material
+ * and region identity. Install before pipeline creation. */
+typedef struct {
+    double center[3];
+    double radius;
+    int owner_triangle;
+} RtStudioSphereRecord;
+
+SK_API int ray_tracer_set_studio_spheres(
+    RayTracerState* st,
+    int n_spheres,
+    const RtStudioSphereRecord* spheres
+);
+
+/* Resolve the authored medium at an arbitrary ray-side point. This is the
+ * cold/public T3 -> T4 handoff: the caller supplies transport frequencies and
+ * receives real/imaginary indices from the exact MatBuf authority, including
+ * additive dye extinction. A nonzero result refuses ambiguous ownership. */
+SK_API int ray_tracer_resolve_studio_medium(
+    const RayTracerState* st,
+    const double position[3],
+    const double direction[3],
+    int n_frequencies,
+    const double* frequencies_hz,
+    int* out_base_material,
+    double* out_n_real,
+    double* out_n_imag
+);
+
 /**
  * Project a multiscale segment buffer onto a coherent complex sensor image.
  *

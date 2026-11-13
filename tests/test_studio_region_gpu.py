@@ -64,7 +64,35 @@ def test_native_t5_scene_handoff_keeps_authored_region_identity():
     native=native_t5_scene_inputs(scene,[.55])
     np.testing.assert_array_equal(native['boundary_tags'],geom[:,[3,7]])
     np.testing.assert_array_equal(native['region_records'][:,:2],[[0,0],[2,1],[3,-1]])
+    np.testing.assert_array_equal(native['native_region_media'],[[0,0],[2,1],[3,-1]])
+    np.testing.assert_array_equal(native['tri_region_ids'],[0,1,2,-1])
     np.testing.assert_array_equal(native['emitter_tri_ids'],[3])
+
+
+def test_native_t5_scene_preserves_exact_sphere_owner():
+    from camera_designer.studio_t5_scene import native_t5_scene_inputs, create_native_t5_tracer
+    from mat_flags import MAT_FLAG_EMISSIVE, MAX_SPECTRAL_BANDS
+    geom=np.zeros((2,16),np.float32)
+    shade=np.zeros((2,16),np.float32)
+    shade[:,14]=np.arange(2,dtype=np.int32).view(np.float32)
+    geom[1,15]=np.array([MAT_FLAG_EMISSIVE],np.uint32).view(np.float32)[0]
+    materials=np.zeros((2*MAX_SPECTRAL_BANDS,12),np.float32)
+    materials[MAX_SPECTRAL_BANDS,5]=1
+    tri=np.zeros((2,3,3),np.float32)
+    tri[0]=[.01,.02,.03]
+    tri[1,1]=[1,0,0];tri[1,2]=[0,1,0]
+    sphere=np.array([[.01,.02,.03,.002,0,0,0,0]],np.float32)
+    scene=(geom,shade,materials,tri,np.empty((0,8),np.float32),{},
+           (np.full(3,-1,np.float32),np.ones(3,np.float32)),np.empty((0,12),np.float32))
+    native=native_t5_scene_inputs(scene,[.55],sphere)
+    np.testing.assert_array_equal(native['exact_spheres'],sphere[:,:5])
+    tracer=create_native_t5_tracer(scene,[.55],sphere)
+    try:
+        assert tracer is not None
+    finally:
+        tracer.stop_pipeline()
+    with pytest.raises(ValueError,match='owner must be'):
+        native_t5_scene_inputs(scene,[.55],np.array([[.01,.02,.03,.002,1,0,0,0]],np.float32))
 
 
 def test_region_thresholds_are_coordinated_and_scale_relative():

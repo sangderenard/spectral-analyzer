@@ -89,6 +89,7 @@ static_assert(sizeof(FilmRecord) == 64 * sizeof(float),
 #include <iomanip>
 #include <map>
 #include <memory>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <string>
@@ -246,11 +247,15 @@ struct Triangle {
 static bool ray_triangle_hit(
     const V3d& orig, const V3d& dir,
     const Triangle& tri,
-    double& t_out)
+    double& t_out, double min_t = T_SELF)
 {
     V3d h = dir.cross(tri.edge2);
     double a = tri.edge1.dot(h);
-    if (std::abs(a) < EPS)
+    // Match Studio's scale-relative boundary determinant. An absolute
+    // threshold discards micron-scale triangles before T3 can identify their
+    // authored medium interface or admit a wavelength-sized wave lamina.
+    const double det_scale = tri.edge1.norm() * tri.edge2.norm() * dir.norm();
+    if (!(det_scale > 0.0) || std::abs(a) < 1e-8 * det_scale)
         return false;           /* ray parallel to triangle */
 
     double f = 1.0 / a;
@@ -265,7 +270,7 @@ static bool ray_triangle_hit(
         return false;
 
     double t = f * tri.edge2.dot(q);
-    if (t <= T_SELF)
+    if (t <= min_t)
         return false;           /* behind or at origin */
 
     t_out = t;
@@ -287,8 +292,9 @@ struct AABB {
     void expand(const AABB& o) { expand(o.lo); expand(o.hi); }
 
     /* Slab test.  inv_dir = 1/dir (IEEE-754 handles ±inf correctly). */
-    bool hit(const V3d& orig, const V3d& inv_dir, double t_max) const {
-        double tmin = T_SELF;
+    bool hit(const V3d& orig, const V3d& inv_dir, double t_max,
+             double min_t = T_SELF) const {
+        double tmin = min_t;
         for (int i = 0; i < 3; ++i) {
             double a = (lo[i] - orig[i]) * inv_dir[i];
             double b = (hi[i] - orig[i]) * inv_dir[i];
@@ -359,7 +365,7 @@ static void bvh_query(
     const std::vector<int>&      tri_ids,
     const std::vector<Triangle>& tris,
     const V3d& orig, const V3d& dir, const V3d& inv_dir,
-    double& t_min, int& hit_tri)
+    double& t_min, int& hit_tri, double min_t = T_SELF)
 {
     int stack[64];
     int sp = 0;
@@ -368,7 +374,7 @@ static void bvh_query(
     while (sp > 0) {
         const BVHNode& node = nodes[static_cast<size_t>(stack[--sp])];
 
-        if (!node.aabb.hit(orig, inv_dir, t_min))
+        if (!node.aabb.hit(orig, inv_dir, t_min, min_t))
             continue;
 
         if (node.left == -1) {
@@ -376,8 +382,8 @@ static void bvh_query(
             for (int i = node.tri_start; i < node.tri_end; ++i) {
                 int ti = tri_ids[static_cast<size_t>(i)];
                 double t;
-                if (ray_triangle_hit(orig, dir, tris[static_cast<size_t>(ti)], t)
-                    && t > T_SELF && t < t_min)
+                if (ray_triangle_hit(orig, dir, tris[static_cast<size_t>(ti)], t, min_t)
+                    && t > min_t && t < t_min)
                 {
                     t_min   = t;
                     hit_tri = ti;
@@ -635,6 +641,18 @@ struct RtWaveContextLink {
     std::vector<float> jones_im;
 };
 
+struct RtStudioRegion {
+    RtStudioRegionRecord record{};
+    std::vector<int> tri_ids;
+    std::vector<BVHNode> bvh;
+};
+
+struct RtStudioSphere {
+    V3d center;
+    double radius = 0.0;
+    int owner_triangle = -1;
+};
+
 struct RayTracerState {
     std::vector<Triangle>       tris;
     std::vector<BVHNode>        bvh_nodes;
@@ -660,6 +678,9 @@ struct RayTracerState {
     RtMaterialSurfaceCache      surf_cache;      /* precomputed GGX/enamel lookups   */
     std::vector<RtScaleContext> scale_contexts; /* multi-scale zones, smallest-radius-first */
     std::vector<RtWaveContextLink> wave_context_links; /* stable context IDs */
+    std::vector<RtStudioRegion> studio_regions; /* authenticated mesh ownership */
+    std::vector<RtStudioSphere> studio_spheres; /* exact authored boundaries */
+    std::vector<int> studio_triangle_region_ids;
     double                      speed_m_s = 343.0; /* cached for context k scaling */
     Eigen::VectorXd             freq_hz_vec; /* cached for context k scaling */
 
@@ -2356,6 +2377,135 @@ static inline double medium_n_real_for_ray(
     return n > EPS ? n : 1.0;
 }
 
+struct RtResolvedStudioMedium {
+    int base_material = -1;
+    std::vector<int> dye_materials;
+    bool valid = true;
+};
+
+static inline double studio_region_epsilon(const V3d& position) {
+    return std::max(1e-12, 2.0 * std::numeric_limits<float>::epsilon()
+        * position.cwiseAbs().maxCoeff());
+}
+
+static bool studio_sphere_query(
+    const RayTracerState& st, const V3d& position, const V3d& direction,
+    int region_filter, double& distance, int& hit_triangle,
+    double min_t = T_SELF);
+
+static V3d studio_outward_normal(
+    const RayTracerState& st, int hit_triangle, const V3d& hit_position)
+{
+    for (const auto& sphere : st.studio_spheres)
+        if (sphere.owner_triangle == hit_triangle)
+            return (hit_position - sphere.center).normalized();
+    return st.tris[static_cast<size_t>(hit_triangle)].normal;
+}
+
+/* Match the authored Studio region resolver: the first forward crossing of
+ * each closed, outward-wound region determines whether the origin is inside.
+ * This is recomputed from geometry, including coincident crossings, so a
+ * reflected/TIR ray never commits a guessed membership stack. */
+static RtResolvedStudioMedium studio_region_medium_at(
+    const RayTracerState& st, const V3d& position, const V3d& direction)
+{
+    RtResolvedStudioMedium medium;
+    if (st.studio_regions.empty()) return medium;
+    if (!(direction.squaredNorm() > 0.0)) { medium.valid = false; return medium; }
+    const V3d inverse = direction.cwiseInverse();
+    bool host = false, bubble = false;
+    int rod = -1, standalone = -1;
+    for (size_t region_id = 0; region_id < st.studio_regions.size(); ++region_id) {
+        const RtStudioRegion& region = st.studio_regions[region_id];
+        double distance = 1e18;
+        int hit = -1;
+        bvh_query(region.bvh, region.tri_ids, st.tris,
+                  position, direction, inverse, distance, hit, 0.0);
+        studio_sphere_query(st, position, direction,
+                            static_cast<int>(region_id), distance, hit, 0.0);
+        V3d normal = V3d::Zero();
+        if (hit >= 0)
+            normal = studio_outward_normal(st, hit, position + direction * distance);
+        if (hit < 0 || direction.dot(normal) <= 0.0)
+            continue;
+        switch (region.record.mode) {
+        case 0: host = true; break;
+        case 1:
+            if (rod >= 0 && rod != region.record.material_index) medium.valid = false;
+            rod = region.record.material_index;
+            break;
+        case 2: medium.dye_materials.push_back(region.record.material_index); break;
+        case 3: bubble = true; break;
+        case 4:
+            if (standalone >= 0) medium.valid = false;
+            standalone = region.record.material_index;
+            break;
+        default: medium.valid = false; break;
+        }
+    }
+    if (standalone >= 0) {
+        if (host || rod >= 0 || bubble || !medium.dye_materials.empty()) medium.valid = false;
+        medium.base_material = standalone;
+    } else if (host) {
+        if (bubble) {
+            if (rod >= 0 || !medium.dye_materials.empty()) medium.valid = false;
+            medium.base_material = -1;
+        } else {
+            if (rod >= 0 && !medium.dye_materials.empty()) medium.valid = false;
+            medium.base_material = rod >= 0 ? rod : st.studio_regions[0].record.material_index;
+        }
+    } else {
+        medium.base_material = -1;
+        medium.dye_materials.clear();
+    }
+    return medium;
+}
+
+int ray_tracer_resolve_studio_medium(
+    const RayTracerState* st,
+    const double position[3], const double direction[3],
+    int n_frequencies, const double* frequencies_hz,
+    int* out_base_material, double* out_n_real, double* out_n_imag)
+{
+    if (!st || !position || !direction || !frequencies_hz ||
+        !out_base_material || !out_n_real || !out_n_imag)
+        return SK_ERR_NULL_STATE;
+    if (st->studio_regions.empty() || n_frequencies < 1 ||
+        n_frequencies > st->n_bands || n_frequencies > 32)
+        return SK_ERR_DIM_MISMATCH;
+    for (int lane = 0; lane < n_frequencies; ++lane)
+        if (!std::isfinite(frequencies_hz[lane]) || frequencies_hz[lane] <= 0.0)
+            return SK_ERR_DIM_MISMATCH;
+    const V3d point(position[0], position[1], position[2]);
+    const V3d ray(direction[0], direction[1], direction[2]);
+    if (!point.allFinite() || !ray.allFinite()) return SK_ERR_DIM_MISMATCH;
+    const RtResolvedStudioMedium medium = studio_region_medium_at(*st, point, ray);
+    if (!medium.valid) return SK_ERR_DIM_MISMATCH;
+    std::vector<double> real(static_cast<size_t>(n_frequencies), 1.0);
+    std::vector<double> imag(static_cast<size_t>(n_frequencies), 0.0);
+    for (int lane = 0; lane < n_frequencies; ++lane) {
+        const double frequency = frequencies_hz[lane];
+        if (medium.base_material >= 0) {
+            real[static_cast<size_t>(lane)] = mat_field_at_frequency(
+                *st, medium.base_material, lane, frequency, 7);
+            imag[static_cast<size_t>(lane)] = mat_field_at_frequency(
+                *st, medium.base_material, lane, frequency, 8);
+            for (int dye : medium.dye_materials)
+                imag[static_cast<size_t>(lane)] += mat_field_at_frequency(
+                    *st, dye, lane, frequency, 8);
+        }
+        if (!std::isfinite(real[static_cast<size_t>(lane)]) ||
+            !std::isfinite(imag[static_cast<size_t>(lane)]) ||
+            real[static_cast<size_t>(lane)] <= 0.0 ||
+            imag[static_cast<size_t>(lane)] < 0.0)
+            return SK_ERR_DIM_MISMATCH;
+    }
+    *out_base_material = medium.base_material;
+    std::copy(real.begin(), real.end(), out_n_real);
+    std::copy(imag.begin(), imag.end(), out_n_imag);
+    return SK_OK;
+}
+
 static inline cd mat_refl_for_ray(
     const RayTracerState& st, int mat_idx, int lane, const RayIntent& ray)
 {
@@ -3707,14 +3857,42 @@ static bool ray_sphere_intersect(
     double& t_enter, double& t_exit)
 {
     V3d oc = orig - center;
+    double a    = dir.squaredNorm();
+    if (!(a > 0.0)) return false;
     double b    = oc.dot(dir);
     double c    = oc.squaredNorm() - radius * radius;
-    double disc = b * b - c;
+    double disc = b * b - a * c;
     if (disc < 0.0) return false;
     double sq = std::sqrt(disc);
-    t_enter = -b - sq;
-    t_exit  = -b + sq;
-    return t_exit > EPS;
+    t_enter = (-b - sq) / a;
+    t_exit  = (-b + sq) / a;
+    return t_exit > 0.0;
+}
+
+static bool studio_sphere_query(
+    const RayTracerState& st, const V3d& position, const V3d& direction,
+    int region_filter, double& distance, int& hit_triangle, double min_t)
+{
+    bool found = false;
+    for (const auto& sphere : st.studio_spheres) {
+        if (region_filter >= 0
+            && (sphere.owner_triangle >= static_cast<int>(
+                    st.studio_triangle_region_ids.size())
+                || st.studio_triangle_region_ids[static_cast<size_t>(
+                    sphere.owner_triangle)] != region_filter))
+            continue;
+        double entry = 0.0, exit = 0.0;
+        if (!ray_sphere_intersect(position, direction, sphere.center,
+                                  sphere.radius, entry, exit))
+            continue;
+        const double t = entry > min_t ? entry : exit;
+        if (t > min_t && t < distance) {
+            distance = t;
+            hit_triangle = sphere.owner_triangle;
+            found = true;
+        }
+    }
+    return found;
 }
 
 /* Write one multiscale segment record (RT_FLOATS_PER_SEG_MS = 14 floats). */
@@ -4413,6 +4591,77 @@ int ray_tracer_set_tri_boundary_media(
         tri.medium_pos_mat_idx = medium_pos_mat_idx;
         tri.medium_neg_mat_idx = medium_neg_mat_idx;
     }
+    return SK_OK;
+}
+
+int ray_tracer_set_studio_regions(
+    RayTracerState* st, int n_regions,
+    const RtStudioRegionRecord* records,
+    const int* triangle_region_ids)
+{
+    if (!st || !records || !triangle_region_ids) return SK_ERR_NULL_STATE;
+    if (n_regions < 1 || n_regions > 1024 || records[0].mode != 0)
+        return SK_ERR_DIM_MISMATCH;
+    std::vector<RtStudioRegion> regions(static_cast<size_t>(n_regions));
+    for (int i = 0; i < n_regions; ++i) {
+        const auto& record = records[i];
+        if ((i == 0 && record.mode != 0)
+            || (i > 0 && (record.mode < 1 || record.mode > 4))
+            || (record.mode == 3 && record.material_index != -1)
+            || (record.mode != 3 && (record.material_index < 0
+                || record.material_index >= st->mat_n_mats)))
+            return SK_ERR_DIM_MISMATCH;
+        regions[static_cast<size_t>(i)].record = record;
+    }
+    for (int ti = 0; ti < static_cast<int>(st->tris.size()); ++ti) {
+        const int id = triangle_region_ids[ti];
+        if (id < -1 || id >= n_regions) return SK_ERR_DIM_MISMATCH;
+        if (id >= 0) regions[static_cast<size_t>(id)].tri_ids.push_back(ti);
+    }
+    std::vector<AABB> bounds(st->tris.size());
+    for (int ti = 0; ti < static_cast<int>(st->tris.size()); ++ti) {
+        const Triangle& tri = st->tris[static_cast<size_t>(ti)];
+        AABB& box = bounds[static_cast<size_t>(ti)];
+        box.expand(tri.v0);
+        box.expand(tri.v0 + tri.edge1);
+        box.expand(tri.v0 + tri.edge2);
+    }
+    for (auto& region : regions) {
+        if (region.tri_ids.empty()) return SK_ERR_DIM_MISMATCH;
+        region.bvh.reserve(region.tri_ids.size() * 2);
+        bvh_build(region.bvh, region.tri_ids, bounds,
+                  0, static_cast<int>(region.tri_ids.size()));
+    }
+    st->studio_regions = std::move(regions);
+    st->studio_triangle_region_ids.assign(
+        triangle_region_ids, triangle_region_ids + st->tris.size());
+    return SK_OK;
+}
+
+int ray_tracer_set_studio_spheres(
+    RayTracerState* st, int n_spheres, const RtStudioSphereRecord* spheres)
+{
+    if (!st || !spheres) return SK_ERR_NULL_STATE;
+    if (n_spheres < 1 || n_spheres > 65) return SK_ERR_DIM_MISMATCH;
+    std::vector<RtStudioSphere> resolved;
+    resolved.reserve(static_cast<size_t>(n_spheres));
+    for (int si = 0; si < n_spheres; ++si) {
+        const auto& source = spheres[si];
+        const V3d center(source.center[0], source.center[1], source.center[2]);
+        if (!center.allFinite() || !std::isfinite(source.radius)
+            || source.radius <= 0.0 || source.owner_triangle < 0
+            || source.owner_triangle >= static_cast<int>(st->tris.size()))
+            return SK_ERR_DIM_MISMATCH;
+        const Triangle& owner = st->tris[static_cast<size_t>(source.owner_triangle)];
+        if (owner.edge1.squaredNorm() != 0.0 || owner.edge2.squaredNorm() != 0.0
+            || (owner.v0 - center).norm() > std::max(1e-8, source.radius * 1e-4))
+            return SK_ERR_DIM_MISMATCH;
+        for (const auto& existing : resolved)
+            if (existing.owner_triangle == source.owner_triangle)
+                return SK_ERR_DIM_MISMATCH;
+        resolved.push_back({center, source.radius, source.owner_triangle});
+    }
+    st->studio_spheres = std::move(resolved);
     return SK_OK;
 }
 
@@ -16700,6 +16949,7 @@ static void pipeline_intersector(RayPipelineState& ps)
                     }
                 }
             }
+            studio_sphere_query(st, pos0, dir, -1, t_hit, hit_tri);
 
             /* Wave arenas are oriented plane-to-plane patches, not spherical
              * annotations. Their axial extent is exactly nz*dz, so routing and
@@ -16743,18 +16993,32 @@ static void pipeline_intersector(RayPipelineState& ps)
             const double tot_len = intent.path_len + t_event;
             VXcd amp_prop        = intent.amp;
             const int nb         = std::min((int)amp_prop.size(), st.n_bands);
+            const bool authored_regions = !st.studio_regions.empty();
+            const RtResolvedStudioMedium segment_medium = authored_regions
+                ? studio_region_medium_at(st, pos0, dir)
+                : RtResolvedStudioMedium{};
+            if (!segment_medium.valid) {
+                fprintf(stderr, "[Studio-region] unresolved native medium at ray segment; cancelling pipeline\n");
+                ps.cancel.store(true, std::memory_order_release);
+                ++finish_count;
+                continue;
+            }
+            const int segment_base = authored_regions
+                ? segment_medium.base_material : intent.medium_mat_idx;
 
             for (int b = 0; b < nb; ++b) {
                 double n_re = 1.0, n_im = 0.0;
-                if (intent.medium_mat_idx >= 0) {
-                    n_re = mat_n_real_for_ray(st, intent.medium_mat_idx, b, intent);
-                    n_im = mat_n_imag_for_ray(st, intent.medium_mat_idx, b, intent);
+                if (segment_base >= 0) {
+                    n_re = mat_n_real_for_ray(st, segment_base, b, intent);
+                    n_im = mat_n_imag_for_ray(st, segment_base, b, intent);
                     if (n_re < 1.0) n_re = 1.0;
                 }
+                for (int dye : segment_medium.dye_materials)
+                    n_im += mat_n_imag_for_ray(st, dye, b, intent);
                 const double frequency_hz = ray_frequency(st, intent, b);
                 double k_med  = TWO_PI * frequency_hz / st.speed_m_s * n_re;
                 double alpha  = st.atmo_abs[b];
-                if (intent.medium_mat_idx >= 0)
+                if (segment_base >= 0)
                     alpha += TWO_PI * frequency_hz * n_im / st.speed_m_s;
                 double atten  = std::exp(-alpha * t_event);
                 /* Backward (sensor-cast) rays are importance-sampling paths, not
@@ -16771,6 +17035,7 @@ static void pipeline_intersector(RayPipelineState& ps)
             if (wave_id >= 0) {
                 WaveIntent wi;
                 wi.ray = intent;
+                if (authored_regions) wi.ray.medium_mat_idx = segment_base;
                 wi.ray.pos = event_pos;
                 wi.ray.amp = amp_prop;
                 wi.ray.path_len = tot_len;
@@ -16795,6 +17060,7 @@ static void pipeline_intersector(RayPipelineState& ps)
             const Triangle& tri = st.tris[static_cast<size_t>(hit_tri)];
             HitRecord hr;
             hr.ray               = intent;
+            if (authored_regions) hr.ray.medium_mat_idx = segment_base;
             hr.ray.amp           = amp_prop;
             hr.ray.path_len      = tot_len;
             hr.seg_start         = pos0;
@@ -16803,7 +17069,7 @@ static void pipeline_intersector(RayPipelineState& ps)
             hr.hit_tri           = hit_tri;
             hr.hit_tri_flags     = tri.flags;
             hr.hit_pos           = hit_pos;
-            hr.hit_n             = tri.normal;
+            hr.hit_n             = studio_outward_normal(st, hit_tri, hit_pos);
             if (dir.dot(hr.hit_n) > 0.0) hr.hit_n = -hr.hit_n;
             hr.t_hit             = t_hit;
             hr.amp_propagated    = amp_prop;
@@ -17406,7 +17672,9 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                               int new_medium = -2) -> RayIntent {
             static constexpr double RAY_ORIGIN_EPS = 2.0e-4;
             RayIntent ri      = hr.ray;
-            ri.pos            = rh.refined_pos + RAY_ORIGIN_EPS * new_dir.normalized();
+            const double origin_eps = st.studio_regions.empty()
+                ? RAY_ORIGIN_EPS : studio_region_epsilon(rh.refined_pos);
+            ri.pos            = rh.refined_pos + origin_eps * new_dir.normalized();
             ri.dir            = new_dir;
             ri.amp            = new_amp;
             ri.path_len       = hr.ray.path_len;
@@ -17478,14 +17746,34 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
         };
 
         const bool mat_transmissive = tri_material_is_transmissive(st, tri);
-        const bool front_face       = (in_dir.dot(tri.normal) < 0.0);
+        const bool front_face       = (in_dir.dot(
+            studio_outward_normal(st, hr.hit_tri, rh.refined_pos)) < 0.0);
         const int spectral_lane = hr.ray.spectral_resolved
             ? static_cast<int>(hr.ray.spectral_lane_id) : 0;
+        RtResolvedStudioMedium region_before, region_after;
+        const bool authored_regions = !st.studio_regions.empty();
+        if (authored_regions && mat_transmissive) {
+            const double offset = studio_region_epsilon(rh.refined_pos);
+            region_before = studio_region_medium_at(
+                st, rh.refined_pos - offset * in_dir, in_dir);
+            region_after = studio_region_medium_at(
+                st, rh.refined_pos + offset * in_dir, in_dir);
+            if (!region_before.valid || !region_after.valid) {
+                fprintf(stderr, "[Studio-region] unresolved native boundary transition; cancelling pipeline\n");
+                ps.cancel.store(true, std::memory_order_release);
+                pipeline_finish_ray(ps, hr.ray.color_flag);
+                continue;
+            }
+        }
 
         if (mat_transmissive) {
             int medium_from = -1, medium_to = -1;
-            const bool has_pair = tri_boundary_media(tri, front_face,
-                                                     medium_from, medium_to);
+            const bool has_pair = authored_regions ? true
+                : tri_boundary_media(tri, front_face, medium_from, medium_to);
+            if (authored_regions) {
+                medium_from = region_before.base_material;
+                medium_to = region_after.base_material;
+            }
             const double n1 = has_pair ? medium_n_real_for_ray(st, medium_from, spectral_lane, hr.ray)
                 : ((hr.ray.medium_mat_idx >= 0)
                    ? mat_n_real_for_ray(st, hr.ray.medium_mat_idx, spectral_lane, hr.ray) : 1.0);
@@ -18003,6 +18291,13 @@ RayPipelineState* ray_pipeline_create(
     auto* ps  = new RayPipelineState();
     ps->st    = st;
     ps->cfg   = cfg ? *cfg : RayPipelineConfig{};
+
+    if (!st->studio_regions.empty() && ps->cfg.use_gpu_compute) {
+        fprintf(stderr,
+                "[Studio-region] native GPU T1/T3 lacks authored region traversal; use CPU stages\n");
+        delete ps;
+        return nullptr;
+    }
 
     for (int i = 0; i < (int)st->scale_contexts.size(); ++i) {
         const RtScaleContext& ctx = st->scale_contexts[static_cast<size_t>(i)];

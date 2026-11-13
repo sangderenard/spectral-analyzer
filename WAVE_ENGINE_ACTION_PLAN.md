@@ -25,6 +25,16 @@ Both use the existing pipeline. T4 additionally owns a persistent contiguous
 state block supplied to its backend as buffers. Neither engine allocates a
 solver or resizes state in the hot dispatch sequence.
 
+For a subject with authored internal media, wave coverage is a wavelength
+tuned margin around **every** authenticated surface and medium transition:
+the exterior, rod and dye interfaces, and each air-bubble boundary. The
+margin is derived from the actual surface and region ownership. A single
+context around the whole subject, or one exterior patch, does not satisfy
+this coverage contract. Where the current fixed T4 grid cannot represent a
+surface margin, compilation must report that boundary as unavailable rather
+than silently substitute coarse wave transport. The local exterior patch in
+the marble trial proves only its own path.
+
 ## Graph and presentation authority
 
 Do not introduce another optical solver or another general graph beside the

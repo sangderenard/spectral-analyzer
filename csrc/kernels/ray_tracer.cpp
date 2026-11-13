@@ -15095,7 +15095,7 @@ public:
 
 /* ── Wave arena helpers ──────────────────────────────────────────────────────────────── */
 
-static void wave_arena_build(
+static bool wave_arena_build(
     WaveArena&               arena,
     int                      id,
     const RtScaleContext&    ctx,
@@ -15232,6 +15232,7 @@ static void wave_arena_build(
                 "[T4] failed to build angular-spectrum plan for %dx%d arena\n",
                 arena.fft_nx, arena.fft_ny);
         fflush(stderr);
+        return false;
     }
     /* Cohort lane budget: room for floor(cohort_lanes / n_bands) independent
      * rays per march, each owning a contiguous n_bands-wide slice. Clamped to
@@ -15258,6 +15259,7 @@ static void wave_arena_build(
         cursor += arena.plane_size;
     }
     arena.state_block.assign(cursor, 0.0f);
+    return true;
 }
 
 static V3d wave_arena_to_local(const WaveArena& a, const V3d& wp)
@@ -18011,12 +18013,16 @@ RayPipelineState* ray_pipeline_create(
                     "1,3,4,8,16,32\n",
                     st->n_bands);
             fflush(stderr);
-            continue;
+            delete ps;
+            return nullptr;
         }
         ps->arenas.emplace_back();
-        wave_arena_build(ps->arenas.back(),
-                         (int)ps->arenas.size() - 1,
-                         ctx, ps->cfg, *st);
+        if (!wave_arena_build(ps->arenas.back(),
+                              (int)ps->arenas.size() - 1,
+                              ctx, ps->cfg, *st)) {
+            delete ps;
+            return nullptr;
+        }
     }
     if (ps->cfg.use_gpu_compute && ps->cfg.gpu_all_stages
         && !ps->arenas.empty()) {

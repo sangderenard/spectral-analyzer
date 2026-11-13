@@ -54,6 +54,13 @@ def _add_arena(tracer):
     )
 
 
+def test_wave_context_rejects_unsupported_exact_lane_count():
+    tracer = _tracer(np.array([450e-9, 550e-9]))
+    _add_arena(tracer)
+    with pytest.raises(RuntimeError, match="ray_pipeline_create failed"):
+        tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+
+
 def test_empty_space_crossing_routes_through_t4():
     tracer = _tracer(np.array([550e-9]))
     _add_arena(tracer)

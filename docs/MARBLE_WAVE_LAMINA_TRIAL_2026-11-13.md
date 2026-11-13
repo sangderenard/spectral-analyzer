@@ -8,6 +8,9 @@ transverse half extent and 0.1 mm long along the optical axis. The requested
 0.2 µm sample pitch is below half of the shortest 450 nm test wavelength;
 the local curvature sag is about 3.2 nm. This trial proves routing and
 sample configuration, not a rendered picture or a wave material bounce.
+The required production coverage is a wavelength tuned margin around every
+subject interface, including both sides of bubbles and rod/dye transitions;
+this one exterior patch does not implement that rule.
 
 T4 now accepts a per-lane imaginary index alongside the existing per-lane
 real index. During each native angular-spectrum step it applies the

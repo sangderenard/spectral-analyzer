@@ -1043,6 +1043,14 @@ class RoutingGridView:
                      canvas_x: int, canvas_y: int) -> bool:
         """Returns True if event was consumed (caller should mark rebuild)."""
         from pygame.locals import K_LSHIFT, K_RSHIFT
+        def _shift_held():
+            # Browser-forwarded events carry their own modifiers. Do not query
+            # the service's keyboard/display for a remote user's input.
+            if hasattr(event, "mod"):
+                return bool(event.mod & pygame.KMOD_SHIFT)
+            held = pygame.key.get_pressed()
+            return held[K_LSHIFT] or held[K_RSHIFT]
+
         keys_list = _routing_grid_node_keys(patch, self.active_key)
         g, _active_router = _active_routing_graph_and_instance(patch, self.active_key)
         tab = self._routing_tab
@@ -1182,8 +1190,7 @@ class RoutingGridView:
             if self._drag_cell is not None:
                 if self._active_cell is not None:
                     ri, ci = self._active_cell
-                    held  = pygame.key.get_pressed()
-                    shift = held[K_LSHIFT] or held[K_RSHIFT] or bool(getattr(event, "mod", 0) & pygame.KMOD_SHIFT)
+                    shift = _shift_held()
                     cur   = _read_cell(ri, ci)
                     _write_cell(ri, ci, _clamp(_snap(cur, shift)))
                 self._drag_cell = None
@@ -1201,8 +1208,7 @@ class RoutingGridView:
                 return True
 
         elif event.type == MOUSEMOTION and self._drag_cell is not None:
-            held  = pygame.key.get_pressed()
-            shift = held[K_LSHIFT] or held[K_RSHIFT] or bool(getattr(event, "mod", 0) & pygame.KMOD_SHIFT)
+            shift = _shift_held()
             dy    = self._drag_y0 - event.pos[1]
             raw   = self._drag_val0 + _delta_from_dy(dy, shift)
             new_v = _clamp(_snap(raw, shift))
@@ -1221,8 +1227,7 @@ class RoutingGridView:
                 self._drag_val0  = self._pending_click_val0
                 self._pending_click = None
                 # Apply the motion that just arrived
-                held  = pygame.key.get_pressed()
-                shift = held[K_LSHIFT] or held[K_RSHIFT] or bool(getattr(event, "mod", 0) & pygame.KMOD_SHIFT)
+                shift = _shift_held()
                 dy    = self._drag_y0 - event.pos[1]
                 raw   = self._drag_val0 + _delta_from_dy(dy, shift)
                 new_v = _clamp(_snap(raw, shift))
@@ -1233,8 +1238,7 @@ class RoutingGridView:
         elif event.type == pygame.MOUSEWHEEL:
             if self._routing_tab == "export":
                 return False
-            held  = pygame.key.get_pressed()
-            shift = held[K_LSHIFT] or held[K_RSHIFT] or bool(getattr(event, "mod", 0) & pygame.KMOD_SHIFT)
+            shift = _shift_held()
             # scroll up (event.y > 0) → show earlier rows/cols → decrease offset
             if shift:
                 self._scroll_col = max(0, min(

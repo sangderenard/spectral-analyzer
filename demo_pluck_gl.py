@@ -10283,7 +10283,8 @@ class SensorAccumulator:
                  n_sources: int = 0,
                  ssbo_spheres: int = 0, n_spheres: int = 0,
                  ssbo_regions: int = 0, n_regions: int = 0, ssbo_native_pbr: int = 0,
-                 *, full_sensor_size: tuple[int, int] | None = None,
+                 *, lens_tilt: tuple[float, float] = (0.0, 0.0),
+                 full_sensor_size: tuple[int, int] | None = None,
                  sensor_origin: tuple[int, int] = (0, 0),
                  volume_extinction=None,surface_transport=None,camera_interval_observer=None,field_continuation=False,light_field_information=None):
         (self._w, self._h), self._full_sensor_size, self._sensor_origin = _sensor_tile_coordinates(
@@ -10376,7 +10377,9 @@ class SensorAccumulator:
         self._tilt_shift = np.asarray(tilt_shift, np.float32).ravel()[:2]
         if self._tilt_shift.size < 2:
             self._tilt_shift = np.zeros(2, np.float32)
-        self._lens_tilt  = np.zeros(2, np.float32)   # Scheimpflug tilt (x=nod, y=pan)
+        self._lens_tilt = np.asarray(lens_tilt, np.float32).ravel()[:2]
+        if self._lens_tilt.size < 2:
+            self._lens_tilt = np.zeros(2, np.float32)
         self._n_blades = max(0, int(n_blades))
         self._aperture_rot = float(aperture_rot)
         self._response_initializing=True

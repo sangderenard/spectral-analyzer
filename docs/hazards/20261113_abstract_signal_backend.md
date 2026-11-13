@@ -30,3 +30,13 @@ still receive these source changes, Turing import availability and opt-in backen
 setting through its supported deployment configuration. LLVM compilation remains
 blocked by a compiler SSA KeyError under separate investigation; this commit is
 an interpreted real-graph path, not a compiled product.
+
+## Actual service interpreter verification
+
+C:/dev/Powershell/srv/python/python.exe (Python 3.11.18, Torch absent) ran
+`tests/camera_trigger_grid_abstract_check.py` successfully with Turing on
+PYTHONPATH and SPECTRAL_TENSOR_BACKEND=abstract. NumPy, Pygame, SciPy and Pillow
+were already installed. Eight actual GraphSolver schedules ran. This removes
+the prior Torch-free-process blocker for the tested grid path, without a new
+worker or solver. Deployment environment/import wiring and source publication
+remain; no live server was started or restarted by this test.

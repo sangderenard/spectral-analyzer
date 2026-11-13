@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T4 Wave Arena</title>
+<style>
+:root{color-scheme:dark;font:15px/1.45 system-ui,sans-serif;background:#080e19;color:#eaf3ff}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 65% -15%,#14345b 0,transparent 55%),#080e19}
+header{padding:26px clamp(20px,4vw,64px) 12px;display:flex;justify-content:space-between;gap:20px;align-items:end;border-bottom:1px solid #24415c}
+h1{font-size:clamp(26px,3vw,40px);margin:0;letter-spacing:.02em}header p{margin:5px 0 0;color:#9bb4c9;max-width:680px}
+.badge{border:1px solid #3c7e9d;border-radius:20px;padding:6px 12px;color:#8fe2ff;white-space:nowrap;font-size:12px;letter-spacing:.1em;text-transform:uppercase}
+main{padding:24px clamp(20px,4vw,64px);display:grid;grid-template-columns:minmax(260px,325px) minmax(0,1fr);gap:24px}
+aside,.display,.metric{background:#101d2d;border:1px solid #294157;border-radius:16px;box-shadow:0 12px 40px #020a13a0}
+aside{padding:20px;align-self:start}h2{font-size:13px;color:#8fe2ff;text-transform:uppercase;letter-spacing:.14em;margin:0 0 16px}
+.control{margin:14px 0}.control label{display:flex;justify-content:space-between;gap:10px;margin-bottom:5px;color:#cbddeb;font-size:13px}.control output{color:#7fdbfa;font-variant-numeric:tabular-nums}
+input[type=range]{width:100%;accent-color:#68d7ef}select{width:100%;padding:9px;background:#0a1625;border:1px solid #44627b;border-radius:8px;color:#effaff}
+.actions{display:flex;gap:8px;margin-top:20px;flex-wrap:wrap}button{cursor:pointer;border:1px solid #3f8199;background:#15506b;color:#fff;border-radius:8px;padding:10px 14px;font-weight:600}button:hover{background:#1e6e8d}button.secondary{background:#182b3e}button:disabled{opacity:.4;cursor:default}
+.hint{color:#91aabd;font-size:12px;margin:16px 0 0}.workspace{min-width:0}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}.metric{padding:11px 15px}.metric span{display:block;color:#8caabc;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.metric strong{display:block;font-size:19px;font-variant-numeric:tabular-nums;font-weight:550;margin-top:3px}
+.panels{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.display{overflow:hidden}.display h3{margin:0;padding:13px 15px;border-bottom:1px solid #294157;color:#c3e7f4;font-size:13px;font-weight:600}.display img{width:100%;aspect-ratio:1;display:block;image-rendering:pixelated;background:#040b13}.display p{color:#829caf;font-size:12px;margin:0;padding:10px 15px;min-height:56px}
+.status{margin:12px 0;color:#87acc1;min-height:22px}.status.error{color:#ffab9f}
+@media(max-width:1050px){main{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.panels{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}header{display:block}.badge{display:inline-block;margin-top:12px}}
+</style>
+<header><div><h1>T4 Wave Arena</h1><p>Shape two coherent emitters, then watch the complex field propagate through the native angular-spectrum kernel.</p></div><div class="badge">Native T4 · live field</div></header>
+<main>
+<aside>
+<h2>Arena setup</h2>
+<div class="control"><label for="size">Grid</label><select id="size"><option>64</option><option selected>128</option><option>256</option></select></div>
+<div id="controls"></div>
+<div class="actions"><button id="apply">Apply & reset</button><button id="play">Pause</button><button id="single" class="secondary">Step once</button></div>
+<p class="hint">Changing parameters resets the field. Pause to inspect a frame. Forward and reverse travel alternate so interference can be watched repeatedly.</p>
+</aside>
+<section class="workspace">
+<div class="metrics"><div class="metric"><span>Kernel steps</span><strong id="generation">0</strong></div><div class="metric"><span>Travel</span><strong id="distance">0 mm</strong></div><div class="metric"><span>Direction</span><strong id="direction">Forward</strong></div><div class="metric"><span>Field power / input</span><strong id="retention">—</strong></div></div>
+<div class="panels"><div class="display"><h3>POWER</h3><img id="power" alt="Evolving wave field power"><p>Intensity on a common scale fixed at the initial peak.</p></div><div class="display"><h3>RELATIVE PHASE</h3><img id="phase" alt="Evolving complex phase"><p>Hue shows phase. Uniform piston phase is removed for inspection.</p></div><div class="display"><h3>CHANGE FROM SOURCE</h3><img id="change" alt="Change from initial complex field"><p>Magnitude of the complex difference from the starting field.</p></div></div>
+<div id="status" class="status" role="status">Connecting to local wave kernel…</div>
+</section>
+</main>
+<script>
+const specs=[
+  ['wavelength_nm','Wavelength','nm',380,900,1,532],
+  ['pitch_um','Pixel pitch','µm',0.5,5,0.1,1.5],
+  ['step_um','Distance per step','µm',1,100,1,25],
+  ['travel_steps','Travel range','steps',8,200,1,80],
+  ['waist_fraction','Emitter waist','of grid',0.02,0.25,0.005,0.075],
+  ['separation_fraction','Emitter separation','of grid',0,0.3,0.005,0.12],
+  ['tilt_fraction','Wavefront tilt scale','of grid',0.1,1,0.01,0.28],
+  ['relative_amplitude','Second emitter strength','×',0,1.5,0.01,0.82],
+  ['relative_phase','Second emitter phase','rad',-3.14,3.14,0.01,0.72],
+];
+const byId=id=>document.getElementById(id);
+const controls=byId('controls');
+for(const [key,label,unit,min,max,step,value] of specs){
+  const box=document.createElement('div');box.className='control';
+  const title=document.createElement('label');title.htmlFor=key;title.textContent=label;
+  const out=document.createElement('output');out.id=key+'Value';title.append(out);
+  const input=document.createElement('input');input.type='range';input.id=key;input.min=min;input.max=max;input.step=step;input.value=value;
+  input.addEventListener('input',()=>out.textContent=`${input.value} ${unit}`);input.dispatchEvent(new Event('input'));
+  box.append(title,input);controls.append(box);
+}
+let playing=true,busy=false,seen=0,timer;
+function status(message,error=false){byId('status').textContent=message;byId('status').classList.toggle('error',error)}
+async function post(path,payload){const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await response.json();if(!response.ok)throw Error(data.error||`HTTP ${response.status}`);return data}
+function present(state){
+  if(state.generation<seen)seen=0;
+  seen=state.generation;
+  for(const [name,url] of Object.entries(state.panels))byId(name).src=url;
+  byId('generation').textContent=state.generation.toLocaleString();
+  byId('distance').textContent=state.distance_mm.toFixed(3)+' mm';
+  byId('direction').textContent=state.direction>0?'Forward':'Reverse';
+  byId('retention').textContent=(state.field_power/state.initial_power).toFixed(5);
+  status(`Native T4 · ${state.config.size}² grid · ${state.config.wavelength_nm} nm`);
+}
+async function request(path,payload){if(busy)return;busy=true;try{present(await post(path,payload))}catch(error){playing=false;byId('play').textContent='Resume';status(error.message,true)}finally{busy=false}}
+byId('apply').onclick=()=>{const config={size:Number(byId('size').value)};for(const [key] of specs)config[key]=Number(byId(key).value);request('/api/configure',config)};
+byId('play').onclick=()=>{playing=!playing;byId('play').textContent=playing?'Pause':'Resume'};
+byId('single').onclick=()=>request('/api/step',{count:1});
+async function tick(){if(playing)await request('/api/step',{count:1});timer=setTimeout(tick,90)}
+fetch('/api/state').then(r=>r.json()).then(present).then(tick).catch(error=>status(error.message,true));
+</script>
+</html>

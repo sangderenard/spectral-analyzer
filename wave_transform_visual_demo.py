@@ -86,19 +86,28 @@ def _transport_calibration_tracer(wavelength_m: float):
     return tracer
 
 
-def _source_field(size: int, pitch_m: float) -> np.ndarray:
+def _source_field(
+    size: int,
+    pitch_m: float,
+    *,
+    waist_fraction: float = 0.075,
+    separation_fraction: float = 0.12,
+    tilt_fraction: float = 0.28,
+    relative_amplitude: float = 0.82,
+    relative_phase: float = 0.72,
+) -> np.ndarray:
     coordinate = (
         np.arange(size, dtype=np.float64) - (size - 1) * 0.5
     ) * pitch_m
     x, y = np.meshgrid(coordinate, coordinate)
-    waist = size * pitch_m * 0.075
-    separation = size * pitch_m * 0.12
-    tilt = 2.0 * np.pi / (size * pitch_m * 0.28)
+    waist = size * pitch_m * waist_fraction
+    separation = size * pitch_m * separation_fraction
+    tilt = 2.0 * np.pi / (size * pitch_m * tilt_fraction)
     left = np.exp(-((x + separation) ** 2 + y**2) / (waist**2))
-    right = 0.82 * np.exp(-((x - separation) ** 2 + y**2) / (waist**2))
+    right = relative_amplitude * np.exp(-((x - separation) ** 2 + y**2) / (waist**2))
     return (
         left * np.exp(1j * tilt * x)
-        + right * np.exp(1j * (-0.7 * tilt * y + 0.72))
+        + right * np.exp(1j * (-0.7 * tilt * y + relative_phase))
     ).astype(np.complex64)
 
 

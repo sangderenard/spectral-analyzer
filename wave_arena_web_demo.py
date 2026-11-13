@@ -27,6 +27,7 @@ from wave_transform_visual_demo import (
 
 PAGE = Path(__file__).with_name("wave_arena_web_demo.html")
 DEFAULTS = {
+    "pattern": "pair",
     "size": 128,
     "wavelength_nm": 532.0,
     "pitch_um": 1.5,
@@ -47,10 +48,13 @@ def _bounded(value: object, key: str, lower: float, upper: float) -> float:
     return number
 
 
-def validate_config(payload: dict[str, object]) -> dict[str, float | int]:
+def validate_config(payload: dict[str, object]) -> dict[str, float | int | str]:
     if not isinstance(payload, dict) or set(payload) - set(DEFAULTS):
         raise ValueError("unknown arena parameter")
     merged = {**DEFAULTS, **payload}
+    pattern = merged["pattern"]
+    if pattern not in ("pair", "slits", "ring"):
+        raise ValueError("pattern must be pair, slits, or ring")
     size = int(merged["size"])
     if size not in (64, 128, 256):
         raise ValueError("size must be 64, 128, or 256")
@@ -58,6 +62,7 @@ def validate_config(payload: dict[str, object]) -> dict[str, float | int]:
     if travel < 1 or travel > 400:
         raise ValueError("travel_steps must be in [1, 400]")
     return {
+        "pattern": pattern,
         "size": size,
         "wavelength_nm": _bounded(merged["wavelength_nm"], "wavelength_nm", 380, 900),
         "pitch_um": _bounded(merged["pitch_um"], "pitch_um", 0.5, 5),
@@ -69,6 +74,36 @@ def validate_config(payload: dict[str, object]) -> dict[str, float | int]:
         "relative_amplitude": _bounded(merged["relative_amplitude"], "relative_amplitude", 0, 1.5),
         "relative_phase": _bounded(merged["relative_phase"], "relative_phase", -math.pi, math.pi),
     }
+
+
+def _initial_field(config: dict[str, float | int | str], size: int, pitch: float) -> np.ndarray:
+    parameters = {
+        "waist_fraction": float(config["waist_fraction"]),
+        "separation_fraction": float(config["separation_fraction"]),
+        "tilt_fraction": float(config["tilt_fraction"]),
+        "relative_amplitude": float(config["relative_amplitude"]),
+        "relative_phase": float(config["relative_phase"]),
+    }
+    if config["pattern"] == "pair":
+        return _source_field(size, pitch, **parameters)
+    coordinate = (np.arange(size, dtype=np.float64) - (size - 1) * 0.5) * pitch
+    x, y = np.meshgrid(coordinate, coordinate)
+    extent = size * pitch
+    waist = extent * parameters["waist_fraction"]
+    separation = extent * parameters["separation_fraction"]
+    tilt = 2.0 * np.pi / (extent * parameters["tilt_fraction"])
+    phase = parameters["relative_phase"]
+    strength = parameters["relative_amplitude"]
+    if config["pattern"] == "slits":
+        slit_width = max(pitch, waist * 0.45)
+        envelope = np.exp(-(y / (extent * 0.23)) ** 2)
+        left = (np.abs(x + separation) <= slit_width * 0.5) * envelope
+        right = strength * (np.abs(x - separation) <= slit_width * 0.5) * envelope
+        return left * np.exp(1j * tilt * x) + right * np.exp(1j * (phase - 0.7 * tilt * y))
+    radius = np.hypot(x, y)
+    annulus = np.exp(-((radius - max(separation, pitch)) / waist) ** 2)
+    center = strength * np.exp(-(radius / max(waist * 0.8, pitch)) ** 2)
+    return annulus * np.exp(1j * tilt * x) + center * np.exp(1j * phase)
 
 
 def _png_data_url(rgba: np.ndarray) -> str:
@@ -86,14 +121,7 @@ class WaveArena:
         size = int(config["size"])
         wavelength = float(config["wavelength_nm"]) * 1e-9
         pitch = float(config["pitch_um"]) * 1e-6
-        initial = _source_field(
-            size, pitch,
-            waist_fraction=float(config["waist_fraction"]),
-            separation_fraction=float(config["separation_fraction"]),
-            tilt_fraction=float(config["tilt_fraction"]),
-            relative_amplitude=float(config["relative_amplitude"]),
-            relative_phase=float(config["relative_phase"]),
-        )
+        initial = _initial_field(config, size, pitch)
         self.config = config
         self.tracer = _calibration_tracer(wavelength)
         self.wavelengths = np.asarray([wavelength], np.float64)

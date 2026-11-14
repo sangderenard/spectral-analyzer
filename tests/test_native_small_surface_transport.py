@@ -121,11 +121,21 @@ def test_native_t3_resolves_host_dye_and_bubble_from_authored_surfaces():
             assert interface['margin_m'] == pytest.approx(8 * 550e-9)
             assert interface['before_n_real'][0] == pytest.approx(expected_before)
             assert interface['after_n_real'][0] == pytest.approx(expected_after)
+            assert interface['crossing_point'] == pytest.approx(tuple(point))
+            assert interface['incoming_direction'] == pytest.approx((0., 0., -1.))
+            assert interface['transition_flags'] & 1  # authored region boundary
+            assert bool(interface['transition_flags'] & 4) == (expected_before != expected_after)
+            reverse = tracer.resolve_studio_wave_interface(
+                tri_id, point, np.array([0., 0., 1.]), frequency, 8.)
+            assert reverse['before_n_real'][0] == pytest.approx(expected_after)
+            assert reverse['after_n_real'][0] == pytest.approx(expected_before)
+            assert reverse['incoming_direction'] == pytest.approx((0., 0., 1.))
         dye_interface = tracer.resolve_studio_wave_interface(
             len(host) + 10, triangles[len(host) + 10].mean(axis=0),
             np.array([0., 0., -1.]), frequency, 8.)
         assert dye_interface['before_n_imag'][0] == pytest.approx(0.)
         assert dye_interface['after_n_imag'][0] == pytest.approx(1e-7)
+        assert dye_interface['transition_flags'] & 8  # extinction change with same base index
         with pytest.raises(ValueError, match='authenticated resolved hit'):
             tracer.resolve_studio_wave_interface(
                 0, np.array([.1, .1, .1]),
@@ -173,6 +183,7 @@ def test_native_exact_sphere_competes_with_host_mesh_and_resolves_bubble():
         assert interface['before_n_real'][0] == pytest.approx(1.)
         assert interface['after_n_real'][0] == pytest.approx(1.5)
         assert interface['outward_normal'] == pytest.approx((1., 0., 0.))
+        assert interface['transition_flags'] & 16  # exact curved boundary
         tracer.submit_rays(
             np.array([[0., 0., 0.]], np.float64),
             np.array([[1., 0., 0.]], np.float64),

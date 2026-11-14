@@ -1142,6 +1142,35 @@ SK_API int ray_tracer_resolve_studio_wave_interface(
     double* out_after_n_imag
 );
 
+/* Versioned companion to the original fixed-size result above. This is an
+ * authenticated pre-scatter crossing vector; it does not claim a T4 solve. */
+#define RT_STUDIO_TRANSITION_REGION       (1u << 0)
+#define RT_STUDIO_TRANSITION_MATERIAL     (1u << 1)
+#define RT_STUDIO_TRANSITION_REFRACTIVE   (1u << 2)
+#define RT_STUDIO_TRANSITION_ABSORPTIVE   (1u << 3)
+#define RT_STUDIO_TRANSITION_EXACT_SPHERE (1u << 4)
+typedef struct {
+    RtStudioWaveInterface interface;
+    double crossing_point[3];
+    double incoming_direction[3];
+    unsigned int transition_flags;
+} RtStudioTransitionVectorV1;
+
+SK_API int ray_tracer_resolve_studio_transition_vector_v1(
+    const RayTracerState* st,
+    int hit_triangle,
+    const double hit_position[3],
+    const double incoming_direction[3],
+    int n_frequencies,
+    const double* frequencies_hz,
+    double margin_wavelengths,
+    RtStudioTransitionVectorV1* out_transition,
+    double* out_before_n_real,
+    double* out_before_n_imag,
+    double* out_after_n_real,
+    double* out_after_n_imag
+);
+
 /**
  * Project a multiscale segment buffer onto a coherent complex sensor image.
  *

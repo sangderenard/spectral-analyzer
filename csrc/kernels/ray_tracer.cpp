@@ -2611,6 +2611,51 @@ int ray_tracer_resolve_studio_wave_interface(
     return SK_OK;
 }
 
+int ray_tracer_resolve_studio_transition_vector_v1(
+    const RayTracerState* st, int hit_triangle,
+    const double hit_position[3], const double incoming_direction[3],
+    int n_frequencies, const double* frequencies_hz,
+    double margin_wavelengths, RtStudioTransitionVectorV1* out_transition,
+    double* out_before_n_real, double* out_before_n_imag,
+    double* out_after_n_real, double* out_after_n_imag)
+{
+    if (!out_transition) return SK_ERR_NULL_STATE;
+    RtStudioTransitionVectorV1 result{};
+    const int rc = ray_tracer_resolve_studio_wave_interface(
+        st, hit_triangle, hit_position, incoming_direction, n_frequencies,
+        frequencies_hz, margin_wavelengths, &result.interface,
+        out_before_n_real, out_before_n_imag,
+        out_after_n_real, out_after_n_imag);
+    if (rc != SK_OK) return rc;
+    const V3d ray(incoming_direction[0], incoming_direction[1],
+                  incoming_direction[2]);
+    const V3d unit = ray.normalized();
+    for (int axis = 0; axis < 3; ++axis) {
+        result.crossing_point[axis] = hit_position[axis];
+        result.incoming_direction[axis] = unit[axis];
+    }
+    result.transition_flags = RT_STUDIO_TRANSITION_REGION;
+    if (result.interface.before_base_material !=
+        result.interface.after_base_material)
+        result.transition_flags |= RT_STUDIO_TRANSITION_MATERIAL;
+    for (const auto& sphere : st->studio_spheres) {
+        if (sphere.owner_triangle != hit_triangle) continue;
+        const V3d hit(hit_position[0], hit_position[1], hit_position[2]);
+        const double tolerance = std::max(1.0e-12, sphere.radius * 1.0e-8);
+        if (std::abs((hit - sphere.center).norm() - sphere.radius) <= tolerance)
+            result.transition_flags |= RT_STUDIO_TRANSITION_EXACT_SPHERE;
+        break;
+    }
+    for (int lane = 0; lane < n_frequencies; ++lane) {
+        if (out_before_n_real[lane] != out_after_n_real[lane])
+            result.transition_flags |= RT_STUDIO_TRANSITION_REFRACTIVE;
+        if (out_before_n_imag[lane] != out_after_n_imag[lane])
+            result.transition_flags |= RT_STUDIO_TRANSITION_ABSORPTIVE;
+    }
+    *out_transition = result;
+    return SK_OK;
+}
+
 static inline cd mat_refl_for_ray(
     const RayTracerState& st, int mat_idx, int lane, const RayIntent& ray)
 {

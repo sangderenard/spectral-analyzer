@@ -4739,15 +4739,16 @@ struct PyRayTracer
             throw std::invalid_argument("Studio wave interface requires a hit point, direction and transport frequencies");
         py::array_t<double> before_re(f.size), before_im(f.size);
         py::array_t<double> after_re(f.size), after_im(f.size);
-        RtStudioWaveInterface result{};
-        const int rc = ray_tracer_resolve_studio_wave_interface(
+        RtStudioTransitionVectorV1 transition{};
+        const int rc = ray_tracer_resolve_studio_transition_vector_v1(
             handle, hit_triangle, static_cast<const double*>(p.ptr),
             static_cast<const double*>(d.ptr), static_cast<int>(f.size),
-            static_cast<const double*>(f.ptr), margin_wavelengths, &result,
+            static_cast<const double*>(f.ptr), margin_wavelengths, &transition,
             before_re.mutable_data(), before_im.mutable_data(),
             after_re.mutable_data(), after_im.mutable_data());
         if (rc != SK_OK)
             throw std::invalid_argument("native Studio wave interface is not an authenticated resolved hit");
+        const auto& result = transition.interface;
         py::dict out;
         out["triangle_id"] = result.triangle_id;
         out["region_id"] = result.region_id;
@@ -4757,6 +4758,13 @@ struct PyRayTracer
         out["margin_m"] = result.margin_m;
         out["before_base_material"] = result.before_base_material;
         out["after_base_material"] = result.after_base_material;
+        out["crossing_point"] = py::make_tuple(
+            transition.crossing_point[0], transition.crossing_point[1],
+            transition.crossing_point[2]);
+        out["incoming_direction"] = py::make_tuple(
+            transition.incoming_direction[0], transition.incoming_direction[1],
+            transition.incoming_direction[2]);
+        out["transition_flags"] = transition.transition_flags;
         out["before_n_real"] = std::move(before_re);
         out["before_n_imag"] = std::move(before_im);
         out["after_n_real"] = std::move(after_re);

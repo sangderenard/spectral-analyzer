@@ -17625,7 +17625,8 @@ static void pipeline_refiner(RayPipelineState& ps)
                 record.region_id = st.studio_triangle_region_ids[
                     static_cast<size_t>(hr.hit_tri)];
                 record.launch_time_s = hr.ray.launch_time;
-                record.path_length_m = hr.ray.path_len;
+                record.path_length_m = hr.path_at_seg_start +
+                    (rh.refined_pos - hr.seg_start).norm();
                 record.active_lane = hr.ray.spectral_resolved
                     ? hr.ray.spectral_lane_id : 0u;
                 const int lanes = hr.ray.spectral_resolved ? 1 :

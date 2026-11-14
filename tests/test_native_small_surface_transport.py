@@ -236,6 +236,7 @@ def test_native_exact_sphere_competes_with_host_mesh_and_resolves_bubble():
         assert field(crossing, 'transition_flags', '<u4') & 16
         assert field(crossing, 'lane_count', '<u4') == 1
         assert field(crossing, 'frequency_hz', '<f8') == pytest.approx(frequency[0])
+        assert field(crossing, 'path_length_m', '<f8') == pytest.approx(.0003, abs=1e-8)
         assert field(crossing, 'before_n_real', '<f8') == pytest.approx(1.)
         assert field(crossing, 'after_n_real', '<f8') == pytest.approx(1.5)
         assert abs(field(crossing, 'amp_re', '<f8')) > 0.

@@ -2860,6 +2860,7 @@ struct PyRayTracer
         out["region_id"] = offsetof(RayTransitionRecordV1, region_id);
         out["transition_flags"] = offsetof(RayTransitionRecordV1, transition_flags);
         out["lane_count"] = offsetof(RayTransitionRecordV1, lane_count);
+        out["path_length_m"] = offsetof(RayTransitionRecordV1, path_length_m);
         out["crossing_point"] = offsetof(RayTransitionRecordV1, crossing_point);
         out["incoming_direction"] = offsetof(RayTransitionRecordV1, incoming_direction);
         out["frequency_hz"] = offsetof(RayTransitionRecordV1, frequency_hz);

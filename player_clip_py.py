@@ -390,7 +390,7 @@ class PlayerClipEngine:
     def tick(self, pos: np.ndarray, vel: np.ndarray,
              floor_z: float = 0.0, ceil_z: float = 4.0,
              radius: float = 0.25, yaw_rad: float = 0.0,
-             dt: float = 0.016) -> tuple[np.ndarray, int]:
+             dt: float = 0.016, *, previous_pos=None) -> tuple[np.ndarray, int]:
         """
         Advance one simulation step.  Returns (corrected_pos_3f, clip_flags).
         """
@@ -416,7 +416,8 @@ class PlayerClipEngine:
         out_arr = np.asarray(out_pos, dtype=np.float32)
         out_vel_arr = np.asarray(out_vel, dtype=np.float32)
         flags_i = int(flags)
-        surface_info = self._surface_cone_clip(pre_pos, out_arr, out_vel_arr)
+        surface_info = self._surface_cone_clip(pre_pos, out_arr, out_vel_arr,
+            previous_pos=previous_pos, radius=radius)
         if surface_info is not None:
             out_arr, out_vel_arr, extra_flags, surface_meta = surface_info
             flags_i |= int(extra_flags)
@@ -444,11 +445,16 @@ class PlayerClipEngine:
         return out_arr, flags_i
 
     def _surface_cone_clip(self, pre_pos: np.ndarray, pos: np.ndarray,
-                           vel: np.ndarray):
+                           vel: np.ndarray, *, previous_pos=None, radius=0.0):
         if (not self._surface_clip_enabled or self._surface_tris.size == 0 or
                 self._surface_clip_distance <= 0.0):
             return None
-        v = np.asarray(vel, dtype=np.float32).reshape(3)
+        swept = previous_pos is not None
+        if swept:
+            pre_pos = np.asarray(previous_pos,dtype=np.float32).reshape(3)
+            v = np.asarray(pos,dtype=np.float32).reshape(3)-pre_pos
+        else:
+            v = np.asarray(vel, dtype=np.float32).reshape(3)
         speed = float(np.linalg.norm(v))
         if speed <= 1e-6:
             delta = np.asarray(pos, dtype=np.float32).reshape(3) - np.asarray(pre_pos, dtype=np.float32).reshape(3)
@@ -462,13 +468,15 @@ class PlayerClipEngine:
                 None,
                 np.asarray(pre_pos, dtype=np.float32).reshape(3),
                 v,
-                cone_angle_rad=self._surface_clip_angle_rad,
-                n_rays=self._surface_clip_rays,
-                max_distance=self._surface_clip_distance,
+                cone_angle_rad=0.0 if swept else self._surface_clip_angle_rad,
+                n_rays=1 if swept else self._surface_clip_rays,
+                max_distance=speed+float(radius) if swept else self._surface_clip_distance,
                 verts=self._surface_tris,
                 normals=None,
             )
-        except Exception:
+        except Exception as exc:
+            if swept:
+                raise RuntimeError("World surface sweep failed") from exc
             return None
         if int(hits.get("n_hits", 0) or 0) <= 0:
             return None
@@ -493,8 +501,17 @@ class PlayerClipEngine:
         if vn < 0.0:
             reject = (-vn * n).astype(np.float32)
             out_vel = (out_vel + reject).astype(np.float32)
-        penetration_guard = max(0.0, self._surface_clip_distance - float(distances[idx]))
-        out_pos = (out_pos + n.astype(np.float32) * min(0.05, penetration_guard)).astype(np.float32)
+        if swept:
+            # Clip this submitted displacement at its first actual triangle hit.
+            # Stop at first contact; an untested tangential remainder must not
+            # tunnel across a second wall. Existing proximity mode is unchanged.
+            incidence = max(1e-6, abs(float(np.dot(n,v/speed))))
+            travel = max(0.0,float(distances[idx])-float(radius)/incidence)
+            hit_fraction = min(1.0,travel/speed)
+            out_pos = (pre_pos+v*hit_fraction).astype(np.float32)
+        else:
+            penetration_guard = max(0.0, self._surface_clip_distance - float(distances[idx]))
+            out_pos = (out_pos + n.astype(np.float32) * min(0.05, penetration_guard)).astype(np.float32)
         axis = int(np.argmax(np.abs(n)))
         meta = {
             "hit": 1.0,

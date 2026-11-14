@@ -306,16 +306,19 @@ class PlacedDutyStation(PlacedObject):
 
 @dataclass
 class PlacedPortalFrame(PlacedObject):
-    """Visual arch/doorway stub.  Portal traversal logic is deferred.
+    """Native arch geometry; declared traversal is owned by DoorRuntime.
 
-    ``target_room_id`` names the destination room; leave blank until
-    multiple rooms are implemented.
+      ``target_room_id`` names the destination room, not permission to load it.
     """
     target_room_id: str = ""
+    width: float = 1.0
+    height: float = 2.0
+    frame_thickness: float = 0.08
 
     def to_dict(self) -> dict:
         d = self._base_dict()
-        d.update(type="portal", target_room_id=self.target_room_id)
+        d.update(type="portal", target_room_id=self.target_room_id,
+                 width=self.width, height=self.height, frame_thickness=self.frame_thickness)
         return d
 
     @classmethod
@@ -323,6 +326,8 @@ class PlacedPortalFrame(PlacedObject):
         return cls(
             **cls._from_base(d),
             target_room_id = str(d.get("target_room_id", "")),
+            width=float(d.get("width",1.0)), height=float(d.get("height",2.0)),
+            frame_thickness=float(d.get("frame_thickness",0.08)),
         )
 
 

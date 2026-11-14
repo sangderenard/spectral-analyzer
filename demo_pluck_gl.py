@@ -14076,7 +14076,31 @@ def _parse_args():
     p.add_argument("--level", default=None, metavar="PATH",
                    help="Scene save file (.yaml) to load on startup. "
                         "If omitted, starts in a blank space with room control + fabricator stations.")
+    p.add_argument("--nodus-graph", help="Authorized Nodus GRAPH JSON export to place as room consoles")
+    p.add_argument("--nodus-consoles", help="Optional console selections and Pluck Panel descriptions JSON")
+    p.add_argument("--nodus-console-port", type=int, help="Existing authenticated loopback Nodus read console")
+    p.add_argument("--nodus-console-token-file", help="Owner-authorized token file for that Nodus read console")
+    p.add_argument("--nodus-world-scale", type=float, default=4.0, help="Uniform Living Map geometry display scale for the full-size Pluck walker")
+    p.add_argument("--living-map-document", help="Authorized local Living Map JSON document")
+    p.add_argument("--living-map-islands", help="Local JSON identity-to-document manifest")
     args = p.parse_args()
+    if args.living_map_document and (args.nodus_graph or args.nodus_console_port or args.level):
+        p.error("--living-map-document cannot accompany a different initial world")
+    if args.living_map_islands and not (args.living_map_document or args.nodus_graph or args.nodus_console_port):
+        p.error("--living-map-islands requires a Living Map or Nodus initial world")
+    if not math.isfinite(args.nodus_world_scale) or args.nodus_world_scale <= 0:
+        p.error("--nodus-world-scale must be finite and positive")
+    if args.living_map_document or args.living_map_islands:
+        from native_island_loader import read_local_document, read_island_manifest
+        try:
+            if args.living_map_document: read_local_document(args.living_map_document)
+            if args.living_map_islands: read_island_manifest(args.living_map_islands)
+        except (ValueError, OSError) as exc:
+            p.error(str(exc))
+    if args.nodus_consoles and not (args.nodus_graph or args.nodus_console_port):
+        p.error("--nodus-consoles requires --nodus-graph or --nodus-console-port")
+    if bool(args.nodus_console_port) != bool(args.nodus_console_token_file):
+        p.error("--nodus-console-port and --nodus-console-token-file are required together")
     if args.pressure_margin_cells < 0:
         p.error("--pressure-margin-cells must be non-negative")
     if args.pressure_pml_cells < 0:
@@ -14195,8 +14219,13 @@ def _scene_outline_or_default(scene) -> tuple[np.ndarray, float]:
     return _guitar_outline(), BODY_H
 
 
-def main():
+def main(*, island_loader=None):
+    # An authenticated host can supply a procedural UnitIndex-backed loader;
+    # no source scanner or executable factory is deserialized from documents.
     args = _parse_args()
+    if island_loader is not None and (args.living_map_document or args.living_map_islands or args.nodus_graph or args.nodus_console_port or args.level):
+        raise ValueError("Host island loader cannot accompany another initial world")
+    _nodus_feeds = None
     pygame.init()
     pygame.display.set_mode((WIN_W, WIN_H), DOUBLEBUF | OPENGL)
     pygame.display.set_caption("Guitar — FDTD 3-D Visualiser")
@@ -14617,6 +14646,9 @@ def main():
     # can reference it regardless of whether _HAS_ROOM_STATION is True.
     _room_ws      = None
     _room_station = None
+    _island_loader = island_loader
+    _pending_island_events = []
+    _scene_stations = []
 
     # ── Player controller ─────────────────────────────────────────────────────
     _player_cfg_path = _config_path("player", "default.yaml")
@@ -15624,7 +15656,44 @@ def main():
     # ── Room station ──────────────────────────────────────────────────────────
     if _HAS_ROOM_STATION:
         try:
-            _room_ws = _build_default_scene()
+            if _island_loader is not None:
+                _geometry = _island_loader.current.geometry
+                _room_ws = _island_loader.current.workspace
+            elif args.living_map_document:
+                from native_island_loader import document_island, read_local_document
+                from nodus_console_station import workspace_from_graph
+                _initial_island = document_island(read_local_document(args.living_map_document),
+                    lambda geometry: workspace_from_graph({'modules': [], 'edges': [], 'connectors': []},
+                        geometry=geometry), scale=args.nodus_world_scale)
+                _geometry, _room_ws = _initial_island.geometry, _initial_island.workspace
+            elif args.nodus_graph or args.nodus_console_port:
+                from nodus_console_station import workspace_from_graph
+                import json as _nodus_json
+                if args.nodus_console_port:
+                    from nodus_graph.console_client import ConsoleClient
+                    from nodus_console_feeds import NodusConsoleFeeds
+                    with open(args.nodus_console_token_file, encoding="utf-8-sig") as _source:
+                        _nodus_token = _source.readline().strip()
+                    _nodus_client = ConsoleClient("127.0.0.1", args.nodus_console_port, _nodus_token)
+                    del _nodus_token
+                    _nodus_client.hello()
+                    _nodus_graph = _nodus_client.graph()
+                    _nodus_feeds = NodusConsoleFeeds(_nodus_client)
+                else:
+                    with open(args.nodus_graph, encoding="utf-8-sig") as _source:
+                        _nodus_graph = _nodus_json.load(_source)
+                _nodus_consoles = None
+                if args.nodus_consoles:
+                    with open(args.nodus_consoles, encoding="utf-8-sig") as _source:
+                        _nodus_consoles = _nodus_json.load(_source)
+                from nodus_world_geometry import from_nodus_graph
+                from src.compiler.nodus_console_world import ConsoleSelection
+                _selections = tuple(ConsoleSelection(str(k),tuple(v['module_ids']),v.get('label',''),v.get('panel'))
+                    for k,v in (_nodus_consoles or {}).items())
+                _geometry = from_nodus_graph(_nodus_graph,consoles=_selections).scaled(args.nodus_world_scale)
+                _room_ws = workspace_from_graph(_nodus_graph, consoles=_nodus_consoles,geometry=_geometry)
+            else:
+                _room_ws = _build_default_scene()
             if _room_ws is None:
                 _room_ws = _RoomWorkspace.from_yaml("configs/room_station")
             _room_station = _RoomStation(_room_ws, WIN_W, WIN_H)
@@ -15634,6 +15703,17 @@ def main():
             # from the workspace registry and add them to the duty_stations list
             # that player_ctrl.tick() and the render loop already consume.
             _scene_stations = _room_ws.build_scene_objects(WIN_W, WIN_H)
+            if getattr(_room_ws,'nodus_door_runtime',None) is not None:
+                from nodus_console_station import NodusConsoleMenu
+                for _station in _scene_stations:
+                    if isinstance(getattr(_station,'menu',None),NodusConsoleMenu):
+                        _station.menu.bind_doors(_room_ws.nodus_door_runtime)
+            if _nodus_feeds is not None:
+                from nodus_console_station import NodusConsoleMenu
+                for _station in _scene_stations:
+                    if isinstance(getattr(_station, "menu", None), NodusConsoleMenu):
+                        _nodus_feeds.attach(_station.menu)
+                _nodus_feeds.start()
             duty_stations.extend(_scene_stations)
             if not getattr(args, "level", None):
                 material_piles = _build_default_material_piles()
@@ -15649,6 +15729,22 @@ def main():
     # Spawn player on the room control floor panel, facing the station.
     # station_pos() / station_yaw_deg() come from configs/room_station/station.yaml.
     if player_ctrl is not None and _room_ws is not None:
+        if getattr(_room_ws, 'nodus_door_runtime', None) is not None:
+            from native_island_loader import NativeIsland, NativeIslandLoader, document_island, read_island_manifest
+            from nodus_console_station import workspace_from_graph
+            _initial_island = NativeIsland(_room_ws.nodus_world_geometry, _room_ws, _room_ws.nodus_door_runtime)
+            if _island_loader is None:
+                _island_loader = NativeIslandLoader(_initial_island)
+            if args.living_map_islands:
+                for _identity, _document in read_island_manifest(args.living_map_islands).items():
+                    def _island_factory(event, document=_document):
+                        if event.get('treadmill'):
+                            raise ValueError('Static documents cannot generate treadmill windows; register a window-aware factory')
+                        return document_island(document,
+                            lambda geometry: workspace_from_graph({'modules': [], 'edges': [], 'connectors': []},
+                                geometry=geometry), scale=args.nodus_world_scale)
+                    _island_loader.register(_identity, _island_factory)
+            player_ctrl.set_door_runtime(_room_ws.nodus_door_runtime, on_island=_pending_island_events.append)
         try:
             player_ctrl._walk_pos = np.array(_room_ws.station_pos(), np.float64)
             player_ctrl._walk_yaw = float(_room_ws.station_yaw_deg())
@@ -15656,6 +15752,8 @@ def main():
             print(f"[player_ctrl] spawn from station_pos failed: {_spawn_err}", flush=True)
         if hasattr(player_ctrl, "set_room_cfg"):
             player_ctrl.set_room_cfg(_room_ws.room_cfg)
+            if getattr(_room_ws,"nodus_world_geometry",None) is not None:
+                player_ctrl.set_world_geometry(_room_ws.nodus_world_geometry)
 
     # ── Camera items (physical cameras placed in the scene) ───────────────────
     cameras: list = []
@@ -15667,6 +15765,10 @@ def main():
             print(f"[camera_items] init failed: {_e}", flush=True)
 
     # ── Camera designer station ──────────────────────────────────────────────
+    if _island_loader is not None:
+        _island_loader.current.host_state.update(room_station=_room_station,
+            scene_stations=_scene_stations, cameras=cameras)
+
     _cam_designer_station = None
     _cam_designer_from_world = False
     if _HAS_CAMERA_DESIGNER_STATION and getattr(args, "station", None) == "camera_designer":
@@ -16293,6 +16395,61 @@ def main():
             player_ctrl.update_synthesis()
         if player_ctrl is not None and not _player_cam_panel.freeze_player_motion:
             player_ctrl.tick(_dt, _keys_held, duty_stations, cameras=cameras)
+        # Build and switch island-owned scene objects on the GL main thread.
+        if _pending_island_events and _island_loader is not None:
+            _event = _pending_island_events.pop(0)
+            try:
+                _prepared = _island_loader.prepare(_event, now_ms=time.perf_counter()*1000)
+                _destination = _prepared.destination
+                if not _destination.host_state:
+                    _new_room = _RoomStation(_destination.workspace, WIN_W, WIN_H)
+                    _new_room.init_gl()
+                    _new_stations = _destination.workspace.build_scene_objects(WIN_W, WIN_H)
+                    _new_cameras = _build_camera_items(_destination.workspace) if _HAS_CAMERA_ITEM else []
+                    from nodus_console_station import NodusConsoleMenu
+                    for _station in _new_stations:
+                        if isinstance(getattr(_station, 'menu', None), NodusConsoleMenu):
+                            _station.menu.bind_doors(_destination.runtime)
+                            if _nodus_feeds is not None:
+                                _nodus_feeds.attach(_station.menu)
+                    _destination.host_state.update(room_station=_new_room,
+                        scene_stations=_new_stations, cameras=_new_cameras)
+                _new_host = _destination.host_state
+                try:
+                    player_ctrl.set_room_cfg(_destination.workspace.room_cfg)
+                    player_ctrl.set_world_geometry(_destination.geometry)
+                except Exception:
+                    player_ctrl.set_room_cfg(_room_ws.room_cfg)
+                    player_ctrl.set_world_geometry(_island_loader.current.geometry)
+                    raise
+                _old_scene_ids = {id(station) for station in _scene_stations}
+                _replacement_stations = [station for station in duty_stations if id(station) not in _old_scene_ids]
+                _replacement_stations.extend(_new_host['scene_stations'])
+                # Validate commit in this same-thread transaction before live
+                # references change. A faulty HUD cannot split the world swap.
+                _island_loader.commit(_prepared)
+                for _station in _scene_stations:
+                    _menu = getattr(_station, 'menu', None)
+                    if _menu is not None and hasattr(_menu, 'show_hud'):
+                        try:
+                            _menu.show_hud(False)
+                        except Exception as _hud_error:
+                            print('[island] old HUD close failed: ' + type(_hud_error).__name__, flush=True)
+                duty_stations[:] = _replacement_stations
+                _room_ws, _room_station = _destination.workspace, _new_host['room_station']
+                _scene_stations, cameras = _new_host['scene_stations'], _new_host['cameras']
+                player_ctrl.set_door_runtime(_destination.runtime, on_island=_pending_island_events.append)
+                _arrival = _prepared.arrival
+                player_ctrl._walk_pos = np.asarray(_arrival.position, np.float64) - np.array([0,0,player_ctrl._eye_height])
+                player_ctrl._walk_vel_z = 0.0
+                player_ctrl._walk_yaw = math.degrees(math.atan2(_arrival.facing[1],_arrival.facing[0]))
+                player_ctrl._walk_pitch = math.degrees(math.asin(max(-1,min(1,_arrival.facing[2]))))
+                player_ctrl._focus_target = None
+                player_ctrl._active_station = None
+                player_ctrl._active_camera = None
+                print('[island] entered ' + str(_destination.identity), flush=True)
+            except Exception as _island_error:
+                print('[island] transition refused: ' + str(_island_error), flush=True)
         # Drive each station's menu visibility from player state — no blocking calls
         if player_ctrl is not None:
             _active_st = getattr(player_ctrl, '_active_station', None)
@@ -17116,6 +17273,8 @@ def main():
             _report_exception(f"render frame {fi}", exc)
             raise
     finally:
+        if _nodus_feeds is not None:
+            _nodus_feeds.close()
         if _render_graph is not None:
             try:
                 _render_graph.shutdown()

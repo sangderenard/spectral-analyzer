@@ -833,6 +833,7 @@ class EmissionProfileDatabase:
     def __init__(self) -> None:
         self._profiles: Dict[str, Any] = {}
         self._order:    List[str]      = []
+        self._source_revisions: Dict[str, dict] = {}
         self._rgb_tensor: np.ndarray   = np.zeros((1, 3), np.float32)
         self._radiance_tensor: np.ndarray = np.zeros((1,), np.float32)
 
@@ -949,14 +950,22 @@ class EmissionProfileDatabase:
         ))
         self._rebake_rgb_tensor()
 
-    def register(self, name: str, profile: Any) -> int:
+    def register(self, name: str, profile: Any, *, source_revision: Optional[dict] = None) -> int:
         """Register a profile object.  Returns its integer index (0-based)."""
         if name not in self._profiles:
             self._order.append(name)
         self._profiles[name] = profile
+        if source_revision is None:
+            self._source_revisions.pop(name, None)
+        else:
+            self._source_revisions[name] = dict(source_revision)
         # Eager prebake: profile->RGB conversion happens here, never in draw loop.
         self._rebake_rgb_tensor()
         return self._order.index(name)
+
+    def source_revision(self, name: str) -> Optional[dict]:
+        source = self._source_revisions.get(name)
+        return dict(source) if source is not None else None
 
     def index_of(self, name: str) -> int:
         return self._order.index(name)
@@ -1532,6 +1541,7 @@ class MaterialDatabase:
     def __init__(self) -> None:
         self._materials: Dict[str, Any] = {}   # name → Material or dict
         self._order:     List[str]      = []   # stable insertion order
+        self._source_snapshots: Dict[str, dict] = {}  # cold source identity only
         self._dirty:     bool           = True
         self._tensors:   Optional[dict] = None
 
@@ -1544,7 +1554,7 @@ class MaterialDatabase:
 
     # ── Registration ──────────────────────────────────────────────────────────
 
-    def register(self, name: str, material: Any) -> int:
+    def register(self, name: str, material: Any, *, source_snapshot: Optional[dict] = None) -> int:
         """Register a Material object or dict.  Returns its integer index.
 
         Registering the same name again updates the material and marks the
@@ -1561,11 +1571,27 @@ class MaterialDatabase:
                 import copy
                 material = copy.copy(material)
                 material.medium = validated
+        if source_snapshot is not None:
+            from canonical_material_documents import restore_material_document
+            source = restore_material_document(source_snapshot)
+            self._source_snapshots[name] = source.snapshot()
+        else:
+            self._source_snapshots.pop(name, None)
         if name not in self._materials:
             self._order.append(name)
         self._materials[name] = material
         self._dirty = True
         return self._order.index(name)
+
+    def material_source_snapshot(self, name: str) -> Optional[dict]:
+        """Return the exact canonical source, if this row came from one.
+
+        Programmatic Studio materials have no canonical YAML identity.  Their
+        compiled tensor row remains valid, but callers must not label it as a
+        disk material or infer a profile definition from its display colour.
+        """
+        source = self._source_snapshots.get(name)
+        return dict(source) if source is not None else None
 
     def medium_profile(self, name: str):
         """Independent cold participating-medium definition from this registry.
@@ -1938,6 +1964,78 @@ class MaterialDatabase:
                 flat[base : base + row_stride, 10] = roughness[i]
                 flat[base : base + row_stride, 11] = metallic[i]
         return flat
+
+    def build_nodus_tensor_states(self, freq_hz: np.ndarray) -> dict:
+        """Freeze this database's existing native tensors for Nodus state Put.
+
+        The index order and exact transport grid travel with the buffers.  A
+        source snapshot exists only for a row registered from canonical YAML;
+        scene-local rows are identified by their compiled bytes instead.  The
+        profile index names travel as cold references. Profile spectra require
+        a separate lowering from their named source; this method does not
+        pretend that the legacy 20-float GPU header is a continuous SPD.
+        """
+        grid = np.asarray(freq_hz, dtype=np.float64).reshape(-1)
+        if not 1 <= grid.size <= MAX_SPECTRAL_BANDS or not np.isfinite(grid).all() or np.any(grid <= 0):
+            raise ValueError('Nodus material frequencies must be 1..32 positive finite values')
+        profile_db = EmissionProfileDatabase.instance()
+        from canonical_material_documents import restore_material_document
+        for name in self._order:
+            snapshot = self._source_snapshots.get(name)
+            if snapshot is None:
+                continue
+            source = restore_material_document(snapshot).definition
+            material = self._materials[name]
+            for source_key, tensor_key in (
+                ('color_profile_name', 'color_profile_idx'),
+                ('emit_profile_name', 'emit_profile_idx'),
+                ('remit_profile_name', 'remit_profile_idx'),
+            ):
+                named = source.get(source_key)
+                if source_key == 'emit_profile_name' and named is None:
+                    named = source.get('emission_profile_name')
+                if named is None:
+                    continue
+                if named not in profile_db:
+                    raise ValueError(f'{name}: unresolved source profile {named}')
+                index = material.get(tensor_key, -1) if isinstance(material, dict) else getattr(material, tensor_key, -1)
+                if float(index) != float(profile_db.index_of(named)):
+                    raise ValueError(f'{name}: {tensor_key} disagrees with named source profile {named}')
+        chunks = self.build_tensors()
+        arrays = {
+            'transport_frequency_hz': np.ascontiguousarray(grid, dtype='<f8'),
+            'mat_buf': np.ascontiguousarray(self.build_mat_buf(freq_hz=grid), dtype='<f4'),
+            'pbr': np.ascontiguousarray(chunks['pbr'], dtype='<f4'),
+            'phong_compat': np.ascontiguousarray(chunks['phong_compat'], dtype='<f4'),
+            'raymat_compat': np.ascontiguousarray(chunks['raymat_compat'], dtype='<f4'),
+            'spectral': np.ascontiguousarray(chunks['spectral'], dtype='<f4'),
+            'n_bands': np.ascontiguousarray(chunks['n_bands'], dtype='<i4'),
+            'enamel': np.ascontiguousarray(chunks['enamel'], dtype='<f4'),
+            'texture_stack': np.ascontiguousarray(chunks['texture_stack'], dtype='<f4'),
+        }
+        for name, value in arrays.items():
+            if not np.isfinite(value).all():
+                raise ValueError(f'nonfinite Nodus material tensor: {name}')
+            arrays[name] = value.copy(order='C')
+            arrays[name].setflags(write=False)
+        names = tuple(self._order)
+        source = [self.material_source_snapshot(name) for name in names]
+        manifest = {
+            'version': 1,
+            'authority': 'spectral.MaterialDatabase',
+            'transport_frequency_hz': grid.tolist(),
+            'material_names': list(names),
+            'material_sources': source,
+            'profile_index_names': list(profile_db._order),
+            'profile_sources': [profile_db.source_revision(name) for name in profile_db._order],
+            'profile_scope': 'named profile references only; this material snapshot does not lower emission, remission or continuous SPD',
+            'tensors': {
+                name: {'dtype': value.dtype.str, 'shape': list(value.shape),
+                       'sha256': hashlib.sha256(value.tobytes(order='C')).hexdigest()}
+                for name, value in arrays.items()
+            },
+        }
+        return {'manifest': manifest, 'tensors': arrays}
 
     # ── Compatibility extraction helpers (post-bake; not the hot path) ──────
 

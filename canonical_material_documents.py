@@ -128,6 +128,7 @@ class NativeMaterialPayload:
     payload: dict[str,Any]
     uncompiled_fields: tuple[str,...]
     warnings: tuple[str,...]
+    source_snapshot: dict[str,Any] | None = None
 
 
 def restore_material_document(snapshot, overrides=()):
@@ -260,7 +261,8 @@ def native_payload(document, *, profile_database=None):
     _validate_native_projection(out)
     if not bands and 'medium' not in source:warnings.append('No authored spectral bands; native transport uses its existing fallback, not a measured spectrum.')
     return NativeMaterialPayload(document.key,document.revision,route,out,
-                                 tuple(sorted(set(uncompiled))),tuple(warnings))
+                                 tuple(sorted(set(uncompiled))),tuple(warnings),
+                                 document.snapshot())
 
 def native_volume_payload(document, *, profile_database=None):
     """Explicit n/k-volume adapter; preserve but do not resolve surface-only data."""
@@ -282,4 +284,5 @@ def native_volume_payload(document, *, profile_database=None):
     payload['_canonical_source_snapshot']=document.snapshot()
     payload['_volume_ignored_fields']=ignored
     warnings=compiled.warnings+tuple(f'{key}: preserved in source; ignored by native n/k volume transport' for key in ignored)
-    return replace(compiled,revision=document.revision,payload=payload,warnings=warnings)
+    return replace(compiled,revision=document.revision,payload=payload,
+                   warnings=warnings,source_snapshot=document.snapshot())

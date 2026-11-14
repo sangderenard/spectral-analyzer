@@ -2656,6 +2656,117 @@ int ray_tracer_resolve_studio_transition_vector_v1(
     return SK_OK;
 }
 
+static double studio_point_segment_distance_sq(
+    const V3d& point, const V3d& first, const V3d& last)
+{
+    const V3d edge = last - first;
+    const double length_sq = edge.squaredNorm();
+    if (!(length_sq > 0.0)) return (point - first).squaredNorm();
+    const double fraction = std::clamp(
+        (point - first).dot(edge) / length_sq, 0.0, 1.0);
+    return (point - (first + fraction * edge)).squaredNorm();
+}
+
+static double studio_point_triangle_distance_sq(
+    const V3d& point, const Triangle& triangle)
+{
+    const V3d& a = triangle.v0;
+    const V3d b = a + triangle.edge1;
+    const V3d c = a + triangle.edge2;
+    const V3d normal = triangle.edge1.cross(triangle.edge2);
+    const double normal_sq = normal.squaredNorm();
+    if (normal_sq > 0.0) {
+        const V3d offset = point - a;
+        const V3d projected = point - normal *
+            (offset.dot(normal) / normal_sq);
+        const V3d relative = projected - a;
+        const double aa = triangle.edge1.squaredNorm();
+        const double ab = triangle.edge1.dot(triangle.edge2);
+        const double bb = triangle.edge2.squaredNorm();
+        const double determinant = aa * bb - ab * ab;
+        if (determinant > 0.0) {
+            const double u = (bb * relative.dot(triangle.edge1)
+                              - ab * relative.dot(triangle.edge2)) / determinant;
+            const double v = (aa * relative.dot(triangle.edge2)
+                              - ab * relative.dot(triangle.edge1)) / determinant;
+            if (u >= 0.0 && v >= 0.0 && u + v <= 1.0)
+                return (point - projected).squaredNorm();
+        }
+    }
+    return std::min({
+        studio_point_segment_distance_sq(point, a, b),
+        studio_point_segment_distance_sq(point, b, c),
+        studio_point_segment_distance_sq(point, c, a),
+    });
+}
+
+static double studio_point_box_distance_sq(const V3d& point, const AABB& box)
+{
+    double result = 0.0;
+    for (int axis = 0; axis < 3; ++axis) {
+        const double distance = point[axis] < box.lo[axis]
+            ? box.lo[axis] - point[axis]
+            : (point[axis] > box.hi[axis]
+                ? point[axis] - box.hi[axis] : 0.0);
+        result += distance * distance;
+    }
+    return result;
+}
+
+int ray_tracer_collect_studio_wave_triangles(
+    const RayTracerState* st, const double crossing_point[3],
+    double search_radius_m, int* out_triangle_ids, int capacity,
+    int* out_count)
+{
+    if (!st || !crossing_point || !out_count ||
+        (capacity > 0 && !out_triangle_ids)) return SK_ERR_NULL_STATE;
+    if (capacity < 0 || !std::isfinite(search_radius_m) ||
+        search_radius_m <= 0.0) return SK_ERR_DIM_MISMATCH;
+    const V3d center(crossing_point[0], crossing_point[1], crossing_point[2]);
+    if (!center.allFinite()) return SK_ERR_DIM_MISMATCH;
+    const double radius_sq = search_radius_m * search_radius_m;
+    if (!std::isfinite(radius_sq)) return SK_ERR_DIM_MISMATCH;
+    std::vector<int> candidates;
+    for (const auto& region : st->studio_regions) {
+        if (region.bvh.empty()) continue;
+        std::vector<int> stack{0};
+        while (!stack.empty()) {
+            const int node_index = stack.back();
+            stack.pop_back();
+            const BVHNode& node = region.bvh[static_cast<size_t>(node_index)];
+            if (studio_point_box_distance_sq(center, node.aabb) > radius_sq)
+                continue;
+            if (node.left >= 0) {
+                stack.push_back(node.left);
+                stack.push_back(node.right);
+                continue;
+            }
+            for (int i = node.tri_start; i < node.tri_end; ++i) {
+                const int id = region.tri_ids[static_cast<size_t>(i)];
+                const Triangle& triangle = st->tris[static_cast<size_t>(id)];
+                if (triangle.edge1.cross(triangle.edge2).squaredNorm() <= 0.0)
+                    continue; // exact sphere owners are checked by shell below
+                if (studio_point_triangle_distance_sq(center, triangle)
+                    <= radius_sq) candidates.push_back(id);
+            }
+        }
+    }
+    for (const auto& sphere : st->studio_spheres) {
+        const double shell_distance = std::abs(
+            (center - sphere.center).norm() - sphere.radius);
+        if (shell_distance <= search_radius_m)
+            candidates.push_back(sphere.owner_triangle);
+    }
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                     candidates.end());
+    *out_count = static_cast<int>(candidates.size());
+    if (*out_count > capacity) return SK_ERR_DIM_MISMATCH;
+    if (*out_count > 0)
+        std::copy(candidates.begin(), candidates.end(), out_triangle_ids);
+    return SK_OK;
+}
+
 static inline cd mat_refl_for_ray(
     const RayTracerState& st, int mat_idx, int lane, const RayIntent& ray)
 {

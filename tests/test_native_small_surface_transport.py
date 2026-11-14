@@ -133,6 +133,17 @@ def test_native_t3_resolves_host_dye_and_bubble_from_authored_surfaces():
         dye_interface = tracer.resolve_studio_wave_interface(
             len(host) + 10, triangles[len(host) + 10].mean(axis=0),
             np.array([0., 0., -1.]), frequency, 8.)
+        local = tracer.collect_studio_wave_triangles(
+            np.array([.0013, 0., 0.]), .00075)
+        assert np.any(local < len(host))
+        assert np.any((local >= len(host)) & (local < len(host) + len(dye)))
+        assert not np.any(local >= len(host) + len(dye))
+        with pytest.raises(ValueError, match='capacity'):
+            tracer.collect_studio_wave_triangles(
+                np.array([.0013, 0., 0.]), .00075, max_ids=1)
+        one_face = tracer.collect_studio_wave_triangles(
+            host[0].mean(axis=0), 1e-8)
+        assert one_face.tolist() == [0]
         assert dye_interface['before_n_imag'][0] == pytest.approx(0.)
         assert dye_interface['after_n_imag'][0] == pytest.approx(1e-7)
         assert dye_interface['transition_flags'] & 8  # extinction change with same base index
@@ -194,6 +205,8 @@ def test_native_exact_sphere_competes_with_host_mesh_and_resolves_bubble():
         )
         tracer.set_studio_spheres(
             np.array([[0., 0., 0., .0003, 12.]], np.float64))
+        assert tracer.collect_studio_wave_triangles(
+            np.array([.0003, 0., 0.]), 1e-6).tolist() == [12]
         for point, expected in (((0., 0., 0.), 1.),
                                 ((.0005, 0., 0.), 1.5),
                                 ((.0003 - 1e-12, 0., 0.), 1.),

@@ -4810,6 +4810,30 @@ struct PyRayTracer
         return out;
     }
 
+    py::array_t<int32_t> collect_studio_wave_triangles(
+        py::array_t<double, py::array::c_style | py::array::forcecast> point,
+        double search_radius_m, int max_ids = 4096)
+    {
+        const auto p = point.request();
+        if (p.ndim != 1 || p.size != 3 || max_ids < 1 || max_ids > 1'000'000)
+            throw std::invalid_argument(
+                "Studio local wave geometry needs a 3D point and bounded capacity");
+        std::vector<int> ids(static_cast<size_t>(max_ids));
+        int count = 0;
+        const int rc = ray_tracer_collect_studio_wave_triangles(
+            handle, static_cast<const double*>(p.ptr), search_radius_m,
+            ids.data(), max_ids, &count);
+        if (rc != SK_OK) {
+            if (count > max_ids)
+                throw std::invalid_argument(
+                    "Studio local wave geometry exceeded the requested capacity");
+            throw std::invalid_argument("Studio local wave geometry query was refused");
+        }
+        py::array_t<int32_t> result(count);
+        for (int i = 0; i < count; ++i) result.mutable_at(i) = ids[i];
+        return result;
+    }
+
     /** Project a (N, 14) float32 multiscale segment array onto a coherent
      *  complex sensor image.  Returns (out_re, out_im) each shape
      *  (n_bands, sensor_h, sensor_w) float32, accumulative (NOT zeroed here).
@@ -7821,6 +7845,10 @@ back-face: - -> +) instead of material-equality toggles.
              py::arg("incoming_direction"), py::arg("frequencies_hz"),
              py::arg("margin_wavelengths"),
              "Classify an authored T3 hit and both wavelength-tuned sides for T4.")
+        .def("collect_studio_wave_triangles", &PyRayTracer::collect_studio_wave_triangles,
+             py::arg("point"), py::arg("search_radius_m"),
+             py::arg("max_ids") = 4096,
+             "Find nearby authored boundary triangles for a local T4 context; exact spheres use owner IDs.")
         .def("project_coherent", &PyRayTracer::project_coherent,
              py::arg("segs"),
              py::arg("n_bands"),

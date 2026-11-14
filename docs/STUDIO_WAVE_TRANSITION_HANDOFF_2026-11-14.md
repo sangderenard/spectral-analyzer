@@ -32,6 +32,13 @@ they do not claim that T4 has solved it.
    aperture edges. Do not wrap the entire marble in one coarse volume. A
    context is admitted only when its spatial pitch and extent resolve its
    requested wavelengths. Keep noncontiguous neighborhoods separate.
+   `ray_tracer_collect_studio_wave_triangles` now supplies a bounded local
+   candidate list from the installed Studio region BVHs and exact sphere
+   shells. It tests actual triangle distance after BVH pruning, returns sorted
+   triangle IDs, and refuses insufficient output capacity without writing a
+   partial list. The caller sets a search radius explicitly. This identifies
+   nearby authored surfaces; it does not yet partition them into connected
+   3D arenas or admit a numerical grid.
 3. Feed each admitted crossing's complex field, Jones/coherence lineage and
    medium state to the appropriate T4 arena through Nodus tensor-state
    addresses. The present 2D angular-spectrum T4 is a transverse propagation

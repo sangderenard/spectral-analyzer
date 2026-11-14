@@ -1171,6 +1171,21 @@ SK_API int ray_tracer_resolve_studio_transition_vector_v1(
     double* out_after_n_imag
 );
 
+/* Collect authored Studio boundary triangles whose exact surface lies within
+ * search_radius_m of a crossing point. This is a conservative local geometry
+ * list for T4 context construction, not an arena admission or wave solve.
+ * Exact spheres are compared by distance to their shell and returned by owner
+ * triangle ID. On insufficient capacity, out_count receives the required
+ * count and no partial list is written. Call only after cold scene setup. */
+SK_API int ray_tracer_collect_studio_wave_triangles(
+    const RayTracerState* st,
+    const double crossing_point[3],
+    double search_radius_m,
+    int* out_triangle_ids,
+    int capacity,
+    int* out_count
+);
+
 /**
  * Project a multiscale segment buffer onto a coherent complex sensor image.
  *

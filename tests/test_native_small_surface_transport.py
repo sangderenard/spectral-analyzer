@@ -144,6 +144,13 @@ def test_native_t3_resolves_host_dye_and_bubble_from_authored_surfaces():
         one_face = tracer.collect_studio_wave_triangles(
             host[0].mean(axis=0), 1e-8)
         assert one_face.tolist() == [0]
+        sampled = tracer.sample_studio_wave_grid(
+            np.array([-.001, 0., 0.]),
+            np.diag([.001, 1., 1.]), np.array([3, 1, 1], np.int32),
+            np.array([1., 0., 0.]), frequency)
+        assert sampled['n_real'].shape == (3, 1, 1, 1)
+        assert sampled['n_real'][:, 0, 0, 0] == pytest.approx([1., 1.5, 1.5])
+        assert sampled['n_imag'][:, 0, 0, 0] == pytest.approx([0., 0., 1e-7])
         assert dye_interface['before_n_imag'][0] == pytest.approx(0.)
         assert dye_interface['after_n_imag'][0] == pytest.approx(1e-7)
         assert dye_interface['transition_flags'] & 8  # extinction change with same base index
@@ -207,6 +214,13 @@ def test_native_exact_sphere_competes_with_host_mesh_and_resolves_bubble():
             np.array([[0., 0., 0., .0003, 12.]], np.float64))
         assert tracer.collect_studio_wave_triangles(
             np.array([.0003, 0., 0.]), 1e-6).tolist() == [12]
+        sampled = tracer.sample_studio_wave_grid(
+            np.array([0., 0., 0.]),
+            np.diag([.0005, 1., 1.]), np.array([7, 1, 1], np.int32),
+            np.array([1., 0., 0.]), frequency)
+        assert sampled['n_real'][0, 0, 0, 0] == pytest.approx(1.)
+        assert sampled['n_real'][1, 0, 0, 0] == pytest.approx(1.5)
+        assert sampled['n_real'][6, 0, 0, 0] == pytest.approx(1.)
         for point, expected in (((0., 0., 0.), 1.),
                                 ((.0005, 0., 0.), 1.5),
                                 ((.0003 - 1e-12, 0., 0.), 1.),

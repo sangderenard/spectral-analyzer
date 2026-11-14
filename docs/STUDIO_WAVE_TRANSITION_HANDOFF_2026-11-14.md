@@ -48,6 +48,14 @@ they do not claim that T4 has solved it.
    mapping, boundaries and a Courant gate. Neither operator can silently
    substitute for the other. The exact conic T2 aperture handoff already
    exists for CPU traversal; GPU interior-stop support is still absent.
+   `ray_tracer_sample_studio_wave_grid` now fills caller-owned voxel arrays
+   with the existing Studio resolver's base material and real/imaginary index
+   at each requested frequency. This includes the authored bubble and dye
+   behavior. It accepts an oriented 3D lattice and reports a failed cell
+   instead of returning a partial material grid as valid. The grid is material
+   input, not a wave result. Converting complex index to the time-domain
+   kernel's speed/damping law and moving the array into Nodus tensor-state
+   addresses remain explicit integration work.
 4. On exit, form continuation vectors with position, direction, phase,
    polarization, spectral weights and medium ownership. Match the wave exits
    to their input lineage before returning them to T1/T3. The known

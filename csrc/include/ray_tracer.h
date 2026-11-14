@@ -1186,6 +1186,31 @@ SK_API int ray_tracer_collect_studio_wave_triangles(
     int* out_count
 );
 
+/* Sample the existing authenticated Studio medium at voxel centers of an
+ * oriented 3D lattice. Results are C-order [x,y,z,frequency], with frequency
+ * fastest. The supplied direction resolves points exactly on a boundary.
+ * Values are complex refractive indices from the installed MatBuf, including
+ * dye extinction; no speed/damping approximation is imposed here. On a
+ * nonzero return the output arrays are incomplete and must be discarded.
+ * This cold scene-state operation may be written directly into caller-owned
+ * tensor-state memory; it is not a per-ray stage. */
+SK_API int ray_tracer_sample_studio_wave_grid(
+    const RayTracerState* st,
+    const double origin[3],
+    const double step_x[3],
+    const double step_y[3],
+    const double step_z[3],
+    int nx, int ny, int nz,
+    const double direction[3],
+    int n_frequencies,
+    const double* frequencies_hz,
+    int* out_base_material,
+    double* out_n_real,
+    double* out_n_imag,
+    uint64_t voxel_capacity,
+    uint64_t* out_failed_voxel
+);
+
 /**
  * Project a multiscale segment buffer onto a coherent complex sensor image.
  *

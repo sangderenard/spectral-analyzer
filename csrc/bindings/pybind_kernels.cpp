@@ -4834,6 +4834,53 @@ struct PyRayTracer
         return result;
     }
 
+    py::dict sample_studio_wave_grid(
+        py::array_t<double, py::array::c_style | py::array::forcecast> origin,
+        py::array_t<double, py::array::c_style | py::array::forcecast> steps,
+        py::array_t<int32_t, py::array::c_style | py::array::forcecast> shape,
+        py::array_t<double, py::array::c_style | py::array::forcecast> direction,
+        py::array_t<double, py::array::c_style | py::array::forcecast> frequencies_hz)
+    {
+        const auto o = origin.request(), s = steps.request(),
+                   sh = shape.request(), d = direction.request(),
+                   f = frequencies_hz.request();
+        if (o.ndim != 1 || o.size != 3 || s.ndim != 2 ||
+            s.shape[0] != 3 || s.shape[1] != 3 ||
+            sh.ndim != 1 || sh.size != 3 || d.ndim != 1 || d.size != 3 ||
+            f.ndim != 1 || f.size < 1 || f.size > _n_bands)
+            throw std::invalid_argument("Studio wave grid needs origin(3), steps(3,3), shape(3), direction(3) and frequencies");
+        const auto* dims = static_cast<const int32_t*>(sh.ptr);
+        if (dims[0] < 1 || dims[1] < 1 || dims[2] < 1 ||
+            dims[0] > 2'000'000 || dims[1] > 2'000'000 ||
+            dims[2] > 2'000'000 ||
+            static_cast<uint64_t>(dims[0]) * dims[1] * dims[2] > 2'000'000)
+            throw std::invalid_argument("Studio wave grid must contain 1 to 2,000,000 voxels");
+        const auto voxels = static_cast<uint64_t>(dims[0]) * dims[1] * dims[2];
+        const std::vector<py::ssize_t> space{
+            dims[0], dims[1], dims[2]};
+        const std::vector<py::ssize_t> spectral{
+            dims[0], dims[1], dims[2], f.size};
+        py::array_t<int32_t> base(space);
+        py::array_t<double> real(spectral), imag(spectral);
+        const auto* step_values = static_cast<const double*>(s.ptr);
+        uint64_t failed = UINT64_MAX;
+        const int rc = ray_tracer_sample_studio_wave_grid(
+            handle, static_cast<const double*>(o.ptr),
+            step_values, step_values + 3, step_values + 6,
+            dims[0], dims[1], dims[2], static_cast<const double*>(d.ptr),
+            static_cast<int>(f.size), static_cast<const double*>(f.ptr),
+            base.mutable_data(), real.mutable_data(), imag.mutable_data(),
+            voxels, &failed);
+        if (rc != SK_OK)
+            throw std::invalid_argument("native Studio wave grid sample refused at voxel " +
+                                        std::to_string(failed));
+        py::dict out;
+        out["base_material"] = std::move(base);
+        out["n_real"] = std::move(real);
+        out["n_imag"] = std::move(imag);
+        return out;
+    }
+
     /** Project a (N, 14) float32 multiscale segment array onto a coherent
      *  complex sensor image.  Returns (out_re, out_im) each shape
      *  (n_bands, sensor_h, sensor_w) float32, accumulative (NOT zeroed here).
@@ -7849,6 +7896,10 @@ back-face: - -> +) instead of material-equality toggles.
              py::arg("point"), py::arg("search_radius_m"),
              py::arg("max_ids") = 4096,
              "Find nearby authored boundary triangles for a local T4 context; exact spheres use owner IDs.")
+        .def("sample_studio_wave_grid", &PyRayTracer::sample_studio_wave_grid,
+             py::arg("origin"), py::arg("steps"), py::arg("shape"),
+             py::arg("direction"), py::arg("frequencies_hz"),
+             "Sample authored Studio complex refractive index on an oriented 3D grid for T4 state.")
         .def("project_coherent", &PyRayTracer::project_coherent,
              py::arg("segs"),
              py::arg("n_bands"),

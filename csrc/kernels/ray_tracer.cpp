@@ -2481,8 +2481,8 @@ int ray_tracer_resolve_studio_medium(
     if (!point.allFinite() || !ray.allFinite()) return SK_ERR_DIM_MISMATCH;
     const RtResolvedStudioMedium medium = studio_region_medium_at(*st, point, ray);
     if (!medium.valid) return SK_ERR_DIM_MISMATCH;
-    std::vector<double> real(static_cast<size_t>(n_frequencies), 1.0);
-    std::vector<double> imag(static_cast<size_t>(n_frequencies), 0.0);
+    std::array<double, 32> real{}, imag{};
+    real.fill(1.0);
     for (int lane = 0; lane < n_frequencies; ++lane) {
         const double frequency = frequencies_hz[lane];
         if (medium.base_material >= 0) {
@@ -2501,8 +2501,71 @@ int ray_tracer_resolve_studio_medium(
             return SK_ERR_DIM_MISMATCH;
     }
     *out_base_material = medium.base_material;
-    std::copy(real.begin(), real.end(), out_n_real);
-    std::copy(imag.begin(), imag.end(), out_n_imag);
+    std::copy_n(real.begin(), n_frequencies, out_n_real);
+    std::copy_n(imag.begin(), n_frequencies, out_n_imag);
+    return SK_OK;
+}
+
+int ray_tracer_sample_studio_wave_grid(
+    const RayTracerState* st, const double origin[3],
+    const double step_x[3], const double step_y[3], const double step_z[3],
+    int nx, int ny, int nz, const double direction[3],
+    int n_frequencies, const double* frequencies_hz,
+    int* out_base_material, double* out_n_real, double* out_n_imag,
+    uint64_t voxel_capacity, uint64_t* out_failed_voxel)
+{
+    if (!st || !origin || !step_x || !step_y || !step_z || !direction ||
+        !frequencies_hz || !out_base_material || !out_n_real || !out_n_imag ||
+        !out_failed_voxel) return SK_ERR_NULL_STATE;
+    *out_failed_voxel = UINT64_MAX;
+    if (st->studio_regions.empty() || nx < 1 || ny < 1 || nz < 1 || n_frequencies < 1 ||
+        n_frequencies > st->n_bands || n_frequencies > 32)
+        return SK_ERR_DIM_MISMATCH;
+    const uint64_t plane = static_cast<uint64_t>(nx) *
+        static_cast<uint64_t>(ny);
+    if (plane > UINT64_MAX / static_cast<uint64_t>(nz))
+        return SK_ERR_DIM_MISMATCH;
+    const uint64_t count = plane * static_cast<uint64_t>(nz);
+    if (count > voxel_capacity || count > SIZE_MAX /
+        static_cast<uint64_t>(n_frequencies)) return SK_ERR_DIM_MISMATCH;
+    const V3d start(origin[0], origin[1], origin[2]);
+    const V3d dx(step_x[0], step_x[1], step_x[2]);
+    const V3d dy(step_y[0], step_y[1], step_y[2]);
+    const V3d dz(step_z[0], step_z[1], step_z[2]);
+    const V3d ray(direction[0], direction[1], direction[2]);
+    if (!start.allFinite() || !dx.allFinite() || !dy.allFinite() ||
+        !dz.allFinite() || !ray.allFinite() || ray.squaredNorm() <= 0.0 ||
+        !std::isfinite(dx.dot(dy.cross(dz))) ||
+        dx.dot(dy.cross(dz)) == 0.0) return SK_ERR_DIM_MISMATCH;
+    for (int lane = 0; lane < n_frequencies; ++lane)
+        if (!std::isfinite(frequencies_hz[lane]) || frequencies_hz[lane] <= 0.0)
+            return SK_ERR_DIM_MISMATCH;
+    const double ray_values[3] = {ray.x(), ray.y(), ray.z()};
+    for (int x = 0; x < nx; ++x) {
+        for (int y = 0; y < ny; ++y) {
+            for (int z = 0; z < nz; ++z) {
+                const uint64_t index =
+                    (static_cast<uint64_t>(x) * ny + y) * nz + z;
+                const V3d point = start + static_cast<double>(x) * dx +
+                    static_cast<double>(y) * dy + static_cast<double>(z) * dz;
+                if (!point.allFinite()) {
+                    *out_failed_voxel = index;
+                    return SK_ERR_DIM_MISMATCH;
+                }
+                const double point_values[3] = {
+                    point.x(), point.y(), point.z()};
+                const uint64_t lane_offset = index * n_frequencies;
+                const int rc = ray_tracer_resolve_studio_medium(
+                    st, point_values, ray_values, n_frequencies,
+                    frequencies_hz, &out_base_material[index],
+                    out_n_real + lane_offset, out_n_imag + lane_offset);
+                if (rc != SK_OK) {
+                    *out_failed_voxel = index;
+                    return rc;
+                }
+            }
+        }
+    }
     return SK_OK;
 }
 

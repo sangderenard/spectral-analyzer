@@ -7830,11 +7830,38 @@ static inline bool apply_parametric_lens_from_f32(
                 const double v = radial.dot(arena.axis_y);
                 if (std::abs(u) > arena.radius || std::abs(v) > arena.radius)
                     continue;
+                if (arena.id < 0 || arena.id >= 65535) {
+                    if (trace_info) *trace_info = local_trace;
+                    return true; /* unrepresentable event identity: refuse */
+                }
                 opl += n_bf*t;
                 local_trace.geom_len += t;
                 local_trace.opl = opl;
                 local_trace.pause_arena_id = arena.id;
                 local_trace.resume_si = si + 1;
+                /* This is a real element transition within the fused exact
+                 * lens. Keep its physical surface index in the same optical
+                 * side stream as the conic and clip events. It is not Snell
+                 * refraction: T4 owns the aperture field until continuation. */
+                BdptOpticalEventRecord wave_entry{};
+                wave_entry.element_index = static_cast<uint16_t>(s);
+                wave_entry.reason = BDPT_OPT_WAVE_CONTEXT_ENTRY;
+                /* For this reason only, flags is arena_id + 1; zero means no
+                 * arena. The T5 optical Jacobian remains exactly one. */
+                wave_entry.flags = static_cast<uint16_t>(arena.id + 1);
+                wave_entry.pos[0] = static_cast<float>(crossing.x());
+                wave_entry.pos[1] = static_cast<float>(crossing.y());
+                wave_entry.pos[2] = static_cast<float>(crossing.z());
+                wave_entry.dir_in[0] = static_cast<float>(rd.x());
+                wave_entry.dir_in[1] = static_cast<float>(rd.y());
+                wave_entry.dir_in[2] = static_cast<float>(rd.z());
+                wave_entry.eta_i = static_cast<float>(n_bf);
+                wave_entry.eta_t = static_cast<float>(n_af);
+                wave_entry.aperture_radius = static_cast<float>(ap_r);
+                wave_entry.transverse_radius = static_cast<float>(std::hypot(u, v));
+                wave_entry.phase_space_jacobian = 1.0f;
+                wave_entry.throughput_multiplier = 1.0f;
+                local_trace.events.push_back(wave_entry);
                 if (path_len) {
                     const double c0 = st.speed_m_s > EPS
                         ? st.speed_m_s : 299792458.0;

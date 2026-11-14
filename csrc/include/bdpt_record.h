@@ -191,7 +191,7 @@ typedef struct {
     uint16_t element_index;         /* lens element or interface index */
     uint8_t  reason;                /* termination/event reason (see BDPT_OPT_*) */
     uint8_t  stream;                /* BDPT_SIDE_LIGHT or BDPT_SIDE_SENSOR */
-    uint16_t flags;
+    uint16_t flags;                /* WAVE_CONTEXT_ENTRY: arena_id + 1 */
     float    pos[3];                /* interface hit point (m) */
     float    normal[3];             /* interface normal */
     float    dir_in[3];             /* ray direction before interface */
@@ -264,6 +264,7 @@ typedef struct {
 #define BDPT_OPT_ABSORPTION         5u  /* absorbed at this surface */
 #define BDPT_OPT_SENSOR_HIT         6u  /* reached sensor plane */
 #define BDPT_OPT_EMISSION           7u  /* emissive surface hit */
+#define BDPT_OPT_WAVE_CONTEXT_ENTRY 8u  /* exact lens stop yielded to T4 */
 
 /* ── Scatter flags for BdptPdfRecord.flags ────────────────────────────────── */
 #define BDPT_PDF_FLAG_DELTA_SPECULAR  (1u << 16)  /* mirror reflection or Snell refraction */

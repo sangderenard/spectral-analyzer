@@ -2,11 +2,12 @@
 
 ## Executable boundary
 
-`ray_tracer_resolve_studio_wave_interface` now returns the authenticated hit
+`ray_tracer_resolve_studio_transition_vector_v1` now returns the authenticated hit
 point and normalized incident vector with flags for an authored region surface,
 base material change, real-index change, imaginary-index change, and an exact
 sphere. It retains the two-sided per-frequency optical indices and the
-wavelength-derived local margin. A dye interface may have identical base
+wavelength-derived local margin. The older C result ABI remains unchanged.
+A dye interface may have identical base
 materials but a changed imaginary index; it must remain a transition. A
 zero-contrast authored surface remains identified as geometry, but does not
 claim an optical contrast. These flags describe a **pre-scatter crossing**;
@@ -30,8 +31,9 @@ they do not claim that T4 has solved it.
 3. Feed each admitted crossing's complex field, Jones/coherence lineage and
    medium state to the appropriate T4 arena through Nodus tensor-state
    addresses. The present 2D angular-spectrum T4 is a transverse propagation
-   operator. The SymPy 3D scalar stencil and its Nodus 64³ GPU trial are a
-   separate volume operator; production use needs two time levels, neighbor
+   operator. The SymPy 3D scalar stencil is a real compiled kernel running
+   through the Nodus GPU row and tensor state library on three GPUs. It is a
+   separate volume operator; arena service use needs two time levels, neighbor
    mapping, boundaries and a Courant gate. Neither operator can silently
    substitute for the other. The exact conic T2 aperture handoff already
    exists for CPU traversal; GPU interior-stop support is still absent.
@@ -58,3 +60,15 @@ local pitch and Courant/admission refusals, field energy and Jones continuity
 across separated contexts, and compare the final linear sensor against the
 non-wave transport with a declared tolerance. A rendered image is evidence
 only after those gates and a native Nodus T1–T5 job pass.
+
+## Exact parametric lens elements
+
+The graph contract now enumerates every surface in the canonical exact T2
+payload as an indexed element. Conic interfaces carry their authored geometry
+and per-lane before/after indices. A physical aperture wave context must bind
+to exactly one indexed stop; a missing or ambiguous stop is refused. The
+native T2 traversal emits an optical event at the exact stop's T4 entry with
+that same element index and an arena ID, before it yields to the wave arena. This identifies
+the internal lens transition even though the lens still executes as one fused
+T2 program. It does not turn the scalar 3D volume kernel into the optical T4
+operator or make all lens paths available as a Nodus crossing-vector stream.

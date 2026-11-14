@@ -475,6 +475,20 @@ def test_exact_compound_lens_routes_through_physical_aperture_wave_region(revers
     arena = tracer.wave_arena_stats()[0]
     assert arena["generation"] > 0
     assert sum(arena["field_active"]) > 0
+    optical = np.asarray(tracer.drain_bdpt_optical(128))
+    wave_entries = optical[optical[:, 8] == 8]
+    assert len(wave_entries) == 1
+    stop_index = next(
+        index for index, element in enumerate(
+            next(node for node in graph.spec.nodes
+                 if node.key == "camera.exact-compound-lens").parameters[
+                     "parametric_elements"])
+        if element["kind"] == "aperture-stop"
+    )
+    assert int.from_bytes(wave_entries[0, 6:8].tobytes(), "little") == stop_index
+    assert int.from_bytes(wave_entries[0, 10:12].tobytes(), "little") == (
+        arena["arena_id"] + 1
+    )
     records = tracer.drain_records(64)
     kinds = np.asarray(records["kind"])
     assert 3 in kinds.tolist()

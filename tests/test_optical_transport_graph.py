@@ -101,6 +101,13 @@ def test_exact_compound_payload_is_the_fused_t2_graph_artifact(lane_count):
     assert contract["execution"] == "compiled-not-hot-interpreted"
     assert contract["t2_payload_keys"] == ["camera.exact-compound-lens"]
     assert contract["t4_descriptor_keys"] == []
+    elements = next(node for node in compiled.spec.nodes
+                    if node.key == "camera.exact-compound-lens").parameters[
+                        "parametric_elements"]
+    assert len(elements) == int(payload[1])
+    assert [item["element_index"] for item in elements] == list(range(len(elements)))
+    assert all(item["kind"] in {"exact-conic-interface", "aperture-stop"}
+               for item in elements)
 
 
 def test_projector_back_uses_reciprocal_exact_lens_graph():
@@ -191,6 +198,16 @@ def test_aperture_inside_exact_lens_carries_stop_medium_into_native_arena():
     )
     descriptor = graph.t4_descriptors["test.stop.arena"]
     assert np.allclose(descriptor["medium_n_by_lane"], expected)
+    assert descriptor["parametric_lens_element"] == {
+        "node_key": "camera.exact-compound-lens",
+        "element_index": stop,
+        "kind": "aperture-stop",
+    }
+    with pytest.raises(ValueError, match="identify one exact lens stop"):
+        compile_compound_lens_graph(
+            lens, lane_count=3,
+            wave_regions=(("wrong.stop", {**region, "center_m": (42., 0., 0.)}),),
+        )
     tracer = _RecordingTracer()
     install_optical_graph(tracer, graph, exact_t2_registered=True)
     native = tracer.contexts[0]

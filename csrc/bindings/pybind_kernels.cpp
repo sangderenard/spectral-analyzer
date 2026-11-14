@@ -2835,6 +2835,43 @@ struct PyRayTracer
     /* Feed GPU-processed child intents back into the pipeline.
      * buf: float32 array of shape (n, INTENT_STRIDE=84).
      * Each row is decoded into a RayIntent and pushed to Q_intent. */
+    py::array_t<uint8_t> drain_studio_transitions(int max_n = 256) {
+        constexpr py::ssize_t stride =
+            static_cast<py::ssize_t>(sizeof(RayTransitionRecordV1));
+        if (!_pipeline || max_n <= 0)
+            return py::array_t<uint8_t>(std::vector<py::ssize_t>{0, stride});
+        std::vector<RayTransitionRecordV1> batch;
+        ray_pipeline_drain_transitions(_pipeline, batch, max_n);
+        auto arr = py::array_t<uint8_t>(
+            std::vector<py::ssize_t>{static_cast<py::ssize_t>(batch.size()), stride});
+        if (!batch.empty())
+            std::memcpy(arr.mutable_data(), batch.data(), batch.size()*sizeof(batch[0]));
+        return arr;
+    }
+
+    py::dict studio_transition_layout() const {
+        py::dict out;
+        out["version"] = 1;
+        out["stride"] = sizeof(RayTransitionRecordV1);
+        out["max_bands"] = RAY_RECORD_MAX_BANDS;
+        out["status"] = offsetof(RayTransitionRecordV1, status);
+        out["tag"] = offsetof(RayTransitionRecordV1, tag);
+        out["triangle_id"] = offsetof(RayTransitionRecordV1, triangle_id);
+        out["region_id"] = offsetof(RayTransitionRecordV1, region_id);
+        out["transition_flags"] = offsetof(RayTransitionRecordV1, transition_flags);
+        out["lane_count"] = offsetof(RayTransitionRecordV1, lane_count);
+        out["crossing_point"] = offsetof(RayTransitionRecordV1, crossing_point);
+        out["incoming_direction"] = offsetof(RayTransitionRecordV1, incoming_direction);
+        out["frequency_hz"] = offsetof(RayTransitionRecordV1, frequency_hz);
+        out["before_n_real"] = offsetof(RayTransitionRecordV1, before_n_real);
+        out["before_n_imag"] = offsetof(RayTransitionRecordV1, before_n_imag);
+        out["after_n_real"] = offsetof(RayTransitionRecordV1, after_n_real);
+        out["after_n_imag"] = offsetof(RayTransitionRecordV1, after_n_imag);
+        out["amp_re"] = offsetof(RayTransitionRecordV1, amp_re);
+        out["amp_im"] = offsetof(RayTransitionRecordV1, amp_im);
+        return out;
+    }
+
     void submit_intents_flat(py::array_t<float, py::array::c_style> buf) {
         auto* pl = _get_pipeline();
         auto info = buf.request();
@@ -7402,6 +7439,16 @@ ray_material.comp.glsl.  Returns shape (0,) when the queue is empty.
 
 Used by the GPU T3 bridge (GpuRayMaterialStage) to intercept the material/Fresnel
 stage and dispatch it on the GPU instead of the C++ worker threads.)doc")
+        .def("drain_studio_transitions",
+             &PyRayTracer::drain_studio_transitions,
+             py::arg("max_n") = 256,
+R"doc(Drain native T2 authored-interface crossing records as raw U8 rows.
+The versioned RayTransitionRecordV1 layout is declared in ray_pipeline.h;
+status, lineage, resolved frequencies, complex amplitudes, and two-sided
+indices travel together. This does not consume the ordinary ray output.)doc")
+        .def("studio_transition_layout",
+             &PyRayTracer::studio_transition_layout,
+R"doc(Return byte offsets and stride of the native version-1 transition row.)doc")
         .def("submit_intents_flat",
              &PyRayTracer::submit_intents_flat,
              py::arg("buf"),

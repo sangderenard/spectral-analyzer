@@ -140,6 +140,32 @@ def test_native_t3_resolves_host_dye_and_bubble_from_authored_surfaces():
             tracer.resolve_studio_wave_interface(
                 0, np.array([.1, .1, .1]),
                 np.array([0., 0., -1.]), frequency, 8.)
+        tracer.submit_rays(
+            np.array([[.001, 0., 0.]], np.float64),
+            np.array([[1., 0., 0.]], np.float64),
+            np.ones((1, 1), np.complex128),
+            max_bounces=1, max_children=1, min_amplitude=0.,
+        )
+        deadline = time.monotonic() + 5
+        while tracer.in_flight_count() and time.monotonic() < deadline:
+            time.sleep(.001)
+        assert tracer.in_flight_count() == 0
+        layout = tracer.studio_transition_layout()
+        rows = np.asarray(tracer.drain_studio_transitions(16))
+        dye_rows = [row for row in rows
+                    if int(np.frombuffer(row[layout['region_id']:
+                                             layout['region_id'] + 4], '<i4')[0]) == 1]
+        assert dye_rows
+        row = dye_rows[0]
+        flags = int(np.frombuffer(
+            row[layout['transition_flags']:layout['transition_flags'] + 4], '<u4')[0])
+        assert flags & 8 and not flags & 2
+        before_k = np.frombuffer(
+            row[layout['before_n_imag']:layout['before_n_imag'] + 8], '<f8')[0]
+        after_k = np.frombuffer(
+            row[layout['after_n_imag']:layout['after_n_imag'] + 8], '<f8')[0]
+        assert before_k == pytest.approx(1e-7)
+        assert after_k == pytest.approx(0.)
     finally:
         tracer.stop_pipeline()
 
@@ -194,6 +220,26 @@ def test_native_exact_sphere_competes_with_host_mesh_and_resolves_bubble():
         while tracer.in_flight_count() and time.monotonic() < deadline:
             time.sleep(.001)
         assert tracer.in_flight_count() == 0
+        layout = tracer.studio_transition_layout()
+        transitions = np.asarray(tracer.drain_studio_transitions(16))
+        assert transitions.shape[1] == layout['stride']
+        assert len(transitions) >= 1
+        def field(row, name, dtype):
+            offset = layout[name]
+            return np.frombuffer(row[offset:offset + np.dtype(dtype).itemsize],
+                                 dtype=dtype)[0]
+        bubble_rows = [row for row in transitions
+                       if field(row, 'triangle_id', '<i4') == 12]
+        assert bubble_rows
+        crossing = bubble_rows[0]
+        assert field(crossing, 'status', '<i4') == 0
+        assert field(crossing, 'transition_flags', '<u4') & 16
+        assert field(crossing, 'lane_count', '<u4') == 1
+        assert field(crossing, 'frequency_hz', '<f8') == pytest.approx(frequency[0])
+        assert field(crossing, 'before_n_real', '<f8') == pytest.approx(1.)
+        assert field(crossing, 'after_n_real', '<f8') == pytest.approx(1.5)
+        assert abs(field(crossing, 'amp_re', '<f8')) > 0.
+        assert tracer.drain_studio_transitions(16).shape[0] == 0
         records = tracer.drain_records(16)
         strikes = np.flatnonzero(np.asarray(records['kind']) == 0)
         assert len(strikes) >= 1

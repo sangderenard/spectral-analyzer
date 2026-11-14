@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <type_traits>
 #include "bdpt_record.h"
 #include "complex_transport.h"
 #include "wave_exit_state.h"
@@ -321,6 +322,45 @@ struct RayRecord {
     float         sensor_origin_y   = 0.f; /* camera-stream launch site on sensor */
     float         sensor_origin_z   = 0.f;
 };
+
+/* T2's authenticated authored-Studio crossing off ramp. One record retains
+ * the exact frequency set used for classification, including a continuous
+ * sample's resolved frequency. A nonzero status is a visible refusal; T3
+ * still receives the refined hit. This is an in-process record layout, not
+ * the network envelope owned by the Nodus graph. */
+struct RayTransitionRecordV1 {
+    uint32_t version = 1;
+    int32_t status = 0;
+    uint64_t tag = 0;
+    uint32_t subpath_id = 0;
+    uint16_t vertex_index = 0;
+    uint8_t stream = 0;
+    uint8_t spectral_resolved = 0;
+    int32_t src_id = 0;
+    int32_t bounce = 0;
+    int32_t triangle_id = -1;
+    int32_t region_id = -1;
+    int32_t before_base_material = -1;
+    int32_t after_base_material = -1;
+    uint32_t transition_flags = 0;
+    uint32_t lane_count = 0;
+    uint32_t active_lane = 0;
+    double launch_time_s = 0.0;
+    double path_length_m = 0.0;
+    double margin_m = 0.0; /* one longest vacuum wavelength; frame contract scales it */
+    double crossing_point[3] = {};
+    double incoming_direction[3] = {};
+    double outward_normal[3] = {};
+    double frequency_hz[RAY_RECORD_MAX_BANDS] = {};
+    double before_n_real[RAY_RECORD_MAX_BANDS] = {};
+    double before_n_imag[RAY_RECORD_MAX_BANDS] = {};
+    double after_n_real[RAY_RECORD_MAX_BANDS] = {};
+    double after_n_imag[RAY_RECORD_MAX_BANDS] = {};
+    double amp_re[RAY_RECORD_MAX_BANDS] = {};
+    double amp_im[RAY_RECORD_MAX_BANDS] = {};
+};
+static_assert(std::is_standard_layout_v<RayTransitionRecordV1>);
+static_assert(std::is_trivially_copyable_v<RayTransitionRecordV1>);
 
 /* ─── Thread-safe pipeline queue ────────────────────────────────────────── */
 
@@ -1485,6 +1525,12 @@ int ray_pipeline_tri_mat_idx(const RayPipelineState* ps, int tri_idx);
 int ray_pipeline_drain_refined(RayPipelineState* ps,
                                 std::vector<RefinedHit>& out,
                                 int max_n);
+
+/* Non-blocking T2 authored-interface transition stream, separate from the
+ * transport output and BDPT side records. */
+int ray_pipeline_drain_transitions(RayPipelineState* ps,
+                                  std::vector<RayTransitionRecordV1>& out,
+                                  int max_n);
 
 /* ── BDPT side-data drains (non-blocking, pop up to max_n each) ─────────────
  * Each function is independent of the others.  Returns count appended (0 if

@@ -8322,6 +8322,7 @@ struct RayPipelineState {
     PipelineQueue<RayIntent>  Q_intent;
     PipelineQueue<HitRecord>  Q_hit;
     PipelineQueue<RefinedHit> Q_refined;
+    PipelineQueue<RayTransitionRecordV1> Q_transitions;
     PipelineQueue<WaveIntent> Q_wave;
     PipelineQueue<RayRecord>  Q_out;    /* output records drained by the caller */
     PipelineQueue<WaveExitStateRecord> Q_wave_exit_states;
@@ -17608,6 +17609,73 @@ static void pipeline_refiner(RayPipelineState& ps)
                 }
             }
 
+            if (hr.hit_tri >= 0 &&
+                static_cast<size_t>(hr.hit_tri) <
+                    st.studio_triangle_region_ids.size() &&
+                st.studio_triangle_region_ids[static_cast<size_t>(hr.hit_tri)] >= 0) {
+                RayTransitionRecordV1 record{};
+                record.tag = hr.ray.tag;
+                record.subpath_id = hr.ray.bdpt_subpath_id;
+                record.vertex_index = hr.ray.bdpt_vertex;
+                record.stream = hr.ray.bdpt_stream;
+                record.spectral_resolved = hr.ray.spectral_resolved;
+                record.src_id = hr.ray.src_id;
+                record.bounce = hr.ray.bounce;
+                record.triangle_id = hr.hit_tri;
+                record.region_id = st.studio_triangle_region_ids[
+                    static_cast<size_t>(hr.hit_tri)];
+                record.launch_time_s = hr.ray.launch_time;
+                record.path_length_m = hr.ray.path_len;
+                record.active_lane = hr.ray.spectral_resolved
+                    ? hr.ray.spectral_lane_id : 0u;
+                const int lanes = hr.ray.spectral_resolved ? 1 :
+                    std::min(st.n_bands, RAY_RECORD_MAX_BANDS);
+                record.lane_count = static_cast<uint32_t>(lanes);
+                for (int lane = 0; lane < lanes; ++lane) {
+                    const int source_lane = hr.ray.spectral_resolved
+                        ? static_cast<int>(hr.ray.spectral_lane_id) : lane;
+                    record.frequency_hz[lane] =
+                        ray_frequency(st, hr.ray, source_lane);
+                    const int amp_lane = source_lane < hr.amp_propagated.size()
+                        ? source_lane : lane;
+                    if (amp_lane < hr.amp_propagated.size()) {
+                        record.amp_re[lane] = hr.amp_propagated[amp_lane].real();
+                        record.amp_im[lane] = hr.amp_propagated[amp_lane].imag();
+                    }
+                }
+                RtStudioTransitionVectorV1 crossing{};
+                const double point[3] = {rh.refined_pos.x(),
+                    rh.refined_pos.y(), rh.refined_pos.z()};
+                const double incident[3] = {hr.incoming_dir.x(),
+                    hr.incoming_dir.y(), hr.incoming_dir.z()};
+                record.status = ray_tracer_resolve_studio_transition_vector_v1(
+                    &st, hr.hit_tri, point, incident, lanes,
+                    record.frequency_hz, 1.0, &crossing,
+                    record.before_n_real, record.before_n_imag,
+                    record.after_n_real, record.after_n_imag);
+                if (record.status == SK_OK) {
+                    record.region_id = crossing.interface.region_id;
+                    record.before_base_material =
+                        crossing.interface.before_base_material;
+                    record.after_base_material =
+                        crossing.interface.after_base_material;
+                    record.transition_flags = crossing.transition_flags;
+                    record.margin_m = crossing.interface.margin_m;
+                    for (int axis = 0; axis < 3; ++axis) {
+                        record.crossing_point[axis] = crossing.crossing_point[axis];
+                        record.incoming_direction[axis] =
+                            crossing.incoming_direction[axis];
+                        record.outward_normal[axis] =
+                            crossing.interface.outward_normal[axis];
+                    }
+                } else {
+                    for (int axis = 0; axis < 3; ++axis) {
+                        record.crossing_point[axis] = point[axis];
+                        record.incoming_direction[axis] = incident[axis];
+                    }
+                }
+                ps.Q_transitions.push(std::move(record));
+            }
             refined_batch.push_back(std::move(rh));
         }
         ps.Q_refined.push_many(refined_batch);
@@ -18819,6 +18887,7 @@ void ray_pipeline_destroy(RayPipelineState* ps)
     ps->Q_intent.set_done();
     ps->Q_hit.set_done();
     ps->Q_refined.set_done();
+    ps->Q_transitions.set_done();
     ps->Q_wave.set_done();
     ps->Q_bdpt_vertices.set_done();
     ps->Q_bdpt_spectral.set_done();
@@ -19644,6 +19713,14 @@ int ray_pipeline_drain_refined(RayPipelineState* ps,
 {
     if (!ps || max_n <= 0) return 0;
     return ps->Q_refined.drain(out, max_n);
+}
+
+int ray_pipeline_drain_transitions(RayPipelineState* ps,
+                                  std::vector<RayTransitionRecordV1>& out,
+                                  int max_n)
+{
+    if (!ps || max_n <= 0) return 0;
+    return ps->Q_transitions.drain(out, max_n);
 }
 
 int ray_pipeline_drain_bdpt_vertices(RayPipelineState* ps,
@@ -21218,6 +21295,7 @@ struct RayPipelineQueueCheckpoint {
     PipelineQueue<RayIntent>::TransactionSnapshot intent;
     PipelineQueue<HitRecord>::TransactionSnapshot hit;
     PipelineQueue<RefinedHit>::TransactionSnapshot refined;
+    PipelineQueue<RayTransitionRecordV1>::TransactionSnapshot transitions;
     PipelineQueue<WaveIntent>::TransactionSnapshot wave;
     PipelineQueue<RayRecord>::TransactionSnapshot output;
     PipelineQueue<WaveExitStateRecord>::TransactionSnapshot wave_exit;
@@ -21248,6 +21326,7 @@ RayPipelineQueueCheckpoint* ray_pipeline_queue_checkpoint_create(
         checkpoint->intent = ps->Q_intent.copy_transaction_state();
         checkpoint->hit = ps->Q_hit.copy_transaction_state();
         checkpoint->refined = ps->Q_refined.copy_transaction_state();
+        checkpoint->transitions = ps->Q_transitions.copy_transaction_state();
         checkpoint->wave = ps->Q_wave.copy_transaction_state();
         checkpoint->output = ps->Q_out.copy_transaction_state();
         checkpoint->wave_exit =
@@ -21285,6 +21364,8 @@ int ray_pipeline_queue_checkpoint_restore(
     ps->Q_intent.restore_transaction_state(std::move(replacement->intent));
     ps->Q_hit.restore_transaction_state(std::move(replacement->hit));
     ps->Q_refined.restore_transaction_state(std::move(replacement->refined));
+    ps->Q_transitions.restore_transaction_state(
+        std::move(replacement->transitions));
     ps->Q_wave.restore_transaction_state(std::move(replacement->wave));
     ps->Q_out.restore_transaction_state(std::move(replacement->output));
     ps->Q_wave_exit_states.restore_transaction_state(

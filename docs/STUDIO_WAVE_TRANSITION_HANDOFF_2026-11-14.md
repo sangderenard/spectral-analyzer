@@ -15,13 +15,17 @@ they do not claim that T4 has solved it.
 
 ## Procedure to complete the photo path
 
-1. T1/T2 must emit each real crossing as a correlated vector record at the
-   stage boundary, preserving root tag, subpath/vertex, launch time, world
-   hit point, incident direction, outward normal, triangle/region identity,
-   frequency lane and complex amplitude. The existing classifier supplies
-   the optical flags and side indices; the record needs explicit job and
-   generation provenance in the Nodus envelope. A stop/aperture edge needs
-   its own geometry flag, even if no material index changes.
+1. T2 now emits authored Studio triangle and exact-sphere hits into a separate
+   native `RayTransitionRecordV1` queue before T3. Each row carries root tag,
+   subpath/vertex, launch time, hit point, incident direction, outward normal,
+   triangle/region identity, resolved frequency lanes, complex amplitude,
+   two-sided optical indices, classifier flags, and an explicit status. The
+   Python binding drains versioned raw rows without consuming ordinary ray
+   output; pipeline checkpoints include the queue. This is an in-process
+   off-ramp, not yet a bounded or TCP-delivered Nodus stream. The Nodus
+   envelope still needs job and generation provenance. Exact lens conic and
+   stop events remain on the separate optical-event path; a stop/aperture
+   edge needs its own geometry flag even when no material index changes.
 2. Gather contiguous wavelength-scale interface neighborhoods from the
    *flagged triangle lists* and exact curved surfaces. The margin is local
    to every boundary: host exterior, bubbles, rods, dye transitions and lens

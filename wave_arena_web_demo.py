@@ -16,6 +16,7 @@ import threading
 
 import numpy as np
 from PIL import Image
+from camera_software.physical_aperture import LivePhysicalAperture
 
 from wave_transform_visual_demo import (
     _calibration_tracer,
@@ -29,6 +30,13 @@ PAGE = Path(__file__).with_name("wave_arena_web_demo.html")
 DEFAULTS = {
     "pattern": "pair",
     "size": 128,
+    "boundary": "periodic",
+    "absorber_cells": 12,
+    "absorber_strength": 8.0,
+    "aperture_shape": "none",
+    "aperture_opening_fraction": 0.2,
+    "aperture_blades": 6,
+    "aperture_thickness_um": 20.0,
     "wavelength_nm": 532.0,
     "pitch_um": 1.5,
     "step_um": 25.0,
@@ -56,16 +64,35 @@ def validate_config(payload: dict[str, object]) -> dict[str, float | int | str]:
     if pattern not in ("pair", "slits", "ring"):
         raise ValueError("pattern must be pair, slits, or ring")
     size = int(merged["size"])
-    if size not in (64, 128, 256):
-        raise ValueError("size must be 64, 128, or 256")
+    if size not in (64, 128, 256, 512):
+        raise ValueError("size must be 64, 128, 256, or 512")
+    boundary = merged["boundary"]
+    if boundary not in ("periodic", "absorbing"):
+        raise ValueError("boundary must be periodic or absorbing")
+    aperture_shape = merged["aperture_shape"]
+    if aperture_shape not in ("none", "iris", "circular"):
+        raise ValueError("aperture_shape must be none, iris, or circular")
+    blades = int(merged["aperture_blades"])
+    if not 3 <= blades <= 16:
+        raise ValueError("aperture_blades must be in [3, 16]")
+    absorber_cells = int(merged["absorber_cells"])
+    if not 0 <= absorber_cells <= size // 4:
+        raise ValueError("absorber_cells must fit inside one quarter of the grid")
     travel = int(merged["travel_steps"])
     if travel < 1 or travel > 400:
         raise ValueError("travel_steps must be in [1, 400]")
     return {
         "pattern": pattern,
         "size": size,
+        "boundary": boundary,
+        "absorber_cells": absorber_cells,
+        "absorber_strength": _bounded(merged["absorber_strength"], "absorber_strength", 0, 32),
+        "aperture_shape": aperture_shape,
+        "aperture_opening_fraction": _bounded(merged["aperture_opening_fraction"], "aperture_opening_fraction", 0.05, 0.4),
+        "aperture_blades": blades,
+        "aperture_thickness_um": _bounded(merged["aperture_thickness_um"], "aperture_thickness_um", 1, 100),
         "wavelength_nm": _bounded(merged["wavelength_nm"], "wavelength_nm", 380, 900),
-        "pitch_um": _bounded(merged["pitch_um"], "pitch_um", 0.5, 5),
+        "pitch_um": _bounded(merged["pitch_um"], "pitch_um", 0.1, 5),
         "step_um": _bounded(merged["step_um"], "step_um", 1, 100),
         "travel_steps": travel,
         "waist_fraction": _bounded(merged["waist_fraction"], "waist_fraction", 0.02, 0.25),
@@ -125,10 +152,28 @@ class WaveArena:
         self.config = config
         self.tracer = _calibration_tracer(wavelength)
         self.wavelengths = np.asarray([wavelength], np.float64)
-        self.initial = initial
-        self.initial_peak = float(np.max(np.abs(initial) ** 2))
         self.re = np.ascontiguousarray(initial.real[None], np.float32)
         self.im = np.ascontiguousarray(initial.imag[None], np.float32)
+        if config["aperture_shape"] != "none":
+            extent = size * pitch
+            opening = extent * float(config["aperture_opening_fraction"])
+            parameters = dict(
+                key="arena-aperture", opening_radius_m=opening,
+                assembly_radius_m=extent * 0.45,
+                thickness_m=float(config["aperture_thickness_um"]) * 1e-6,
+                material_n_real=2.9, material_n_imag=3.0,
+            )
+            aperture = (
+                LivePhysicalAperture.iris(blade_count=int(config["aperture_blades"]), **parameters)
+                if config["aperture_shape"] == "iris" else
+                LivePhysicalAperture.circular_hole(display_segments=32, **parameters)
+            )
+            self.tracer.t4_apply_aperture_material(
+                1, size, size, pitch, aperture.thickness_m, 1,
+                self.wavelengths, aperture.wave_payload(), self.re, self.im,
+            )
+        self.initial = self.re[0].astype(np.float64) + 1j * self.im[0].astype(np.float64)
+        self.initial_peak = float(np.max(np.abs(self.initial) ** 2))
         self.position = 0
         self.direction = 1
         self.generation = 0
@@ -148,6 +193,13 @@ class WaveArena:
                 float(self.config["step_um"]) * 1e-6,
                 self.direction, self.wavelengths, self.re, self.im,
             )
+            if self.config["boundary"] == "absorbing":
+                self.tracer.t4_apply_absorbing_border(
+                    1, int(self.config["size"]), int(self.config["size"]),
+                    int(self.config["absorber_cells"]),
+                    float(self.config["absorber_strength"]), 1.0,
+                    self.re, self.im,
+                )
             self.position += self.direction
             self.generation += 1
 

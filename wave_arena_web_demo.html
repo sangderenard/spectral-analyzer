@@ -28,10 +28,12 @@ input[type=range]{width:100%;accent-color:#68d7ef}select{width:100%;padding:9px;
 <div class="control"><label for="preset">Starting setup</label><select id="preset"><option value="interference">Twin beam interference</option><option value="single">Single beam diffraction</option><option value="close">Close coherent pair</option><option value="wide">Wide fringe field</option><option value="violet">Violet tight focus</option><option value="slits">Two-slit fringes</option><option value="ring">Infrared ring and centre</option></select></div>
 <button id="loadPreset" class="secondary">Load setup</button>
 <div class="control"><label for="pattern">Source geometry</label><select id="pattern"><option value="pair">Gaussian pair</option><option value="slits">Two slits</option><option value="ring">Annulus and centre</option></select></div>
-<div class="control"><label for="size">Grid</label><select id="size"><option>64</option><option selected>128</option><option>256</option></select></div>
+<div class="control"><label for="size">Grid</label><select id="size"><option>64</option><option selected>128</option><option>256</option><option>512</option></select></div>
+<div class="control"><label for="boundary">Arena edge</label><select id="boundary"><option value="periodic">Periodic wrap</option><option value="absorbing">Native absorbing border</option></select></div>
+<div class="control"><label for="aperture_shape">Physical aperture</label><select id="aperture_shape"><option value="none">Open field</option><option value="iris">Finite iris</option><option value="circular">Circular bore</option></select></div>
 <div id="controls"></div>
 <div class="actions"><button id="apply">Apply & reset</button><button id="play">Pause</button><button id="single" class="secondary">Step once</button><button id="savePower" class="secondary">Save power PNG</button><button id="copyLink" class="secondary">Copy setup link</button></div>
-<p class="hint">Changing parameters resets the field. Pause to inspect a frame. Forward and reverse travel alternate so interference can be watched repeatedly.</p>
+<p class="hint">Changing parameters resets the field. Periodic edges wrap through the FFT; the absorbing border removes field power near the edge. Pause to inspect a frame. Forward and reverse travel alternate.</p>
 </aside>
 <section class="workspace">
 <div class="metrics"><div class="metric"><span>Kernel steps</span><strong id="generation">0</strong></div><div class="metric"><span>Travel</span><strong id="distance">0 mm</strong></div><div class="metric"><span>Direction</span><strong id="direction">Forward</strong></div><div class="metric"><span>Field power / input</span><strong id="retention">—</strong></div></div>
@@ -42,8 +44,13 @@ input[type=range]{width:100%;accent-color:#68d7ef}select{width:100%;padding:9px;
 </main>
 <script>
 const specs=[
+  ['absorber_cells','Absorber width','cells',0,32,1,12],
+  ['absorber_strength','Absorber strength','×',0,32,.5,8],
+  ['aperture_opening_fraction','Aperture radius','of grid',.05,.4,.005,.2],
+  ['aperture_blades','Iris blades','',3,16,1,6],
+  ['aperture_thickness_um','Aperture thickness','µm',1,100,1,20],
   ['wavelength_nm','Wavelength','nm',380,900,1,532],
-  ['pitch_um','Pixel pitch','µm',0.5,5,0.1,1.5],
+  ['pitch_um','Pixel pitch','µm',0.1,5,0.1,1.5],
   ['step_um','Distance per step','µm',1,100,1,25],
   ['travel_steps','Travel range','steps',8,200,1,80],
   ['waist_fraction','Emitter waist','of grid',0.02,0.25,0.005,0.075],
@@ -85,18 +92,18 @@ function present(state){
   status(`Native T4 · ${state.config.size}² grid · ${state.config.wavelength_nm} nm`);
 }
 async function request(payload){if(busy)return;busy=true;try{present(await post('/api/wave_arena',payload))}catch(error){playing=false;byId('play').textContent='Resume';status(error.message,true)}finally{busy=false}}
-function currentConfig(){const config={size:Number(byId('size').value),pattern:byId('pattern').value};for(const [key] of specs)config[key]=Number(byId(key).value);return config}
+function currentConfig(){const config={size:Number(byId('size').value),pattern:byId('pattern').value,boundary:byId('boundary').value,aperture_shape:byId('aperture_shape').value};for(const [key] of specs)config[key]=Number(byId(key).value);return config}
 byId('apply').onclick=()=>request({op:'configure',...currentConfig()});
-byId('loadPreset').onclick=()=>{const config=presets[byId('preset').value];byId('size').value=String(config.size);byId('pattern').value=config.pattern;for(const [key] of specs){byId(key).value=String(config[key]);byId(key).dispatchEvent(new Event('input'))}request({op:'configure',...config})};
+byId('loadPreset').onclick=()=>{const config={boundary:'periodic',absorber_cells:12,absorber_strength:8,aperture_shape:'none',aperture_opening_fraction:.2,aperture_blades:6,aperture_thickness_um:20,...presets[byId('preset').value]};byId('size').value=String(config.size);byId('pattern').value=config.pattern;byId('boundary').value=config.boundary;byId('aperture_shape').value=config.aperture_shape;for(const [key] of specs){byId(key).value=String(config[key]);byId(key).dispatchEvent(new Event('input'))}request({op:'configure',...config})};
 byId('savePower').onclick=()=>{const a=document.createElement('a');a.href=byId('power').src;a.download=`t4-wave-power-${seen}.png`;a.click()};
 byId('copyLink').onclick=async()=>{try{const url=new URL(location.href);url.search=new URLSearchParams(currentConfig()).toString();await navigator.clipboard.writeText(url.href);status('Setup link copied')}catch(error){status(String(error.message||error),true)}};
 byId('play').onclick=()=>{playing=!playing;byId('play').textContent=playing?'Pause':'Resume'};
 byId('single').onclick=()=>request({op:'step',count:1});
 async function tick(){if(playing)await request({op:'step',count:1});timer=setTimeout(tick,90)}
 const shared=new URLSearchParams(location.search);
-const sharedConfig=Object.fromEntries([...shared].filter(([key])=>key==='size'||key==='pattern'||specs.some(([name])=>name===key)));
+const sharedConfig=Object.fromEntries([...shared].filter(([key])=>key==='size'||key==='pattern'||key==='boundary'||key==='aperture_shape'||specs.some(([name])=>name===key)));
 const startup=Object.keys(sharedConfig).length?post('/api/wave_arena',{op:'configure',...sharedConfig}):fetch('/api/wave_arena').then(r=>{if(!r.ok)throw Error(`HTTP ${r.status}`);return r.json()});
-startup.then(state=>{byId('size').value=String(state.config.size);byId('pattern').value=state.config.pattern;for(const [key] of specs){byId(key).value=String(state.config[key]);byId(key).dispatchEvent(new Event('input'))}present(state);tick()}).catch(error=>status(error.message,true));
+startup.then(state=>{byId('size').value=String(state.config.size);byId('pattern').value=state.config.pattern;byId('boundary').value=state.config.boundary;byId('aperture_shape').value=state.config.aperture_shape;for(const [key] of specs){byId(key).value=String(state.config[key]);byId(key).dispatchEvent(new Event('input'))}present(state);tick()}).catch(error=>status(error.message,true));
 if(location.pathname==='/wave_arena.html'){const nav=document.createElement('script');nav.type='module';nav.src='/site-nav.js';nav.dataset.siteNav='allow';document.head.append(nav)}
 </script>
 </html>

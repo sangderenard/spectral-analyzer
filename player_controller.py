@@ -225,6 +225,8 @@ class PlayerController:
         self._gravity         = float(w.get("gravity", 9.81))   # m/s²
         self._floor_z         = float(w.get("floor_z", 0.0))    # world Z of floor
         self._walk_vel_z      = 0.0                              # vertical velocity
+        self._door_runtime = None
+        self._island_door_handler = None
 
         i = config.get("interact", {})
         self._lerp_speed      = float(i.get("lerp_speed", 5.0))
@@ -301,6 +303,7 @@ class PlayerController:
 
     def set_room_cfg(self, cfg: dict) -> None:
         """Build wall slabs from an applied room_cfg and feed them to the clip engine."""
+        self._world_surface_sweep=False
         try:
             from player_clip_py import PlayerClipEngine
             if self._clip_engine is None:
@@ -317,6 +320,17 @@ class PlayerController:
                 )
         except Exception:
             pass
+
+    def set_world_geometry(self, geometry):
+        """Attach actual map triangles to the existing clip engine, no AABB seal."""
+        from player_clip_py import PlayerClipEngine
+        from living_map_room_station import world_surface_triangles
+        engine=PlayerClipEngine()
+        engine.set_slabs(np.zeros((0,8),np.float32))
+        engine.set_surface_field(world_surface_triangles(geometry))
+        engine.enable_surface_clip(True)
+        self._clip_engine=engine
+        self._world_surface_sweep=True
 
     def set_clip_engine(self, engine) -> None:
         """Directly attach a pre-built PlayerClipEngine."""
@@ -405,9 +419,12 @@ class PlayerController:
         new_pos, flags = self._clip_engine.tick(
             self._walk_pos.astype(np.float32),
             vel,
-            float(self._floor_z), float(self._floor_z + 4.0),
-            0.25, math.radians(float(self._walk_yaw)), float(dt))
+            float(self._floor_z), float(self._floor_z if getattr(self,"_world_surface_sweep",False) else self._floor_z + 4.0),
+            0.25, math.radians(float(self._walk_yaw)), float(dt),
+            **({"previous_pos":pre_pos} if getattr(self,"_world_surface_sweep",False) else {}))
         self._walk_pos[:] = new_pos.astype(self._walk_pos.dtype)
+        if getattr(self,"_world_surface_sweep",False) and flags & 4:
+            self._walk_vel_z=0.0
 
     # ── Public queries ────────────────────────────────────────────────────────
 
@@ -919,6 +936,36 @@ class PlayerController:
         elif self.state == PlayerState.IN_CAMERA:
             self._tick_camera(dt, keys)
 
+    def set_door_runtime(self, runtime, *, on_island=None):
+        """Install original declared door contracts in this Z-up Pluck world.
+
+        The host supplies matching Z-up aperture frames. Island loading stays
+        with the host; proximity cannot authorize loading or graph actions.
+        """
+        self._door_runtime = runtime
+        self._island_door_handler = on_island
+
+    def _advance_doors(self, previous, dt):
+        runtime = self._door_runtime
+        if runtime is None: return
+        eye = np.array([0.0, 0.0, self._eye_height])
+        yaw, pitch = math.radians(self._walk_yaw), math.radians(self._walk_pitch)
+        facing = (math.cos(pitch)*math.cos(yaw), math.cos(pitch)*math.sin(yaw), math.sin(pitch))
+        velocity = (self._walk_pos - previous) / max(float(dt), 1e-9)
+        velocity[2] = self._walk_vel_z
+        crossing = runtime.step('player', previous + eye, self._walk_pos + eye,
+            velocity, facing, now_ms=time.perf_counter()*1000, radius=0.15)
+        if crossing is None: return
+        if crossing.event is not None:
+            if self._island_door_handler is not None:
+                self._island_door_handler(crossing.event)
+            return
+        self._walk_pos = np.asarray(crossing.position, np.float64) - eye
+        self._walk_vel_z = float(crossing.velocity[2])
+        self._walk_yaw = math.degrees(math.atan2(crossing.facing[1], crossing.facing[0]))
+        self._walk_pitch = math.degrees(math.asin(max(-1.0,min(1.0,crossing.facing[2]))))
+        self._focus_target = None
+
     def _tick_orbit(self, dt: float, keys):
         pass   # auto-rotate handled by Camera.tick() in the main loop
 
@@ -963,6 +1010,7 @@ class PlayerController:
             self._walk_vel_z  = 0.0
 
         self._apply_room_bounds(pre_pos, dt)
+        self._advance_doors(pre_pos, dt)
 
         # Single-ray aimer nudge (arrow keys).
         # This offsets the ray-intersection target without changing camera look.

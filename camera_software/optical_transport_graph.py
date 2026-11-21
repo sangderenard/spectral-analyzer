@@ -434,7 +434,9 @@ def wave_context_nodes(
     medium_n_real: float = 1.0,
     medium_n_imag: float = 0.0,
     medium_n_by_lane: Sequence[float] | None = None,
+    medium_n_imag_by_lane: Sequence[float] | None = None,
     aperture_material: Any | None = None,
+    parametric_lens_element: Mapping[str, Any] | None = None,
 ) -> tuple[tuple[OpticalNodeSpec, ...], tuple[OpticalLinkSpec, ...]]:
     """Return explicit complex-ray→field→complex-ray T4 boundary modules."""
 
@@ -492,6 +494,15 @@ def wave_context_nodes(
         physical["medium_n_by_lane"] = tuple(
             float(value) for value in lane_indices
         )
+    if medium_n_imag_by_lane is not None:
+        if medium_n_by_lane is None:
+            raise ValueError("per-lane extinction requires per-lane real indices")
+        lane_extinction = np.asarray(medium_n_imag_by_lane, np.float64).reshape(-1)
+        if (lane_extinction.size != lane_count
+            or np.any(~np.isfinite(lane_extinction))
+            or np.any(lane_extinction < 0.0)):
+            raise ValueError("wave arena extinction must match nonnegative lanes")
+        physical["medium_n_imag_by_lane"] = tuple(float(v) for v in lane_extinction)
     if aperture_material is not None:
         graph_parameters = getattr(aperture_material, "graph_parameters", None)
         wave_payload = getattr(aperture_material, "wave_payload", None)
@@ -517,6 +528,8 @@ def wave_context_nodes(
         physical["aperture_payload"] = tuple(
             float(value) for value in wave_payload(direction / norm)
         )
+    if parametric_lens_element is not None:
+        physical["parametric_lens_element"] = dict(parametric_lens_element)
 
     arena = OpticalNodeSpec(
         key=f"{prefix}.arena",
@@ -651,6 +664,16 @@ def install_optical_graph(
             payload = np.ascontiguousarray(
                 descriptor["aperture_payload"], np.float64
             )
+            if "medium_n_by_lane" in descriptor:
+                # APTR retains its 19-value prefix. Its optional tail carries
+                # the same lane indices that a WAVE-only payload would carry.
+                lane_indices = np.asarray(
+                    descriptor["medium_n_by_lane"], np.float64
+                ).reshape(-1)
+                payload = np.ascontiguousarray(
+                    [*payload, float(len(lane_indices)), *lane_indices],
+                    np.float64,
+                )
         elif "medium_n_by_lane" in descriptor:
             lane_indices = np.asarray(
                 descriptor["medium_n_by_lane"], np.float64
@@ -665,6 +688,10 @@ def install_optical_graph(
                 [0.0, 0.0, 0.0, axis[0], axis[1], axis[2]],
                 np.float64,
             )
+        if "medium_n_imag_by_lane" in descriptor:
+            payload = np.ascontiguousarray([
+                *payload, *descriptor["medium_n_imag_by_lane"],
+            ], np.float64)
         payloads.append(payload)
         context_id = int(add_context(
             pos=np.ascontiguousarray(center, np.float64),
@@ -1106,6 +1133,36 @@ def compile_compound_lens_graph(
     is_projection = transport_direction == "backward"
     if source_contract is not None and not is_projection:
         raise ValueError("source_contract is only valid for backward projection")
+    surface_count = int(payload[1])
+    spectral_count = int(payload[5])
+    spectral_offset = int(payload[6])
+    spectral_stride = int(payload[7])
+    if surface_count < 1 or payload.size < 8 + 8 * surface_count:
+        raise ValueError("exact lens payload has no complete surface list")
+    lens_elements = []
+    for surface in range(surface_count):
+        base = 8 + 8 * surface
+        stop = bool(int(payload[base + 6]) & 1)
+        if spectral_count:
+            start = spectral_offset + surface * spectral_stride
+            end = start + 2 * spectral_count
+            if spectral_stride < 2 * spectral_count or end > payload.size:
+                raise ValueError("exact lens spectral surface data is incomplete")
+            before = tuple(float(v) for v in payload[start:start + spectral_count])
+            after = tuple(float(v) for v in payload[start + spectral_count:end])
+        else:
+            before = (float(payload[base + 2]),) * lane_count
+            after = (float(payload[base + 3]),) * lane_count
+        lens_elements.append({
+            "element_index": surface,
+            "kind": "aperture-stop" if stop else "exact-conic-interface",
+            "vertex_x_m": float(payload[base]),
+            "conic_radius_m": float(payload[base + 1]),
+            "conic_k": float(payload[base + 5]),
+            "aperture_radius_m": float(payload[base + 4]),
+            "before_n_by_lane": before,
+            "after_n_by_lane": after,
+        })
     entry_key = (
         "camera.projector-back-port" if is_projection else "scene.complex-rays"
     )
@@ -1145,6 +1202,7 @@ def compile_compound_lens_graph(
             "jones_transport": "indexed-2x2-complex",
             "differential_transport": "indexed-canonical-4x4",
             "operator_state": "persistent-contiguous-block",
+            "parametric_elements": tuple(lens_elements),
         },
     )
     sensor = OpticalNodeSpec(
@@ -1175,6 +1233,40 @@ def compile_compound_lens_graph(
         ))
     for region_key, raw_parameters in authored_regions:
         parameters = dict(raw_parameters)
+        if "aperture_material" in parameters and "center_m" not in parameters:
+            raise ValueError("exact lens aperture wave context requires center_m")
+        if "aperture_material" in parameters and "center_m" in parameters:
+            # The aperture can sit between exact refracting surfaces. The
+            # native T4 arena must march through the stop's authored optical
+            # medium, including its per-lane dispersion, rather than silently
+            # treating the interior of the lens as vacuum.
+            center = np.asarray(parameters["center_m"], np.float64).reshape(-1)
+            if center.size != 3:
+                raise ValueError("aperture wave center must have three coordinates")
+            matches = [element for element in lens_elements
+                       if element["kind"] == "aperture-stop"
+                       and abs(float(center[0]) - element["vertex_x_m"]) <= 1e-6]
+            if len(matches) != 1:
+                raise ValueError("aperture wave context must identify one exact lens stop")
+            element = matches[0]
+            stop_medium = element["before_n_by_lane"]
+            if "medium_n_by_lane" in parameters:
+                authored = np.asarray(
+                    parameters["medium_n_by_lane"], np.float64
+                ).reshape(-1)
+                if authored.size != lane_count or not np.allclose(
+                    authored, stop_medium, rtol=1e-5, atol=1e-6
+                ):
+                    raise ValueError(
+                        "aperture wave medium disagrees with exact lens stop"
+                    )
+            parameters["medium_n_by_lane"] = stop_medium
+            parameters["medium_n_real"] = stop_medium[0]
+            parameters["parametric_lens_element"] = {
+                "node_key": fused.key,
+                "element_index": element["element_index"],
+                "kind": element["kind"],
+            }
         if "propagation" in parameters:
             parameters["propagation"] = WavePropagationStyle(
                 parameters["propagation"]

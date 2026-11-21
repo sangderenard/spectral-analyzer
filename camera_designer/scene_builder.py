@@ -1973,7 +1973,7 @@ def append_saved_studio_mesh_to_gpu_scene(
                     # Derived interface flags only: original YAML stays intact.
                     material.update(opacity=0.0, transmission=1.0)
                     material['pbr'] = dict(material.get('pbr', {}), opacity=0.0, transmission=1.0)
-                db.register(key, material)
+                db.register(key, material, source_snapshot=compiled.source_snapshot)
             names[int(old_id)] = key
             continue
         key = ("saved_studio_medium_v1:" if pairs is not None else "saved_studio_pbr:") + hashlib.sha256(

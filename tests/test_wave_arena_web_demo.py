@@ -3,7 +3,9 @@ import json
 import threading
 from urllib.request import Request, urlopen
 
-from wave_arena_web_demo import ArenaServer
+import numpy as np
+
+from wave_arena_web_demo import ArenaServer, WaveArena
 
 
 def test_wave_arena_page_and_native_step():
@@ -40,3 +42,33 @@ def test_wave_arena_page_and_native_step():
         finally:
             server.shutdown()
             worker.join(timeout=5)
+
+
+def test_larger_arena_uses_native_absorbing_border():
+    periodic = WaveArena({"size": 512, "boundary": "periodic", "absorber_cells": 24})
+    absorbing = WaveArena({"size": 512, "boundary": "absorbing", "absorber_cells": 24})
+    for arena in (periodic, absorbing):
+        arena.re.fill(0)
+        arena.im.fill(0)
+        arena.re[0, 2, 256] = 1.0
+    periodic.step()
+    absorbing.step()
+    periodic_power = float(np.sum(periodic.re**2 + periodic.im**2))
+    absorbing_power = float(np.sum(absorbing.re**2 + absorbing.im**2))
+    assert periodic_power > 0.99
+    assert absorbing_power < periodic_power
+
+
+def test_finite_aperture_material_changes_field_before_propagation():
+    open_field = WaveArena({"size": 128, "aperture_shape": "none"})
+    iris = WaveArena({"size": 128, "aperture_shape": "iris", "aperture_opening_fraction": 0.12})
+    bore = WaveArena({"size": 128, "aperture_shape": "circular", "aperture_opening_fraction": 0.12})
+    powers = [arena.snapshot()["field_power"] for arena in (open_field, iris, bore)]
+    assert powers[1] < powers[0]
+    assert powers[2] < powers[0]
+    assert not np.array_equal(iris.re, bore.re)
+    iris.step()
+    assert iris.generation == 1
+    fine = WaveArena({"size": 512, "pitch_um": 0.2, "aperture_shape": "circular"})
+    fine.step()
+    assert fine.snapshot()["field_power"] > 0

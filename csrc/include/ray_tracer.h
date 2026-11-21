@@ -1062,6 +1062,155 @@ SK_API int ray_tracer_set_tri_boundary_media(
     int             medium_neg_mat_idx
 );
 
+/* Authenticated Studio volume membership for native CPU T1/T3. Region zero
+ * is the host. Modes are host=0, glass rod=1, injection dye=2, air bubble=3,
+ * standalone dielectric=4;
+ * a bubble has material -1. Each triangle has a region ID or -1 for ordinary
+ * geometry. The native path builds one BVH per region at installation and
+ * resolves membership from geometry on each segment; no material-ID guess or
+ * last-entered stack is used. GPU all-stages submission must refuse this
+ * contract until its region buffer and traversal are wired. */
+typedef struct {
+    int mode;
+    int material_index;
+} RtStudioRegionRecord;
+
+SK_API int ray_tracer_set_studio_regions(
+    RayTracerState* st,
+    int n_regions,
+    const RtStudioRegionRecord* records,
+    const int* triangle_region_ids
+);
+
+/* Exact Studio sphere rows retain the degenerate owner triangle for material
+ * and region identity. Install before pipeline creation. */
+typedef struct {
+    double center[3];
+    double radius;
+    int owner_triangle;
+} RtStudioSphereRecord;
+
+SK_API int ray_tracer_set_studio_spheres(
+    RayTracerState* st,
+    int n_spheres,
+    const RtStudioSphereRecord* spheres
+);
+
+/* Resolve the authored medium at an arbitrary ray-side point. This is the
+ * cold/public T3 -> T4 handoff: the caller supplies transport frequencies and
+ * receives real/imaginary indices from the exact MatBuf authority, including
+ * additive dye extinction. A nonzero result refuses ambiguous ownership. */
+SK_API int ray_tracer_resolve_studio_medium(
+    const RayTracerState* st,
+    const double position[3],
+    const double direction[3],
+    int n_frequencies,
+    const double* frequencies_hz,
+    int* out_base_material,
+    double* out_n_real,
+    double* out_n_imag
+);
+
+/* Classify an actual T3 hit on an authored Studio interface for T4 admission.
+ * The triangle ID is compared against the installed region triangle lists;
+ * exact spheres use their owner triangle. The caller supplies the hit point,
+ * incoming direction, transport frequencies and a margin in wavelengths.
+ * Both sides are resolved from the same authenticated geometry as T3. The
+ * returned margin is the largest vacuum wavelength times margin_wavelengths;
+ * it sizes a local patch, not a whole-subject wave arena. */
+typedef struct {
+    int triangle_id;
+    int region_id;
+    double outward_normal[3];
+    double margin_m;
+    int before_base_material;
+    int after_base_material;
+} RtStudioWaveInterface;
+
+SK_API int ray_tracer_resolve_studio_wave_interface(
+    const RayTracerState* st,
+    int hit_triangle,
+    const double hit_position[3],
+    const double incoming_direction[3],
+    int n_frequencies,
+    const double* frequencies_hz,
+    double margin_wavelengths,
+    RtStudioWaveInterface* out_interface,
+    double* out_before_n_real,
+    double* out_before_n_imag,
+    double* out_after_n_real,
+    double* out_after_n_imag
+);
+
+/* Versioned companion to the original fixed-size result above. This is an
+ * authenticated pre-scatter crossing vector; it does not claim a T4 solve. */
+#define RT_STUDIO_TRANSITION_REGION       (1u << 0)
+#define RT_STUDIO_TRANSITION_MATERIAL     (1u << 1)
+#define RT_STUDIO_TRANSITION_REFRACTIVE   (1u << 2)
+#define RT_STUDIO_TRANSITION_ABSORPTIVE   (1u << 3)
+#define RT_STUDIO_TRANSITION_EXACT_SPHERE (1u << 4)
+typedef struct {
+    RtStudioWaveInterface interface;
+    double crossing_point[3];
+    double incoming_direction[3];
+    unsigned int transition_flags;
+} RtStudioTransitionVectorV1;
+
+SK_API int ray_tracer_resolve_studio_transition_vector_v1(
+    const RayTracerState* st,
+    int hit_triangle,
+    const double hit_position[3],
+    const double incoming_direction[3],
+    int n_frequencies,
+    const double* frequencies_hz,
+    double margin_wavelengths,
+    RtStudioTransitionVectorV1* out_transition,
+    double* out_before_n_real,
+    double* out_before_n_imag,
+    double* out_after_n_real,
+    double* out_after_n_imag
+);
+
+/* Collect authored Studio boundary triangles whose exact surface lies within
+ * search_radius_m of a crossing point. This is a conservative local geometry
+ * list for T4 context construction, not an arena admission or wave solve.
+ * Exact spheres are compared by distance to their shell and returned by owner
+ * triangle ID. On insufficient capacity, out_count receives the required
+ * count and no partial list is written. Call only after cold scene setup. */
+SK_API int ray_tracer_collect_studio_wave_triangles(
+    const RayTracerState* st,
+    const double crossing_point[3],
+    double search_radius_m,
+    int* out_triangle_ids,
+    int capacity,
+    int* out_count
+);
+
+/* Sample the existing authenticated Studio medium at voxel centers of an
+ * oriented 3D lattice. Results are C-order [x,y,z,frequency], with frequency
+ * fastest. The supplied direction resolves points exactly on a boundary.
+ * Values are complex refractive indices from the installed MatBuf, including
+ * dye extinction; no speed/damping approximation is imposed here. On a
+ * nonzero return the output arrays are incomplete and must be discarded.
+ * This cold scene-state operation may be written directly into caller-owned
+ * tensor-state memory; it is not a per-ray stage. */
+SK_API int ray_tracer_sample_studio_wave_grid(
+    const RayTracerState* st,
+    const double origin[3],
+    const double step_x[3],
+    const double step_y[3],
+    const double step_z[3],
+    int nx, int ny, int nz,
+    const double direction[3],
+    int n_frequencies,
+    const double* frequencies_hz,
+    int* out_base_material,
+    double* out_n_real,
+    double* out_n_imag,
+    uint64_t voxel_capacity,
+    uint64_t* out_failed_voxel
+);
+
 /**
  * Project a multiscale segment buffer onto a coherent complex sensor image.
  *

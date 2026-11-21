@@ -16,6 +16,7 @@ from camera_software.complex_optical_operators import (
     canonical_operator_contract,
     dielectric_interface,
     compile_planar_reflection_interface,
+    compile_normal_dielectric_field_pair,
     estimate_compound_lens_phase_space,
     optical_phase,
 )
@@ -118,6 +119,26 @@ def test_planar_mirror_compiles_exact_pentaprism_field_turn():
     contract = artifact.graph_parameters()
     assert contract["resampling"] == "none-exact-signed-permutation"
     assert contract["allocation"] == "cold-only"
+
+
+def test_bubble_lamina_has_coherent_reflection_and_transmission_products():
+    source=TransverseBasis.from_direction((0.,0.,1.))
+    reflected=TransverseBasis.from_direction((0.,0.,-1.))
+    incident=(1.52,1.53,1.54)
+    air=(1.,1.,1.)
+    reflection,transmission=compile_normal_dielectric_field_pair(
+        source,reflected,source,(0.,0.,-1.),incident,air,
+        material_name="authored-air-bubble",
+    )
+    assert reflection.lane_count==transmission.lane_count==3
+    assert reflection.interaction=="dielectric-reflection"
+    assert transmission.interaction=="dielectric-transmission"
+    for b in range(3):
+        for field in (np.array([1.+0.j,0.j]),np.array([0.j,1.+0.j])):
+            power=(np.linalg.norm(reflection.jones[b]@field)**2
+                   +np.linalg.norm(transmission.jones[b]@field)**2)
+            assert power==pytest.approx(1.,abs=2e-7)
+    assert not np.array_equal(reflection.jones[0],reflection.jones[2])
 
 
 def test_emitter_polarization_becomes_incoherent_jones_modes_without_faking_it():

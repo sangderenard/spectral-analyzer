@@ -54,6 +54,13 @@ def _add_arena(tracer):
     )
 
 
+def test_wave_context_rejects_unsupported_exact_lane_count():
+    tracer = _tracer(np.array([450e-9, 550e-9]))
+    _add_arena(tracer)
+    with pytest.raises(RuntimeError, match="ray_pipeline_create failed"):
+        tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+
+
 def test_empty_space_crossing_routes_through_t4():
     tracer = _tracer(np.array([550e-9]))
     _add_arena(tracer)
@@ -82,6 +89,122 @@ def test_empty_space_crossing_routes_through_t4():
     assert np.count_nonzero(p_field["re"]) == 0
     assert np.count_nonzero(p_field["im"]) == 0
     assert tracer.drain_wave_exit_states(16).shape == (0, 160)
+
+
+def test_wave_arena_bulk_extinction_uses_complex_index_per_band():
+    wavelengths=np.array([550e-9])
+    def propagate(k):
+        tracer=_tracer(wavelengths)
+        tracer.add_scale_context(
+            np.array([0.,0.,0.]), 32e-6, 1, 1e-6, 4,
+            1.52, k, 1,
+            np.array([0.,0.,0.,0.,0.,1.]),
+        )
+        tracer.ensure_pipeline(max_children=1,min_amplitude=1e-12)
+        tracer.submit_rays(
+            np.array([[0.,0.,-50e-6]]),np.array([[0.,0.,1.]]),
+            np.array([[1.+0.j]]),max_bounces=1,min_amplitude=1e-12,
+        )
+        _wait(tracer)
+        snapshot=tracer.wave_arena_field_snapshot(0,0,0,0)
+        field=np.asarray(snapshot['re'])+1j*np.asarray(snapshot['im'])
+        return float(np.sum(np.abs(field)**2)),tracer.wave_arena_stats()[0]
+    clear,clear_stats=propagate(0.)
+    absorbed,absorbed_stats=propagate(.001)
+    assert clear>0.
+    assert absorbed/clear==pytest.approx(
+        np.exp(-4*np.pi*.001*4e-6/550e-9),rel=.03,
+    )
+    assert clear_stats['material_absorbed_power']==0.
+    assert absorbed_stats['material_absorbed_power']>0.
+    assert absorbed_stats['absorbed_power']==pytest.approx(
+        absorbed_stats['material_absorbed_power']
+        +absorbed_stats['numerical_border_absorbed_power'],rel=1e-6,
+    )
+
+
+def test_wave_arena_bulk_extinction_preserves_separate_authored_lanes():
+    wavelengths=np.array([450e-9,550e-9,650e-9])
+    extinction=(.0005,0.,.001)
+    def propagate(with_extinction):
+        tracer=_tracer(wavelengths)
+        payload=np.asarray([
+            0.,0.,0.,0.,0.,1.,57_415_645.,1.,3.,
+            1.52,1.53,1.54,
+            *(extinction if with_extinction else (0.,0.,0.)),
+        ],np.float64)
+        tracer.add_scale_context(
+            np.array([0.,0.,0.]),32e-6,1,1e-6,4,
+            1.52,0.,1,payload,
+        )
+        tracer.ensure_pipeline(max_children=1,min_amplitude=1e-12)
+        tracer.submit_rays(
+            np.array([[0.,0.,-50e-6]]),np.array([[0.,0.,1.]]),
+            np.ones((1,3),np.complex128),max_bounces=1,
+            min_amplitude=1e-12,
+        )
+        _wait(tracer)
+        powers=[]
+        for band in range(3):
+            state=tracer.wave_arena_field_snapshot(0,0,0,band)
+            field=np.asarray(state['re'])+1j*np.asarray(state['im'])
+            powers.append(float(np.sum(np.abs(field)**2)))
+        return np.asarray(powers)
+    clear=propagate(False)
+    absorbed=propagate(True)
+    assert np.all(clear>0.)
+    expected=np.exp(-4*np.pi*np.asarray(extinction)*4e-6/wavelengths)
+    assert absorbed/clear==pytest.approx(expected,rel=.03)
+
+
+def test_exact_compound_lens_routes_to_local_marble_surface_wave_patch():
+    from camera_designer.compound_optics import CompoundLens
+    from camera_designer.scene_builder import build_tracer
+    from camera_software.camera_designer_bridge import camera_manifest_to_designer_preset
+    from camera_software.camera_manifest import resolve_camera_manifest
+    from camera_software.optical_transport_graph import (
+        compile_compound_lens_graph, install_optical_graph,
+    )
+
+    preset=camera_manifest_to_designer_preset(resolve_camera_manifest())
+    wavelengths=(.45,.55,.65)
+    tracer,_=build_tracer(
+        preset,[],scene_object={"type":"sphere","pos":[-.25,0.,0.],
+                                "radius":.01},wavelengths_um=wavelengths,
+    )
+    lens=CompoundLens.from_preset(
+        preset,wavelengths_um=wavelengths,axial_scale=-1.,
+    )
+    # The patch is an 8-um transverse lamina extending 0.1 mm in front of the
+    # sensor-facing sphere interface. Its curvature sag is about 3.2 nm.
+    # It uses the physical exterior medium;
+    # the material bounce remains a separate T3 boundary event.
+    graph=compile_compound_lens_graph(
+        lens,lane_count=3,transport_direction="backward",
+        wave_regions=(("marble.exterior-lamina",{
+            "center_m":(-.23995,0.,0.),"axis":(-1.,0.,0.),
+            "radius_m":8e-6,"longitudinal_step_m":5e-6,
+            "longitudinal_steps":20,
+            "medium_n_by_lane":(1.,1.,1.),
+            "medium_n_imag_by_lane":(0.,0.,0.),
+        }),),
+    )
+    install_optical_graph(tracer,graph,exact_t2_registered=True)
+    tracer.ensure_pipeline(max_children=1,min_amplitude=1e-12,
+                           wave_grid_dx_m=.2e-6)
+    tracer.submit_rays(
+        np.array([[0.,0.,0.]]),np.array([[-1.,0.,0.]]),
+        np.ones((1,3),np.complex128),
+        color_flags=np.array([64],np.uint8),
+        max_bounces=4,min_amplitude=1e-12,
+    )
+    _wait(tracer,timeout_s=30.)
+    arena=tracer.wave_arena_stats()[0]
+    assert arena["generation"]>0
+    assert arena["sample_pitch_m"]<=.45e-6/2
+    assert sum(arena["field_active"])>0
+    records=tracer.drain_records(64)
+    assert 3 in np.asarray(records["kind"]).tolist()
 
 
 def test_wave_transaction_checkpoint_restores_and_replays_native_field_state():
@@ -295,6 +418,89 @@ def test_compiled_optical_graph_installs_and_drives_native_t4():
     assert sum(arena["field_active"]) == 1
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("lane_count", [1, 8])
+def test_exact_compound_lens_routes_through_physical_aperture_wave_region(reverse, lane_count):
+    from camera_designer.compound_optics import CompoundLens
+    from camera_designer.scene_builder import build_tracer
+    from camera_software.camera_designer_bridge import camera_manifest_to_designer_preset
+    from camera_software.camera_manifest import resolve_camera_manifest
+    from camera_software.optical_transport_graph import (
+        compile_compound_lens_graph,
+        install_optical_graph,
+    )
+    from camera_software.physical_aperture import LivePhysicalAperture
+
+    preset = camera_manifest_to_designer_preset(resolve_camera_manifest())
+    wavelengths_um = tuple(np.linspace(0.45, 0.65, lane_count))
+    tracer, _ = build_tracer(
+        preset, [], wavelengths_um=wavelengths_um,
+    )
+    lens = CompoundLens.from_preset(
+        preset, wavelengths_um=wavelengths_um, axial_scale=-1.0,
+    )
+    aperture = LivePhysicalAperture.circular_hole(
+        "doublet.aperture",
+        opening_radius_m=20e-6,
+        assembly_radius_m=50e-6,
+        thickness_m=4e-6,
+    )
+    graph = compile_compound_lens_graph(
+        lens,
+        lane_count=lane_count,
+        wave_regions=(("doublet.aperture", {
+            "center_m": (-preset.aperture_stop.z_pos, 0.0, 0.0),
+            "axis": (1.0, 0.0, 0.0),
+            "radius_m": 60e-6,
+            "longitudinal_step_m": 1e-6,
+            "longitudinal_steps": 4,
+            "aperture_material": aperture,
+        }),),
+    )
+    receipt = install_optical_graph(
+        tracer, graph, exact_t2_registered=True,
+    )
+    assert len(receipt.wave_arenas) == 1
+    assert receipt.wave_arenas[0].node_key == "doublet.aperture.arena"
+    tracer.ensure_pipeline(max_children=1, min_amplitude=1e-12)
+    tracer.submit_rays(
+        np.array([[0.0 if reverse else -0.22, 0.0, 0.0]]),
+        np.array([[-1.0 if reverse else 1.0, 0.0, 0.0]]),
+        np.ones((1, lane_count), np.complex128),
+        color_flags=np.array([64 if reverse else 0], np.uint8),
+        max_bounces=4,
+        min_amplitude=1e-12,
+    )
+    _wait(tracer, timeout_s=30.0)
+    arena = tracer.wave_arena_stats()[0]
+    assert arena["generation"] > 0
+    assert sum(arena["field_active"]) > 0
+    optical = np.asarray(tracer.drain_bdpt_optical(128))
+    wave_entries = optical[optical[:, 8] == 8]
+    assert len(wave_entries) == 1
+    stop_index = next(
+        index for index, element in enumerate(
+            next(node for node in graph.spec.nodes
+                 if node.key == "camera.exact-compound-lens").parameters[
+                     "parametric_elements"])
+        if element["kind"] == "aperture-stop"
+    )
+    assert int.from_bytes(wave_entries[0, 6:8].tobytes(), "little") == stop_index
+    assert int.from_bytes(wave_entries[0, 10:12].tobytes(), "little") == (
+        arena["arena_id"] + 1
+    )
+    records = tracer.drain_records(64)
+    kinds = np.asarray(records["kind"])
+    assert 3 in kinds.tolist()
+    if reverse:
+        misses = np.asarray(records["pos"])[kinds == 2]
+        assert len(misses) == 1
+        assert misses[0, 0] < -0.17
+    else:
+        strikes = np.asarray(records["seg_start"])[kinds == 0]
+        assert np.any(strikes[:, 0] > -0.06)
+
+
 def test_wave_boundary_preserves_power_tilt_and_authored_axial_extent():
     tracer = _tracer(np.array([550e-9]))
     radius = 64.0e-6
@@ -481,6 +687,49 @@ def test_native_wave_fanout_conserves_power_and_is_link_order_invariant():
         ],
         rtol=4.0e-6,
     )
+
+
+def test_native_bubble_interface_branches_coherent_field_products():
+    from camera_software.complex_optical_operators import (
+        TransverseBasis, compile_normal_dielectric_field_pair,
+    )
+    wavelengths=np.array([450e-9,550e-9,650e-9])
+    tracer=_tracer(wavelengths)
+    source_basis=TransverseBasis.from_direction((0.,0.,1.))
+    reflection_basis=TransverseBasis.from_direction((0.,0.,-1.))
+    reflection,transmission=compile_normal_dielectric_field_pair(
+        source_basis,reflection_basis,source_basis,(0.,0.,-1.),
+        (1.52,1.53,1.54),(1.,1.,1.),material_name='authored-air-bubble',
+    )
+    contexts=[]
+    for center_z,axis,n_real in (
+        (-8e-6,(0.,0.,1.),1.52),
+        (-8e-6,(0.,0.,-1.),1.52),
+        (8e-6,(0.,0.,1.),1.),
+    ):
+        payload=np.asarray((0.,0.,0.,*axis),np.float64)
+        contexts.append(tracer.add_scale_context(
+            np.asarray((0.,0.,center_z)),16e-6,1,2e-6,8,
+            n_real,0.,1,payload,
+        ))
+    for destination,artifact in ((1,reflection),(2,transmission)):
+        tracer.add_wave_context_interface_link(
+            contexts[0],contexts[destination],int(artifact.coordinate_map),
+            artifact.jones.real,artifact.jones.imag,
+        )
+    tracer.ensure_pipeline(max_children=1,min_amplitude=1e-12)
+    tracer.submit_rays(
+        np.asarray([[0.,0.,-.001]]),np.asarray([[0.,0.,1.]]),
+        np.ones((1,3),np.complex128),max_bounces=1,min_amplitude=1e-12,
+    )
+    _wait(tracer)
+    source,reflected,transmitted=tracer.wave_arena_stats()
+    assert source['generation']==reflected['generation']==transmitted['generation']==1
+    seeded=(reflected['boundary']['seeded_field_power']
+            +transmitted['boundary']['seeded_field_power'])
+    assert seeded==pytest.approx(source['field_power'],rel=2e-5)
+    records=tracer.drain_records(16)
+    assert np.count_nonzero(np.asarray(records['kind'])==3)==2
 
 
 def test_native_wave_link_api_rejects_fanin_and_cycles_before_pipeline_build():

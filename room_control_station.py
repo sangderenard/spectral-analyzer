@@ -3397,67 +3397,20 @@ class RoomControlStation(_StationMenuBase):
     def _handle_doc_knob_click(self, knob_name: str, info: dict,
                                 local_x: float, rect_w: float) -> None:
         """Advance or toggle a knob value based on click position within its rect."""
-        widget = str(info.get("widget", ""))
-        dtype  = str(info.get("dtype", "float"))
-        lo     = float(info.get("low",  0.0))
-        hi     = float(info.get("high", 1.0))
-        step   = float(info.get("step", 0.0))
-        choices: list = list(info.get("choices", []) or [])
-
-        if widget == "stepper":
-            if step == 0.0:
-                step = 1.0 if dtype == "int" else 0.1
-            delta   = -step if local_x < rect_w / 2.0 else step
-            cur_src = self.state.get(knob_name, info.get("default", 0))
-            cur     = float(cur_src or 0)
-            new_val = max(lo, min(hi, cur + delta))
-            self.state[knob_name] = int(round(new_val)) if dtype == "int" else new_val
-
-        elif widget == "segmented":
-            if choices:
-                if knob_name == "floor_type":
-                    # The rendered segmented text includes a leading "Label:" area.
-                    # Map clicks only over the value region to avoid selecting the
-                    # wrong floor type when clicking option text.
-                    value_x0 = rect_w * 0.34
-                    value_w = max(1.0, rect_w - value_x0)
-                    local_vx = max(0.0, min(value_w - 1.0, local_x - value_x0))
-                    seg_w = value_w / max(1, len(choices))
-                else:
-                    seg_w = rect_w / max(1, len(choices))
-                    local_vx = local_x
-                idx = min(len(choices) - 1, max(0, int(local_vx / seg_w)))
-                if knob_name == "floor_type" or (
-                    knob_name.startswith("hull_") and knob_name.endswith("_type")
-                ):
-                    self.state[knob_name] = int(idx)
-                else:
-                    self.state[knob_name] = choices[idx]
-
-        elif widget == "toggle":
-            self.state[knob_name] = not bool(self.state.get(knob_name, False))
-
-        elif dtype in ("choice",) and choices:
-            cur = self.state.get(knob_name, 0)
-            try:
-                idx = choices.index(str(cur))
-            except ValueError:
-                try:
-                    idx = int(cur)
-                except Exception:
-                    idx = 0
-            except Exception:
-                idx = 0
-            next_idx = (idx + 1) % len(choices)
-            if knob_name == "floor_type" or (
-                knob_name.startswith("hull_") and knob_name.endswith("_type")
-            ):
-                self.state[knob_name] = int(next_idx)
-            else:
-                self.state[knob_name] = choices[next_idx]
-
-        elif dtype == "bool":
-            self.state[knob_name] = not bool(self.state.get(knob_name, False))
+        from controls import clicked_knob_value
+        if info.get("widget") not in ("stepper", "segmented", "toggle") and info.get("dtype") not in ("choice", "bool"):
+            self._invalidate_doc_ui_cache()
+            return
+        if info.get("widget") == "segmented" and knob_name == "floor_type":
+            value_x0 = rect_w * 0.34
+            value_w = max(1.0, rect_w - value_x0)
+            local_x = max(0.0, min(value_w - 1.0, local_x - value_x0))
+            rect_w = value_w
+        as_index = knob_name == "floor_type" or (
+            knob_name.startswith("hull_") and knob_name.endswith("_type"))
+        self.state[knob_name] = clicked_knob_value(
+            info, self.state.get(knob_name, info.get("default", 0)),
+            local_x, rect_w, choice_index=as_index)
 
         self._invalidate_doc_ui_cache()
 

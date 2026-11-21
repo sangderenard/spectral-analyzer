@@ -22,6 +22,7 @@ Conventions
 from __future__ import annotations
 
 import os
+import hashlib
 from typing import Any, Optional
 
 import yaml
@@ -109,15 +110,18 @@ def load_library(path: str = _DEFAULT_LIBRARY_PATH) -> EmissionProfileDatabase:
         remission:  {<name>: {frequency: [...], response_envelope: {...}}, ...}
                                                               → RemissionProfile
     """
-    with open(path, "r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or {}
+    with open(path, "rb") as fh:
+        source_bytes = fh.read()
+    data = yaml.safe_load(source_bytes.decode("utf-8")) or {}
+    revision = hashlib.sha256(source_bytes).hexdigest()
 
     epdb = EmissionProfileDatabase.instance()
 
     # ── Colour (reflectance) profiles ────────────────────────────────────────
     for name, spec in (data.get("color") or {}).items():
         cp = ColorProfile(spread=_build_spread_profile(spec or {}))
-        epdb.register(name, cp)
+        epdb.register(name, cp, source_revision={
+            "library_sha256": revision, "section": "color", "name": name})
 
     # ── Emission (light source) profiles ─────────────────────────────────────
     for name, spec in (data.get("emission") or {}).items():
@@ -129,7 +133,8 @@ def load_library(path: str = _DEFAULT_LIBRARY_PATH) -> EmissionProfileDatabase:
             fwhm_nm=float(spec.get("fwhm_nm", 30.0)),
             total_power_W=float(spec.get("total_power_W", 1.0)),
         )
-        epdb.register(name, ep)
+        epdb.register(name, ep, source_revision={
+            "library_sha256": revision, "section": "emission", "name": name})
 
     # ── Re-emission (frame-delayed) profiles ────────────────────────────────
     for name, spec in (data.get("remission") or {}).items():
@@ -144,7 +149,8 @@ def load_library(path: str = _DEFAULT_LIBRARY_PATH) -> EmissionProfileDatabase:
             spread=sp,
             response_envelope=_build_envelope(spec.get("response_envelope")),
         )
-        epdb.register(name, rp)
+        epdb.register(name, rp, source_revision={
+            "library_sha256": revision, "section": "remission", "name": name})
 
     return epdb
 

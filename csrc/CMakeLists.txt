@@ -107,3 +107,5 @@ spectral_c_dll(router_step_c router_step kernels/router_step.cpp kernels/field_m
   kernels/acoustic_pressure_backend.cpp transforms/picard_step.cpp)
 target_compile_definitions(router_step_c PRIVATE BUILDING_ROUTER_STEP_DLL)
 spectral_c_dll(tile_overlap_c tile_overlap kernels/tile_overlap.cpp)
+spectral_c_dll(wave_t4_c wave_t4 kernels/wave_t4_c.cpp kernels/wave_t4.cpp)
+target_compile_definitions(wave_t4_c PRIVATE BUILDING_WAVE_T4_DLL)

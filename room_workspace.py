@@ -331,7 +331,7 @@ class RoomWorkspace:
           - ``handle_event(ev)``
 
         Enclosures that wrap a simulator are also instantiated here.
-        Lights and portals are NOT instantiated as station objects.
+        Portal frames share the native station mesh path. Lights are separate.
         """
         stations = []
         for obj in self._objects.values():
@@ -344,7 +344,13 @@ class RoomWorkspace:
                            win_w: int, win_h: int):
         """Attempt to build a live station from a placed object."""
         if isinstance(obj, PlacedDutyStation):
+            if obj.station_type == "living_map_room":
+                from living_map_room_station import LivingMapRoomStation
+                return LivingMapRoomStation(obj)
             return self._build_duty_station(obj, win_w, win_h)
+        if isinstance(obj, PlacedPortalFrame):
+            from portal_frame_station import PortalFrameStation
+            return PortalFrameStation(obj)
 
         if isinstance(obj, PlacedEnclosure) and obj.simulator is not None:
             return self._build_enclosure_simulator(obj, win_w, win_h)
@@ -426,6 +432,9 @@ class RoomWorkspace:
             elif obj.station_type == "camera_designer":
                 from camera_station import CameraStationMenu
                 menu = CameraStationMenu()
+            elif obj.station_type == "nodus_console":
+                from nodus_console_station import NodusConsoleMenu
+                menu = NodusConsoleMenu(obj.build_state)
 
             if menu is not None:
                 st.menu = menu
@@ -488,6 +497,8 @@ class RoomWorkspace:
         return result
 
     def save_scene(self, path: str = None) -> bool:
+        if path is None and getattr(self, "require_explicit_scene_path", False):
+            return False
         if path is None:
             path = os.path.join(self._config_dir, "scene.yaml")
         return _dump_yaml(self.to_dict(), path)

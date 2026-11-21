@@ -31,6 +31,7 @@ from camera_software.optical_transport_contracts import (
     OpticalSolveReport,
     OpticalTimingSpec,
 )
+from camera_software.physical_aperture import LivePhysicalAperture
 
 
 def _lens(lane_count: int) -> CompoundLens:
@@ -100,6 +101,13 @@ def test_exact_compound_payload_is_the_fused_t2_graph_artifact(lane_count):
     assert contract["execution"] == "compiled-not-hot-interpreted"
     assert contract["t2_payload_keys"] == ["camera.exact-compound-lens"]
     assert contract["t4_descriptor_keys"] == []
+    elements = next(node for node in compiled.spec.nodes
+                    if node.key == "camera.exact-compound-lens").parameters[
+                        "parametric_elements"]
+    assert len(elements) == int(payload[1])
+    assert [item["element_index"] for item in elements] == list(range(len(elements)))
+    assert all(item["kind"] in {"exact-conic-interface", "aperture-stop"}
+               for item in elements)
 
 
 def test_projector_back_uses_reciprocal_exact_lens_graph():
@@ -156,6 +164,56 @@ def test_wave_context_defaults_to_vector_fft_and_absorbing_padding():
     assert descriptor["state_layout"] == "solid-contiguous-state-block"
     assert descriptor["allocation"] == "cold-only"
     assert compiled.contract()["graph_stats"]["edges"] == 5
+
+
+def test_aperture_inside_exact_lens_carries_stop_medium_into_native_arena():
+    from camera_software.camera_designer_bridge import camera_manifest_to_designer_preset
+    from camera_software.camera_manifest import resolve_camera_manifest
+
+    preset = camera_manifest_to_designer_preset(resolve_camera_manifest())
+    lens = CompoundLens.from_preset(
+        preset, wavelengths_um=(0.45, 0.55, 0.65), axial_scale=-1.0,
+    )
+    payload = lens.build_gpu_payload()
+    stop = next(
+        surface for surface in range(int(payload[1]))
+        if int(payload[8 + surface * 8 + 6]) & 1
+    )
+    spectral_base = int(payload[6]) + stop * int(payload[7])
+    expected = payload[spectral_base:spectral_base + 3]
+    aperture = LivePhysicalAperture.circular_hole(
+        "test.stop", opening_radius_m=20e-6,
+        assembly_radius_m=50e-6, thickness_m=4e-6,
+    )
+    region = {
+        "center_m": (-preset.aperture_stop.z_pos, 0.0, 0.0),
+        "axis": (1.0, 0.0, 0.0),
+        "radius_m": 60e-6,
+        "longitudinal_step_m": 1e-6,
+        "longitudinal_steps": 4,
+        "aperture_material": aperture,
+    }
+    graph = compile_compound_lens_graph(
+        lens, lane_count=3, wave_regions=(("test.stop", region),),
+    )
+    descriptor = graph.t4_descriptors["test.stop.arena"]
+    assert np.allclose(descriptor["medium_n_by_lane"], expected)
+    assert descriptor["parametric_lens_element"] == {
+        "node_key": "camera.exact-compound-lens",
+        "element_index": stop,
+        "kind": "aperture-stop",
+    }
+    with pytest.raises(ValueError, match="identify one exact lens stop"):
+        compile_compound_lens_graph(
+            lens, lane_count=3,
+            wave_regions=(("wrong.stop", {**region, "center_m": (42., 0., 0.)}),),
+        )
+    tracer = _RecordingTracer()
+    install_optical_graph(tracer, graph, exact_t2_registered=True)
+    native = tracer.contexts[0]
+    assert native["n_real"] == pytest.approx(expected[0])
+    assert native["payload"][19] == 3
+    assert np.allclose(native["payload"][20:23], expected)
 
 
 def test_periodic_fft_boundary_requires_explicit_authoring():
@@ -458,6 +516,27 @@ def test_installer_places_real_angular_arena_without_registering_surrogate_lens(
     arena_contract = receipt.contract()["wave_arenas"][0]
     assert arena_contract["boundary_geometry"] == "oriented-plane-to-plane-patch"
     assert arena_contract["longitudinal_extent_m"] == pytest.approx(9.6e-4)
+
+
+def test_wave_context_carries_authored_complex_index_lanes_to_native_payload():
+    nodes,links=wave_context_nodes(
+        "marble.local-lamina",3,center_m=(0.,0.,0.),
+        radius_m=32e-6,longitudinal_step_m=1e-6,longitudinal_steps=20,
+        medium_n_by_lane=(1.52,1.53,1.54),
+        medium_n_imag_by_lane=(0.,.0001,.0002),
+    )
+    graph=compile_optical_graph(OpticalTransportGraphSpec(
+        nodes=nodes,links=links,
+        entry_keys=(nodes[0].key,),product_keys=(nodes[-1].key,),
+    ))
+    tracer=_RecordingTracer()
+    install_optical_graph(tracer,graph,exact_t2_registered=False)
+    payload=tracer.contexts[0]["payload"]
+    assert payload[6:9].tolist()==pytest.approx([57_415_645.,1.,3.])
+    assert payload[9:12].tolist()==pytest.approx([1.52,1.53,1.54])
+    assert payload[12:15].tolist()==pytest.approx([0.,.0001,.0002])
+    with pytest.raises(ValueError,match="per-lane real indices"):
+        wave_context_nodes("invalid",3,medium_n_imag_by_lane=(0.,0.,0.))
 
 
 def test_installer_lowers_field_to_field_edge_to_native_persistent_link():

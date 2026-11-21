@@ -691,6 +691,7 @@ struct PyRayTracer
     bool        _gpu_all_stages  = false;
     bool        _gpu_skip_record_readback = false;
     bool        _capture_wave_exit_states = false;
+    double      _wave_grid_dx_m = 2e-6;
     std::string _shader_dir;
     uint64_t    _gl_display_hglrc = 0;  /* Pygame display HGLRC for WGL object sharing */
     uint64_t    _gl_display_hdc   = 0;  /* Pygame display HDC for pixel-format matching */
@@ -726,6 +727,7 @@ struct PyRayTracer
             cfg.gpu_all_stages              = _gpu_all_stages;
             cfg.gpu_skip_record_readback    = _gpu_skip_record_readback;
             cfg.capture_wave_exit_states    = _capture_wave_exit_states;
+            cfg.wave_grid_dx_m = _wave_grid_dx_m;
             cfg.sensor_mipmap_enabled = _sensor_mipmap_enabled;
             cfg.sensor_mipmap_max_nodes = _sensor_mipmap_max_nodes;
             cfg.sensor_mipmap_max_depth = _sensor_mipmap_max_depth;
@@ -1793,8 +1795,11 @@ struct PyRayTracer
         bool                 use_gpu_compute = false,
         bool                 gpu_all_stages  = false,
         std::string          shader_dir      = "",
-        bool                 capture_wave_exit_states = false)
+        bool                 capture_wave_exit_states = false,
+        double               wave_grid_dx_m = 2e-6)
     {
+        if (!std::isfinite(wave_grid_dx_m) || wave_grid_dx_m <= 0.0)
+            throw std::invalid_argument("wave_grid_dx_m must be finite and positive");
         {
             std::lock_guard<std::mutex> lk(_pipeline_mu);
             if (!_pipeline) {
@@ -1802,6 +1807,7 @@ struct PyRayTracer
                 _use_gpu_compute = use_gpu_compute;
                 _gpu_all_stages  = gpu_all_stages;
                 _capture_wave_exit_states = capture_wave_exit_states;
+                _wave_grid_dx_m = wave_grid_dx_m;
                 if (!shader_dir.empty()) _shader_dir = shader_dir;
             }
         }
@@ -2829,6 +2835,44 @@ struct PyRayTracer
     /* Feed GPU-processed child intents back into the pipeline.
      * buf: float32 array of shape (n, INTENT_STRIDE=84).
      * Each row is decoded into a RayIntent and pushed to Q_intent. */
+    py::array_t<uint8_t> drain_studio_transitions(int max_n = 256) {
+        constexpr py::ssize_t stride =
+            static_cast<py::ssize_t>(sizeof(RayTransitionRecordV1));
+        if (!_pipeline || max_n <= 0)
+            return py::array_t<uint8_t>(std::vector<py::ssize_t>{0, stride});
+        std::vector<RayTransitionRecordV1> batch;
+        ray_pipeline_drain_transitions(_pipeline, batch, max_n);
+        auto arr = py::array_t<uint8_t>(
+            std::vector<py::ssize_t>{static_cast<py::ssize_t>(batch.size()), stride});
+        if (!batch.empty())
+            std::memcpy(arr.mutable_data(), batch.data(), batch.size()*sizeof(batch[0]));
+        return arr;
+    }
+
+    py::dict studio_transition_layout() const {
+        py::dict out;
+        out["version"] = 1;
+        out["stride"] = sizeof(RayTransitionRecordV1);
+        out["max_bands"] = RAY_RECORD_MAX_BANDS;
+        out["status"] = offsetof(RayTransitionRecordV1, status);
+        out["tag"] = offsetof(RayTransitionRecordV1, tag);
+        out["triangle_id"] = offsetof(RayTransitionRecordV1, triangle_id);
+        out["region_id"] = offsetof(RayTransitionRecordV1, region_id);
+        out["transition_flags"] = offsetof(RayTransitionRecordV1, transition_flags);
+        out["lane_count"] = offsetof(RayTransitionRecordV1, lane_count);
+        out["path_length_m"] = offsetof(RayTransitionRecordV1, path_length_m);
+        out["crossing_point"] = offsetof(RayTransitionRecordV1, crossing_point);
+        out["incoming_direction"] = offsetof(RayTransitionRecordV1, incoming_direction);
+        out["frequency_hz"] = offsetof(RayTransitionRecordV1, frequency_hz);
+        out["before_n_real"] = offsetof(RayTransitionRecordV1, before_n_real);
+        out["before_n_imag"] = offsetof(RayTransitionRecordV1, before_n_imag);
+        out["after_n_real"] = offsetof(RayTransitionRecordV1, after_n_real);
+        out["after_n_imag"] = offsetof(RayTransitionRecordV1, after_n_imag);
+        out["amp_re"] = offsetof(RayTransitionRecordV1, amp_re);
+        out["amp_im"] = offsetof(RayTransitionRecordV1, amp_im);
+        return out;
+    }
+
     void submit_intents_flat(py::array_t<float, py::array::c_style> buf) {
         auto* pl = _get_pipeline();
         auto info = buf.request();
@@ -3719,6 +3763,9 @@ struct PyRayTracer
             d["field_power"] = s.field_power;
             d["border_power"] = s.border_power;
             d["absorbed_power"] = s.absorbed_power;
+            d["material_absorbed_power"] = s.material_absorbed_power;
+            d["numerical_border_absorbed_power"] =
+                s.numerical_border_absorbed_power;
             py::list lanes;
             for (int b = 0; b < s.bands; ++b) {
                 py::dict lane;
@@ -4650,6 +4697,188 @@ struct PyRayTracer
             medium_neg_mat_idx);
         if (rc != SK_OK)
             throw std::runtime_error("ray_tracer_set_tri_boundary_media failed: rc=" + std::to_string(rc));
+    }
+
+    void set_studio_regions(
+        py::array_t<int, py::array::c_style | py::array::forcecast> records,
+        py::array_t<int, py::array::c_style | py::array::forcecast> triangle_region_ids)
+    {
+        if (!handle || _pipeline)
+            throw std::runtime_error("Studio regions must be installed before pipeline creation");
+        const auto r = records.request();
+        const auto ids = triangle_region_ids.request();
+        if (r.ndim != 2 || r.shape[1] != 2 || r.shape[0] < 1 ||
+            ids.ndim != 1 || ids.shape[0] != _n_tris)
+            throw std::invalid_argument("Studio regions require (N,2) records and one ID per triangle");
+        std::vector<RtStudioRegionRecord> native(static_cast<size_t>(r.shape[0]));
+        const int* values = static_cast<const int*>(r.ptr);
+        for (size_t i = 0; i < native.size(); ++i)
+            native[i] = {values[2*i], values[2*i+1]};
+        const int rc = ray_tracer_set_studio_regions(
+            handle, static_cast<int>(native.size()), native.data(),
+            static_cast<const int*>(ids.ptr));
+        if (rc != SK_OK)
+            throw std::invalid_argument("native Studio region ownership was refused");
+    }
+
+    void set_studio_spheres(
+        py::array_t<double, py::array::c_style | py::array::forcecast> records)
+    {
+        if (!handle || _pipeline)
+            throw std::runtime_error("Studio spheres must be installed before pipeline creation");
+        const auto r = records.request();
+        if (r.ndim != 2 || r.shape[1] != 5 || r.shape[0] < 1)
+            throw std::invalid_argument("Studio spheres require (N,5) center/radius/owner records");
+        std::vector<RtStudioSphereRecord> native(static_cast<size_t>(r.shape[0]));
+        const double* values = static_cast<const double*>(r.ptr);
+        for (size_t i = 0; i < native.size(); ++i) {
+            const double* row = values + i * 5;
+            if (!std::isfinite(row[4]) || row[4] != std::floor(row[4]))
+                throw std::invalid_argument("Studio sphere owner must be an exact triangle ID");
+            native[i] = {{row[0], row[1], row[2]}, row[3], static_cast<int>(row[4])};
+        }
+        if (ray_tracer_set_studio_spheres(handle, static_cast<int>(native.size()), native.data()) != SK_OK)
+            throw std::invalid_argument("native exact Studio spheres were refused");
+    }
+
+    py::dict resolve_studio_medium(
+        py::array_t<double, py::array::c_style | py::array::forcecast> position,
+        py::array_t<double, py::array::c_style | py::array::forcecast> direction,
+        py::array_t<double, py::array::c_style | py::array::forcecast> frequencies_hz)
+    {
+        const auto p = position.request(), d = direction.request(), f = frequencies_hz.request();
+        if (p.size != 3 || d.size != 3 || f.ndim != 1 || f.size < 1 || f.size > _n_bands)
+            throw std::invalid_argument("Studio medium query requires a point, direction and transport frequencies");
+        py::array_t<double> real(f.size), imag(f.size);
+        int base = -1;
+        const int rc = ray_tracer_resolve_studio_medium(
+            handle, static_cast<const double*>(p.ptr), static_cast<const double*>(d.ptr),
+            static_cast<int>(f.size), static_cast<const double*>(f.ptr), &base,
+            static_cast<double*>(real.mutable_data()), static_cast<double*>(imag.mutable_data()));
+        if (rc != SK_OK) throw std::runtime_error("native Studio medium ownership is unresolved");
+        py::dict out;
+        out["base_material"] = base;
+        out["n_real"] = std::move(real);
+        out["n_imag"] = std::move(imag);
+        return out;
+    }
+
+    py::dict resolve_studio_wave_interface(
+        int hit_triangle,
+        py::array_t<double, py::array::c_style | py::array::forcecast> hit_position,
+        py::array_t<double, py::array::c_style | py::array::forcecast> incoming_direction,
+        py::array_t<double, py::array::c_style | py::array::forcecast> frequencies_hz,
+        double margin_wavelengths)
+    {
+        const auto p = hit_position.request(), d = incoming_direction.request();
+        const auto f = frequencies_hz.request();
+        if (p.ndim != 1 || p.size != 3 || d.ndim != 1 || d.size != 3
+            || f.ndim != 1 || f.size < 1 || f.size > _n_bands)
+            throw std::invalid_argument("Studio wave interface requires a hit point, direction and transport frequencies");
+        py::array_t<double> before_re(f.size), before_im(f.size);
+        py::array_t<double> after_re(f.size), after_im(f.size);
+        RtStudioTransitionVectorV1 transition{};
+        const int rc = ray_tracer_resolve_studio_transition_vector_v1(
+            handle, hit_triangle, static_cast<const double*>(p.ptr),
+            static_cast<const double*>(d.ptr), static_cast<int>(f.size),
+            static_cast<const double*>(f.ptr), margin_wavelengths, &transition,
+            before_re.mutable_data(), before_im.mutable_data(),
+            after_re.mutable_data(), after_im.mutable_data());
+        if (rc != SK_OK)
+            throw std::invalid_argument("native Studio wave interface is not an authenticated resolved hit");
+        const auto& result = transition.interface;
+        py::dict out;
+        out["triangle_id"] = result.triangle_id;
+        out["region_id"] = result.region_id;
+        out["outward_normal"] = py::make_tuple(
+            result.outward_normal[0], result.outward_normal[1],
+            result.outward_normal[2]);
+        out["margin_m"] = result.margin_m;
+        out["before_base_material"] = result.before_base_material;
+        out["after_base_material"] = result.after_base_material;
+        out["crossing_point"] = py::make_tuple(
+            transition.crossing_point[0], transition.crossing_point[1],
+            transition.crossing_point[2]);
+        out["incoming_direction"] = py::make_tuple(
+            transition.incoming_direction[0], transition.incoming_direction[1],
+            transition.incoming_direction[2]);
+        out["transition_flags"] = transition.transition_flags;
+        out["before_n_real"] = std::move(before_re);
+        out["before_n_imag"] = std::move(before_im);
+        out["after_n_real"] = std::move(after_re);
+        out["after_n_imag"] = std::move(after_im);
+        return out;
+    }
+
+    py::array_t<int32_t> collect_studio_wave_triangles(
+        py::array_t<double, py::array::c_style | py::array::forcecast> point,
+        double search_radius_m, int max_ids = 4096)
+    {
+        const auto p = point.request();
+        if (p.ndim != 1 || p.size != 3 || max_ids < 1 || max_ids > 1'000'000)
+            throw std::invalid_argument(
+                "Studio local wave geometry needs a 3D point and bounded capacity");
+        std::vector<int> ids(static_cast<size_t>(max_ids));
+        int count = 0;
+        const int rc = ray_tracer_collect_studio_wave_triangles(
+            handle, static_cast<const double*>(p.ptr), search_radius_m,
+            ids.data(), max_ids, &count);
+        if (rc != SK_OK) {
+            if (count > max_ids)
+                throw std::invalid_argument(
+                    "Studio local wave geometry exceeded the requested capacity");
+            throw std::invalid_argument("Studio local wave geometry query was refused");
+        }
+        py::array_t<int32_t> result(count);
+        for (int i = 0; i < count; ++i) result.mutable_at(i) = ids[i];
+        return result;
+    }
+
+    py::dict sample_studio_wave_grid(
+        py::array_t<double, py::array::c_style | py::array::forcecast> origin,
+        py::array_t<double, py::array::c_style | py::array::forcecast> steps,
+        py::array_t<int32_t, py::array::c_style | py::array::forcecast> shape,
+        py::array_t<double, py::array::c_style | py::array::forcecast> direction,
+        py::array_t<double, py::array::c_style | py::array::forcecast> frequencies_hz)
+    {
+        const auto o = origin.request(), s = steps.request(),
+                   sh = shape.request(), d = direction.request(),
+                   f = frequencies_hz.request();
+        if (o.ndim != 1 || o.size != 3 || s.ndim != 2 ||
+            s.shape[0] != 3 || s.shape[1] != 3 ||
+            sh.ndim != 1 || sh.size != 3 || d.ndim != 1 || d.size != 3 ||
+            f.ndim != 1 || f.size < 1 || f.size > _n_bands)
+            throw std::invalid_argument("Studio wave grid needs origin(3), steps(3,3), shape(3), direction(3) and frequencies");
+        const auto* dims = static_cast<const int32_t*>(sh.ptr);
+        if (dims[0] < 1 || dims[1] < 1 || dims[2] < 1 ||
+            dims[0] > 2'000'000 || dims[1] > 2'000'000 ||
+            dims[2] > 2'000'000 ||
+            static_cast<uint64_t>(dims[0]) * dims[1] * dims[2] > 2'000'000)
+            throw std::invalid_argument("Studio wave grid must contain 1 to 2,000,000 voxels");
+        const auto voxels = static_cast<uint64_t>(dims[0]) * dims[1] * dims[2];
+        const std::vector<py::ssize_t> space{
+            dims[0], dims[1], dims[2]};
+        const std::vector<py::ssize_t> spectral{
+            dims[0], dims[1], dims[2], f.size};
+        py::array_t<int32_t> base(space);
+        py::array_t<double> real(spectral), imag(spectral);
+        const auto* step_values = static_cast<const double*>(s.ptr);
+        uint64_t failed = UINT64_MAX;
+        const int rc = ray_tracer_sample_studio_wave_grid(
+            handle, static_cast<const double*>(o.ptr),
+            step_values, step_values + 3, step_values + 6,
+            dims[0], dims[1], dims[2], static_cast<const double*>(d.ptr),
+            static_cast<int>(f.size), static_cast<const double*>(f.ptr),
+            base.mutable_data(), real.mutable_data(), imag.mutable_data(),
+            voxels, &failed);
+        if (rc != SK_OK)
+            throw std::invalid_argument("native Studio wave grid sample refused at voxel " +
+                                        std::to_string(failed));
+        py::dict out;
+        out["base_material"] = std::move(base);
+        out["n_real"] = std::move(real);
+        out["n_imag"] = std::move(imag);
+        return out;
     }
 
     /** Project a (N, 14) float32 multiscale segment array onto a coherent
@@ -7013,6 +7242,7 @@ intersect it are not launched.)doc")
              py::arg("gpu_all_stages") = false,
              py::arg("shader_dir") = "",
              py::arg("capture_wave_exit_states") = false,
+             py::arg("wave_grid_dx_m") = 2e-6,
 R"doc(Force creation of the persistent ray pipeline without submitting rays.
 Use this on the display thread when the pipeline needs to share with the
 currently-bound OpenGL display context. Set capture_wave_exit_states before
@@ -7281,6 +7511,16 @@ ray_material.comp.glsl.  Returns shape (0,) when the queue is empty.
 
 Used by the GPU T3 bridge (GpuRayMaterialStage) to intercept the material/Fresnel
 stage and dispatch it on the GPU instead of the C++ worker threads.)doc")
+        .def("drain_studio_transitions",
+             &PyRayTracer::drain_studio_transitions,
+             py::arg("max_n") = 256,
+R"doc(Drain native T2 authored-interface crossing records as raw U8 rows.
+The versioned RayTransitionRecordV1 layout is declared in ray_pipeline.h;
+status, lineage, resolved frequencies, complex amplitudes, and two-sided
+indices travel together. This does not consume the ordinary ray output.)doc")
+        .def("studio_transition_layout",
+             &PyRayTracer::studio_transition_layout,
+R"doc(Return byte offsets and stride of the native version-1 transition row.)doc")
         .def("submit_intents_flat",
              &PyRayTracer::submit_intents_flat,
              py::arg("buf"),
@@ -7638,6 +7878,28 @@ Use -1 for ambient air/vacuum.
 Refraction then uses crossing direction directly (front-face: + -> -,
 back-face: - -> +) instead of material-equality toggles.
 )doc")
+        .def("set_studio_regions", &PyRayTracer::set_studio_regions,
+             py::arg("records"), py::arg("triangle_region_ids"),
+             "Install authenticated Studio region ownership before native pipeline creation.")
+        .def("set_studio_spheres", &PyRayTracer::set_studio_spheres,
+             py::arg("records"),
+             "Install exact Studio sphere boundaries with their material owner triangles.")
+        .def("resolve_studio_medium", &PyRayTracer::resolve_studio_medium,
+             py::arg("position"), py::arg("direction"), py::arg("frequencies_hz"),
+             "Resolve native real/imaginary medium indices for a ray-side point.")
+        .def("resolve_studio_wave_interface", &PyRayTracer::resolve_studio_wave_interface,
+             py::arg("hit_triangle"), py::arg("hit_position"),
+             py::arg("incoming_direction"), py::arg("frequencies_hz"),
+             py::arg("margin_wavelengths"),
+             "Classify an authored T3 hit and both wavelength-tuned sides for T4.")
+        .def("collect_studio_wave_triangles", &PyRayTracer::collect_studio_wave_triangles,
+             py::arg("point"), py::arg("search_radius_m"),
+             py::arg("max_ids") = 4096,
+             "Find nearby authored boundary triangles for a local T4 context; exact spheres use owner IDs.")
+        .def("sample_studio_wave_grid", &PyRayTracer::sample_studio_wave_grid,
+             py::arg("origin"), py::arg("steps"), py::arg("shape"),
+             py::arg("direction"), py::arg("frequencies_hz"),
+             "Sample authored Studio complex refractive index on an oriented 3D grid for T4 state.")
         .def("project_coherent", &PyRayTracer::project_coherent,
              py::arg("segs"),
              py::arg("n_bands"),

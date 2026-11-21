@@ -1921,3 +1921,30 @@ def publish_owner_target(
         flip_slots=flip_slots,
         change_key=change_key,
     )
+
+# Shared by document-rendered station menus. Extracted from RoomControlStation's
+# existing knob interaction; layout-specific label regions remain host-owned.
+def clicked_knob_value(info, current, local_x, rect_w, *, choice_index=False):
+    widget = str(info.get('widget', ''))
+    dtype = str(info.get('dtype', 'float'))
+    choices = list(info.get('choices', []) or [])
+    if widget == 'readonly':
+        return current
+    if widget == 'stepper':
+        step = float(info.get('step', 0.0)) or (1.0 if dtype == 'int' else 0.1)
+        value = float(current or 0) + (-step if local_x < rect_w / 2 else step)
+        value = max(float(info.get('low', 0)), min(float(info.get('high', 1)), value))
+        return int(round(value)) if dtype == 'int' else value
+    if widget == 'segmented' and choices:
+        index = min(len(choices)-1, max(0, int(local_x / (max(1.0, rect_w) / len(choices)))))
+        return index if choice_index else choices[index]
+    if widget == 'toggle' or dtype == 'bool':
+        return not bool(current)
+    if dtype == 'choice' and choices:
+        try: index = choices.index(str(current))
+        except ValueError:
+            try: index = int(current)
+            except (TypeError, ValueError): index = 0
+        index = (index + 1) % len(choices)
+        return index if choice_index else choices[index]
+    return current

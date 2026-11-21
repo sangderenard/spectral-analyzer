@@ -10,7 +10,7 @@ import numpy as np
 import scene_orders
 from camera_designer.obj_loader import load_obj
 from camera_designer.studio_photo_geometry import prepare_photo_geometry
-from camera_designer.studio_t5_scene import native_t5_scene_inputs
+from camera_designer.studio_t5_scene import native_t5_scene_inputs, create_native_t5_tracer
 from camera_software.render_assets import (
     RenderAssetCatalog, ink_order_for_request, plan_ink_atlas_bake,
 )
@@ -52,6 +52,11 @@ def test_atlas_uses_timed_studio_shutter_and_original_authored_geometry():
     np.testing.assert_array_equal(native["verts"], scene[3].reshape(-1, 9))
     np.testing.assert_array_equal(native["mat_buf"], scene[2])
     assert len(native["emitter_tri_ids"]) > 0
+    tracer = create_native_t5_tracer(scene, [.45, .55, .65])
+    try:
+        assert tracer is not None
+    finally:
+        tracer.stop_pipeline()
 
 
 def test_studio_hdr_keeps_linear_profiled_frame():

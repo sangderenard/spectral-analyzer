@@ -110,6 +110,8 @@ struct Progress {
     double field_power = 0.0;
     double border_power = 0.0;
     double absorbed_power = 0.0;
+    double material_absorbed_power = 0.0;
+    double numerical_border_absorbed_power = 0.0;
 };
 
 /** Fixed-layout live material operator embedded in a wave-arena payload.

@@ -22,9 +22,11 @@ is `COHERENT_RECEPTION_POOL_HANDOFF.md`.
 ## Implemented Nodus facilities
 
 Nodus `EdgeTensorFifo` is implemented, not merely proposed. The implementation
-is in `include/inl/table_abi_core.inl`, its public operations are surfaced by
-`include/inl/table_abi_edge_io.inl` and `include/table_abi.h`, and execution is
-coordinated by `include/thread_manager.h` and `src/thread_manager.cpp`:
+is now in `include/edge_tensor_fifo.h`. Its public operations are surfaced by
+the runtime-only ABI in `include/nodus_runtime_abi.h` and by the legacy table
+ABI in `include/inl/table_abi_edge_io.inl` and `include/table_abi.h`; broader
+execution is coordinated by `include/thread_manager.h` and
+`src/thread_manager.cpp`:
 
 - one atomically bound writer per edge;
 - fixed typed shape, element size, layout, dtype, slot capacity, and overwrite
@@ -94,6 +96,13 @@ The transport extraction then landed:
 - the Spectral bridge prefers this ABI and retains a legacy-table fallback;
 - native runtime tests, byte-for-byte legacy snapshot parity, two-reader
   backpressure, and the camera/Turing rollback-rerun test pass.
+
+These dated landing and test statements are historical receipts. The focused
+Spectral tests were not re-executed for this documentation reconciliation: they
+require `NODUS_RUNTIME_LIBRARY` or the expected Windows `nodus_runtime.dll`, and
+legacy snapshot parity additionally requires `canvas_tables.dll`. Test source
+present in the repository does not imply a passing result on every host or
+qualification of arbitrary Nodus ABI versions.
 
 ## Required extraction in Nodus
 
@@ -178,9 +187,12 @@ both reader cursors before the same request reruns and commits exactly.
 ## Adoption order
 
 1. Keep current pipeline-native linear and cold fan-out paths.
-2. Qualify `OpticalBranchToken` round-trip through an extracted Nodus FIFO.
-   **Landed:** the exact 96-byte token passes the extracted runtime, legacy
-   parity, two-reader backpressure, and transaction restore gates.
+2. Keep `OpticalBranchToken` round-trip qualification open until branch-specific
+   evidence covers its exact ABI and metadata. **Landed for
+   `OpticalReceptionToken` only:** the focused source covers its exact 96-byte
+   round-trip, two-reader slowest-reader backpressure, transaction-frontier
+   restore, and byte-for-byte extracted/legacy snapshot parity. This reception
+   coverage is not branch-token qualification.
 3. Compare shuffled versus ordered acyclic execution.
 4. Add coherent fan-in as an optical accumulator process.
 5. Add delayed-cycle worklists.
